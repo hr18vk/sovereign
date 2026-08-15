@@ -1,0 +1,17 @@
+{
+    "name": "Supremum Engine Dev Environment",
+    "image": "mcr.microsoft.com/devcontainers/go:1.26",
+    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y libjemalloc-dev capnproto",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "go.toolsManagement.checkForUpdates": "local",
+                "go.useLanguageServer": true,
+                "go.gopath": "/go"
+            },
+            "extensions": [
+                "golang.Go"
+            ]
+        }
+    }
+}

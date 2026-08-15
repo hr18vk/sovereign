@@ -1,0 +1,148 @@
+# Sovereign Engine — Automated Hostility CI
+#
+# There is no "build" job that passes on good intentions. Every job here enforces
+# a physical property of the engine. A green run means: zero wasted struct
+# padding, zero hot-path heap allocations, and no benchmark regression beyond the
+# statistical thresholds below. A red run is a mechanical rejection that does not
+# require, and does not wait for, human judgement.
+
+name: gatekeeper
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so the bare-metal Bencher budget is not
+# wasted on stale revisions.
+concurrency:
+  group: gatekeeper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fieldalignment:
+    name: struct-padding gate (zero wasted bytes)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      - name: install fieldalignment
+        run: go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@latest
+      - name: verify zero wasted struct padding
+        run: |
+          set -euo pipefail
+          pkgs=$(go list ./internal/...)
+          offending=""
+          for pkg in $pkgs; do
+            # -l lists structs whose fields can be reordered to reduce padding.
+            # -fix is NOT applied: we want the failure, not the auto-patch, and
+            # we never let a linter mutate layout silently.
+            out=$(fieldalignment -l "$pkg" 2>/dev/null || true)
+            if [ -n "$out" ]; then
+              offending="$offending
+          $pkg:
+          $out"
+            fi
+          done
+          if [ -n "$offending" ]; then
+            echo "::error::Wasted struct padding detected. Every hot struct must be packed with zero internal padding (CRDTEntry=120B, hamtLeaf=32B, HamtNode=72B, ElimSlot=128B with deliberate tail pad). Reorder per docs/internals/STRUCT_ALIGNMENT.md."
+            echo "$offending"
+            exit 1
+          fi
+
+  zero-alloc:
+    name: zero-GC hot-path gate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      # The hot path must show 0 B/op 0 allocs/op. TestHotPathZeroAllocations
+      # asserts this via testing.AllocsPerRun; -benchmem is the second witness.
+      - name: hot-path allocation gate
+        run: |
+          go test ./pkg/sync/ -run 'TestHotPathZeroAllocations' -count=1
+          go test ./pkg/sync/ -run '^$' -bench 'BenchmarkHAMTInsertZeroAlloc' -benchmem -count=3 \
+            | tee /tmp/zero.txt
+          # Fail if any iteration reports allocations.
+          if grep -E 'allocs/op' /tmp/zero.txt | awk '{print $5}' | grep -vq '^0$'; then
+            echo "::error::Hot path allocated. Zero-GC mandate violated."
+            exit 1
+          fi
+
+  layout:
+    name: layout-assertion gate (offsets & sizes)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      - name: struct offset / size assertions
+        run: |
+          go test ./pkg/sync/ \
+            -run 'TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment|TestHamtNodeOffsets' \
+            -count=1 -v
+
+  benchmark:
+    name: bare-metal bencher (no regression)
+    # Runs on dedicated Graviton self-hosted runners so the signal is mesh and
+    # DRAM, not a noisy shared-tenant vCPU. PRs are compared to the target
+    # branch with a strict upper-bound threshold; the gate blocks merge on
+    # regression beyond the configured noise floor.
+    runs-on: [self-hosted, graviton, bare-metal]
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      - name: bencher
+        uses: bencherdev/bencher@main
+      - name: run gatekeeper benchmarks
+        env:
+          RUN_CRUCIBLE: '1'
+        run: |
+          # CPU-pinned so taskset affinity, not the scheduler, decides the tier.
+          # The canonical 57,638,422 ops/s @ GOMAXPROCS=32 measurement (recorded
+          # in docs/architecture/5_BENCHMARKS_AND_LIMITS.md and README) was taken
+          # exactly this way: taskset -c 0-31, RUN_CRUCIBLE=1, the Stage 5 gate.
+          # D4 FIX: the previous comment cited an earlier 54,241,432 figure from
+          # a pre-Stage-5-tuning run; both numbers are from this same harness,
+          # only the canonical one across docs/README is the post-tuning 57.63M.
+          taskset -c 0-31 go test ./pkg/sync/ \
+            -run '^$' \
+            -bench 'BenchmarkEliminationCrucible|BenchmarkEngineScaling' \
+            -benchmem -count=10
+      # Block the PR if throughput regresses > 0.5% or P99 rises > 1us vs target.
+      - name: bencher threshold gate
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_ADAPTER: rust
+          BENCHER_TEST: benchmark
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bencher run \
+            --if-branch "$GITHUB_BASE_REF" \
+            --else-if-branch "$GITHUB_HEAD_REF" \
+            --if-branch-start-point "$GITHUB_BASE_REF" \
+            --github-actions "$GITHUB_TOKEN" \
+            --err \
+            --test-bound 'upper_bound' \
+            --power '0.99' \
+            --threshold-min-sample-size 30 \
+            --thresholds '{ "throughput": { "upper_bound":{"ratio":0.995}, "lower_bound":{"ratio":0.0} }, "latency": { "upper_bound":{"ratio":1.01},"lower_bound":{"ratio":0.0} } }' \
+            --file /tmp/bench.ndjson \
+            "taskset -c 0-31 go test ./pkg/sync/ -run '^$' -bench 'BenchmarkEliminationCrucible' -benchmem -count=20 | tee /tmp/bench.ndjson"

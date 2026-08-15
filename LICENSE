@@ -1,0 +1,62 @@
+Business Source License 1.1
+
+Parameters
+===========
+
+Licensor:             Sovereign Systems (Sovereign Engine Project)
+Licensed Work:        The Sovereign Engine source code, including all packages
+                      under pkg/, internal/, cmd/, api/, and sdk/, collectively
+                      the "Sovereign Engine".
+Change Date:          2029-08-15
+Additional Use Grant: Non-Production Use is permitted without restriction.
+                      "Non-Production Use" means evaluation, testing,
+                      benchmarking, internal research, development, educational
+                      use, and personal use. "Production Use" means any use of
+                      the Licensed Work that is offered as a commercial product
+                      or service, or that competes with or substitutes for the
+                      Licensor's offerings. Production Use requires a separate
+                      written grant from the Licensor until the Change Date.
+
+Terms
+=====
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make Non-Production Use of the Licensed Work. Any
+exercise of rights granted hereunder shall be subject to the following
+conditions:
+
+1. Notices — You must retain all copyright, patent, trademark, and attribution
+   notices present in the Licensed Work in any copies or distributions.
+
+2. Production Use Restriction — Production Use is not permitted under this
+   License. You may not use the Licensed Work in Production without a separate
+   written grant of production-use rights from the Licensor. Production Use of
+   any derivative work must honor the same restriction.
+
+3. Change Date — On the Change Date (2029-08-15), this License automatically
+   converts to an unencumbered license. From that date forward, rights to copy,
+   modify, redistribute, and make Production Use of the Licensed Work are granted
+   in perpetuity, and the Production Use restriction in condition (2) ceases to
+   apply.
+
+4. Derivative Works — You may create and distribute derivative works of the
+   Licensed Work, provided that each derivative work:
+   (a) includes a prominent notice stating it is derived from the Sovereign
+       Engine, and includes the text of this BSL; and
+   (b) grants rights no more restrictive than this BSL until the Change Date,
+       and upon and after the Change Date grants rights no more restrictive than
+       the same unencumbered license this BSL converts to.
+
+5. No Warranty — The Licensed Work is provided "AS IS", without warranty of any
+   kind, express or implied, including without limitation warranties of title,
+   non-infringement, merchantability, or fitness for a particular purpose.
+
+6. Limitation of Liability — In no event shall the Licensor be liable for any
+   direct, indirect, incidental, special, exemplary, or consequential damages
+   arising out of the use or inability to use the Licensed Work, even if advised
+   of the possibility of such damage.
+
+7. Non-Production Use Clarification — Evaluation, testing, benchmarking,
+   internal research, development, educational use, and personal use are
+   expressly permitted without restriction, subject to conditions (1), (4),
+   (5), and (6).

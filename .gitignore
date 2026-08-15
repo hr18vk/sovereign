@@ -1,0 +1,32 @@
+# Secrets and credentials — never commit
+.env
+*.pem
+*.key
+*_key.pem
+id_rsa
+id_ed25519
+*.ppk
+
+# Build output
+bin/
+*.out
+*.test
+.buildcache/
+
+# Node / frontend tooling
+node_modules/
+.wrangler/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE / editor local state
+.vscode/
+.idea/
+
+# Container / orchestration local state
+.kube/
