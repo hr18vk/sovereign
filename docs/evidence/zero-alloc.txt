@@ -1,0 +1,14 @@
+ZERO-GC HOT PATH — the write path allocates nothing
+================================================================================
+Claim      : HAMT.Set (the write hot path) performs ZERO heap allocations —
+             0 B/op, 0 allocs/op. The GC never runs on the hot path.
+Command    : go test -bench=BenchmarkHAMTInsertZeroAlloc -benchmem -count=3 ./pkg/sync/
+Companion  : the gate test TestHotPathZeroAllocations asserts 0 allocs/op and fails CI
+             on any regression. (Benchmark run here at 4 cores; the 0-alloc property is
+             core-count-independent — it is a property of the code path, not the load.)
+--------------------------------------------------------------------------------
+
+BenchmarkHAMTInsertZeroAlloc-4   	  166969	      9650 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHAMTInsertZeroAlloc-4   	  163645	      9555 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHAMTInsertZeroAlloc-4   	  164134	      9790 ns/op	       0 B/op	       0 allocs/op
+PASS

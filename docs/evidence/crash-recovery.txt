@@ -1,0 +1,18 @@
+CRASH RECOVERY — a node killed mid-run recovers to the identical fleet root
+================================================================================
+Claim      : a node killed with SIGKILL (no graceful flush) recovers from its
+             WAL + snapshot and its Merkle root re-equals the fleet — the writes
+             that were fsynced before the kill survive.
+Method     : inject a batch, kill -9 the seed node, restart it on the same
+             WAL + snapshot, then compare its root to the pre-crash fleet root.
+Silicon    : c7gd.8xlarge (AWS Graviton3E), local NVMe WAL, Amazon Linux 2023 arm64
+Date       : 2026-09-02
+--------------------------------------------------------------------------------
+Real gate output (verdict lines):
+
+CRASH-RECOVERY: kill -9 the seed, restart, re-assert root equality
+  seed sent SIGKILL (kill -9: no graceful flush, so recovery is REAL, not a clean-shutdown shortcut)
+  recovery boot: durability ON — bounded recovery from WAL + snapshot ckpt/10001 (replayed 0 post-checkpoint records, bridge active)
+  WAL-replay witness = PRESENT; wiped-WAL marker = ABSENT
+  [+]   seed-actually-died=PASS (DEAD); relaunch-alive=PASS; control-port-ready=PASS (yes); WAL-replay-witness=PASS (witness=PRESENT wiped-marker=ABSENT replayed 0 post-checkpoint record); root re-equals pre-crash=PASS (pre=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 post=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); crash->root-equal=14943ms vs 30000ms bound=PASS
+  crash-recovery verdict = PASS (14.943s to root-equality, vs a 30s bound)

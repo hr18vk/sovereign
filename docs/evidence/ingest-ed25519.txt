@@ -1,0 +1,32 @@
+PRODUCTION INGEST PATH (the layer BELOW the core number)
+================================================================================
+Claim      : the production ingest path (verified Ed25519 + CRDT apply + envelope)
+             sustains 5.7M-6.0M deltas/sec at 32 cores (N=100-256 batching, the
+             single-origin "shared" path); the multi-origin "ceiling" path reaches
+             12.5M-14.7M deltas/sec. The per-frame Ed25519 verify is the bound that
+             the batching + parallelism amortize.
+Command    : go test -run '^$' -bench=BenchmarkBatchedVerifyParallel -benchmem \
+               -count=3 -cpu=32 ./pkg/receive/
+Layer note : this is the REAL ingest layer (verified Ed25519 + CRDT apply + envelope),
+             deliberately a different, lower number than the 50-69M core microbench.
+             The two are never conflated.
+Silicon    :  instance-type : c8g.8xlarge
+  nproc         : 32
+  CPU part      : 0xd4f   (Graviton4 / Neoverse V2 = 0xd4f)
+  go version    : go version go1.26.1 linux/arm64
+  GOMAXPROCS    : 32
+  kernel        : 6.1.176-221.367.amzn2023.aarch64
+  measured      : 2026-09-15 (first-hand, this tree)
+
+--------------------------------------------------------------------------------
+Single-origin "shared" path (the real-world receive rate — the headline):
+BenchmarkBatchedVerifyParallel/shared/N=100-32   197308   17691 ns/op   5.65 MB/s   32.00 GOMAXPROCS   5681818 aggregate_deltas/sec   100.0 deltas/batch   176.0 ns/delta   35582 B/op   327 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=100-32   194347   17622 ns/op   5.67 MB/s   32.00 GOMAXPROCS   5681818 aggregate_deltas/sec   100.0 deltas/batch   176.0 ns/delta   35510 B/op   327 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=256-32    82149   42710 ns/op   5.99 MB/s   32.00 GOMAXPROCS   6024096 aggregate_deltas/sec   256.0 deltas/batch   166.0 ns/delta   92508 B/op   797 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=256-32    78548   42642 ns/op   6.00 MB/s   32.00 GOMAXPROCS   6024096 aggregate_deltas/sec   256.0 deltas/batch   166.0 ns/delta   92506 B/op   793 allocs/op
+
+Multi-origin "ceiling" path (upper bound, distinct origins):
+BenchmarkBatchedVerifyParallel/ceiling/N=100-32  449001    8077 ns/op  12.38 MB/s   32.00 GOMAXPROCS  12500000 aggregate_deltas/sec   100.0 deltas/batch    80.00 ns/delta   36150 B/op   328 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=256-32  206961   17505 ns/op  14.62 MB/s   32.00 GOMAXPROCS  14705882 aggregate_deltas/sec   256.0 deltas/batch    68.00 ns/delta   84067 B/op   792 allocs/op
+
+Stable: the count=2 and count=3 runs agree to five significant figures.

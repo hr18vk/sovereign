@@ -1,0 +1,31 @@
+CORE MICROBENCHMARK — the data-structure throughput floor (NOT the ingest rate)
+================================================================================
+Claim      : the CRDT core (off-heap HAMT Set push/pop) sustains tens of millions
+             of ops/s with zero GC involvement.
+Command    : RUN_CRUCIBLE=1 go test -v -run TestScalingGate -cpu=32 -count=1 ./pkg/sync/
+Silicon    : AWS c8g.8xlarge, ARM64 Graviton4 (CPU part 0xd4f), 32 cores, Go 1.26.1
+Date       : 2026-09-03
+Layer note : this measures the in-process HAMT.Set crucible ONLY — no Ed25519 verify,
+             no envelope unmarshal, no network, no TLS, no persistence. It is the
+             data-structure floor, deliberately NOT the production ingest rate.
+--------------------------------------------------------------------------------
+
+=== RUN   TestScalingGate
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║  STAGE 5 — ASYMMETRIC PRODUCER-CONSUMER BURST CRUCIBLE (REWRITTEN GATE)        ║
+║  Hostile workload: heavy-tail bursts, mixed-mode, decorrelated cadence        ║
+║  Gates: (1) linearizability @ EVERY tier, (2) >=50M ops/s Absolute Mandate  ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+  core       throughput      speedup  efficiency    lin-ok?         pushed         popped      drained      surplus
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────
+  4            45722911         1.00x      100.0%         OK       22853509       22813670        39839        39839
+  8            59481186         1.30x       65.0%         OK       29715012       29711081         3931         3931
+  16           85096809         1.86x       46.5%         OK       42600071       42555039        45032        45032
+  32           68278197         1.49x       18.7%         OK       34193479       34153912        39567        39567
+  NumCPU=32, candidate=SEC-sharded
+
+    scaling_gate_test.go:664: ✓ STAGE 5 PASSED: 68278197 ops/s at 32 cores (18.7% efficiency vs base tier). Linearizable at every tier. The engine (SEC-sharded) successfully shatters the 50 Million RPS absolute threshold under an asymmetric crucible.
+--- PASS: TestScalingGate (4.02s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	4.024s
