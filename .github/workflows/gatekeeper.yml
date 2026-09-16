@@ -1,0 +1,72 @@
+# Sovereign Engine — public CI gate.
+#
+# Every job enforces a physical property of the engine; a red run is a mechanical
+# rejection, not a human judgement call. These jobs run on GitHub-hosted ARM64
+# runners (the engine's target is ARM64 / Graviton). The throughput-regression
+# benchmark gate runs separately on dedicated bare-metal Graviton runners — it
+# needs pinned CPUs and a noise floor the shared hosted tier cannot provide — so
+# it is intentionally not part of this hosted workflow.
+
+name: gatekeeper
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so stale revisions do not waste CI time.
+concurrency:
+  group: gatekeeper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (CGO + jemalloc), gofmt, vet
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      # The engine binds jemalloc via CGO for the off-heap store; install the dev headers.
+      - name: install jemalloc (CGO substrate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjemalloc-dev
+      - name: go build ./...
+        run: go build ./...
+      - name: gofmt must be clean
+        run: test -z "$(gofmt -l .)"
+      - name: go vet (only the sanctioned unsafe.Pointer arena notes allowed)
+        run: |
+          out=$(go vet ./... 2>&1 || true)
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -vE 'possible misuse of unsafe.Pointer|^#' | grep -qE '\.go:[0-9]'; then
+            echo "::error::go vet reported findings beyond the sanctioned unsafe.Pointer arena notes"
+            exit 1
+          fi
+
+  gates:
+    name: zero-GC + struct-layout
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+      - name: install jemalloc (CGO substrate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjemalloc-dev
+      # The headline invariant: the write hot path allocates nothing.
+      - name: zero-GC hot path (0 allocs/op, 0 B/op)
+        run: go test ./pkg/sync/ -run 'TestHotPathZeroAllocations' -count=1
+      # The cache-line discipline: contended structs are packed to a 128-byte stride
+      # with zero wasted padding.
+      - name: struct layout (zero wasted padding)
+        run: go test ./pkg/sync/ -run 'TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment|TestHamtNodeOffsets' -count=1
