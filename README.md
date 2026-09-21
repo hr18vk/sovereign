@@ -69,6 +69,24 @@ Most engines make you choose. This one is built on four things nobody else combi
 
 Every one of these is reproducible — the exact command, the machine, and the unedited output are in [docs/evidence/](docs/evidence/). **That's my substitute for an outside audit: you don't have to trust the numbers, you can re-run them.**
 
+### How it compares
+
+Numbers only mean anything at the same layer, so read the **Workload** and **Hardware** columns before the **Throughput** one. And note what only one row is paying for: a post-quantum signature verified on every single operation.
+
+| System | Workload | Hardware | Throughput |
+|:--|:--|:--|:--|
+| **Sovereign — production ingest** | PQ-verified write path | Graviton4, 32 cores | **5.7M–6.0M deltas/s** |
+| **Sovereign — CRDT core** | in-process data structure (no network/crypto/disk) | Graviton4, 32 cores | **50.7M–68.3M ops/s** |
+| Dragonfly | in-memory, write / read | 48 cores | 4.2–5.2M write · 4–15.5M read |
+| Redis | in-memory SET | single core | ~72K (1.8M pipelined) |
+| FoundationDB | 90/10 transactional | 24-machine cluster | 8.2M ops/s |
+| TigerBeetle | transfers (batched, durable) | single core, replicated | ~100K–450K/s |
+| ScyllaDB | durable write | per node, RF=3 | ~75K ops/s |
+| CockroachDB | TPC-C | multi-node, 3× replicated | 128,000+ tpmC |
+| PostgreSQL | durable writes (pgbench) | single node | ~5K–12K TPS |
+
+The bottom rows pay for durability and replication on every operation — a cost Sovereign's ingest number does **not** yet carry, because this is a research preview, not a production database. The full methodology and the source for every figure: **[Full benchmark comparison →](https://sovereignengine.space/docs/benchmarks/competitive-comparison)**
+
 ---
 
 ## Try it
