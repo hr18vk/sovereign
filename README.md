@@ -177,7 +177,7 @@ The honest boundary, and the evidence tier behind each row, is on the [verificat
 
 ## About the author
 
-Built by **Harsh Rawat**, working solo. I use AI coding tools the same way I use a profiler or a debugger. The architecture, the design decisions and the failures above are mine, and every number in this repo is one I ran and read myself.
+Built by **Harsh Rawat**, working solo. The architecture, the design decisions and the failures above are mine, and every number in this repo is one I ran and read myself.
 
 ## License
 
