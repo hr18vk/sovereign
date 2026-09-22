@@ -35,6 +35,8 @@ This engine does all three at once:
 
 And I'm not asking you to take my word for it. Every number here is a real measurement — the exact command, the machine, and the raw output are in the repo so you can check my work. That matters more to me than sounding impressive.
 
+**Want the longer version, without the jargon?** [**What this is, in plain English**](https://sovereignengine.space/what-is-sovereign-engine) — the problem the engine solves, how it actually works, what every published number does and does *not* mean, and what isn't finished yet. No prior database knowledge assumed; it ends with a glossary.
+
 > **Status: research preview.** This is not production-ready software — it's a working, measured research engine I'm sharing early so the design and the numbers can be checked. See [Where it stands](#where-it-stands) for the honest boundary.
 
 ## Why I built this
@@ -43,12 +45,12 @@ It bothered me that "pick two out of three" was treated as normal for something 
 
 ## Why it's different
 
-Most engines make you choose. This one is built on four things nobody else combines:
+Most engines make you choose. This one is built on four design choices no other engine combines — with each one's real status stated, not implied:
 
 | | |
 |:--|:--|
 | **Tri-temporal CRDT state** | Every fact carries `system × valid × assertion` time, so you can ask "what did we know, and when." Concurrent writers converge without a leader or coordination. No other engine does this. |
-| **H3 spatial, built in** | Geospatial indexing lives inside the CRDT, not bolted on top. |
+| **Geospatial axis, reserved in the record** | Every fact carries an H3 cell alongside its three clocks — on the wire and in storage — so spatial state belongs to the CRDT rather than to a bolted-on index. The producer that fills those cells is built but not yet wired into the write path, so this is a **reserved axis today, not a live index**. |
 | **Post-quantum from day one** | X25519MLKEM768 key exchange + hybrid Ed25519 + ML-DSA-65 signatures, on by default. |
 | **Zero-GC** | The write path does **0 allocations per op** — state lives in an off-heap arena the Go garbage collector never touches. |
 
