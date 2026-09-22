@@ -112,14 +112,11 @@ run_crucible() {
     -run 'TestScalingGate' \
     -count=1 -v
 
-  # Re-emit Zero-GC + cache-line physics witnesses, CPU-pinned via taskset
-  # when available. These are the engine's hot-path benchmarks — the actual
-  # BenchmarkEliminationCrucible/BenchmarkEngineScaling names referenced in
-  # the original script do not exist in the repo (the gate harness is the
-  # Test* form invoked above), so we run the real Zero-GC witness
-  # (BenchmarkHAMTInsertZeroAlloc — must show 0 B/op) and the false-sharing
-  # pair (BenchmarkFalseSharingPadded vs Unpadded) that backs the 128-byte
-  # stride physics claim.
+  # Re-emit the Zero-GC + cache-line physics witnesses, CPU-pinned via taskset
+  # when available: the Zero-GC witness (BenchmarkHAMTInsertZeroAlloc — must
+  # show 0 B/op, 0 allocs/op) and the false-sharing pair
+  # (BenchmarkFalseSharingPadded vs Unpadded) that backs the 128-byte stride
+  # claim. The gate itself is the Test* form invoked above.
   local pin=""
   if command -v taskset >/dev/null 2>&1; then
     local range="0-$((CORES - 1))"
