@@ -31,7 +31,7 @@ Right now, databases make you pick. You can have one that's **fast**, or one tha
 This engine does all three at once:
 
 - **Fast** — millions of writes a second on one server, with every incoming frame signature-checked before any of it is applied.
-- **Converges on its own** — writes from many places settle on the same answer with no leader and no lost updates. A read can be briefly stale; the state it settles on is never in doubt. (Checked on a 100-node fleet across 3 cloud regions.)
+- **Converges on its own** — writes from many places settle on the same answer with no leader and no lost updates. A read can be briefly stale; the state it settles on is never in doubt. (Checked with 100 node processes on three machines, one per AWS region.)
 - **Quantum-resistant** — every connection between nodes already uses post-quantum encryption, so traffic recorded today can't be unlocked later by a quantum computer. (Post-quantum *signatures* are built and tested too, behind a flag.)
 
 And I'm not asking you to take my word for it. Every number here is a real measurement, and the exact command, the machine and the unedited output are in the repo so you can check my work. That matters more to me than sounding impressive.
@@ -90,7 +90,7 @@ Two things came out of it. Every contended atomic now gets a 128-byte stride of 
 | **CRDT core** | gate floor **50,736,038 ops/s**; this tree re-measured **68,278,197 ops/s** on 32 cores | `TestScalingGate` · c8g.8xlarge (Graviton4) · Go 1.26.1 |
 | **Production ingest** | **5.7M–6.0M deltas/sec** on 32 cores (N=100–256; ceiling 12.5M–14.7M) | `BenchmarkBatchedVerifyParallel` · measured 2026-09-15 |
 | **Hot-path allocations** | **0 allocs/op, 0 B/op** | `TestHotPathZeroAllocations` |
-| **Convergence** | 100 nodes / 3 regions agree in **6.6–10.2s** | real silicon, integrity checks on |
+| **Convergence** | 100 node processes on 3 machines (one per region) agree in **8.95s** on the published run; six of seven logged runs 6.6–8.7s, one miss at 10.15s | `convergence-100-node.txt` · 3× c7gd.8xlarge (Graviton3) · integrity checks on · the seven-run table is in [ADR-0050](docs/architecture/adr/0050_checkpoint_decouple_delta.md) |
 
 Every one of these is reproducible. The exact command, the machine and the unedited output are in [docs/evidence/](docs/evidence/). **That's my substitute for an outside audit: you don't have to trust the numbers, you can re-run them.**
 
@@ -154,8 +154,8 @@ The SDK path (dev CA, node identity, the mTLS control port, the 44-line client e
 
 | Capability | Status |
 |:--|:--|
-| Mesh — 100 nodes, 3 regions, mTLS | ✅ Verified |
-| Convergence — 10K keys across the fleet | ✅ Met (6.6–10.2s) |
+| Mesh — 100 node processes on 3 machines (one per region), mTLS | ✅ Verified |
+| Convergence — 10K keys across the fleet | ✅ Met on the published run (8.95s); six of seven logged runs 6.6–8.7s, one miss at 10.15s |
 | Crash recovery | ✅ Proven (root re-equals after a kill) |
 | Durability — WAL fsync per batch | ✅ Held on every run |
 | Convergence tail (last 1–2 of 100 nodes) | 🟡 Still hardening (~1 run in 7 straggle) |

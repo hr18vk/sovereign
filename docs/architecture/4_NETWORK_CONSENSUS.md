@@ -194,8 +194,8 @@ convergence is a deterministic lattice join, not a transport-dependent
 artifact.
 
 The same property holds on real silicon, not only in the in-process fabric. I
-ran 100 nodes across 3 regions (us-east-1, eu-west-1, ap-southeast-2) on
-c8g.8xlarge instances and measured the wall-time for all 100 nodes to reach an
+ran 100 node processes across 3 regions (us-east-1, eu-west-1, ap-southeast-2), on
+one c7gd.8xlarge per region, and measured the wall-time for all 100 to reach an
 identical Merkle root: the mesh converges within the 10 s SLO (see ADR-0041).
 One honest caveat: the last 1–2 nodes occasionally straggle past 10 s, about
 one run in seven. That is an open robustness item I am still hardening, not a

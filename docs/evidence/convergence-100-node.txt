@@ -2,8 +2,8 @@ MULTI-REGION CONVERGENCE — 100 nodes, 3 AWS regions, production checkpointing 
 ================================================================================
 Claim      : a 10,000-key write converges to an identical Merkle root on all 100
              nodes across 3 regions within the 10-second convergence target.
-Fleet      : 100 nodes across us-east-1, eu-west-1, ap-southeast-2 (one
-             c7gd.8xlarge per region; AWS Graviton3E, AL2023 arm64), mTLS mesh.
+Fleet      : 100 node processes (34/33/33) across us-east-1, eu-west-1, ap-southeast-2
+             (one c7gd.8xlarge per region; AWS Graviton3, AL2023 arm64), mTLS mesh.
 Gate       : the clock starts at ORIGIN QUIESCENCE (the post-inject root-stability
              probe), not at inject — the honest measure of convergence alone.
 Date       : 2026-09-13

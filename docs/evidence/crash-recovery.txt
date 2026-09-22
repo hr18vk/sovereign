@@ -5,7 +5,7 @@ Claim      : a node killed with SIGKILL (no graceful flush) recovers from its
              that were fsynced before the kill survive.
 Method     : inject a batch, kill -9 the seed node, restart it on the same
              WAL + snapshot, then compare its root to the pre-crash fleet root.
-Silicon    : c7gd.8xlarge (AWS Graviton3E), local NVMe WAL, Amazon Linux 2023 arm64
+Silicon    : c7gd.8xlarge (AWS Graviton3), local NVMe WAL, Amazon Linux 2023 arm64
 Date       : 2026-09-02
 --------------------------------------------------------------------------------
 Real gate output (verdict lines):

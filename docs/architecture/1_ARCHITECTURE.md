@@ -7,7 +7,7 @@ implemented in Go (1.26+). It is designed as the temporal state substrate for a
 multi-region temporal ledger: state that stays convergent and causally
 attributable across a fleet of mutually-distrusting nodes, and that is retained
 over a long horizon rather than overwritten in place. The largest measured
-deployment is **100 nodes across 3 AWS regions** (ADR-0041); "planetary scale"
+deployment is **100 node processes on three machines, one per AWS region** (ADR-0041); "planetary scale"
 is a design target, not a measured claim — ADR-0045 gates any such restatement
 on a ≥1K-node silicon run.
 
