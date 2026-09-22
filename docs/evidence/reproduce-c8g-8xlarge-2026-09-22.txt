@@ -1,0 +1,156 @@
+
+==== provenance ====
+utc:        Tue Sep 22 16:38:11 UTC 2026
+repo:       https://github.com/hr18vk/sovereign  commit: 320d21d  (clean tree)
+kernel:     Linux 7.0.0-1006-aws  arch: aarch64
+cpus:       32 online, GOMAXPROCS tier for this run: 32
+            Vendor ID:                               ARM
+            Model name:                              Neoverse-V2
+ec2:        c8g.8xlarge in us-east-1
+go:         go version go1.26.1 linux/arm64
+jemalloc:   libjemalloc.so.2
+
+==== 1. zero-allocation gate + benchmark (pkg/sync) ====
+
+$ go test -run TestHotPathZeroAllocations -count=1 ./pkg/sync/
+ok  	github.com/hr18vk/sovereign/pkg/sync	0.005s
+[exit 0]
+
+$ go test -run ^$ -bench=BenchmarkHAMTInsertZeroAlloc -benchmem -count=1 ./pkg/sync/
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/sync
+BenchmarkHAMTInsertZeroAlloc-32    	  136974	     10136 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	1.487s
+[exit 0]
+
+==== 2. struct layout gate (128-byte stride, cache-line alignment) ====
+
+$ go test -run TestHamtNodeOffsets|TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment -count=1 -v ./pkg/sync/
+=== RUN   TestHamtNodeOffsets
+    hamt_test.go:317: Sizeof(HamtNode): 72
+    hamt_test.go:318: Offsetof(refCount): 0
+    hamt_test.go:319: Offsetof(bitmap): 4
+    hamt_test.go:320: Offsetof(childrenPtr): 16
+    hamt_test.go:321: Offsetof(entriesPtr): 24
+    hamt_test.go:322: Offsetof(nextFree): 64
+--- PASS: TestHamtNodeOffsets (0.00s)
+=== RUN   TestCRDTEntry_SizeAndAlignment
+--- PASS: TestCRDTEntry_SizeAndAlignment (0.00s)
+=== RUN   TestHamtLeaf_SizeAndAlignment
+--- PASS: TestHamtLeaf_SizeAndAlignment (0.00s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	0.005s
+[exit 0]
+
+==== 3. false-sharing benchmark (unpadded vs padded counters) ====
+
+$ go test -run ^$ -bench=BenchmarkFalseSharing -benchmem -count=1 ./pkg/sync/
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/sync
+BenchmarkFalseSharingUnpadded-32    	      42	  33405937 ns/op	     173 B/op	       2 allocs/op
+BenchmarkFalseSharingPadded-32      	     235	   5099412 ns/op	      56 B/op	       2 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	3.152s
+[exit 0]
+
+==== 4. CRDT algebra (commutative, associative, idempotent; property-based) ====
+
+$ go test -run TestCRDTJoin|TestCRDTConvergenceMultiNode|TestCRDTMonotonicGrowth -count=1 -v ./pkg/sync/
+=== RUN   TestCRDTJoinCommutativity
+    crdt_property_test.go:161: [rapid] OK, passed 100 tests (56.595897ms)
+--- PASS: TestCRDTJoinCommutativity (0.06s)
+=== RUN   TestCRDTJoinAssociativity
+    crdt_property_test.go:190: [rapid] OK, passed 100 tests (59.954597ms)
+--- PASS: TestCRDTJoinAssociativity (0.06s)
+=== RUN   TestCRDTJoinIdempotence
+    crdt_property_test.go:222: [rapid] OK, passed 100 tests (46.210923ms)
+--- PASS: TestCRDTJoinIdempotence (0.05s)
+=== RUN   TestCRDTConvergenceMultiNode
+    crdt_property_test.go:252: [rapid] OK, passed 100 tests (117.994259ms)
+--- PASS: TestCRDTConvergenceMultiNode (0.12s)
+=== RUN   TestCRDTJoinMonotonicGrowth
+    crdt_property_test.go:294: [rapid] OK, passed 100 tests (31.055691ms)
+--- PASS: TestCRDTJoinMonotonicGrowth (0.03s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	0.321s
+[exit 0]
+
+==== 5. post-quantum key exchange (X25519MLKEM768 must be negotiated) ====
+
+$ go test -run TestPQ_ -count=1 -v ./pkg/transport/
+=== RUN   TestPQ_KEMNegotiated
+    tls_pq_test.go:158: PQ-KEM-negotiated PASS: the engine's DEFAULT config (no CurvePreferences) negotiates X25519MLKEM768 (CurveID=4588) on a real loopback handshake — the PQ KEM is PROVEN (Go 1.24+ default inherited), NOT enabled
+--- PASS: TestPQ_KEMNegotiated (0.00s)
+=== RUN   TestPQ_KEMClassicalControl
+    tls_pq_test.go:181: PQ-KEM-classical-control PASS: forced CurvePreferences=[X25519] -> CurveID=29 (X25519, classical) — the BUG-INJECT control proves PQ-KEM-negotiated is load-bearing (NOT a tautology)
+--- PASS: TestPQ_KEMClassicalControl (0.00s)
+=== RUN   TestPQ_KEMRecordHandshake
+    tls_pq_test.go:200: PQ-KEM-record-handshake PASS: tr.RecordHandshake fires the reporter exactly once on a PQ (X25519MLKEM768) handshake
+--- PASS: TestPQ_KEMRecordHandshake (0.00s)
+=== RUN   TestPQ_KEMClassicalNoFire
+    tls_pq_test.go:223: PQ-KEM-classical-no-fire PASS: a classical (X25519) handshake does NOT fire the PQ reporter (the counter is PQ-KEM-only, NOT every handshake)
+--- PASS: TestPQ_KEMClassicalNoFire (0.00s)
+=== RUN   TestPQ_CounterFire
+    tls_pq_test.go:238: PQ-counter-fire PASS: PQHandshakeNegotiated (0->1) increments on.Inc() (the direct-seam proof; the transport.Dial path fires it end-to-end)
+--- PASS: TestPQ_CounterFire (0.00s)
+=== RUN   TestPQ_Counter22
+    tls_pq_test.go:263: PQ-counter-22 PASS: Counters() carries 24 DISTINCT (21->22), the PQ name present (PQHandshakeNegotiated)
+--- PASS: TestPQ_Counter22 (0.00s)
+=== RUN   TestPQ_DialFiresCounter
+    tls_pq_test.go:309: PQ-dial-fires-counter PASS: tr.Dial (the production dial seam) negotiated X25519MLKEM768 + fired the PQHandshakeNegotiated reporter (fires=1) — the end-to-end wiring proof
+--- PASS: TestPQ_DialFiresCounter (0.00s)
+=== RUN   TestPQ_OffIsByteIdentical
+    tls_pq_test.go:331: PQ-off-is-byte-identical PASS: a nil-reporter transport's RecordHandshake is a no-op (the opt-OUT default is byte-identical; the PQ seam is dormant until the operator binds the reporter)
+--- PASS: TestPQ_OffIsByteIdentical (0.00s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/transport	0.013s
+[exit 0]
+
+==== 6. ingest: one Ed25519 verify per frame, then envelope + merge per delta (pkg/receive) ====
+
+$ go test -run ^$ -bench=BenchmarkBatchedVerifyParallel -benchmem -count=1 -cpu=32 ./pkg/receive/
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/receive
+BenchmarkBatchedVerifyParallel/shared/N=1-32         	  258999	      4650 ns/op	   0.22 MB/s	        32.00 GOMAXPROCS	    215053 aggregate_deltas/sec	         1.000 deltas/batch	      4650 ns/delta	    3097 B/op	      20 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=1-32        	  554163	      2276 ns/op	   0.44 MB/s	        32.00 GOMAXPROCS	    439367 aggregate_deltas/sec	         1.000 deltas/batch	      2276 ns/delta	    3123 B/op	      20 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=10-32        	  198146	      7627 ns/op	   1.31 MB/s	        32.00 GOMAXPROCS	   1312335 aggregate_deltas/sec	        10.00 deltas/batch	       762.0 ns/delta	    7890 B/op	      52 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=10-32       	  422593	      2787 ns/op	   3.59 MB/s	        32.00 GOMAXPROCS	   3597122 aggregate_deltas/sec	        10.00 deltas/batch	       278.0 ns/delta	    5708 B/op	      51 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=100-32       	   46047	     22509 ns/op	   4.44 MB/s	        32.00 GOMAXPROCS	   4444444 aggregate_deltas/sec	       100.0 deltas/batch	       225.0 ns/delta	   40953 B/op	     328 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=100-32      	  137604	      8807 ns/op	  11.35 MB/s	        32.00 GOMAXPROCS	  11363636 aggregate_deltas/sec	       100.0 deltas/batch	        88.00 ns/delta	   34808 B/op	     327 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=256-32       	   26194	     40137 ns/op	   6.38 MB/s	        32.00 GOMAXPROCS	   6410256 aggregate_deltas/sec	       256.0 deltas/batch	       156.0 ns/delta	  111194 B/op	     794 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=256-32      	   63366	     19324 ns/op	  13.25 MB/s	        32.00 GOMAXPROCS	  13333333 aggregate_deltas/sec	       256.0 deltas/batch	        75.00 ns/delta	   89512 B/op	     794 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/receive	12.829s
+[exit 0]
+
+==== 7. core scaling gate (RUN_CRUCIBLE=1; runs on 8+ cores, asserts 50M ops/s at the top tier) ====
+
+$ go test -run TestScalingGate -count=1 -v -cpu=32 ./pkg/sync/
+=== RUN   TestScalingGate
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║ ASYMMETRIC PRODUCER-CONSUMER BURST CRUCIBLE (REWRITTEN GATE) ║
+║ Hostile workload: heavy-tail bursts, mixed-mode, decorrelated cadence ║
+║ Gates: (1) linearizability @ EVERY tier, (2) >=50M ops/s Absolute Mandate ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+ core       throughput      speedup  efficiency    lin-ok?         pushed         popped      drained      surplus
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────
+ 4            43171368         1.00x      100.0%         OK       21564705       21552499        12206        12206
+ 8            66938137         1.55x       77.5%         OK       33460001       33453330         6671         6671
+ 16           79106994         1.83x       45.8%         OK       39614991       39560257        54734        54734
+ 32           69102044         1.60x       20.0%         OK       34635688       34594165        41523        41523
+ NumCPU=32, candidate=SEC-sharded
+
+    scaling_gate_test.go:674: ✓ SCALING PASSED: 69102044 ops/s at 32 cores (20.0% efficiency vs base tier). Linearizable at every tier. The engine (SEC-sharded) successfully shatters the 50 Million RPS absolute threshold under an asymmetric crucible.
+--- PASS: TestScalingGate (4.02s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	4.024s
+[exit 0]
+
+==== done ====
+steps with a non-zero exit: 0
+transcript: /home/ubuntu/sovereign/reproduce-20260922T163811Z-320d21d.txt
