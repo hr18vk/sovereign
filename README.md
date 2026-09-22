@@ -85,7 +85,7 @@ Numbers only mean anything at the same layer, so read the **Workload** and **Har
 | CockroachDB | TPC-C | multi-node, 3× replicated | 128,000+ tpmC |
 | PostgreSQL | durable writes (pgbench) | single node | ~5K–12K TPS |
 
-The bottom rows pay for durability and replication on every operation — a cost Sovereign's ingest number does **not** yet carry, because this is a research preview, not a production database. The full methodology and the source for every figure: **[Full benchmark comparison →](https://sovereignengine.space/docs/benchmarks/competitive-comparison)**
+The bottom rows pay for durability and replication on every operation — a cost Sovereign's ingest number does **not** yet carry, because this is a research preview, not a production database. The full methodology and the source for every figure: **[Full benchmark comparison →](https://sovereignengine.space/benchmark-comparison)**
 
 ---
 
