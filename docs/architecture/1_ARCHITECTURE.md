@@ -2,10 +2,14 @@
 
 ## 1.1 Abstract
 
-Sovereign Engine is a planetary-scale, lock-free, off-heap $\delta$-CRDT
-synchronization engine implemented in Go (1.26+). It serves as the temporal
-state substrate for a planetary-scale temporal ledger mandated to govern billions of records
-across a 100-year horizon with sub-millisecond latency bounds.
+Sovereign Engine is a lock-free, off-heap $\delta$-CRDT synchronization engine
+implemented in Go (1.26+). It is designed as the temporal state substrate for a
+multi-region temporal ledger: state that stays convergent and causally
+attributable across a fleet of mutually-distrusting nodes, and that is retained
+over a long horizon rather than overwritten in place. The largest measured
+deployment is **100 nodes across 3 AWS regions** (ADR-0041); "planetary scale"
+is a design target, not a measured claim — ADR-0045 gates any such restatement
+on a ≥1K-node silicon run.
 
 **Throughput — the layer discipline (never conflate the two numbers):**
 - **CRDT core microbenchmark** (in-process `HAMT.Set` producer-consumer crucible — no Ed25519 verify, no envelope, no network, no TLS, no persistence): the `TestScalingGate` gate mandates 50M ops/s absolute; the gate-passing floor measured **50,736,038 ops/s** at 32 cores, and the current tree re-measured **68,278,197 ops/s** at 32 cores on 2026-09-03 (c8g.8xlarge, Graviton4 CPU part 0xd4f, Go 1.26.1). The honest range is **50.7M–68.3M ops/s**. The cache-line post-mortem at `docs/architecture/6_ENGINEERING_POST_MORTEM.md` refuses any single-figure round-up — quote the range and the layer, never a hero number.

@@ -1,8 +1,8 @@
 # Security Policy
 
-Sovereign Engine takes its security claims seriously — post-quantum signatures and
-key exchange, mTLS mesh transport, and Cedar-based authorization are core to the
-design, and a real vulnerability in any of them matters. If you find one, I want to
+Sovereign Engine takes its security claims seriously — post-quantum key exchange (on
+by default), opt-in post-quantum signatures, mTLS mesh transport, and Cedar-based
+authorization are core to the design, and a real vulnerability in any of them matters. If you find one, I want to
 hear about it directly and will treat it as a priority.
 
 ## Reporting a vulnerability

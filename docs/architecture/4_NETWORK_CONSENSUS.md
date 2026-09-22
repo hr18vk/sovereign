@@ -39,7 +39,7 @@ single mutation has no sub-join representation). Anti-entropy therefore ships
 and only once — the CRDT lattice $\sqcup$ is idempotent, so a duplicate
 delivery is a no-op. This bounds network egress by the set difference rather
 than the state size, which is the economic motivation for the $\delta$ model
-under degraded planetary-scale networks.
+under degraded wide-area networks.
 
 ## 4.3 IBLT — Sub-Linear State Reconciliation
 

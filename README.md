@@ -7,7 +7,8 @@
 
   <h1>Sovereign Engine</h1>
 
-  <p><strong>A fast, globally-consistent, quantum-resistant database engine.<br/>
+  <p><strong>A leaderless database engine: multi-region writes that converge without coordination,<br/>
+  post-quantum transport, and a zero-allocation hot path.<br/>
   Every number below is measured on real hardware. None of it is marketing.</strong></p>
 
   <p>
@@ -25,12 +26,12 @@
 
 Sovereign Engine is a database engine: the layer that sits underneath almost every app and actually stores its data.
 
-Right now, databases make you pick. You can have one that's **fast**, or one that stays **correct when a hundred machines write to it at once across the world**, or one that's **safe against the quantum computers people are building**. Getting all three at once is supposed to be nearly impossible, so big companies spend millions of dollars a year duct-taping it together.
+Right now, databases make you pick. You can have one that's **fast**, or one that **never loses a write when a hundred machines are writing to it at once, in different parts of the world**, or one that's **safe against the quantum computers people are building**. Getting all three at once is supposed to be nearly impossible, so big companies spend millions of dollars a year duct-taping it together.
 
 This engine does all three at once:
 
-- **Fast** — millions of verified operations a second on one server.
-- **Globally consistent** — writes from many places converge to the same answer on their own. No leader, no lost updates. (Checked on a 100-node fleet across 3 cloud regions.)
+- **Fast** — millions of writes a second on one server, with every incoming frame signature-checked before any of it is applied.
+- **Converges on its own** — writes from many places settle on the same answer with no leader and no lost updates. A read can be briefly stale; the state it settles on is never in doubt. (Checked on a 100-node fleet across 3 cloud regions.)
 - **Quantum-resistant** — every connection between nodes already uses post-quantum encryption, so traffic recorded today can't be unlocked later by a quantum computer. (Post-quantum *signatures* are built and tested too, behind a flag.)
 
 And I'm not asking you to take my word for it. Every number here is a real measurement, and the exact command, the machine and the unedited output are in the repo so you can check my work. That matters more to me than sounding impressive.
@@ -82,7 +83,7 @@ Two things came out of it. Every contended atomic now gets a 128-byte stride of 
 
 ## The measured numbers
 
-> **Two layers, never mixed up.** The CRDT **core** number is an in-process data-structure test with no crypto, no network, no TLS and no disk. The **production ingest** number is the real receive path (signature verify + apply + envelope). They're different things, so I show both. That way neither one gets misread.
+> **Two layers, never mixed up.** The CRDT **core** number is an in-process data-structure test with no crypto, no network, no TLS and no disk. The **production ingest** number is the real receive path: one Ed25519 signature verified per frame, then an envelope decode and a CRDT merge for each delta the frame carries. They're different things, so I show both. That way neither one gets misread.
 
 | Layer | Number | Where it's from |
 |:--|:--|:--|
@@ -95,11 +96,11 @@ Every one of these is reproducible. The exact command, the machine and the unedi
 
 ### How it compares
 
-Numbers only mean anything at the same layer, so read the **Workload** and **Hardware** columns before the **Throughput** one. Note what the ingest row is paying that the in-memory rows are not: a cryptographic signature verified on every single operation.
+Numbers only mean anything at the same layer, so read the **Workload** and **Hardware** columns before the **Throughput** one. Note what the ingest row is paying that the in-memory rows are not: **one Ed25519 signature verified per frame**, amortized across the 100–256 deltas that frame carries, plus a CRDT merge for each of them. That's a real cost the bare in-memory engines don't pay — and it is *not* a signature per operation, which at these rates would be arithmetically impossible.
 
 | System | Workload | Hardware | Throughput |
 |:--|:--|:--|:--|
-| **Sovereign — production ingest** | signature-verified write path (Ed25519) | Graviton4, 32 cores | **5.7M–6.0M deltas/s** |
+| **Sovereign — production ingest** | Ed25519-verified write path (one signature per frame) | Graviton4, 32 cores | **5.7M–6.0M deltas/s** |
 | **Sovereign — CRDT core** | in-process data structure (no network/crypto/disk) | Graviton4, 32 cores | **50.7M–68.3M ops/s** |
 | Dragonfly | in-memory, write / read | 48 cores | 4.2–5.2M write · 4–15.5M read |
 | Redis | in-memory SET | single core | ~72K (1.8M pipelined) |

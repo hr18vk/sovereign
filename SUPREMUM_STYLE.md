@@ -5,7 +5,7 @@ Sovereign Engine's CRDT core holds a gate-passing floor of **50,736,038 ops/s**,
 below traces to a measured gate in `pkg/sync`. A pull request that
 violates them is rejected by continuous integration before a human reads it.
 That mechanical rejection is not hostility for its own sake; it is the only
-honest authority at planetary scale, because a gate that cannot be talked out
+honest authority at this scale, because a gate that cannot be talked out
 of failing is the only authority that survives contact with silicon.
 
 ## 1. Zero-GC on the Hot Path
