@@ -513,6 +513,8 @@ The dev-mesh CA (`pkg/crypto/certgen.go`: `NewMeshCA` → `IssueLeaf` → `Write
 5. **Observe**: scrape `/metrics` for `sovereign_*` (labelled) and `supremum_*` (cumulative) series; hit `/livecheck` for liveness; arm `--otel` for OTel export to the node's log.
 6. **Write/read**: via the SDK (`sdk/sovereign`) over mTLS to the control port — `InsertLocal` (originator), `Get` (digest on peers, value on originator), `AsOf`/`Range` (`/v1/query`, `/v1/range`).
 
+Scripted, on one machine: `./scripts/local-mesh.sh` does steps 1–3 for three nodes (`cmd/mesh-bootstrap` mints the CA, the identities and the peer directory; three loopback addresses stand in for three regions) and checks convergence with `cmd/convergence-gate`; `CRASH=1` adds a `kill -9` of the origin node and its recovery from the WAL.
+
 ### 6.8 Getting started (developer)
 
 Embed the stack core via `examples/embed` (historical API) or drive a full node via `examples/sdk` (the canonical SDK path). For direct engine use, the `pkg/sync` public surface is:

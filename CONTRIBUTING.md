@@ -9,14 +9,19 @@ Requires **Go 1.26.1**, **Linux/ARM64** (the target is AWS Graviton), and **jema
 (the off-heap store binds it via CGO):
 
 ```bash
-sudo apt-get install -y libjemalloc-dev
+sudo apt-get install -y build-essential libjemalloc-dev
 go build ./...
 go test ./...
 ```
 
-`scripts/benchmark.sh` runs the gated throughput crucible; it self-skips the absolute
-assertion below 32 cores (it still builds and runs — it just won't reproduce the
-headline number off the named silicon).
+`scripts/benchmark.sh` installs the exact Go 1.26.1 toolchain and runs the gated
+throughput crucible (`TestScalingGate` under `RUN_CRUCIBLE=1`). The gate needs eight or
+more cores to run at all and asserts 50M ops/s at its top tier, so below the named
+silicon it can fail on throughput alone; `--no-crucible` skips that assertion and still
+runs the zero-GC and false-sharing witnesses. `scripts/reproduce.sh` re-runs every
+receipt in `docs/evidence/` with a provenance header and a saved transcript, and
+`scripts/local-mesh.sh` brings up a three-node mesh on one machine and checks that the
+Merkle roots converge.
 
 ## The non-negotiables (see `SUPREMUM_STYLE.md`)
 

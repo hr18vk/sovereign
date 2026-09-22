@@ -121,7 +121,7 @@ It builds and runs on any Linux box (and the Codespace installs the one dependen
 ```bash
 git clone https://github.com/hr18vk/sovereign.git
 cd sovereign
-sudo apt-get install -y libjemalloc-dev    # the one dependency
+sudo apt-get install -y build-essential libjemalloc-dev   # gcc for the jemalloc CGO bridge, and jemalloc itself
 go build ./...                             # builds the engine
 go test ./pkg/sync/ -run TestHotPathZeroAllocations -v  # the zero-GC gate
 ```
@@ -133,9 +133,18 @@ That last command is the memory law. On a clean tree it prints:
 ok      github.com/hr18vk/sovereign/pkg/sync    0.006s
 ```
 
+Two more commands cover every number in [docs/evidence](docs/evidence) on whatever machine you have:
+
+```bash
+./scripts/reproduce.sh            # every receipt, one command, provenance header, saved transcript
+CRASH=1 ./scripts/local-mesh.sh   # three nodes on this box: converge, kill -9 the origin, recover from the WAL
+```
+
+Fewer cores mean lower absolute numbers. The zero-allocation, struct-layout, PQ and CRDT-law gates hold on any Linux box; the scaling gate needs eight or more cores and asserts 50M ops/s at its top tier, so a small machine can fail it on throughput alone, and the transcript will say so.
+
 Or open a ready-to-run [GitHub Codespace](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=hr18vk%2Fsovereign), where the dependencies are already installed.
 
-The full 3-node mesh walkthrough (dev CA, node identity, the SDK) is in [docs/sdk-quickstart.md](docs/sdk-quickstart.md). The 32-core benchmark (`scripts/benchmark.sh`) self-skips on smaller machines. On a laptop it still builds and runs, it just won't reproduce the headline number, which needs the named ARM64 box. That's the honest truth of it.
+The SDK path (dev CA, node identity, the mTLS control port, the 44-line client example) is in [docs/sdk-quickstart.md](docs/sdk-quickstart.md). The 32-core benchmark (`scripts/benchmark.sh`) installs the exact Go 1.26.1 toolchain and runs the scaling gate, which asserts 50M ops/s at its top tier. On a laptop it still builds and runs, it just won't reproduce the headline number, which needs the named ARM64 box. That's the honest truth of it.
 
 ---
 

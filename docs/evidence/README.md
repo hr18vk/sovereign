@@ -16,6 +16,7 @@ ingest* path are different layers and are never conflated.
 | **Production ingest: 5.7M–6.0M deltas/sec 32c** | [ingest-ed25519.txt](ingest-ed25519.txt) | `go test -run '^$' -bench=BenchmarkBatchedVerifyParallel -benchmem -cpu=32 ./pkg/receive/` |
 | **Zero-GC hot path: 0 B/op, 0 allocs/op** | [zero-alloc.txt](zero-alloc.txt) | `go test -bench=BenchmarkHAMTInsertZeroAlloc -benchmem ./pkg/sync/` |
 | **Crash recovery: kill -9 → root re-equals in ~15s** | [crash-recovery.txt](crash-recovery.txt) | inject batch → `kill -9` the seed → restart on the same WAL + snapshot → compare root |
+| **All of the above, on your own machine** | your transcript | `./scripts/reproduce.sh` (provenance header + saved transcript); `CRASH=1 ./scripts/local-mesh.sh` for a 3-node mesh, `kill -9`, and WAL recovery on one box |
 
 ## How to read these
 

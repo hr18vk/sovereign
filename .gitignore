@@ -9,6 +9,7 @@ id_ed25519
 
 # Build output
 bin/
+/reproduce-*.txt
 *.out
 *.test
 .buildcache/
