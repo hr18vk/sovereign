@@ -24,11 +24,12 @@ ingest* path are different layers and are never conflated.
   push/pop crucible with **no** Ed25519 verify, envelope, network, TLS, or
   persistence. It is the largest number the engine can cite, and it is deliberately
   *not* the ingest rate.
-- **`ingest-ed25519.txt`** is the *real production receive path*: verified Ed25519 +
-  CRDT apply + envelope. It is a different, lower layer — the per-frame Ed25519
-  verify (~60µs unbatched) is the dominant per-op cost that batching + 32-way
-  parallelism amortize. This is the honest gap between "the core does 68M" and
-  "the wire does ~5.7–6M", stated plainly instead of hidden.
+- **`ingest-ed25519.txt`** is the *receive path, run in-process*: one Ed25519 verify
+  per frame, envelope decode and CRDT apply, with no socket and no disk in the loop.
+  It is a different, lower layer — the per-frame Ed25519 verify (~60µs unbatched) is
+  the dominant per-op cost that batching + 32-way parallelism amortize. This is the
+  honest gap between "the core does 68M" and "the receive path does ~5.7–6M", stated
+  plainly instead of hidden.
 - **`convergence-100-node.txt`** is the multi-region run: 100 node processes on three
   machines (one per region) reach an identical Merkle root 8.95 s after the origin went
   quiet, against a 10-second target, with the durable write path (WAL, one fsync per
