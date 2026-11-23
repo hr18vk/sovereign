@@ -19,6 +19,7 @@ of these files is a v0.2.0 re-run; new results need their own dated receipts.
 | HAMT.Set: 0 B/op and 0 allocs/op | [zero-alloc.txt](zero-alloc.txt) | `go test -bench=BenchmarkHAMTInsertZeroAlloc -benchmem -count=3 ./pkg/sync/` |
 | Crash recovery: `kill -9` to equal roots in 14.943s on 2026-09-02 | [crash-recovery.txt](crash-recovery.txt) | Inject, kill the seed, restart on its WAL and snapshot, then compare roots |
 | Local test and benchmark transcript at v0.1.0 on 2026-09-22 | [reproduce-c8g-8xlarge-2026-09-22.txt](reproduce-c8g-8xlarge-2026-09-22.txt) | `./scripts/reproduce.sh` |
+| Local test and benchmark transcript at v0.2.0 on 2026-11-23 | [reproduce-c4a-standard-32-2026-11-23.txt](reproduce-c4a-standard-32-2026-11-23.txt) | `./scripts/reproduce.sh` |
 
 ## v0.2.0 1,000-process fleet evidence
 

@@ -167,23 +167,25 @@ The [verification page](docs/VERIFY.md) describes the evidence tier behind each 
 
 ### Platform status
 
-The pre-publication platform check on 2026-11-21 tested native Linux arm64 and emulated Linux amd64 builds and complete short-test invocations:
+Targeted verification suites pass on Linux arm64 (`go build ./...`, `TestHotPathZeroAllocations`, `CRASH=1 ./scripts/local-mesh.sh`, and `./scripts/reproduce.sh` at **67,391,807 ops/s** on 32 cores on `c4a-standard-32` on 2026-11-23 — [reproduce-c4a-standard-32-2026-11-23.txt](https://github.com/hr18vk/sovereign/blob/v0.2.0/docs/evidence/reproduce-c4a-standard-32-2026-11-23.txt)).
 
-| Platform | Build | Short tests | Build duration | Test duration |
+Separately, the pre-publication whole-tree check on 2026-11-21 built cleanly on both native Linux arm64 and emulated Linux amd64, while complete `go test -short -count=1 ./...` invocations recorded two isolated non-core failures on native arm64 and QEMU-emulated amd64 crashes (native amd64 hardware was not tested):
+
+| Platform | Build | Complete `-short` sweep | Build duration | Test duration |
 |:--|:--|:--|:--|:--|
-| Native Linux arm64, Go 1.26.1 | PASS, exit 0 | FAIL, exit 1 | 20 s | 409 s |
+| Native Linux arm64, Go 1.26.1 | PASS, exit 0 | FAIL, exit 1 (2 tests) | 20 s | 409 s |
 | Emulated Linux amd64, Ubuntu 24.04.5, Go 1.26.1 | PASS, exit 0 | FAIL, exit 1 | 357 s | 677 s |
 
-**Native arm64 failures:**
+**Native arm64 isolated failures (2026-11-21):**
 - `pkg/durability`: `TestCheckpointWalkPinnedAgainstState` → `panic: HamtArena: OOM - arena exhausted (variable alloc)`
-- `sdk/sovereign`: `TestClientGetOnPeerReturnsDigestNotValue` → `did not converge in 20 rounds` (known SDK failure)
+- `sdk/sovereign`: `TestClientGetOnPeerReturnsDigestNotValue` → `did not converge in 20 rounds` (known SDK test-harness issue)
 
-**Emulated amd64 failures:**
+**Emulated amd64 failures (2026-11-21):**
 - Ten packages failed with `signal: segmentation fault (core dumped)`: `cmd/sovereign-node`, `internal/database`, `internal/index`, `internal/network`, `internal/transport`, `pkg/durability`, `pkg/mesh`, `pkg/receive`, `pkg/security/fuzz`, `sdk/sovereign`
 - `pkg/attribution`: `TestEnvelope_HopBoundExceededZeroVerify` → `O(1) depth check took 12.754µs (must be sub-microsecond, zero Verify)`
 - `pkg/metrics`: `TestIngestLatencyRecorded` → `the 1e-06 bucket has no early-rejection samples`
 
-The emulated result does not establish behavior on native amd64 hardware or a root cause for the segmentation faults. Neither complete short-test invocation passed. These results do not support a claim of a green test suite on either platform. Full receipt: [platform-checks-2026-11-21.txt](https://github.com/hr18vk/sovereign/blob/v0.2.0/docs/evidence/platform-checks-2026-11-21.txt).
+The emulated result does not establish behavior on native amd64 hardware or a root cause for the segmentation faults. Neither complete short-test invocation passed, so neither full-repository sweep is described as green. Full receipt: [platform-checks-2026-11-21.txt](https://github.com/hr18vk/sovereign/blob/v0.2.0/docs/evidence/platform-checks-2026-11-21.txt).
 
 ---
 

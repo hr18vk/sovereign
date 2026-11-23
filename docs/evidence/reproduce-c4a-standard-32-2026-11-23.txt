@@ -1,0 +1,185 @@
+
+==== provenance ====
+utc:        Mon Nov 23 15:51:31 UTC 2026
+repo:       https://github.com/hr18vk/sovereign  commit: d685597  (clean tree)
+kernel:     Linux 7.0.0-1017-gcp  arch: aarch64
+cpus:       32 online, GOMAXPROCS tier for this run: 32
+            Vendor ID:                               ARM
+            Model name:                              Neoverse-V2
+go:         go version go1.26.1 linux/arm64
+jemalloc:   libjemalloc.so.2
+
+==== 1. zero-allocation gate + benchmark (pkg/sync) ====
+
+$ go test -run TestHotPathZeroAllocations -count=1 ./pkg/sync/
+go: downloading github.com/stretchr/testify v1.11.1
+go: downloading capnproto.org/go/capnp/v3 v3.1.0-alpha.2
+go: downloading pgregory.net/rapid v1.3.0
+go: downloading github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
+go: downloading github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
+go: downloading gopkg.in/yaml.v3 v3.0.1
+go: downloading golang.org/x/sync v0.21.0
+go: downloading github.com/colega/zeropool v0.0.0-20230505084239-6fb4a4f75381
+ok  	github.com/hr18vk/sovereign/pkg/sync	0.006s
+[exit 0]
+
+$ go test -run ^$ -bench=BenchmarkHAMTInsertZeroAlloc -benchmem -count=1 ./pkg/sync/
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/sync
+BenchmarkHAMTInsertZeroAlloc-32    	  216384	      6817 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	1.543s
+[exit 0]
+
+==== 2. struct layout (CRDTEntry and hamtLeaf assertions; HamtNode diagnostics) ====
+
+$ go test -run TestHamtNodeOffsets|TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment -count=1 -v ./pkg/sync/
+=== RUN   TestHamtNodeOffsets
+    hamt_test.go:301: Sizeof(HamtNode): 72
+    hamt_test.go:302: Offsetof(refCount): 0
+    hamt_test.go:303: Offsetof(bitmap): 4
+    hamt_test.go:304: Offsetof(childrenPtr): 16
+    hamt_test.go:305: Offsetof(entriesPtr): 24
+    hamt_test.go:306: Offsetof(nextFree): 64
+--- PASS: TestHamtNodeOffsets (0.00s)
+=== RUN   TestCRDTEntry_SizeAndAlignment
+--- PASS: TestCRDTEntry_SizeAndAlignment (0.00s)
+=== RUN   TestHamtLeaf_SizeAndAlignment
+--- PASS: TestHamtLeaf_SizeAndAlignment (0.00s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	0.006s
+[exit 0]
+
+==== 3. false-sharing benchmark (unpadded vs padded counters) ====
+
+$ go test -run ^$ -bench=BenchmarkFalseSharing -benchmem -count=1 ./pkg/sync/
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/sync
+BenchmarkFalseSharingUnpadded-32    	      45	  28406523 ns/op	     532 B/op	       2 allocs/op
+BenchmarkFalseSharingPadded-32      	     250	   4769059 ns/op	      96 B/op	       2 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	2.985s
+[exit 0]
+
+==== 4. CRDT algebra (commutative, associative, idempotent; property-based) ====
+
+$ go test -run TestCRDTJoin|TestCRDTConvergenceMultiNode|TestCRDTMonotonicGrowth -count=1 -v ./pkg/sync/
+=== RUN   TestCRDTJoinCommutativity
+    crdt_property_test.go:142: [rapid] OK, passed 100 tests (517.150725ms)
+--- PASS: TestCRDTJoinCommutativity (0.52s)
+=== RUN   TestCRDTJoinAssociativity
+    crdt_property_test.go:171: [rapid] OK, passed 100 tests (528.436873ms)
+--- PASS: TestCRDTJoinAssociativity (0.53s)
+=== RUN   TestCRDTJoinIdempotence
+    crdt_property_test.go:203: [rapid] OK, passed 100 tests (471.089533ms)
+--- PASS: TestCRDTJoinIdempotence (0.47s)
+=== RUN   TestCRDTConvergenceMultiNode
+    crdt_property_test.go:228: [rapid] OK, passed 100 tests (1.018227238s)
+--- PASS: TestCRDTConvergenceMultiNode (1.02s)
+=== RUN   TestCRDTJoinMonotonicGrowth
+    crdt_property_test.go:269: [rapid] OK, passed 100 tests (365.141304ms)
+--- PASS: TestCRDTJoinMonotonicGrowth (0.37s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	2.910s
+[exit 0]
+
+==== 5. post-quantum key exchange (X25519MLKEM768 must be negotiated) ====
+
+$ go test -run TestPQ_ -count=1 -v ./pkg/transport/
+go: downloading golang.org/x/sys v0.46.0
+go: downloading github.com/cloudflare/circl v1.6.4
+go: downloading go.opentelemetry.io/otel/metric v1.43.0
+go: downloading golang.org/x/crypto v0.53.0
+go: downloading filippo.io/mldsa v0.0.0-20260711112038-ff3f469cee29
+go: downloading github.com/koblas/cedar-go v0.1.0
+go: downloading filippo.io/edwards25519 v1.2.0
+go: downloading go.opentelemetry.io/otel v1.43.0
+go: downloading github.com/cespare/xxhash/v2 v2.3.0
+=== RUN   TestPQ_KEMNegotiated
+    tls_pq_test.go:108: pq kem negotiated: default config negotiates X25519MLKEM768 (CurveID=4588) on loopback
+--- PASS: TestPQ_KEMNegotiated (0.00s)
+=== RUN   TestPQ_KEMClassicalControl
+    tls_pq_test.go:128: pq kem classical control: forced CurvePreferences=[X25519] -> CurveID=29 (X25519)
+--- PASS: TestPQ_KEMClassicalControl (0.00s)
+=== RUN   TestPQ_KEMRecordHandshake
+    tls_pq_test.go:145: pq record handshake: tr.RecordHandshake fired reporter once on X25519MLKEM768
+--- PASS: TestPQ_KEMRecordHandshake (0.00s)
+=== RUN   TestPQ_KEMClassicalNoFire
+    tls_pq_test.go:166: pq classical no-fire: classical (X25519) handshake did not fire PQ reporter
+--- PASS: TestPQ_KEMClassicalNoFire (0.00s)
+=== RUN   TestPQ_CounterFire
+    tls_pq_test.go:177: pq counter fire: PQHandshakeNegotiated (0->1) incremented on .Inc()
+--- PASS: TestPQ_CounterFire (0.00s)
+=== RUN   TestPQ_Counter22
+    tls_pq_test.go:198: pq counter set: Counters() carries 25 distinct series including supremum.pki.pq_handshake_negotiated
+--- PASS: TestPQ_Counter22 (0.00s)
+=== RUN   TestPQ_DialFiresCounter
+    tls_pq_test.go:240: pq dial fires counter: tr.Dial negotiated X25519MLKEM768 and fired PQHandshakeNegotiated (fires=1)
+--- PASS: TestPQ_DialFiresCounter (0.00s)
+=== RUN   TestPQ_OffIsByteIdentical
+    tls_pq_test.go:252: pq nil reporter: RecordHandshake on a nil-reporter transport is a no-op
+--- PASS: TestPQ_OffIsByteIdentical (0.00s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/transport	0.014s
+[exit 0]
+
+==== 6. ingest: one Ed25519 verify per frame, then envelope + merge per delta (pkg/receive) ====
+
+$ go test -run ^$ -bench=BenchmarkBatchedVerifyParallel -benchmem -count=1 -cpu=32 ./pkg/receive/
+go: downloading github.com/apache/arrow/go/v17 v17.0.0
+go: downloading github.com/jackc/pgx/v5 v5.10.0
+go: downloading github.com/jackc/puddle/v2 v2.2.2
+go: downloading golang.org/x/text v0.38.0
+go: downloading github.com/jackc/pgpassfile v1.0.0
+go: downloading github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761
+go: downloading github.com/pierrec/lz4/v4 v4.1.27
+go: downloading github.com/klauspost/compress v1.18.6
+go: downloading golang.org/x/exp v0.0.0-20240604190554-fc45aab8b7f8
+go: downloading github.com/google/flatbuffers v24.3.25+incompatible
+go: downloading github.com/goccy/go-json v0.10.3
+go: downloading golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028
+go: downloading github.com/zeebo/xxh3 v1.0.2
+goos: linux
+goarch: arm64
+pkg: github.com/hr18vk/sovereign/pkg/receive
+BenchmarkBatchedVerifyParallel/shared/N=1-32         	  263863	      5374 ns/op	   0.19 MB/s	        32.00 GOMAXPROCS	    186115 aggregate_deltas/sec	         1.000 deltas/batch	      5373 ns/delta	    5153 B/op	      21 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=1-32        	  580593	      2077 ns/op	   0.48 MB/s	        32.00 GOMAXPROCS	    481463 aggregate_deltas/sec	         1.000 deltas/batch	      2077 ns/delta	    3121 B/op	      20 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=10-32        	  158935	      7085 ns/op	   1.41 MB/s	        32.00 GOMAXPROCS	   1412429 aggregate_deltas/sec	        10.00 deltas/batch	       708.0 ns/delta	    7855 B/op	      52 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=10-32       	  406887	      2633 ns/op	   3.80 MB/s	        32.00 GOMAXPROCS	   3802281 aggregate_deltas/sec	        10.00 deltas/batch	       263.0 ns/delta	    5711 B/op	      51 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=100-32       	   45406	     23532 ns/op	   4.25 MB/s	        32.00 GOMAXPROCS	   4255319 aggregate_deltas/sec	       100.0 deltas/batch	       235.0 ns/delta	   41071 B/op	     329 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=100-32      	  134187	      8723 ns/op	  11.46 MB/s	        32.00 GOMAXPROCS	  11494252 aggregate_deltas/sec	       100.0 deltas/batch	        87.00 ns/delta	   36830 B/op	     328 allocs/op
+BenchmarkBatchedVerifyParallel/shared/N=256-32       	   24894	     43637 ns/op	   5.87 MB/s	        32.00 GOMAXPROCS	   5882352 aggregate_deltas/sec	       256.0 deltas/batch	       170.0 ns/delta	  110315 B/op	     796 allocs/op
+BenchmarkBatchedVerifyParallel/ceiling/N=256-32      	   60085	     19197 ns/op	  13.34 MB/s	        32.00 GOMAXPROCS	  13513513 aggregate_deltas/sec	       256.0 deltas/batch	        74.00 ns/delta	   87117 B/op	     793 allocs/op
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/receive	14.819s
+[exit 0]
+
+==== 7. core scaling gate (RUN_CRUCIBLE=1; runs on 8+ cores, asserts 50M ops/s at the top tier) ====
+
+$ go test -run TestScalingGate -count=1 -v -cpu=32 ./pkg/sync/
+=== RUN   TestScalingGate
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║  Asymmetric producer-consumer burst scaling gate                               ║
+║  Hostile workload: heavy-tail bursts, mixed-mode, decorrelated cadence        ║
+║  Gates: (1) linearizability at every tier, (2) >= 50M ops/s at max tier        ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+  core       throughput      speedup  efficiency    lin-ok?         pushed         popped      drained      surplus
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────
+  4            46515700         1.00x      100.0%         OK       23231302       23217192        14110        14110
+  8            68869849         1.48x       74.0%         OK       34434888       34403271        31617        31617
+  16           81758967         1.76x       43.9%         OK       40951893       40886317        65576        65576
+  32           67391807         1.45x       18.1%         OK       33759016       33731090        27926        27926
+  NumCPU=32, candidate=SEC-sharded
+
+    stack_scaling_gate_test.go:708: PASS: Scaling gate passed: 67391807 ops/s at 32 cores (18.1% efficiency vs base tier). Linearizable at every tier. The engine (SEC-sharded) exceeds the 50 million RPS absolute threshold under an asymmetric gate.
+--- PASS: TestScalingGate (4.08s)
+PASS
+ok  	github.com/hr18vk/sovereign/pkg/sync	4.089s
+[exit 0]
+
+==== done ====
+steps with a non-zero exit: 0
+transcript: reproduce-20261123T155131Z-d685597.txt
