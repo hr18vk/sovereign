@@ -2,7 +2,7 @@
 //
 // Use of this software is governed by the Business Source License 1.1,
 // which can be found in the LICENSE file. Production use requires a written
-// grant from the Licensor until the Change Date (2029-08-15).
+// grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // The manifest-channel download skip guards (ADR-0030) — the SECOND
 // channel the transitively-safe download-skip (ADR-0029) closes.

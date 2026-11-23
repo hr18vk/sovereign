@@ -2,7 +2,7 @@
 //
 // Use of this software is governed by the Business Source License 1.1,
 // which can be found in the LICENSE file. Production use requires a written
-// grant from the Licensor until the Change Date (2029-08-15).
+// grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // Package fuzz is the (ADR-0038) wire-protocol + CRDT-apply FUZZ HARNESS —
 // the trust anchor that makes the receiver's "NEVER panics on adversarial input"

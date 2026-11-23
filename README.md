@@ -181,4 +181,4 @@ Built by **Harsh Rawat**, working solo. The architecture, the design decisions a
 
 ## License
 
-Source-available under the [Business Source License 1.1](LICENSE) — Licensor **Harsh Rawat** ("Sovereign Engine" is the project name, not a company). Non-Production Use is free; Production Use needs a written grant until the **Change Date 2029-08-15**, when it converts in perpetuity to an unencumbered license.
+Source-available under the [Business Source License 1.1](LICENSE) — Licensor **Harsh Rawat** ("Sovereign Engine" is the project name, not a company). Non-Production Use is free; Production Use needs a written grant until the applicable Change Date, when that version converts to Apache License 2.0. The v0.1.0 Change Date remains **2029-08-15**. The v0.2.0 Change Date is four years after its actual publication date. To ask about a production-use grant, contact the Licensor through his [GitHub profile](https://github.com/hr18vk).

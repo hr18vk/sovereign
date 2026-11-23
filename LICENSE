@@ -1,21 +1,27 @@
-Business Source License 1.1
-
-Licensor:             Harsh Rawat
-
-Licensed Work:        The Sovereign Engine source code, including all
-                      packages and files distributed in this repository.
-                      Copyright 2026 Harsh Rawat
-
-Additional Use Grant: Non-Production Use is permitted without restriction.
-                      Production Use requires a separate written grant from
-                      the Licensor until the Change Date.
-
-Change Date:          2029-08-15
-
-Change License:       Apache License, Version 2.0
-
 License text copyright © 2017 MariaDB Corporation Ab, All Rights Reserved.
 "Business Source License" is a trademark of MariaDB Corporation Ab.
+
+Parameters
+
+Licensor:             Harsh Rawat
+Licensed Work:        Sovereign Engine version 0.2.0 or later. The Licensed Work
+                      is (c) 2026 Harsh Rawat.
+Additional Use Grant: None
+Change Date:          Four years from the date the Licensed Work is published.
+Change License:       Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed Work,
+including production use, see https://github.com/hr18vk/sovereign#license.
+
+Notice
+
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
+
+-----------------------------------------------------------------------------
+
+Business Source License 1.1
 
 Terms
 

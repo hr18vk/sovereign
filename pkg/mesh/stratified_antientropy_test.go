@@ -2,7 +2,7 @@
 //
 // Use of this software is governed by the Business Source License 1.1,
 // which can be found in the LICENSE file. Production use requires a written
-// grant from the Licensor until the Change Date (2029-08-15).
+// grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // The stratified anti-entropy guards (ADR-0034). They wire the dormant
 // GenerateDeltaStratified primitive (crdt.go:1934) into the mesh sweep via a
