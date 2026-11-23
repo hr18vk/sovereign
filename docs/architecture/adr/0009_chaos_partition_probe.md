@@ -1,166 +1,184 @@
-# ADR-0009: Chaos partition probe — the <100ms convergence-after-heal SLO (the survival gate)
+# ADR-0009: Partition probe and convergence after healing
 
-- **Status:** ACCEPTED (2026-07-28) — the in-process gate passes on the build host; the broader release verdict stays conditional.
-- **Predecessor:** ADR-0008 (the Prometheus `/metrics` surface + SLO p99 histograms)
-- **Verdict:** this iteration is not a release blocker; it is the first time the engine proves, observably, that a real 2-node mesh heals a network partition and re-converges to equal `MerkleRoot()` inside a wall-clock SLO an operator reads from `/metrics`.
-- **Enforced by:** `TestPartitionHeal_ConvergesUnder100ms` (the in-process survival gate), a check that the core files are untouched, the honest-label `t.Logf` guard, and the `gofmt -s` / `go vet` / `go build` symmetry.
+- **Status:** Accepted
+- **Date:** 2026-07-28
+- **Predecessor:** [ADR-0008](0008_prometheus_metrics.md)
+
+## Context
+
+The encrypted transport, two-node gossip mesh, and Prometheus metrics were in
+place, but no test had closed a peer connection, introduced writes during the
+partition, restored connectivity, and checked reconvergence. The missing
+property was recovery without losing the writes made while partitioned.
+
+This decision adds a two-node probe over real loopback TLS connections. It uses
+equal Merkle roots as the convergence condition and a target of less than 100ms
+from healing to equal roots. The `sovereign_convergence_lag_seconds` gauge
+exposes the interval, while `sovereign_gossip_rounds_total` records completed
+gossip rounds.
+
+The target has a deliberately narrow meaning. The in-process test establishes
+partition recovery on one kernel; it does not establish the same latency across
+machines or availability zones.
 
 ---
 
-## 1. Context
+## Decision
 
-ADR-0006 gave the engine its first encrypted pipe and binary. ADR-0007 gave it a real-socket two-node mesh with signed-envelope gossip. ADR-0008 gave it the `/metrics` observability surface — including the `sovereign_convergence_lag_seconds` gauge and the `sovereign_gossip_rounds_total` counter this iteration reads. Through that point the engine had **never survived a partition**: no test had closed a peer's connection mid-stream, injected divergence while partitioned, healed, and proved zero-data-loss re-convergence inside a wall-clock SLO.
+### Close one transport peer
 
-This iteration is the survival gate: a mesh that loses data on partition fails the engine's reason to exist, and this iteration proves it does not. The mechanism is CRDT idempotency — the divergence A injects while partitioned is replicated to B after heal via the IBLT-delta `Join`, so there is zero data loss by construction. The <100ms convergence-after-heal SLO is the operator-facing surface: an operator scrapes `sovereign_convergence_lag_seconds` and reads a real heal time, under the 50ms heal-control-plane tick (FACT 1), measured from the first successful gossip round after datapath restore (FACT 2), and honestly labeled as an in-process (not silicon) number (FACT 3).
+`(*PeerSet).ClosePeer(peerID [16]byte) error` removes the peer from both the
+`peers` and `byAddr` maps under the write lock, then cancels its reader and
+closes the connection. Removing the map entries first makes a concurrent
+`Publish` fail its live-peer lookup instead of writing to a closed connection.
+A later `Dial` or `ReconnectLoop` can restore the peer; closing a missing peer
+is an idempotent no-op.
 
-This iteration is the first time the convergence-lag gauge is read under a real failure event. It composes the earlier mesh work; it does not re-implement it. An iteration that re-touched `receiver.go`, `ingress_epoll.go`, or the frozen files would fail the gate.
+The current implementation also calls `closeDone` before waiting on `pc.done`.
+Inbound peer connections have no read loop that would otherwise close that
+channel, so this prevents `ClosePeer` from waiting forever. `sync.Once` handles
+the outbound reader closing it concurrently.
+
+### Compose the probe from production components
+
+`ConvergenceProbe` drives the two existing peer sets and gossipers:
+
+- `Partition` closes both directions and records `partitionAt`.
+- `Heal` re-dials both sides through `PeerSet.Dial` and records `healAt` only
+  after both peer maps contain the restored edges.
+- `StartSweepLoops` starts the ordinary `SweepLoop` before the partition.
+- `WaitForConvergence` polls both engines with `MerkleRootFromShards` and
+  returns `time.Since(healAt)` when the roots match. Reading shard roots avoids
+  constructing a merged state snapshot on every poll.
+
+The probe changes no receive-path behavior. Frames after healing still pass
+through `HandleFrame`, `VerifyCRDTFrame`, and `ApplyCRDTDeltaEvent`.
+
+### Report gossip rounds without a metrics dependency
+
+`Gossiper` holds a nil-safe `roundReporter func()` and exposes
+`SetRoundReporter(fn func())`. `SweepLoop` invokes the callback after each
+executed round. The command binds it to `Recorder.IncGossipRound` immediately
+after constructing the gossiper.
+
+This callback keeps `pkg/mesh` independent of `pkg/metrics` and leaves the
+`NewGossiper` signature unchanged. A gossiper constructed without a recorder,
+including the `--selftest` path, retains a scrapeable counter whose value is 0.
 
 ---
 
-## 2. Decision
+### Include the sweep wait in the latency target
 
-The change is one atomic unit — a composer of the existing `PeerSet`/`Gossiper` and the convergence-lag machinery, plus the per-peer partition primitive the composition needs:
+The measured interval is:
 
 ```
-PARTITION (the transport-layer primitive, NOT the receive gate):
-  PeerSet.ClosePeer(peerID)                  // peer.go — the SINGLE new PeerSet method
-    -> delete from peers + byAddr maps (mu write-lock)
-    -> cancelReader + conn.Close + <-pc.done  // the readLoop exits cleanly
-
-PROBE (the composer, pkg/mesh/probe.go NEW):
-  ConvergenceProbe{ gA, gB, psA, psB, engineA, engineB, addrA, addrB, peerA, peerB }
-  Partition(ctx, peerID)    -> ClosePeer on BOTH PeerSets (bidirectional); record partitionAt
-  Heal(ctx, peerID)         -> PeerSet.Dial BOTH sides (the existing re-dial seam); record healAt
-  StartSweepLoops(ctx, tick) -> the production model: the sweep runs CONTINUOUSLY
-  WaitForConvergence(ctx, slo, tick) -> poll MerkleRoot(A)==MerkleRoot(B); return time.Since(healAt)
-
-THE ROUND-REPORTER SEAM (completes the gossip-rounds counter, previously scrapeable but unwired):
-  Gossiper.roundReporter func()              // nil-safe field (nil = no-op)
-  Gossiper.SetRoundReporter(fn func())        // cmd binds metrics.Recorder.IncGossipRound
-  SweepLoop: g.roundReporter() nil-guarded    // after stampConvergence, every executed round increments
-  cmd: gossiper.SetRoundReporter(metricsExp.Recorder().IncGossipRound)  // right after NewGossiper
+heal to equal roots = sweep wait + RTT + IBLT reconciliation + apply
 ```
 
-The probe does not reimplement the sweep (it starts the existing `SweepLoop` at the tick arg) nor convergence detection (it reads `MerkleRoot` directly via `engine.State().MerkleRoot()` — the same path the gauge seeds from via `stampConvergence`). It does not touch the frozen receive-gate stack: a frame that arrives after heal still flows `HandleFrame` -> `VerifyCRDTFrame` -> `ApplyCRDTDeltaEvent`. The partition is at the transport layer (`PeerSet.ClosePeer`), not the receive gate.
+With a running sweep, the wait for the next tick is in `[0, tick)`. At the
+default 100ms tick, that wait alone can exhaust the 100ms target. The in-process
+test therefore uses `--gossip-tick=50ms` as an explicit fixture, leaving the
+remaining budget for the round trip, reconciliation, and application.
 
-### 2.1 The `SetRoundReporter` seam, not a recorder field
+`StartSweepLoops` runs before the partition. Starting a ticker at `healAt` would
+instead add a full tick before its first fire and measure a different setup.
+During the partition, `AntiEntropySweep` returns early when no peers remain; the
+same running loop resumes within `[0, tick)` after `Heal` re-dials.
 
-An earlier draft of this change had added a `recorder *metrics.Recorder` field, a 5-arg `NewGossiper`, and a `pkg/metrics` import to `gossip.go` — but the import was missing, so the tree did not build (`undefined: metrics`). I adopted the narrower seam precisely to avoid importing `pkg/metrics` into `pkg/mesh`: a `roundReporter func()` field (nil by default) plus a `SetRoundReporter(fn func())` setter; `SweepLoop` calls `g.roundReporter()` nil-guarded; `cmd` binds `gossiper.SetRoundReporter(metricsExp.Recorder().IncGossipRound)`. `NewGossiper` stays 4-arg. The nil-guard is non-vacuous: the `--selftest` path and the cold-scrape gate construct a `Gossiper` with no recorder, and a nil `roundReporter` keeps that path scrapeable-with-0 exactly as it shipped. The mesh package stays Prometheus-free; the cmd owns the binding.
+### Start the clock when connectivity returns
 
----
+In the in-process probe, `healAt` is recorded after the re-dials and peer-map
+checks complete. The returned interval is `time.Since(healAt)`.
 
-## 3. The §0 invariant — the three facts that govern this gate
+A security-group partition on AWS has a different boundary. The CLI request can
+return before the datapath rule changes, with propagation taking from 100ms to
+minutes. Starting the mesh latency measurement at that CLI return would include
+cloud control-plane delay. The multi-machine procedure therefore starts at the
+first successful gossip round after connectivity returns, detected through
+`sovereign_gossip_rounds_total`, and records both timestamps so the exclusion is
+visible.
 
-### FACT 1 — the SLO decomposition is tick-bound, and the tick is hardcoded
+### Keep loopback and multi-machine results separate
 
-The <100ms convergence-after-heal SLO decomposes as:
+The in-process test uses loopback TLS on `127.0.0.1`, with an RTT of roughly
+10µs rather than the approximately 0.3–1.0ms expected within an availability
+zone. Its less-than-100ms assertion covers convergence behavior and the tick
+budget; it is not a multi-machine latency receipt.
 
-```
-SLO        <=  sweep-wait      +  (RTT + IBLT-peel + apply)
-100ms      <=  <=50ms           +  <=50ms
-```
-
-The sweep-wait is the time from "connectivity restored" to the next sweep tick firing: a uniform `[0, tick)` random variable with worst-case = tick. At `--gossip-tick=50ms` the worst-case sweep-wait is 50ms; at the 100ms default the worst-case sweep-wait is 100ms — i.e. the SLO is exhausted by the tick alone before a single byte crosses the wire. The probe therefore hardcodes `--gossip-tick=50ms`. The 50ms is a test fixture (a hardcoded precondition), not a hidden assumption; the log records it explicitly. A probe that runs the heal at the 100ms default and reports "<100ms" is a silent tie-break fraud.
-
-**The continuous-sweep model (the FACT-1 physics the probe enforces):** the sweep-wait is `[0, tick)` only when the sweep is already running at heal. The probe therefore starts the `SweepLoop` once at mesh setup (before the partition) via `StartSweepLoops`, not at `healAt`. Starting the sweep at `healAt` would bill a full tick the first ticker fire costs (`time.NewTicker(tick)` delivers its first tick at `tick` elapsed, not 0) — a probe-instrumentation artifact the production mesh does not pay. The continuous sweep stalls cleanly during partition (`AntiEntropySweep` returns early when `len(peerIDs) == 0`) and resumes within `[0, tick)` when `Heal` re-dials.
-
-### FACT 2 — the SLO clock starts at restore-of-connectivity, not at SG-CLI-return
-
-The silicon partition primitive is an AWS Security Group rule change (revoke + re-grant the peer-port ingress). AWS SG propagation is async on the control plane — the `aws ec2 revoke-security-group-ingress` CLI returns immediately, but the datapath rule may take 100ms–minutes to actually drop / re-admit traffic. Measuring "convergence-after-heal" from the SG-CLI-return would bill AWS control-plane latency against the mesh's heal SLO — a category error. The honest boundary: the SLO clock starts at the first successful gossip round after the datapath is restored (the first `AntiEntropySweep` that ships an envelope across the healed link and gets a peer's delta back). The SG propagation time is excluded. The log records both the SG-CLI-return timestamp and the first-successful-sweep timestamp, so the exclusion is auditable, not silent.
-
-In the in-process probe there is no SG layer, so `healAt` (the re-dial returning) is the connectivity-restored timestamp; the wall-clock the probe returns is `time.Since(healAt)`. The silicon harness detects datapath restoration by the `sovereign_gossip_rounds_total` counter incrementing (the round-reporter wire makes the counter mean something — the first increment after `sgGrantAt` is the first successful gossip round).
-
-### FACT 3 — the honest-labeling rule governs the in-process vs silicon claim
-
-The in-process test (loopback TLS, one kernel, 127.0.0.1) has RTT ~10µs, not the ~0.3–1.0ms of intra-AZ. The in-process test proves the convergence property (the mesh heals, roots equal, the 50ms tick fires the sweep, and the latency is bounded by the tick not the apply), not the silicon <100ms number. A loopback "<100ms" is a correctness claim, not a silicon-latency claim. The silicon <100ms is a separate gate (two c8g nodes, an AWS conditional). Relabeling the in-process number as silicon would be dishonest. The in-process gate asserts:
-
-- (a) roots equal after heal (the convergence property)
-- (b) the measured heal-to-convergence wall-clock is < 100ms (honest under the loopback RTT; the 100ms cap is the same target the silicon gate uses, but the loopback number is not relabeled as silicon)
-- (c) the 50ms tick is the recorded fixture (the sweep-wait budget)
-
-The silicon gate asserts the same (a)+(b) over a real intra-AZ RTT, with the SG-revoke/grant as the partition primitive. If silicon measures 140ms (real WAN jitter), that is an honest result: the log flags the SLO as not met at single-AZ + 50ms tick, and the honest fallback options (restate to <200ms, or drop to a 25ms tick, or accept cross-AZ > single-AZ) are named in the log — never fabricated as a pass.
-
-These three facts are non-negotiable. The gate is an operator-facing total (wall-clock from restored-connectivity to roots-equal), not a gauge that excludes the sweep-wait; games that exclude the tick from the SLO clock are rejected as hidden assumptions. A fabricated pass is the catastrophic-failure mode.
+The separate security-group procedure applies the same roots-equal and latency
+checks across two machines. A result such as 140ms would be recorded as a missed
+target. Restating the target as less than 200ms, using a 25ms tick, or reporting
+a different cross-zone bound would each be a separate, explicitly labeled
+result rather than a reinterpretation of the loopback measurement.
 
 ---
 
-## 4. The per-peer `ClosePeer` primitive, and why it is minimal
+### Exercise divergence during a partition
 
-`PeerSet` had `Close()` (all peers) but lacked a per-peer close. This change adds the single method `ClosePeer(peerID [16]byte) error`:
+`TestPartitionHeal_ConvergesUnder100ms` builds on the two-node loopback TLS
+harness used by `TestTwoNodeConvergence_InMemory`. It performs this sequence:
 
-- close one peer's conn and cancel its readLoop; remove it from the `peers` map and the `byAddr` map (under the `mu` write-lock, before closing the conn — the nil-safety ordering);
-- leave other peers untouched (a per-peer partition, not close-all);
-- a reconnect via `ReconnectLoop` (or the probe's `Heal` -> `PeerSet.Dial`) can re-establish;
-- return nil for a peer not present (idempotent — already gone).
+1. Write to A and let the ordinary sweep converge both roots.
+2. Close both directions with `probe.Partition`.
+3. Write three more events to A and verify that B does not receive them.
+4. Restore both connections with `probe.Heal`.
+5. Call `WaitForConvergence` with a 100ms deadline and 50ms tick, then check
+   equal roots and the presence of every partitioned write on B.
 
-I did not add a `Heal` method to `PeerSet` (re-dial is `PeerSet.Dial`; the probe composes it). `ClosePeer` is the only new `PeerSet` method — the single `pkg/mesh/peer.go` edit this change makes.
-
-**Nil-safety (verified):** `ClosePeer` deletes the peer from both maps under the write-lock before closing the conn; `Publish` takes the `mu` RLock and checks `peers[peerID]` presence (peer.go:845). A `Publish` after `ClosePeer` finds the peer already gone and returns the "no live peer" error — never a write to a closed/nil conn. `AntiEntropySweep` iterates `g.peers.Peers()` (a snapshot); after `ClosePeer` the snapshot excludes the closed peer, so the sweep ships nothing to it (returns early when `len(peerIDs) == 0` in the 2-node case). The probe's sweep does not `Publish` during the partition (the continuous sweep sees no live peers and returns early). Bounded.
-
----
-
-## 5. The in-process gate (correctness, not silicon-latency)
-
-`TestPartitionHeal_ConvergesUnder100ms` (`pkg/mesh/partition_test.go`) reuses the `TestTwoNodeConvergence_InMemory` harness shape (dev CA + two `NodeIdentity` + two `tls.Listen` on 127.0.0.1:0 + two `PeerSet`s + two `Gossiper`s + the pubkey registration) and composes the `ConvergenceProbe`. Sequence:
-
-1. Inject a divergence on A only (not B) — roots differ.
-2. Baseline: the continuous sweep converges A's divergence to B — roots equal.
-3. Partition: `probe.Partition(B)` closes A's conn to B and B's to A (bidirectional `ClosePeer`).
-4. Inject more divergence on A while partitioned — B must not get it (roots diverge; the partition does not leak).
-5. Heal: `probe.Heal(B)` re-dials both sides; wait for readLoops to plumb.
-6. `WaitForConvergence(ctx, slo=100ms, tick=50ms)`: poll roots at <=tick until equal; assert `healToConv < 100ms` and roots equal and zero data loss (B holds A's partitioned events).
-7. The honest-label `t.Logf` records the boundary (in-process loopback, not silicon intra-AZ latency).
-
-Race-clean (the full test runs under `-race`). The failure teeth: fail if roots never converge (a true defect — the mesh lost data on partition); accept-with-negative-perf if roots converge but 100ms is exceeded (record the measured wall-clock and the implication; the silicon gate is separate).
-
-**The divergence scale (a small handful):** this test injects a small divergence (3 events per phase) because it proves the heal latency (sweep-wait + RTT + small-apply), not the large-state convergence bound (a 10K+ divergence with many IBLT-peel rounds is later work). The per-delta apply cost (~8ms/envelope over loopback TLS, measured) bounds the apply phase; a handful keeps it well inside the 50ms apply budget so the tick (not the apply) is the SLO floor — the FACT-1 physics. A 20-event divergence blows the SLO on the apply phase alone (~160ms) — an honest negative that belongs to the later batched-delta work, not this gate.
+The test records that its latency is loopback-only and runs under the race
+detector in the recorded gate. Failure to converge is a correctness failure;
+convergence beyond the deadline is a missed latency target.
 
 ---
 
-## 6. The silicon gate (the AWS conditional)
+### Multi-machine security-group procedure
 
-The silicon harness runs two c8g nodes in the same AZ (intra-AZ RTT ~0.3–1.0ms, launched with distinct `--node-id` + `--bind` ports and a shared security group). Steps: provision the two nodes; rsync the tree; run `sovereign-node` on each with `--peers=<other> --gossip-tick=50ms --tls-* --metrics-addr=0.0.0.0:7431`; inject divergence on A; partition via `aws ec2 revoke-security-group-ingress` on the peer-port (8443) for both nodes' SG (record `sgRevokeAt`); inject more divergence on A while partitioned; heal via `authorize-security-group-ingress` (record `sgGrantAt`); poll `/metrics` `sovereign_convergence_lag_seconds` every 10ms after `sgGrantAt`; detect datapath restoration by the `sovereign_gossip_rounds_total` counter incrementing (the round-reporter wire — the first round that ships >0 envelopes after `sgGrantAt`); `healToConv = firstRootsEqualAt - firstGossipRoundAfterDatapathRestore` (not minus `sgGrantAt` — FACT 2). The log records both timestamps so the exclusion is auditable.
+The proposed multi-machine procedure uses two nodes in one availability zone
+and the same 50ms gossip-tick fixture. The peer port is 8443 and the metrics
+port is 7431. It revokes and restores security-group ingress, polls metrics
+every 10ms, and subtracts the first successful post-restore gossip round from
+the time the roots
+become equal. Both the security-group grant and first-round timestamps must be
+recorded.
 
-The silicon run is an AWS conditional: if the two nodes are provisioned, the run produces the convergence log with `healToConv_ms` and an honest SLO-met/not-met. If they are not provisioned, the silicon gate is deferred honestly and the in-process gate lands. Either way the broader release verdict stays conditional; this iteration is not a release blocker.
-
----
-
-## 7. IS NOT
-
-- This change does not touch the five core merge-law/wire-schema files (`crdt.go`, `crdt_apply.go`, `schema.capnp`, `schema.capnp.go`, `envelope.go`). They are unchanged.
-- It does not touch `receiver.go` or `ingress_epoll.go`. The partition is at the transport layer (`PeerSet.ClosePeer`), not the receive-gate stack. A frame that arrives after heal still flows `HandleFrame` -> `VerifyCRDTFrame` -> `ApplyCRDTDeltaEvent` — the frozen sink is never bypassed.
-- It does not edit `internal/chaos/partition.go`. The in-process chaos orchestration harness stays the CI path; this change builds its own in-process probe at `pkg/mesh/` over the real loopback TLS socket, not the chaos VirtualNet. The chaos `Orchestrator` (`partition.go:214 GossipOnce`, `:248 MerkleRoots`) is the reference pattern, not the code to edit. Cited, not forked.
-- It does not restate the SLO as <200ms to dodge a measurement (the FACT-3 fallback is an honest option named only if silicon > 100ms, not a pre-emptive relaxation). The 100ms target stands; physics decides.
-- It does not bundle a 3-node mesh or the batched delta envelope. The probe is 2-node; the per-delta signing cost (~60µs) is bounded by the small divergence this change injects. This change proves the heal latency, not the throughput.
-- It does not fabricate the <100ms. A loopback <100ms is a correctness claim; a silicon > 100ms is an honest result, recorded verbatim.
-- It does not promote post-quantum signing or re-open `crdt.go` (both are out of scope here).
+That procedure was conditional on provisioning. This ADR records no completed
+multi-machine run and no intra-zone latency measurement.
 
 ---
 
-## 8. Honest weaknesses
+## Consequences
 
-1. **The in-process gate proves the convergence property + the 50ms-tick fixture, not the silicon <100ms intra-AZ number** (loopback RTT ~10µs, not ~1ms). The silicon gate is the AWS conditional (two c8g nodes).
-2. **The partition primitive is a per-peer conn close (`PeerSet.ClosePeer`), not a real AWS SG revoke.** The in-process test models the logic (one peer drops, the other's sweep stalls, heal re-dials, convergence resumes); it does not model the AWS SG control-plane propagation latency (which FACT 2 excludes from the SLO clock either way). The SG propagation is unmeasured in-process; it is a silicon-only effect.
-3. **The SLO clock starts at the first successful gossip round after the datapath is restored (FACT 2), not at the SG authorize CLI return.** This excludes AWS control-plane latency from the mesh heal SLO — an honest boundary, but it means the <100ms measures the mesh, not the AWS control plane. A stricter SLO that includes SG propagation would be longer and is a separate ops-SLO (named here, not this gate).
-4. **The divergence this test injects is small (3 events per phase).** The apply-phase latency is ~24ms at this scale (measured: ~8ms/envelope over loopback TLS). A larger divergence (10K+, many IBLT-peel rounds) is later work; this test proves the heal latency (sweep-wait + RTT + small-apply), not the large-state convergence bound. A 20-event divergence blows the SLO on the apply phase alone (~160ms) — an honest negative that the later batched-delta work addresses (one verify per N deltas), not a defect here.
-5. **The probe is 2-node.** A 3-node partition (a split-brain where two peers heal at different times) is future work. The 2-node heal is the simplest non-trivial partition; the 3-node quorum-aware convergence is a separate track.
-6. **The <100ms SLO at a 50ms tick is a specific knob** — an operator running the 100ms default gets ~100ms heal, so the SLO is tick-dependent. This is exactly the FACT-1 physics. The `--help` documents both knobs (100ms steady-state, 50ms heal-control-plane) — the operator chooses. The <100ms is the heal workload's number; the throughput workload keeps 100ms (a tighter tick is a CPU tax there). Two documented workloads, not a single misleading claim.
-7. **The `sovereign_gossip_rounds_total` counter was scrapeable-but-unwired before this change** (the earlier observability work defined `IncGossipRound` and registered the counter so it scraped from a cold start, but never called it from `SweepLoop`). This change wires it (`SetRoundReporter`) — the FACT-2 silicon signal depends on it incrementing. The wire is a completion of that earlier counter, carried in now because this is the first gate that reads it.
-
----
-
-## 9. Self-adversarial critique
-
-**The SLO excludes AWS SG propagation latency — so the mesh could claim <100ms while the real outage was 5 seconds.** The SLO measures the mesh heal time (the property this gate proves), not AWS control-plane latency. The log records both timestamps (`sgGrantAt` and `firstGossipRoundAfterDatapathRestore`) so the exclusion is auditable, not silent. A stricter ops-SLO that includes SG propagation is named in §8 weakness 3 as a separate future item; this gate does not claim it. The honest boundary: the mesh's heal, not the cloud's.
-
-**`ClosePeer` drops the conn but the PeerSet's `Publish` might still write to a deleted peer — a goroutine panic.** No: `ClosePeer` deletes the peer from both maps under the `mu` write-lock before closing the conn; `Publish` takes the `mu` RLock and checks `peers[peerID]` presence (peer.go:845). A `Publish` after `ClosePeer` returns the "no live peer" error — never a panic on a nil conn. `AntiEntropySweep` iterates `Peers()` (a snapshot that excludes the closed peer) and returns early when `len == 0`. The probe's sweep does not `Publish` during the partition. Bounded — verified by the race-clean gate run.
-
-**The `sovereign_gossip_rounds_total` counter was scrapeable but never incremented, so the FACT-2 silicon signal would be broken — the harness would wait forever for a counter that stays 0.** This change wires it (`SetRoundReporter` + the `SweepLoop` call site). The wire is a completion of the earlier counter, in-scope and minimal, and the nil-guard preserves the cold-scrape path. Named in §3 and §8 weakness 7.
-
-**The <100ms SLO at a 50ms tick is a specific knob — an operator running the 100ms default gets ~100ms heal, so the SLO is tick-dependent.** This is exactly the FACT-1 physics. The `--help` documents both knobs (100ms steady-state, 50ms heal-control-plane) — the operator chooses. The <100ms is the heal workload's number; the throughput workload keeps 100ms (a tighter tick is a CPU tax there). Two documented workloads, not a single misleading claim. Named honestly in §3 and the `--help` output.
+- Partitioning is a transport operation. The receive verification and merge path
+  is unchanged, and the independent chaos orchestrator remains a separate test
+  harness.
+- The 50ms tick is part of the measurement conditions. The default 100ms tick
+  cannot support the same worst-case bound because its sweep wait can consume
+  the entire target.
+- Three events per phase exercise a small apply phase. The recorded envelope
+  cost was ~8ms/envelope over loopback TLS, or ~24ms for the three-event phase.
+  This does not bound convergence for 10K+ divergent events;
+  a 20-event example already implied approximately 160ms of apply time before
+  batching.
+- The probe covers two nodes, not a three-node partition whose peers heal at
+  different times. It also measures healing rather than throughput or the
+  approximately 60µs per-delta signing cost at scale.
+- Closing a connection does not model security-group propagation. Excluding
+  that propagation keeps the measurement scoped to the mesh, but an operational
+  SLO that includes the cloud control plane would be longer and separate.
 
 ---
 
-## 10. Bottom line
+## Evidence
 
-This is the survival gate: a mesh that loses data on partition fails the engine's reason to exist, and this change proves it does not. The mechanism is CRDT idempotency — the divergence A injects while partitioned is replicated to B after heal via the IBLT-delta `Join`, so there is zero data loss by construction. The <100ms convergence-after-heal SLO is the operator-facing surface: an operator scrapes `sovereign_convergence_lag_seconds` and reads a real heal time, under the 50ms heal-control-plane tick (FACT 1), measured from the first successful gossip round after datapath restore (FACT 2), and honestly labeled (FACT 3). The broader release verdict stays conditional. Nothing fabricated; physics decides where the heal time lands. A silicon > 100ms is an honest result recorded verbatim; a fabricated pass is the catastrophic-failure mode.
+- `TestPartitionHeal_ConvergesUnder100ms` in `pkg/mesh/partition_test.go` is the
+  primary regression test. It drives real loopback TLS connections, checks that
+  partitioned writes replicate after healing, and applies the 100ms deadline
+  with the explicit 50ms tick. The recorded gate also ran it with `-race`.
+- `TestTwoNodeConvergence_InMemory` in `pkg/mesh/gossip_test.go` supplies the
+  underlying two-node convergence harness.
+- `WaitForConvergence` compares roots through `MerkleRootFromShards`, the same
+  shard-root mechanism used by the convergence gauge. `ClosePeer` covers both
+  inbound and outbound connection shutdown without bypassing the receive path.
+- No completed two-machine security-group run is cited as evidence for this
+  decision. The loopback test and the proposed multi-machine procedure are
+  separate evidence tiers.

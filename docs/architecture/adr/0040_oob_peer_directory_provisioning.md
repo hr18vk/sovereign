@@ -1,313 +1,243 @@
 # ADR-0040: OOB Peer-Directory Pubkey Provisioning
 
-- **Status:** ACCEPTED
+- **Status:** Accepted
 - **Date:** 2026-08-13
-- **Scope:** the identity/provisioning half of the region-aware mesh work —
-  the complement to ADR-0039's region-aware data-plane.
-- **Core files:** the merge-law/wire-schema files are untouched — the
-  provisioning layer is an identity/routing addition, not a CRDT/data-layer
-  change.
-- **Telemetry:** no new counter, no `registry.go` change. The existing
-  `InterRegionEnvelopesShipped` counter firing A=1 B=1 in the 2-node binary
-  mesh is its first runtime disclosure.
 
 ## Context
 
-ADR-0039 shipped the region-aware **selection** logic — `topology.Select(ctx)`
-picks intra-region full-mesh + inter-region fan-out-N peers. Its honest
-residual was the **N=2 no-op**: the cmd dial loop keyed the peerConn under a
-placeholder zero peerID (the long-standing honest gap — "the peer's real
-nodeID is unknown until the peer presents its leaf"), while the topology
-registry keyed the region tag under `peerIDForAddr(addr)` (a SHA-256
-surrogate). The zero peerID never matched the surrogate → `Select` returned
-the surrogate → `Publish(surrogate)` found no live peer (the dial keyed zero)
-→ silent fallback → the mesh **never converged** at N=2 in the binary.
-ADR-0039 shipped the selection logic; this change ships the **provisioning
-logic** that makes a real 2-node binary mesh converge.
+ADR-0039 added region-aware selection: `topology.Select(ctx)` chooses an
+intra-region full mesh plus inter-region fan-out peers. A two-node binary mesh
+could not use that selection. The command's dial loop keyed each `peerConn`
+under a placeholder zero peerID because the peer's real nodeID was unknown,
+while the topology registry keyed the region under `peerIDForAddr(addr)`, a
+SHA-256 address surrogate. `Select` returned the surrogate, but `Publish` could
+find no connection under that identity. Region-aware routing therefore fell
+back to full-mesh behavior and the two nodes did not converge.
 
-The zero-peerID hazard has two halves:
+The provisioning gap had two parts:
 
-1. **the peerID half** — the dial keys the peerConn under a wrong/zero
-   nodeID, so `Publish(realNodeID)` misses the live-peer map (routing).
-2. **the retry half** — the dial loop is one-shot; a peer not yet listening
-   at boot (the inevitable 2-node startup race) is a permanent miss, with no
-   reconnect.
+1. The dial keyed the connection under a zero or incorrect nodeID, so
+   `Publish(realNodeID)` missed the live-peer map.
+2. Boot dialing was one-shot. A peer that was not yet listening remained
+   disconnected, with no reconnect attempt.
 
-This change retires both halves.
+This decision supplies peer identities and verification keys out of band, adds
+optional certificate-based routing reconciliation, and wires the existing
+reconnect loop into the node binary. It does not change the CRDT merge or wire
+schema, and it adds no telemetry counter.
 
 ## Decision
 
-Ship two seams plus the retry watcher.
+### Provision identities and keys with `--peer-dir`
 
-### Seam A — `--peer-dir` deterministic provisioning (the load-bearing arm)
+`cmd/sovereign-node/provisioning.go` parses a line-oriented peer directory with
+these positional fields:
 
-A new `cmd/sovereign-node/provisioning.go` with a line-oriented failsafe
-parser mapping `addr → {nodeID, ed25519_pubkey, optional mldsa65_pubkey,
-optional region}`. `applyProvisioning` calls
-`gossiper.RegisterPeer(realNodeID, pub)` (the CRDT verification pubkey into
-the Directory) + `dir.RegisterPQ` (the ML-DSA-65 pubkey, when present — the
-hybrid arm) + `topo.SetRegion(realNodeID, region)` (the topology re-key under
-the real nodeID — the retirement of the surrogate). The dial loop's new
-peerID branch: a provisioned peer dials under the real nodeID → the topology
-selector hits → `Publish(realNodeID)` finds the live peer → the inter-region
-arm fires → the 2-node mesh converges.
+```
+addr nodeID ed25519_pubkey [mldsa65_pubkey|-] [region|-]
+```
 
-The parser is failsafe: a malformed entry (bad hex / wrong length / duplicate
-addr / out-of-range region) is rejected with a named-line error, never
-coerced to zero. The ML-DSA-65 pubkey round-trips via
-`mldsa.NewPublicKey(mldsa.MLDSA65(), enc)` from a 1952-byte serialized config
-blob — the first site that reconstructs a directory post-quantum pubkey from
-a serialized config.
+The address is a host and port. The nodeID is 16 bytes encoded as 32 hexadecimal
+characters, and the Ed25519 key is 32 bytes. The optional ML-DSA-65 key uses its
+1,952-byte public-key encoding; `-` omits it. A region is an unsigned 8-bit
+value, and `-` leaves it unset. Blank lines and text following `#` are ignored.
 
-### Seam B — `--peer-auto-reconcile` runtime TLS-leaf reconcile (the routing complement)
+`parsePeerDir` rejects malformed hexadecimal, incorrect key lengths, duplicate
+addresses or nodeIDs, and out-of-range regions with an error naming the line and
+field. An empty path returns `ErrPeerDirEmpty`, which the caller treats as
+provisioning being disabled. A named file that cannot be opened fails startup.
+Invalid identities are never replaced with zero values.
 
-`pkg/mesh/peer.go`'s `autoReconcile` field + `reconcilePeerID`: read the
-peer's TLS leaf `CommonName` (the certgen mirror — `IssueLeaf` sets
-`CommonName: hex(nodeID)`) → `hex.DecodeString` the 32-char CN → `[16]byte` →
-re-key the peerConn under the real nodeID. Routing-only (cert key ≠ CRDT
-key): the reconcile changes which `ps.peers` entry `Publish` writes to; it
-never touches the verification pubkey (the Directory's OOB-provisioned key is
-the verification anchor). A provisioned peer (Seam A already dialed under the
-real nodeID) skips the reconcile — the peer is keyed correctly and the leaf
-CN is a redundant signal.
+`applyProvisioning` registers each Ed25519 key through
+`gossiper.RegisterPeer`, each optional ML-DSA-65 key through `dir.RegisterPQ`,
+and each configured region through `topo.SetRegion`, all under the real nodeID.
+`mldsa.NewPublicKey(mldsa.MLDSA65(), enc)` reconstructs the post-quantum public
+key from its serialized encoding. The returned address-to-nodeID map makes the
+dial loop use the same identity as the topology registry. `Select` can then
+return an identity for which `Publish` has a live connection.
 
-### The retry watcher — `ReconnectLoop` wired
+### Reconcile routing from the TLS leaf
 
-`pkg/mesh/peer.go:528` `ReconnectLoop` (docstring: "the production binary
-wires it") was not wired in the binary's dial loop — the one-shot residual of
-the original dial path. This change wires it: after each `Dial` (success or
-failure), spawn `go peerSet.ReconnectLoop(meshCtx, pa, host, dialPeerID, 1s,
-10s)` — bounded exponential backoff until the peer connects, then watch +
-re-dial on drop. This retires the retry half: a peer not yet listening at
-boot re-dials until it is up, so the 2-node startup race is absorbed.
-Idempotent and safe in all three modes (provisioned / reconcile /
-un-provisioned-no-reconcile = byte-identical to the previous behavior).
+The optional `--peer-auto-reconcile` flag enables `PeerSet.reconcilePeerID`.
+`crypto.MeshCA.IssueLeaf` sets the leaf's CommonName to the hexadecimal nodeID.
+After the handshake, reconciliation decodes those 32 characters into a
+`[16]byte` and keys the `peerConn` under that identity. A peer already dialed
+with a provisioned nodeID skips this step.
 
-### The files
+Reconciliation changes only the `ps.peers` routing entry. The TLS certificate
+key is not the CRDT verification key, and reconciliation does not populate
+`identity.Directory`. Without a separately provisioned verification key, the
+receiver's `Directory.Lookup` fails and its frame handlers return `DropVerify`.
+Certificate reconciliation is therefore a routing complement, not a standalone
+convergence mechanism.
 
-- **`cmd/sovereign-node/provisioning.go`** (new): the `peerDirConfig` struct
-  + `parsePeerDir` (the failsafe line parser) + `parsePeerDirLine` (per-field
-  decode with length checks) + `applyProvisioning`
-  (RegisterPeer/RegisterPQ/SetRegion under the real nodeID) +
-  `ErrPeerDirEmpty` (the opt-in no-op).
-- **`pkg/mesh/peer.go`** (modified): the `autoReconcile` field (tail-placed —
-  absorbs into existing padding, fieldalignment net-neutral) +
-  `SetAutoReconcile` + `reconcilePeerID` (the leaf-CN hex-decode) + the
-  `Dial` reconcile branch + the `ReconnectLoop` primitive (pre-existing, now
-  wired from main.go).
-- **`cmd/sovereign-node/main.go`** (modified): the `--peer-dir` +
-  `--peer-auto-reconcile` flags + `applyProvisioning` wiring before the dial
-  loop + the dial-peerID branch (provisioned → real nodeID; else zero =
-  byte-identical to the previous behavior) + the `go
-  peerSet.ReconnectLoop(...)` watcher wiring.
-- **`pkg/mesh/oob_provision_test.go`** (new): the mesh-side guards.
-- **`cmd/sovereign-node/provisioning_test.go`** (new): the cmd-side guards
-  (plus the malformed-entry RED cases).
+### Wire `ReconnectLoop` into boot dialing
 
-### The guards (all green)
+The node binary previously left `(*PeerSet).ReconnectLoop` unused and attempted
+each boot dial only once. After each `Dial`, whether it succeeds or fails, the
+command now starts:
 
-1. **`TestOOBConfigParse`** — `parsePeerDir` round-trips a 3-peer config (1
-   ML-DSA + 2 classical + 1 region); the ML-DSA-65 `Bytes()`/`NewPublicKey`
-   round-trip is byte-identical. Four malformed-entry RED cases (short
-   nodeID / bad-hex pubkey / dup addr / out-of-range region) are rejected
-   with named-line errors, not coerced to zero.
-2. **`TestOOBProvisionRetiresSurrogate`** (the load-bearing headline) — the
-   provisioned path (region keyed under the real nodeID) makes
-   `topo.IsInterRegion` true + `Select` returns the real nodeID →
-   `Publish(real)` hits → the inter-region arm fires → convergence. RED: the
-   previous surrogate keying → `Select` returns the surrogate →
-   `Publish(real)` misses → the no-op reproduces.
-3. **`TestOOBReconcile`** — `reconcilePeerID` hex-decodes the leaf CN → the
-   real nodeID (the production-cert-minter mirror; routing-only). RED: a
-   non-hex CN is rejected (ok=false) — the hex-decode guard is load-bearing
-   (a naive `copy(id[:], cn)` would truncate 32-char hex to 16 garbage
-   bytes).
-4. **`TestOOBOffByteIdentical`** — `--peer-dir ""` + `--peer-auto-reconcile
-   false` is byte-identical to the previous behavior (an un-provisioned peer
-   routes intra = `IsInterRegion=false` = byte-identical full-mesh).
-5. **`TestOOBRace`** — the reconcile + the `autoReconcile` field are race-free
-   under concurrent `Dial` + `reconcilePeerID` (green under `-race`
-   GOMAXPROCS=4).
-6. **`TestOOBApply` / `TestOOBEmptyNoOp` / `TestOOBMissingPathFails`** —
-   `applyProvisioning` resolves all 3 pubkeys (hybrid via `LookupBoth`); an
-   empty `--peer-dir` is a no-op (byte-identical to the previous behavior);
-   a non-empty-but-missing path fails the boot — a deploy misconfiguration
-   must be loud.
+```go
+go peerSet.ReconnectLoop(meshCtx, pa, host, dialPeerID, 1s, 10s)
+```
 
-### The binary harness (the 2-node convergence proof, overall pass)
+The loop waits for an established peer to disconnect and retries failed or
+dropped dials with exponential backoff from 1 second to a 10-second ceiling.
+This absorbs the startup race in which one node begins listening after its peer
+has already tried to dial. Provisioning and reconciliation remain optional; an
+unprovisioned peer with reconciliation disabled retains the earlier routing
+behavior.
 
-A 3-run harness driving two sovereign-node binaries with a mutual
-`--peer-dir`, deterministic `--identity-seed` (0xAA×32 / 0xBB×32 →
-reproducible nodeIDs), a shared dev CA (the 2-node gotcha — each node's dial
-must trust the other's leaf; a per-node CA fails as "signed by unknown
-authority"), and the `localhost:port` peer addr (the leaf's DNSNames are
-`{nodeID, "localhost"}`, not `127.0.0.1` → the dial's TLS ServerName must be
-`localhost` or it fails "no IP SANs"):
+### Correct connection lifecycle and configuration failures
 
-- **RUN 1 (Seam A)**: mutual `--peer-dir`, `--region-aware` on,
-  `--self-region` 1-vs-2. Converges — insert A → query B **200**, insert B →
-  query A **200**. The headline: the zero-peerID hazard is retired. The
-  inter-region telemetry counter fires A=1 B=1.
-- **RUN 2 (Seam A + Seam B)**: `--peer-dir` + `--peer-auto-reconcile`.
-  Converges — the reconcile composes with provisioning without regression (a
-  provisioned peer skips the reconcile; redundant signal).
-- **RUN 3 (Seam B only — the honest negative)**: `--peer-auto-reconcile`, no
-  `--peer-dir`. Does not converge (404) — the reconcile routes, but the
-  receiver's `Directory.Lookup` misses (receiver.go:436) → DropVerify →
-  every delta dropped. This is the premise correction below, asserted by a
-  guard.
+The initial tests used persistent loopback connections and did not exercise a
+natural peer drop. A dropped peer left a `peerConn` whose TLS pointer was still
+non-nil. `Dial` treated it as live, while `ReconnectLoop` repeatedly attempted
+the same suppressed re-dial and consumed 100% of a CPU without restoring the
+connection. The implementation corrects that failure and six related defects:
 
-## §6 — The premise-audit correction (the load-bearing finding)
+1. **`Dial` determines liveness from `pc.done`.** A closed `*tls.Conn` remains
+   non-nil, so the old `existing.conn != nil` check could prevent re-dialing a
+   dead peer forever. A closed `done` channel now permits replacement. The stale
+   connection is retained for closure after releasing the peer-set lock.
+2. **Reconnect lookup uses the configured address.** Reconciliation can replace
+   the caller's zero peerID with the leaf's real nodeID. Looking only in
+   `ps.peers[peerID]` then misses the live connection, skips the wait, and
+   causes a tight loop. `byAddr` provides the stable key shared by boot dialing
+   and reconnection.
+3. **`readLoop` closes its connection.** Previously only `ClosePeer` or a later
+   `Dial` closed it, so a drop during shutdown could leak the connection and its
+   descriptor. Deferred calls close `pc.done` before closing the connection,
+   preserving the channel as the liveness signal.
+4. **Stale connections close outside `ps.mu`.** `tls.Conn.Close` can block while
+   sending close-notify. Holding the peer-set write lock across that call would
+   stall concurrent `Publish` and `Peers` calls. `Dial` now captures the stale
+   pointer under the lock and closes it after unlocking.
+5. **Reconnect rechecks cancellation before dialing.** A peer drop and shutdown
+   can wake together. Because the transport dialer does not accept a context,
+   dialing after cancellation could install a connection that shutdown never
+   reclaims. The loop returns instead when `ctx.Err()` is non-nil.
+6. **Backoff timers are stopped.** `time.NewTimer` replaces `time.After`, with a
+   stop and channel drain on cancellation so an in-backoff loop does not retain
+   its timer until the delay expires.
+7. **Provisioned addresses do not retain surrogate regions.** The old `@region`
+   path registered both the address surrogate and the real nodeID. `Select`
+   could spend an inter-region slot on the surrogate, which had no connection.
+   `applySurrogateRegions` now skips addresses present in `--peer-dir`.
 
-Seam B was originally framed as the "zero-config bonus — a deploy that opts
-into `--peer-auto-reconcile` alone converges via the handshake." The binary
-harness RUN 3 **proved this wrong**: without `--peer-dir`, the Directory has
-no verification pubkey for the peer (`RegisterPeer` was never called) → the
-receiver's `Directory.Lookup(originNodeID)` at `receiver.go:436` misses →
-the incoming CRDT delta is `DropVerify`'d → the mesh cannot converge. Seam B
-is a **routing complement** to Seam A (it re-keys the PeerSet so `Publish`
-routes under the real nodeID), not a standalone convergence path. Convergence
-requires Seam A's OOB-provisioned verification pubkey. The committed-source
-comment sites that repeated the "converges via the handshake" framing were
-corrected to disclose the DropVerify honestly, and the binary harness RUN 3
-honest-negative guard asserts the non-convergence.
+Two startup warnings cover mismatches that neither file can detect alone: an
+address in `--peers` but absent from `--peer-dir` uses zero-peerID dialing, and
+an address in `--peer-dir` but absent from `--peers` is registered but never
+dialed. The parser also rejects duplicate nodeIDs at different addresses.
+Without that check, the second registration would replace the first peer's
+Directory binding and deltas from the first peer would fail verification.
 
-## Review hardening (7 confirmed defects + 3 new guards)
+### Subsequent changes
 
-A multi-pass review of the change before merge surfaced a class of
-root-cause defects the guards had not caught: the guards used persistent
-loopback conns that never drop, so none of them exercised a natural peer
-drop. A natural drop left a stale dead peerConn in `ps.byAddr`/`ps.peers`
-whose `conn` pointer was non-nil → `Dial`'s `existing.conn != nil` guard
-returned "already live" → `ReconnectLoop` tight-spun at 100% CPU, never
-re-dialing → the mesh never healed. The seven confirmed findings and their
-fixes:
+`applyProvisioning` now accepts pre-parsed entries and the local nodeID. A shared
+directory may therefore list every node in the deployment: registration and
+dialing skip the local entry. When hierarchical routing is enabled, file order
+selects regional gateways as described in
+[ADR-0073](0073_hierarchical_gateway_topology_and_boot_dial.md).
 
-1. **`Dial` liveness guard** (`peer.go:302`) — the `existing.conn != nil`
-   guard mis-reads a dead peer (a closed `*tls.Conn` is non-nil) as live →
-   the re-dial is skipped → permanent silent partition. **Fix:** the guard
-   now checks `pc.done` (the readLoop's goroutine-signal), not the conn
-   pointer — a dead peer's `done` is closed (the readLoop exited) → the
-   re-dial falls through. The stale conn is captured and closed out of the
-   lock (fix 4).
-2. **`ReconnectLoop` addr-keyed lookup** (`peer.go:621`) — the pre-existing
-   lookup was `ps.peers[peerID]` (the caller-supplied zero peerID), but
-   `Dial` re-keys a reconciled peer under the real nodeID → the lookup
-   missed → the wait skipped → `Dial`'s old guard returned "already live"
-   for the live reconciled peer → a tight CPU spin. **Fix:** look up by addr
-   (the stable identity the dial loop and the reconnect watcher share), not
-   by peerID.
-3. **`readLoop` never closes the conn** (`peer.go:458`) — only `defer
-   close(pc.done)`; the conn was closed only by `ClosePeer` (never called on
-   a natural drop) or the `Dial` dead-branch (never fires during a
-   `meshCtx`-canceled shutdown). A drop during shutdown leaked the conn + fd
-   for the process lifetime. **Fix:** `defer pc.conn.Close()` (LIFO-ordered
-   so `close(pc.done)` runs first — the liveness signal stays the gate, not
-   a conn-state sniff).
-4. **`Dial` dead-branch closes under the write-lock** (`peer.go:310`) —
-   `tls.Conn.Close()` sends a close-notify alert via a blocking Write; under
-   `ps.mu` it stalls every concurrent `Publish`/`Peers()` (no
-   `SetWriteDeadline` exists in `pkg/transport`). **Fix:** capture the stale
-   conn under the lock, release the lock, then close it.
-5. **`ReconnectLoop` no ctx-recheck before Dial** (`peer.go:603`) — a woken
-   ReconnectLoop (the runtime picks `pc.done` at the instant `meshCancel`
-   fires) falls straight to `ps.Dial` with a canceled ctx; `tls.Dial` is not
-   ctx-aware → it completes a real dial → installs a conn that is never
-   reclaimed. **Fix:** re-check `ctx.Err()` after the `pc.done` wait and
-   before the dial.
-6. **`ReconnectLoop` `time.After` timer leak** (`peer.go:634`) —
-   `time.After` returns no `Stop()` handle → a timer per in-backoff loop
-   leaks on shutdown. **Fix:** `time.NewTimer` + `Stop()` (draining the
-   channel if Stop reports the timer already fired).
-7. **Surrogate region-tag pollution** (`main.go:1035`) — the previous
-   `@region` loop keys `peerIDForAddr(addr)` surrogates; `applyProvisioning`
-   adds real-nodeID keys but never deletes the surrogates → `Select`
-   iterates both → the dead surrogate consumes an inter-region fan-out slot,
-   evicting a real cross-region peer. **Fix:** `applySurrogateRegions`
-   (extracted helper) skips the surrogate for a `--peer-dir`-provisioned
-   addr — its region comes from `applyProvisioning`'s
-   `SetRegion(realNodeID, region)` instead.
+Boot dialing now runs in `startMeshBootDialAndSweep` with up to 32 workers.
+Same-region targets are queued before cross-region targets, and
+`TopologyManager.ShouldDialPeer` filters targets before dialing. The reconnect
+loop still starts after every dial attempt.
 
-Plus two consistency warnings (the failsafe parser cannot catch cross-file
-mismatches — each file is well-formed on its own):
-
-- a `--peers` addr not in `--peer-dir` → silent zero-peerID fallback (a
-  warning makes it observable);
-- a `--peer-dir` addr not in `--peers` → registered but never dialed (a
-  silent one-way partition — a warning makes it observable).
-
-And the nodeID-dedup: `parsePeerDir` deduped on addr only → two lines with
-the same nodeID but different addrs both passed → `applyProvisioning`'s
-second `RegisterPeer`/`RegisterPQ` silently overwrote the first's Directory
-binding → the first peer's deltas dropped as forged. **Fix:** `parsePeerDir`
-now dedups on nodeID too — a duplicate-nodeID deploy error is rejected with
-a named-line error, not silently shadowed.
-
-### The 3 new guards (runtime proofs that the fixes compose)
-
-- **`TestOOBReconnectHeals`** (`pkg/mesh/oob_provision_test.go`) — the runtime
-  proof. Builds a 2-node loopback TLS mesh, dials a peer (live), closes the
-  server-side conn (a natural drop — readLoop io.EOF, not `ClosePeer`),
-  spawns `ReconnectLoop`, and asserts the mesh heals (a fresh live peerConn
-  overwrites the stale entry within 8s). RED control (in the comment): with
-  the old `existing.conn != nil` guard, `Dial` would return "already live" →
-  the heal would never happen → the 8s deadline would `t.Fatalf`. The guard
-  passing proves the liveness fix + the readLoop conn-close + the addr-keyed
-  ReconnectLoop + the ctx-recheck + the timer-stop compose.
-- **`TestOOBSurrogateRetirement`** (`cmd/sovereign-node/provisioning_test.go`)
-  — calls `applySurrogateRegions` (the real helper `main.go` calls, not a
-  re-implementation) and asserts: a peer tagged `@region` in `--peers` and
-  provisioned in `--peer-dir` has its region keyed under the real nodeID
-  (not the surrogate) → `Select` returns the real nodeID, not the dead
-  surrogate (no fan-out slot wasted). RED control: an empty
-  `provisionedAddr` (no `--peer-dir`) keys the surrogate (the previous
-  pollution reproduces) → the guard is load-bearing.
-- **`TestOOBNodeIDDedup`** (`cmd/sovereign-node/provisioning_test.go`) — a
-  2-line config with the same nodeID and different addrs is rejected by
-  `parsePeerDir` with a "duplicate peer nodeID" error (the dedup fired, not
-  a length check — the error message is asserted). RED control: a 2-line
-  config with distinct nodeIDs is accepted (the dedup is nodeID-specific,
-  not a false reject).
-
-One further reported finding — that the dead-branch leaves both the real and
-the zero peerID in `Peers()` forever — was refuted on closer analysis: the
-leaf CN is the stable hex nodeID across mint/rotation/reboot, so
-`reconcilePeerID` succeeds on every reconnect of the same peer and
-`ps.peers[real]` is overwritten; the lingering-both outcome is unreachable.
-That finding was dropped; the seven stand.
+[ADR-0045](0045_mesh_transport_invariants.md) extends the lifecycle handling.
+The read loop removes its dead entries from both peer maps, reconnect checks
+liveness again after waking, and backoff sleeps use per-peer jitter. Reconnect
+also recognizes a live inbound edge for the same nodeID instead of dialing a
+duplicate outbound connection. The two-node mechanism described here was later
+exercised in the 100-node, three-region runs recorded in
+[ADR-0041](0041_100_node_silicon_convergence.md) and ADR-0045.
 
 ## Consequences
 
-- **Positive:** the 2-node binary mesh converges (RUN 1 + RUN 2 green) — the
-  zero-peerID dial hazard is retired by class elimination (the peerID half
-  via the dial-peerID branch + the provisioning; the retry half via the
-  `ReconnectLoop` wiring). The region-aware data-plane (ADR-0039) now has its
-  provisioning complement — `--region-aware` on at N=2 is no longer a no-op.
-  The inter-region telemetry counter fires A=1 B=1 in the real binary — the
-  previous single-node harness could only assert its presence. The failsafe
-  parser, the reconcile hex-decode guard, and the nodeID dedup are all
-  bug-inject-proven.
-- **Negative / honest residual:** Seam B alone does not converge (the
-  DropVerify disclosure — the RUN 3 honest negative). A deploy must supply
-  `--peer-dir` for the verification pubkey; `--peer-auto-reconcile` is a
-  routing convenience, not a zero-config convergence path. The 32-bit-build
-  length-bomb residual (the ADR-0038 known limitation) is not patched here. The
-  harness runs on a 4-core development box over loopback TLS 1.3, not on
-  production-scale hardware — the silicon-scale 100-node convergence and the
-  multi-AZ `--peer-dir` distribution remain open.
-- **Future work:** the Raft metadata-plane (the data plane here is its
-  substrate); the 100-node silicon convergence gate; the multi-AZ
-  `--peer-dir` distribution (the production deploy work — the harness proves
-  N=2 over loopback, not the multi-AZ WAN); the 32-bit length-bomb hardening
-  (the ADR-0038 future work).
+- A two-node binary mesh with a mutual peer directory converges with
+  region-aware selection enabled. Provisioning supplies the verification anchor
+  and a consistent routing identity; reconnect handles the startup race and
+  later disconnects. Enabling certificate reconciliation alongside provisioning
+  does not change the result.
+- `--peer-auto-reconcile` alone is insufficient for convergence. It can repair
+  the outbound routing key, but the receiver still has no verification public
+  key and drops the peer's deltas with `DropVerify`. Deployments must distribute
+  the peer directory, including its Ed25519 keys and any ML-DSA-65 keys required
+  by their verification mode.
+- Both provisioning mechanisms are opt-in. An empty `--peer-dir` and disabled
+  reconciliation preserve the previous unprovisioned behavior. No telemetry
+  counter or merge-law code was added; the two-node run did provide the first
+  binary observation of `InterRegionEnvelopesShipped` incrementing on both
+  nodes.
+- The initial evidence is a functional two-node result over loopback TLS 1.3 on
+  a 4-core development machine, not a multi-region latency or scale measurement.
+  The Raft metadata plane and the 32-bit frame-length hardening tracked in
+  ADR-0038 remain separate work.
 
-## The 4-core honesty
+## Evidence
 
-The binary harness runs on a 4-core development box over loopback TLS 1.3,
-not on production-scale hardware. The convergence is a 2-node loopback proof
-(insert → converge → cross-query 200), not a silicon-scale wall-time gate.
-The guards prove the correctness (the failsafe parser + the topology re-key +
-the reconcile hex-decode + byte-identity-when-off), the mechanism (the
-provisioning makes `Select` hit and `Publish` route), the disclosure (the
-inter-region counter fires A=1 B=1), and the honest negative (Seam B alone
-DropVerify's) — the silicon-scale number remains future work.
+### Unit and connection tests
+
+The tests exercise the same parser, Directory, topology, and peer-set code used
+by the node binary. Negative cases retain the surrogate-keyed and malformed
+identity behavior that the change is intended to reject.
+
+- **`TestOOBConfigParse`** round-trips a three-peer configuration containing
+  classical and hybrid entries, with and without regions. The reconstructed
+  ML-DSA-65 key has the same bytes as the original. Four malformed cases cover
+  a short nodeID, non-hexadecimal public key, duplicate address, and
+  out-of-range region; each must return an error.
+- **`TestOOBProvisionRetiresSurrogate`** contrasts surrogate-only topology
+  registration with registration under the real nodeID. Only the latter makes
+  `IsInterRegion` true and lets `Select` return the identity used by `Publish`.
+- **`TestOOBReconcile`** uses a real TLS leaf to check decoding of the
+  32-character CommonName into a 16-byte nodeID. A CommonName that does not
+  decode to exactly 16 bytes is rejected instead of being truncated into an
+  invalid identity.
+- **`TestOOBOffByteIdentical`** checks that an unregistered peer retains
+  same-region classification and that an empty topology selects no peers, so
+  the sweep continues to use its full-mesh path when region routing is not
+  provisioned.
+- **`TestOOBRace`** runs concurrent gossip sweeps and peer-map snapshots under
+  the race detector, with the original run using `GOMAXPROCS=4`.
+- **`TestOOBApply`**, **`TestOOBEmptyNoOp`**, and
+  **`TestOOBMissingPathFails`** cover Directory registration of all three
+  Ed25519 keys and the optional ML-DSA-65 key, real-nodeID region registration,
+  the disabled empty path, and startup failure for a named missing file.
+- **`TestOOBReconnectHeals`** closes the server side of a live two-node
+  loopback TLS connection without calling `ClosePeer`. The client read loop
+  must close `pc.done` and remove both dead map entries. `ReconnectLoop` then
+  has 8 seconds to install a distinct live `peerConn`. The old non-nil-pointer
+  liveness check would instead suppress re-dialing until the deadline failed.
+- **`TestOOBSurrogateRetirement`** calls the command's actual
+  `applySurrogateRegions` helper. With no peer directory, an `@region` suffix
+  registers the address surrogate. With the address provisioned, the surrogate
+  is omitted, the real nodeID receives the region, and `Select` returns that
+  real identity rather than wasting a fan-out slot.
+- **`TestOOBNodeIDDedup`** gives two addresses the same nodeID and requires a
+  "duplicate peer nodeID" parse error. A second two-line fixture with distinct
+  nodeIDs must parse, showing that the rejection is specific to identity
+  duplication rather than malformed key lengths.
+
+### Two-node binary harness
+
+A three-run harness drove two `sovereign-node` binaries on a 4-core development
+machine over loopback TLS 1.3. The nodes used deterministic 32-byte identity
+seeds (`0xAA` for A and `0xBB` for B), a shared development CA, and
+`localhost:port` peer addresses. The shared CA let each node trust the other's
+leaf. The `localhost` server name matched the leaf's DNS names, which contained
+the nodeID and `localhost` but not `127.0.0.1`.
+
+- **Provisioning:** both nodes used mutual `--peer-dir` files,
+  `--region-aware`, and self-regions 1 and 2. An insert on A was subsequently
+  queried on B with HTTP **200**, and an insert on B was queried on A with HTTP
+  **200**. `InterRegionEnvelopesShipped` incremented once on each node.
+- **Provisioning and reconciliation:** adding `--peer-auto-reconcile` on both
+  nodes preserved the same convergence result. Provisioned peers already had
+  their real nodeIDs and skipped reconciliation.
+- **Reconciliation alone:** both nodes used `--peer-auto-reconcile` without
+  `--peer-dir`. The nodes did not converge, and the cross-node query returned
+  HTTP 404. Reconciliation repaired routing, but the receiver's
+  `Directory.Lookup` found no verification key and returned `DropVerify` for
+  every delta.

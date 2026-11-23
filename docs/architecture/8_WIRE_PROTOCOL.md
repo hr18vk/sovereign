@@ -1,302 +1,478 @@
 # 8. Wire Protocol
 
-Sovereign Engine discards standard HTTP/gRPC stacks in favor of a zero-copy, EPOLLET-based Cap'n Proto interface. This document maps the exact physical byte-layout across the network and memory paths, as implemented in `internal/transport/capnp_server.go` and `internal/network/capnp_arena.go`.
+Sovereign Engine has separate protocols for peer synchronization, client control,
+and the experimental Cap'n Proto ingestion server. They have different trust
+boundaries and framing. A shared schema file does not make them interchangeable.
 
-## TCP Packet Layout
+The node binary uses a length-prefixed TLS data plane between peers and a
+JSON-over-mTLS control listener for clients. The raw EPOLLET server under
+`internal/transport` is implemented and tested on Linux, but
+`cmd/sovereign-node` does not start it. It is therefore an available transport
+implementation, not the listener used by the node binary.
 
-Sovereign Engine requires clients to send Cap'n Proto single-segment stream frames over a persistent TCP socket.
+## Wire surfaces
 
-### Framing Header (8 Bytes)
+| Surface | Framing and encoding | Authentication | Status |
+|---|---|---|---|
+| Peer data plane | Big-endian length prefix around relay, batch, hybrid, digest, or challenge bodies; Cap'n Proto inside state-carrying envelopes | TLS peer identity, signed deltas, and a node-key challenge | Used by `cmd/sovereign-node` |
+| Client control | JSON over HTTP | mTLS with client certificates | Enabled by `--control-addr`; disabled when that flag is empty |
+| Operations | HTTP, including health and optional metrics | Separate listener configuration | Separate from the peer and client-control listeners |
+| Raw event ingestion | Cap'n Proto stream framing around `TriTemporalEvent` | No peer authentication in `EpollServer` | Built and tested on Linux; not wired into the node binary |
 
-The engine strictly mandates a single segment message. Multi-segment messages are treated as protocol violations.
+## Cap'n Proto schemas
 
-| Offset | Size (Bytes) | Field Name | Expected Value | Description |
-|--------|--------------|------------|----------------|-------------|
-| 0x00 | 4 | `segmentCount - 1` | `0x00000000` | Little-endian uint32. Must be 0 (indicating 1 segment). |
-| 0x04 | 4 | `segmentWords` | `uint32` | Little-endian. The size of the payload in 8-byte words. |
-| 0x08 | N | `Segment Data` | - | The serialized Cap'n Proto payload. |
+`api/capnp/api/capnp/schema.capnp` defines the three Cap'n Proto structs. The
+file ID is `@0xeb5b7e1f3a9c4d27`. Generated bindings are produced with
+`capnp compile -ogo -I <capnp-go>/std` and live beside the schema.
 
-### Visual Hex-Byte Diagram
+The generated `*_TypeID` constants identify the schema types. The generated
+`ReadRoot*` functions resolve the message root as the requested Go type; they
+do not compare a root Type ID against those constants. Envelope dispatch,
+explicit version checks, and field validation provide the protocol checks.
 
-```hex
-// Example: A 16-byte Cap'n Proto payload
-00 00 00 00  02 00 00 00  // Framing: 1 segment, 2 words (16 bytes)
-xx xx xx xx  xx xx xx xx  // Word 1
-xx xx xx xx  xx xx xx xx  // Word 2
-```
+### Client event: `TriTemporalEvent`
 
-### Cap'n Proto Schema
-
-The zero-copy overlay maps directly to the following structural schema, which
-lives verbatim at `api/capnp/api/capnp/schema.capnp` and is the authoritative
-source for the generated Go bindings (`schema.capnp.go`, produced by
-`capnp compile -ogo -I <capnp-go>/std`). The Cap'n Proto type ID
-(`TriTemporalEvent_TypeID = 0xbeb44ec2f6a3f8ae`) is derived from the file ID
-below; a client sending a message whose root struct has any other Type ID is
-rejected by `ReadRootTriTemporalEvent` in the transport hot path.
+`TriTemporalEvent` is the input to the standalone EPOLLET ingestion server:
 
 ```capnp
-@0xeb5b7e1f3a9c4d27;
-
-using Go = import "/go.capnp";
-$Go.package("capnp");
-$Go.import("github.com/hr18vk/sovereign/api/capnp/api/capnp");
-
-# 8-byte-aligned data section: 3 fixed-width primitives (24 bytes) +
-# 2 Text pointer slots. Zero internal padding.
 struct TriTemporalEvent {
-    latitude        @0:Float64;
-    longitude       @1:Float64;
-    assertionTime   @2:UInt64;
-    entityId        @3:Text;
-    payload         @4:Text;
+    latitude        @0 :Float64;
+    longitude       @1 :Float64;
+    assertionTime   @2 :UInt64;
+    entityId        @3 :Text;
+    payload         @4 :Text;
 }
 ```
 
-**Note on the logical vs. wire data model.** The wire schema above carries the
-five fields the EPOLLET transport actually parses off the socket. The full
-**logical** `TriTemporalEvent` the database layer materializes
-(`internal/database/memtable.go`) additionally carries `SystemTime`,
-`ValidTimeStart`, `ValidTimeEnd`, `H3Index`, and `PayloadDigest` — those are
-derived/attested by the engine after ingest, not transmitted on the wire. See
-`docs/architecture/1_ARCHITECTURE.md` §1.4 for the logical data-model tuple.
+Its generated Type ID is `0xbeb44ec2f6a3f8ae`. The three scalar fields occupy
+24 bytes and the two text fields are pointers. This client event is not the
+full database record: system time, the valid-time interval, the H3 cell, and
+the payload digest are handled separately by the database and CRDT paths. The
+logical tuple is described in `docs/architecture/1_ARCHITECTURE.md` §1.4.
 
----
+### Peer event: `CRDTDeltaEvent`
 
-## The Two Distinct Wires
-
-This document describes TWO physically-distinct Cap'n Proto wires, both
-rooted in the same file (`api/capnp/api/capnp/schema.capnp`, file ID
-`@0xeb5b7e1f3a9c4d27`). The schema's own header comment
-(`schema.capnp:33-40`) states they are intentionally distinct protocols and
-MUST NOT be folded into one another (folding re-entrenches the defect class
-where a schema that does not fit gets bypassed instead of extended). They
-differ in sender, receiver, trust boundary, and field set:
-
-| Wire | Struct | TypeID | Direction | Transport | Trust boundary |
-|------|--------|--------|-----------|-----------|-----------------|
-| **client→engine ingestion** | `TriTemporalEvent` | `0xbeb44ec2f6a3f8ae` | untrusted client → single engine | raw `EPOLLET` + `syscall.Read` (this doc, §TCP Packet Layout / §EPOLLET Raw Event Loop) | untrusted edge — spatial lat/long, no peer auth |
-| **engine↔engine CRDT sync** | `CRDTDeltaEvent` (single) / `CRDTDeltaBatch` (batch wrapper) | `0xa90774c0daa3fdc7` / `0x8832c13e5bbfaa0c` | mutually-authenticated peer engines | TLS mesh `DispatchFrame` ingress (see §Engine↔Engine CRDT Wire below) | mutually-authenticated peers — CRDT delta contract, Ed25519+ML-DSA-65 signed |
-
-Everything above this divider (§TCP Packet Layout through §EPOLLET Raw Event
-Loop and the `mmap` mapping) is the **client→engine ingestion wire**
-(`TriTemporalEvent`). Everything below is the **engine↔engine CRDT wire**
-(`CRDTDeltaEvent` / `CRDTDeltaBatch`).
-
-## Engine↔Engine CRDT Wire
-
-### `CRDTDeltaEvent` — the engine↔engine CRDT sync wire unit
-
-`CRDTDeltaEvent` is the single-delta wire unit one engine ships to a peer to
-reconstruct-and-Join a CRDT delta. Schema lives verbatim at
-`api/capnp/api/capnp/schema.capnp` (the `struct CRDTDeltaEvent` block); the
-generated binding's TypeID constant is
-`CRDTDeltaEvent_TypeID = 0xa90774c0daa3fdc7`
-(`api/capnp/api/capnp/schema.capnp.go:139`).
+`CRDTDeltaEvent` carries one delta between engines. Its generated Type ID is
+`0xa90774c0daa3fdc7`.
 
 ```capnp
 struct CRDTDeltaEvent {
-    version         @0:UInt16;
-    payloadDigest   @1:Data;
-    originNodeID    @2:Data;
-    dotNodeID       @3:Data;
-    dotCounter      @4:UInt64;
-    h3Index         @5:UInt64;
-    systemTime      @6:Int64;
-    validTimeStart  @7:Int64;
-    validTimeEnd    @8:Int64;
-    assertionTime   @9:Int64;
-    decisionTime    @10:Int64;
-    entityId        @11:Text;
-    payload         @12:Text;
+    version         @0 :UInt16;
+    payloadDigest   @1 :Data;
+    originNodeID    @2 :Data;
+    dotNodeID       @3 :Data;
+    dotCounter      @4 :UInt64;
+    h3Index         @5 :UInt64;
+    systemTime      @6 :Int64;
+    validTimeStart  @7 :Int64;
+    validTimeEnd    @8 :Int64;
+    assertionTime   @9 :Int64;
+    decisionTime    @10 :Int64;
+    entityId        @11 :Text;
+    payload         @12 :Text;
 }
 ```
 
-Field set (13 fields; data section is a contiguous run of 8-byte slots with
-zero internal padding — `Data` slots are 8-byte-aligned, the two `Text` slots
-are pointers):
+The 13 fields have these contracts:
 
-- `version @0:UInt16` — the single forward-compat surface. The encoder stamps
-  the schema version it serialized against; the decoder compares the on-wire
-  tag against its compiled-in version and on mismatch fails explicitly (no
-  silent fall-through to zero-received fields). The compiled-in version is
-  `CRDTDeltaEventWireVersion uint16 = 1` (`pkg/sync/crdt_apply.go:67`), enforced
-  as a hard refusal at `pkg/sync/crdt_apply.go:137` (`if ev.Version() != CRDTDeltaEventWireVersion` returns an explicit "wire version mismatch … refusing silent fall-through to zero-received fields" error).
-- `payloadDigest @1:Data` — the `[32]` SHA-256 digest; the receiver
-  cross-validates `PayloadDigest == SHA-256(payload)` in `ReconstructEntry`
-  (`pkg/sync/crdt_reconstruct.go`). A mismatch is an honest `DropVerify` on the
-  receive side, never a silent accept. Per the schema physics comment, the
-  payload bytes (`@12`) MUST cross the wire alongside the digest — never the
-  digest alone.
-- `originNodeID @2:Data` — the `[16]` origin node ID.
-- `dotNodeID @3:Data` / `dotCounter @4:UInt64` — the CRDT causal dot
-  (`{nodeID, counter}`).
-- `h3Index @5:UInt64` — the H3 spatial index cell.
-- The FIVE temporal fields — `systemTime @6:Int64`, `validTimeStart @7:Int64`,
-  `validTimeEnd @8:Int64`, `assertionTime @9:Int64`, `decisionTime @10:Int64`
-  — the full tri-temporal-plus-decision envelope the database layer carries.
-  (Only `assertionTime` is shared with `TriTemporalEvent`; the other four are
-  disjoint on the two wires.)
-- `entityId @11:Text` / `payload @12:Text` — the entity/payload pair.
+- `version` must equal `CRDTDeltaEventWireVersion`, currently `1`. Both apply
+  paths reject a mismatch instead of interpreting missing or incompatible
+  fields as zero values.
+- `payloadDigest` is the 32-byte SHA-256 digest of `payload`.
+  `ReconstructEntry` recomputes the digest from the received payload and
+  rejects a mismatch. The payload itself must be present; its digest alone
+  cannot reconstruct the value.
+- `originNodeID` and `dotNodeID` are 16-byte node identities. Reconstruction
+  requires them to match, binding the causal counter to its origin.
+- `dotCounter` is the origin's causal counter. `h3Index` is the H3 cell carried
+  by the entry.
+- `systemTime`, `validTimeStart`, `validTimeEnd`, `assertionTime`, and
+  `decisionTime` carry the temporal coordinates. Only `assertionTime` also
+  appears in `TriTemporalEvent`.
+- `entityId` and `payload` are the entity/value pair. Reconstruction copies
+  fields out of the Cap'n Proto arena. The engine retains the digest but not
+  the payload bytes after validation.
 
-The decoder is `ReadRootCRDTDeltaEvent` (generated). A root struct with any
-other TypeID is rejected at decode.
+### Batch wrapper: `CRDTDeltaBatch`
 
-### `CRDTDeltaBatch` — the batched wrapper
-
-`CRDTDeltaBatch` is the batch wrapper around `CRDTDeltaEvent`. It
-carries a `List(CRDTDeltaEvent)` so one decode + one Join moves N deltas
-through the reconstruct-then-join seam atomically. Schema at
-`api/capnp/api/capnp/schema.capnp` (`struct CRDTDeltaBatch`); generated TypeID
-`CRDTDeltaBatch_TypeID = 0x8832c13e5bbfaa0c`
-(`api/capnp/api/capnp/schema.capnp.go:342`).
+`CRDTDeltaBatch` adds a list without changing `CRDTDeltaEvent`. Its generated
+Type ID is `0x8832c13e5bbfaa0c`.
 
 ```capnp
 struct CRDTDeltaBatch {
-    events @0:List(CRDTDeltaEvent);
+    events @0 :List(CRDTDeltaEvent);
 }
 ```
 
-It is a DISTINCT struct from `CRDTDeltaEvent`; the single-event wire surface
-(13 fields, TypeID `0xa90774c0daa3fdc7`) is byte-identical — the batch is a new
-wrapper, not a modification of the single-event schema.
+`BuildCRDTDeltaEvent` in `pkg/sync` builds one event. `BuildCRDTDeltaBatch` in
+`pkg/mesh` builds the batch form directly from `BuiltEvent` values. Both use
+`capnp.Message.Marshal`, so the returned `batchWire` or event wire includes
+Cap'n Proto stream framing. Attribution and transport envelopes wrap those
+bytes; they do not replace that inner framing.
 
-### Build / apply seams
+The receive methods are:
 
-- `BuildCRDTDeltaEvent(entityID, payload string, entry CRDTEntry) ([]byte, error)`
-  (`pkg/sync/crdt_capnp_wire.go:66`) — the production encoder. Stamps
-  `CRDTDeltaEventWireVersion` and constructs the entry from `InsertLocal`'s
-  returned `CRDTEntry`; payload and `PayloadDigest` are kept consistent by the
-  caller (the receiver cross-validates).
-- `ApplyCRDTDeltaEvent(wire []byte) error` (`pkg/sync/crdt_apply.go:113`) — the
-  production single-event ingress entry point. Owns the
-  `capnp.Unmarshal` → `ReadRootCRDTDeltaEvent` → version guard
-  (`:137`) → `ReconstructEntryWithSkewBound` → `Join` boundary; enforces wire
-  integrity on EVERY frame before it reaches `Join`. `Release`s the single
-  `*Message` at function scope (one arena per frame).
-- `ApplyCRDTDeltaBatch(wire []byte) error` (`pkg/sync/crdt_apply_batch.go:118`)
-  — the batched ingress entry point; decodes the `CRDTDeltaBatch` and applies
-  the per-element reconstruct-then-join, releasing the single arena at function
-  scope (one arena per batch frame, not one per element).
+- `(*DeltaCRDTEngine).ApplyCRDTDeltaEvent(wire []byte) error` decodes one
+  event, checks its version, reconstructs it with the receiver's Lamport skew
+  bound, and joins the validated entry.
+- `(*DeltaCRDTEngine).ApplyCRDTDeltaBatch(wire []byte) (BatchApplyResult,
+  error)` uses one Cap'n Proto message and one Lamport snapshot for the whole
+  batch. Valid elements are accumulated before one `Join`. An excessive
+  Lamport counter holds only that element; a version, field, attribution, or
+  digest failure rejects the batch before `Join`.
 
-### Envelope framing + versioning (the attribution layer)
+`BatchApplyResult` reports joined and held counts, the held dot counters, and
+the origin of the first joined element. The receiver reports a batch held in
+full as `DropVerify`; an empty batch is an accepted no-op. Index feeds omit
+held elements. A partially held batch is not retained for relay because its
+origin signature covers the complete batch and cannot be split into a new
+signed subset.
 
-The CRDT wire's batch bytes are not shipped bare — they are wrapped by the
-attribution layer (`pkg/attribution/wire_v1.go`) in a crypto-minimal envelope
-that carries the origin's signature:
+## Peer transport framing
 
-- `BatchEnvelope` (`pkg/attribution/wire_v1.go:148`) — the v1 classical
-  envelope: ONE Ed25519 signature over a batch of N self-originated deltas.
-  Fixed header `BatchEnvelopeHeaderLen = 4 + 1 + 8 + 2 + OriginNodeIDSize + OriginSigSize`
-  (`wire_v1.go:128`); forward-compat tag `WireV1Version uint8 = 1`
-  (`wire_v1.go:122`), honored on parse — a version field `!= WireV1Version` is
-  an `ErrMalformed` (no silent downgrade). `OriginNodeIDSize = 16`
-  (`envelope.go:164`), `OriginSigSize = 64` (`envelope.go:161`, the origin
-  Ed25519 signature). The 15-byte fixed prefix is
-  `4 (magic) + 1 (WireV1Version) + 8 (originSeq) + 2 (batchCount)`, followed by
-  the `[16]` originNodeID and `[64]` originSig, then the verbatim batchWire.
-- `HybridEnvelope` (`pkg/attribution/wire_v1.go:490`) — the hybrid-PQ envelope
-  (ADR-0037): BOTH an Ed25519 `edSig [64]` AND an ML-DSA-65
-  `pqSig [3309]` over a shared 120-byte SHAKE256 pad. Fixed header
-  `HybridEnvelopeHeaderLen = 4 + 1 + 8 + 2 + OriginNodeIDSize + OriginSigSize + PQSignatureSize`
-  (`wire_v1.go:464`), where `PQSignatureSize = 3309` (`wire_v1.go:451`, the
-  ML-DSA-65 signature wire slot — 3309 B = 51.7× the 64 B Ed25519 sig). A zero
-  `edSig` or `pqSig` is rejected pre-verify — BOTH signatures is the
-  both-required contract.
+Every peer body is prefixed by a four-byte big-endian length:
 
-### Ingress router (the 4-way `DispatchFrame`)
+```text
+[4] frameLen, uint32 big-endian
+[frameLen] frame body
+```
 
-Every engine readLoop, after TLS, hands the inbound frame to the 4-way ingress
-router `DispatchFrame(frame []byte, peerID [16]byte, recv frameSink, digester DigestSink) receive.AcceptVerdict`
-(`pkg/mesh/digest.go:176`). It peeks the first 4 bytes (the magic) and routes
-to exactly one of four arms — the batch frame arm
-(`attribution.IsBatchFrame` → `recv.HandleBatchFrame`), the digest-exchange arm
-(`attribution.IsDigestFrame` → `digester.DeliverDigest`), the hybrid frame arm
-(`→ recv.HandleHybridFrame`, the state-carrying CRDT-delta path that runs the
-Receiver's gate stack: rate → verify → Join), and the relay arm. A digest frame
-is not a CRDT delta; the receive gate stack never touches it. The fuzz harness
-`FuzzDispatchFrame` (`pkg/security/fuzz/`, corpus in
-`pkg/security/fuzz/dispatch_fuzz_test.go` + `seeds_test.go`) is the
-no-panic anchor (ADR-0038) over `DispatchFrame` and the FIVE unmarshalers under
-it (`UnmarshalRelayEnvelope`, `UnmarshalBatchEnvelope`, `UnmarshalHybridFrame`,
-`UnmarshalStrataEstimator`, `UnmarshalIBLT`); the corpus is committed
-(tracked on-disk, not git-ignored) and verified byte-for-byte against the
-builders, and a bug-inject test proves the harness is non-tautological.
+`receive.LengthPrefixFrame` adds the prefix and `receive.FrameReader.ReadFrame`
+removes it. The reader rejects empty bodies and bodies larger than 16 MiB,
+retains trailing bytes for the next call, and returns an owned copy of each
+body. The limit bounds allocation from an untrusted length prefix; it is not a
+Cap'n Proto segment-size field.
 
-### Hybrid PQ signature pad (Ed25519 + ML-DSA-65)
+TLS protects the resulting byte stream. After reassembly, the body is a
+`RelayEnvelope`, `BatchEnvelope`, `HybridEnvelope`, digest frame, or challenge
+frame. The first bytes select the parser.
 
-When `--hybrid-sign` is set, the self-originated delta path ships each batch
-under a hybrid signature: one Ed25519 signature `[64]` AND one ML-DSA-65
-signature `[3309]`, both computed over the SAME 120-byte SHAKE256 pad of
-`batchWire` (the 120-byte CRDT-frame delta is the ADR-0010 `CRDTEntry` shape;
-`hybridFrameSize = 120` at `pkg/identity/hybrid_verify.go:110`). A classical
-break does NOT compromise a PQ frame; a PQ break does NOT compromise a
-classical frame (defense-in-depth).
+### `RelayEnvelope`: one event with relay provenance
 
-- `ShipBatchHybrid` (`pkg/mesh/batch.go:245`) — the hybrid-SIGN shipper; signs
-  via `SignCRDTFrame_Hybrid` and wraps in a `HybridEnvelope`.
-- `VerifyCRDTFrame_Hybrid(edPub ed25519.PublicKey, pqPub *mldsa.PublicKey, msg, edSig, pqSig []byte, ctx string) bool`
-  (`pkg/identity/hybrid_verify.go:77`) — the both-required verify gate; returns
-  `edOK && pqOK`.
-- `--hybrid-sign` (cmd/sovereign-node/main.go:434) and `--hybrid-verify`
-  (cmd/sovereign-node/main.go:420) are BOTH **OPT-IN, default false**. OFF keeps
-  the self-originated path on the v1 `BatchEnvelope` (one Ed25519) and the
-  receive path classical-only — byte-identical to the current default. `--hybrid-sign=true`
-  switches `shipBatchedDelta` to `ShipBatchHybrid`; `--hybrid-verify=true`
-  switches the receive path to the both-required `VerifyCRDTFrame_Hybrid` seam
-  (a v1 frame is REJECTED in strict mode). The relay/foreign path stays
-  per-frame regardless.
+`RelayEnvelope.Marshal` writes version 3. The parser also accepts version 2.
+Fields in this envelope are little-endian, unlike the outer length prefix and
+the batch-envelope header.
 
-### Batched-delta HTTP/control wire (v1)
+```text
+v3 fixed header:
+  [2]  envelopeVersion = 3
+  [2]  hopCount
+  [4]  innerLen
+  [64] originSig, over innerWire
+  [8]  dotCounter mirror
+  [16] originNodeID mirror
 
-The control port exposes a JSON batch-insert endpoint that stages N events for
-the engine AND records their payloads for the gossiper, so a subsequent sweep
-can put the payloads on the wire alongside the engine's `PayloadDigest`:
+then:
+  [innerLen] innerWire, the marshaled CRDTDeltaEvent
+  hopCount records:
+    [32] relayPub
+    [64] relay signature
+    [8]  wallUSec
 
-- `BatchItem` (`pkg/mesh/gossip.go:652`) — `{EntityID string; Payload string; Entry eng.CRDTEntry}`, mirrors `durability.LocalItem` field-for-field.
-- `InsertLocalEventsBatch(items []BatchItem) (dots []eng.CausalDot, failedFrom int, err error)` (`pkg/mesh/gossip.go:685`) — the ADR-0044 batch insertion seam. Durable path (`g.bridge!= nil`): N × `InsertLocal` + ONE `AppendMutations` + ONE fsync (the group-commit — 10K keys → 1 fsync, not 10K). In-memory path (`g.bridge == nil`, the `--wal-path=""` in-memory mode): N × bare `engine.InsertLocal`. Per-batch 503 signal: a `failedFrom!= -1` or non-nil `err` means the WHOLE batch is un-durable (the WAL atomic-batch model) and the caller ACKs all items 503; on success the caller ACKs all items 200 with `DotHex=dots[i]`.
-- HTTP surface: `mux.HandleFunc("/v1/batch-insert", s.handleBatchInsert)` (`pkg/mesh/control.go:275`); handler `handleBatchInsert` at `pkg/mesh/control.go:395`. The single `/v1/insert` (`control.go:274` → `handleInsert`, routing through `Gossiper.InsertLocalEvents`) stays byte-identical and is NOT removed.
+The accepted v2 header is 72 bytes and omits both mirror fields.
+```
 
-### WAL opcodes (the durability wire, not the network wire)
+`RelayEnvelope.Open` checks the hop bound before verifying relay signatures.
+Each hop signs `innerWire || precedingHopsSigMaterial || hopIndex || wallUSec`.
+After `Open` returns, `Receiver.HandleFrame` resolves the origin key and checks
+`originSig` against the unchanged inner event.
 
-For completeness, the durability wire (`internal/chaos/wal.go`) carries five
-record types — these are on-disk opcodes, NOT network frame types, but they are
-the third wire a node's data crosses. (`pkg/durability/wal.go` re-exports all
-five — the legacy three plus the `WALRecMutationV2` /
-`WALRecCheckpointV2` — from their definition site `internal/chaos/wal.go`.)
+Version 3 lets the rate and clock gates read the counter and origin before a
+Cap'n Proto decode. Those mirrors are cross-checked against the authenticated
+inner event before it is applied. Version 2 instead decodes its admission
+fields from the inner event.
 
-- `WALRecMutation = 0x01` — a mutation record.
-- `WALRecCheckpoint = 0x02` — a legacy checkpoint record (the pair).
-- `WALRecClockAdvance = 0x03` — the foreign-clock-advance record (the clock jump a peer-driven `Join` performs, fsync-on-commit).
-- `WALRecMutationV2 = 0x04` — the V2 mutation record, carrying the recorded dot so replay RESTORES rather than re-mints (ADR-0045).
-- `WALRecCheckpointV2 = 0x05` — the V2 checkpoint anchor (CutSeq + ClockHigh + optional state fingerprint; the recovery-integrity anchor, ADR-0045/§7b).
+### `BatchEnvelope`: one Ed25519 signature per batch
 
-*(Line numbers intentionally omitted: `internal/chaos/wal.go` is still being actively edited and they drift. The constant names above are the stable reference.)*
+`BatchEnvelope` carries self-originated events in one signed Cap'n Proto batch.
+Its header fields are big-endian.
 
-## EPOLLET Raw Event Loop
+```text
+fixed header:
+  [4]  magic = "SBAT"
+  [1]  version = 1
+  [8]  originSeq
+  [2]  batchCount, informational
+  [16] originNodeID
+  [64] originSig, Ed25519 over batchWire
 
-The `internal/transport/capnp_server.go` implementation leverages raw `epoll(7)` in edge-triggered (`EPOLLET`) mode:
-1. **Zero Goroutines Per Connection:** A single thread handles the event loop. Go's standard `net.Listener` is bypassed entirely to avoid `bufio.Reader` heap allocations.
-2. **Jemalloc Overlays:** All reads from the socket directly populate a `jemalloc`-backed buffer (`ReadBufSize = 64 * 1024`, `internal/transport/capnp_server.go:44`).
-3. **Backpressure via `EPOLLET` drain + hard admission cap (no `net.Conn`, no RWIN):** The read path uses raw `syscall.Read` directly on the fd (`internal/transport/capnp_server.go:324`, comment at `:323` — *"Use raw syscall.Read to bypass Go's net.Conn GC-tracked buffers"*); there is no `net.Conn.Read()` to block and no `gopark`. Under `EPOLLET`, the handler loops `syscall.Read` into the jemalloc grow-buffer until the fd returns `EAGAIN`/`EWOULDBLOCK`, at which point it simply `return`s (`internal/transport/capnp_server.go:334-335` — *"No more data available — edge drained"*). This drains the socket to empty on every edge notification and relies on the kernel's natural TCP flow control (the sender blocks on its own send window when the receiver stops reading); the engine performs no intentional receive-window manipulation and emits no Zero-Window mechanism. The ONLY admission control is a hard connection cap: `MaxConnections = 4096` (`internal/transport/capnp_server.go:47`), enforced at accept time by closing the freshly-accepted fd when `len(s.conns) >= MaxConnections` (`internal/transport/capnp_server.go:262-266`). Beyond that cap, backpressure is edge-triggered drain-until-`EAGAIN` only — no bounded semaphore, no `gopark`, no `internal/temporal_store/toki.go` (that package was removed; see ADR-0033).
+then:
+  [...] batchWire, the marshaled CRDTDeltaBatch
+```
 
-## `mmap` Zero-Copy Pointer Mapping
+`UnmarshalBatchEnvelope` rejects a short header, wrong magic, or unsupported
+version with `ErrBatchMalformed`; a zero origin signature returns
+`ErrBatchUnsigned`. Parsing leaves `batchWire` opaque until verification
+succeeds. `CRDTDeltaBatch.Events().Len()`, not the informational header count,
+is authoritative for apply.
 
-When a payload traverses the NIC, it is placed directly into the `jemalloc` buffer.
-The `internal/network/capnp_arena.go` system applies the `capnp.SingleSegment(messageData)` wrapper to construct a Cap'n Proto `Arena`.
+`ShipBatch` signs the marshaled batch directly and increments `originSeq` for
+each distinct batch. `Receiver.HandleBatchFrame` resolves `originNodeID`,
+charges the sequence advance to the origin's rate budget, verifies the exact
+bytes later passed to `ApplyCRDTDeltaBatch`, and then applies them.
 
-- **Strict Read-Only Guarantee:** Bypassing `bufferpool.Default`, the `SingleSegmentArena` disables the `.Allocate()` method.
-- **Zero-GC Invariant:** The Cap'n Proto message structure reads memory directly from the bounded `jemalloc` slice. The byte slice is never registered with the Go runtime pool, and no serialization structs are allocated on the heap, allowing data to flow from the NIC straight to the Tri-Temporal MemTable with O(1) processing overhead.
-- **`runtime.Pinner` Relocation Lock (Go 1.21+):** The slice surfaced to the
-  Go runtime is GC-visible, so the runtime is *theoretically* free to relocate
-  its backing array. A relocation mid-handler would dangle the parsed
-  `TriTemporalEvent`'s Text pointers into stale memory — silent cross-request
-  corruption. `internal/transport/pinner.go` wraps every handler dispatch in
-  `pinIngestionMessage(msgData, …)`, which calls `pin.Pin(&msgData[0])` /
-  `defer pin.Unpin()`. Pinning the backing-array object guarantees the GC
-  cannot move it for the duration of the handler; `Unpin` releases on return
-  (or on panic, via `defer`). This is the second half of the zero-copy
-  contract: not only is the buffer not copied, it is *pinned* so it cannot be
-  moved out from under the zero-copy struct. `Pin`/`Unpin` are allocation-free
-  (the `runtime.Pinner` is a stack value); the witness is
-  `TestParseMessages_RealClient_EndToEnd` in `internal/transport/`.
+A relayer cannot sign for another origin. After a fully joined batch,
+`RetainForeignBatch` retains its original envelope. `shipBatchedDelta`
+republishes those signed bytes unchanged and deduplicates the batch for each
+peer and sweep. If no retained batch exists, it falls back to a retained
+per-frame `RelayEnvelope` when one is available.
+
+### `HybridEnvelope`: Ed25519 and ML-DSA-65
+
+The opt-in hybrid format extends the batch header with a post-quantum
+signature:
+
+```text
+fixed header:
+  [4]    magic = "SHYB"
+  [1]    version = 1
+  [8]    originSeq
+  [2]    batchCount, informational
+  [16]   originNodeID
+  [64]   edSig
+  [3309] pqSig, ML-DSA-65
+
+then:
+  [...] batchWire
+```
+
+`ShipBatchHybrid` obtains both signatures from `SignCRDTFrame_Hybrid`. They
+cover the same 120-byte SHAKE256 pad derived from `batchWire`; the receiver
+applies the original `batchWire`, not the pad. `VerifyBatchHybrid` requires
+both signatures to verify. A zero value for either returns
+`ErrHybridUnsigned`, and an invalid header returns `ErrHybridMalformed`.
+
+`--hybrid-sign` and `--hybrid-verify` both default to false. Signing selects
+`ShipBatchHybrid` for self-originated batches and requires the owner's ML-DSA
+key. Verification enables `HandleHybridFrame` and rejects classical-only relay
+and batch frames; with verification disabled, hybrid frames are rejected.
+Foreign hybrid envelopes are retained and republished with both signatures
+intact.
+
+### Digest frames
+
+Digest frames carry reconciliation hints rather than CRDT state. `SDST`
+distinguishes them from signed state envelopes.
+
+```text
+fixed header:
+  [4]  magic = "SDST"
+  [16] senderNodeID
+  [1]  role
+  [8]  seed
+  [8]  buildStamp
+  [4]  seLen
+
+then, for an ordinary request or response:
+  [seLen] marshaled StrataEstimator
+  [...]   marshaled IBLT
+```
+
+The roles are `0x01` for a v1 request, `0x02` for a v1 response, `0x11` and
+`0x12` for their v2 counterparts, and `0x03` for a one-way Merkle-root
+announcement. A root announcement has `seLen == 0` followed by the root, not
+an estimator and IBLT. Multi-byte digest-header fields are big-endian; the
+IBLT body has its own encoding.
+
+With `--iblt-v2` enabled alongside stratified anti-entropy, a request body can
+contain only the eight-byte `IBL2` header: its little-endian magic and the
+requested bucket count. The responder builds the populated table at that size,
+so the request need not carry a table the receiver would discard. The option
+defaults to false and has no effect when stratified anti-entropy is disabled.
+
+Digests are unsigned advisory input. `Gossiper.DeliverDigest` requires a
+challenge-verified connection and an exact match between that connection's
+identity and `senderNodeID`. A malformed response or failed peel leads to the
+configured defer or oversend path. Any resulting state still arrives in signed
+delta envelopes.
+
+### Connection challenge
+
+`SGWC` frames bind the TLS connection's claimed node identity to possession of
+the Ed25519 key registered in the identity directory. They run during
+connection setup, outside `RelayEnvelope`:
+
+```text
+challenge:
+  [4] "SGWC" + [1] role 0x01 + [16] challengerID + [32] nonce
+
+response:
+  [4] "SGWC" + [1] role 0x02 + [16] responderID +
+  [16] challengerID + [32] nonce + [64] Ed25519 signature
+```
+
+The response signs a domain-separated message containing the nonce and both
+identities. The challenger checks the returned nonce and the directory key.
+The accept-side `serveConnWithDigest` handles these frames before ordinary
+batch, digest, hybrid, or relay dispatch.
+
+## Dispatch and parser tests
+
+`DispatchFrame` classifies an already reassembled body without copying it:
+
+```text
+IsBatchFrame  -> Receiver.HandleBatchFrame
+IsDigestFrame -> DigestSink.DeliverDigest
+IsHybridFrame -> Receiver.HandleHybridFrame
+otherwise     -> Receiver.HandleFrame
+```
+
+The frame discriminators are pairwise distinct; relay bodies instead begin
+with their little-endian version. Challenges are intercepted before
+this router on the accept side. A nil digest sink consumes and drops a digest
+without sending it through the state-receive gates.
+
+`FuzzDispatchFrame` checks classification and routing with no-op sinks. It
+does not decode Cap'n Proto, verify signatures, or apply CRDT entries. Separate
+fuzz targets drive `UnmarshalRelayEnvelope`, `UnmarshalBatchEnvelope`,
+`UnmarshalHybridFrame`, `UnmarshalStrataEstimator`, and `UnmarshalIBLT`
+directly. The seed builders supply both the in-process inputs and committed
+corpora.
+
+## HTTP control wire
+
+`ControlServer.Handler` serves JSON on the `--control-addr` mTLS listener.
+Client certificates are required and the listener uses TLS 1.3. These routes
+are not carried on the peer data plane.
+
+| Method and route | Purpose |
+|---|---|
+| `POST /v1/insert` | Insert one key/value and return its causal dot |
+| `POST /v1/batch-insert` | Insert a JSON `items` array through the WAL group-commit path when durable mode is configured |
+| `GET /v1/get` | Read current live state and, on a local cache hit, its payload |
+| `GET /v1/query` | Resolve one persisted version at valid and transaction times |
+| `GET /v1/range` | Return persisted rows intersecting a valid-time window |
+| `GET /v1/merkle` | Return the current Merkle root and commit statistics |
+| `GET /livecheck` | Return node, peer, and TLS status |
+| `GET /metrics` | Serve metrics when a metrics handler is configured |
+
+The persisted query routes return HTTP 503 when no resolver is configured.
+`/v1/querybyh3` and `/v1/querybysystime` are registered only with
+`--secondary-index`; they use the same resolver and also return HTTP 503 when
+it is unavailable. The H3 value is opaque to the engine apart from syntactic
+cell-mode validation.
+
+Insert handlers call the gossiper so the payload cache and engine state stay
+suitable for a later signed delta. `BatchItem` contains `EntityID`, `Payload`,
+and `Entry` and is converted to `durability.LocalItem` for durable insertion.
+With a bridge configured, `InsertLocalEventsBatch` performs the engine inserts
+and one `AppendMutations` group commit. Without a bridge, it performs the same
+in-memory insertion sequence as repeated single inserts.
+
+A durable batch error sets every otherwise valid item's JSON status to `503`;
+success sets it to `200` and returns its dot. This is all-or-none
+acknowledgment, not a rollback: earlier inserts may already have changed
+engine state or reached the page cache when a later write or fsync fails. The
+caller retries the batch.
+
+The plain-HTTP operations listener is configured separately from this mTLS
+control API. Enabling one does not move its routes onto the other listener.
+
+## WAL records
+
+The write-ahead log is an on-disk format, not a peer frame. Its implementation
+is in `internal/chaos/wal.go`; `pkg/durability/wal.go` aliases the same types so
+recovery and callers share one codec.
+
+A WAL file starts with an eight-byte header containing `WAL\0`, format version
+`1`, and two reserved bytes. Each record then has a big-endian sequence,
+type, and payload length:
+
+```text
+file record:
+  [8] sequence
+  [1] record type
+  [4] payload length
+  [payload length] payload
+```
+
+The type byte has six defined values:
+
+```text
+0x01  WALRecMutation       legacy mutation subset
+0x02  WALRecCheckpoint     legacy root and Lamport watermark
+0x03  WALRecClockAdvance   peer-driven Lamport advance
+0x04  WALRecMutationV2     complete CRDTEntry with its recorded dot
+0x05  WALRecCheckpointV2   CutSeq, ClockHigh, and optional state fingerprint
+0x06  WALRecChecksummed    CRC32C wrapper around another record
+```
+
+New appends use `0x06`. Its payload is:
+
+```text
+[1] innerType + [innerPayload] + [4] CRC32C, big-endian
+```
+
+The Castagnoli checksum covers `innerType` and `innerPayload`. Sequence
+contiguity and the payload-length bound check the outer fields separately.
+New local mutations carry the V2 payload inside this wrapper, preserving the
+recorded dot so replay restores rather than re-mints it. Checkpoints and clock
+advances use the same wrapper. Replay also accepts unframed `0x01` through
+`0x05` records for existing logs.
+
+A partial trailing record is treated as the crash boundary. A complete record
+with a bad checksum returns `ErrWALCorrupt`, and recovery refuses to rebuild
+from it. Group commit appends each mutation record under one write-side lock
+and then releases that lock before the batch fsync. A nil return means the
+batch's fsync completed.
+
+## Standalone EPOLLET ingestion server
+
+`internal/transport.EpollServer` accepts `TriTemporalEvent` messages on a
+persistent TCP or Unix domain socket. It is Linux-specific and independent of
+the peer `FrameReader`. `TestParseMessages_RealClient_EndToEnd` exercises it
+over a Unix domain socket; that test is not evidence of node-binary TCP wiring.
+
+### Single-segment stream framing
+
+The server accepts Cap'n Proto single-segment stream messages and closes the
+connection on a multi-segment message.
+
+| Offset | Size | Field | Meaning |
+|---|---:|---|---|
+| `0x00` | 4 bytes | `segmentCount - 1` | Little-endian uint32; zero selects one segment |
+| `0x04` | 4 bytes | `segmentWords` | Little-endian uint32; payload size in eight-byte words |
+| `0x08` | variable | segment data | Serialized Cap'n Proto payload |
+
+For example, a 16-byte segment uses two words:
+
+```text
+00 00 00 00  02 00 00 00  // one segment, two words
+xx xx xx xx  xx xx xx xx  // word 1
+xx xx xx xx  xx xx xx xx  // word 2
+```
+
+`parseMessages` waits for the complete header and segment, and limits a
+segment to 64 MiB. A larger declared segment closes the connection. Once the
+segment is complete, `ReadRootTriTemporalEvent` decodes it and the handler runs
+synchronously before the reassembly buffer is advanced.
+
+### Event loop and buffer lifetime
+
+One event-loop goroutine serves all connections to an `EpollServer`. The read
+path uses `syscall.Read` into a jemalloc-backed reassembly buffer, initially
+64 KiB, and drains each edge-triggered socket until `EAGAIN` or `EWOULDBLOCK`.
+TCP flow control applies when the receiver stops reading; the server does not
+manipulate the receive window. A separate admission limit closes newly
+accepted connections above `MaxConnections = 4096`.
+
+`network.NewIngestionArena` wraps the exact segment slice with
+`capnp.SingleSegment`. The arena is read-only: `Allocate` returns an error,
+`Release` does not return the segment to Cap'n Proto's buffer pool, and
+Cap'n Proto reads the segment in place. This avoids copying the segment into a
+Go-owned buffer; it is not a claim that event handling or the complete write
+path performs no allocations.
+
+The event and its text views remain valid only during the synchronous handler
+call. The handler must copy anything it retains. `pinIngestionMessage` uses a
+zero-value `runtime.Pinner` around dispatch: for a Go-backed slice, pinning
+keeps its allocation at a fixed address until `Unpin`, and the first Go-heap
+use may allocate pinner state. For the server's off-heap jemalloc storage,
+`Pin` is a no-op because the garbage collector does not move or free that
+storage.
+
+After the handler returns and the message is released, `advanceBuffer` moves
+any trailing partial message over the consumed bytes. Closing a connection
+frees its jemalloc buffer. These lifetime rules, rather than pinning alone,
+keep decoded views from referring to reused storage.
+

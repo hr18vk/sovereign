@@ -3,238 +3,242 @@
 ## 1.1 Abstract
 
 Sovereign Engine is a lock-free, off-heap $\delta$-CRDT synchronization engine
-implemented in Go (1.26+). It is designed as the temporal state substrate for a
-multi-region temporal ledger: state that stays convergent and causally
-attributable across a fleet of mutually-distrusting nodes, and that is retained
-over a long horizon rather than overwritten in place. The largest measured
-deployment is **100 node processes on three machines, one per AWS region** (ADR-0041); "planetary scale"
-is a design target, not a measured claim — ADR-0045 gates any such restatement
-on a ≥1K-node silicon run.
+implemented in Go 1.26.1. It stores temporal state that converges without a
+leader and retains the causal dots needed to attribute each mutation. The
+largest measured deployment is **1,000 node processes on 30 c7gd.8xlarge
+machines across three AWS regions**, measured on 2026-11-06
+([receipt](../evidence/convergence-1000-node.txt)). An earlier run on
+2026-09-13 measured **100 node processes on three c7gd.8xlarge machines,
+one per AWS region**
+([ADR-0041](adr/0041_100_node_silicon_convergence.md),
+[receipt](../evidence/convergence-100-node.txt)).
 
-**Throughput — the layer discipline (never conflate the two numbers):**
-- **CRDT core microbenchmark** (in-process `HAMT.Set` producer-consumer crucible — no Ed25519 verify, no envelope, no network, no TLS, no persistence): the `TestScalingGate` gate mandates 50M ops/s absolute; the gate-passing floor measured **50,736,038 ops/s** at 32 cores, and the current tree re-measured **68,278,197 ops/s** at 32 cores on 2026-09-03 (c8g.8xlarge, Graviton4 CPU part 0xd4f, Go 1.26.1). The honest range is **50.7M–68.3M ops/s**. The cache-line post-mortem at `docs/architecture/6_ENGINEERING_POST_MORTEM.md` refuses any single-figure round-up — quote the range and the layer, never a hero number.
-- **Production ingest path** (verified Ed25519 + CRDT apply + envelope unmarshal, the real per-node receive rate): **5.7M-6.0M deltas/sec** at 32c (N=100-256 batch, single-origin shared path; multi-origin ceiling 12.5M-14.7M), first-hand this tree 2026-09-15 — ~8-12x below the core number, because the core number omits the ~60us/batch Ed25519 verify.
+**Throughput has two measurement layers:**
 
-Quoting the core number as the engine's ingest rate is a **layer mismatch**. The core number is the data-structure floor, NOT the production rate a node sustains.
+- **Sharded-stack microbenchmark:** `TestScalingGate` exercises an
+  in-process `ShardedStack` with producer/consumer push and pop bursts,
+  without Ed25519 verification, envelope decoding, networking, TLS, or
+  persistence. Its ops/s figure counts every push and pop attempt, including
+  empty pops. It requires 50M ops/s at 32 cores; the gate-passing floor is
+  **50,736,038 ops/s**. Published 32-core results on AWS Graviton span
+  **50.7M–68.3M ops/s**. A c8g.8xlarge (Graviton4) measured the high end,
+  **68,278,197 ops/s**, on 2026-09-03
+  ([receipt](../evidence/core-crucible.txt)).
+- **In-process production ingest benchmark:** the receive path verifies an
+  Ed25519 signature, decodes the envelope, and applies each CRDT delta. The
+  single-origin shared path measured **5.7M–6.0M deltas/sec** at 32 cores with
+  batches of N=100–256 on 2026-09-15; the distinct-origin ceiling path measured
+  **12.5M–14.7M deltas/sec** ([receipt](../evidence/ingest-ed25519.txt)).
 
-**Provenance.** The gate-passing floor measured **50,736,038 ops/s** at 32 cores; the current tree re-measured **68,278,197 ops/s** on 2026-09-03 via `RUN_CRUCIBLE=1 go test -v -run TestScalingGate ./pkg/sync/` on a 32-core AWS Graviton (c8g.8xlarge, Graviton4 CPU part 0xd4f, Go 1.26.1). The spread between the floor and the re-measurement is thermal and silicon variance, not a regression — quote the range and the layer, never a single point.
+The stack result is a data-structure measurement, not a network ingest rate or a
+multi-region convergence time. It is distinct from the `HAMT.Set` allocation
+measurements below and from signed receive benchmarks. The ingest figures are
+also in-process benchmark results, not a claim about a deployed fleet's
+sustained write rate.
 
-This throughput is not a software-engineering flourish; it is
-the result of three deliberate physical abstractions: (i) the complete
-circumvention of Go's mark-and-sweep garbage collector via an `mmap`'d
-off-heap arena, (ii) the eradication of cache-coherence stall via a
-**128-byte-stride Home-Shard SEC Allocator** that defeats the Neoverse-V1
-L2 spatial prefetcher, and (iii) the mathematical convergence guarantee of
-state-based $\delta$-CRDTs, which makes the engine's distributed state
-asynchronous and recoverable.
+Three implementation choices shape the core. HAMT nodes and entries live in an
+anonymous `mmap` arena outside the Go heap. The 128-byte-stride Home-Shard SEC
+allocator spreads contended free-list heads across cache lines. Delta-CRDT
+merges retain the union of causal dots, allowing replicas to apply updates
+asynchronously and reach the same state.
 
-The engine executes entirely in user-space. No `mmap`'d file-backed page
-cache, no kernel `fsync` blocking on the hot path, and no mutex acquisition
-in the steady-state read/write path. The architecture partitions every
-responsibility along hardware boundaries — cache lines, NUMA domains, and
-process isolation boundaries — so that the parallelism of the software is
-isomorphic to the parallelism of the silicon.
+The measured `HAMT.Set` hot path does not allocate Go heap objects, acquire a
+mutex, use file-backed `mmap`, or call `fsync`. Higher-level insertion and
+receive paths can allocate, and WAL, networking, and storage work is outside
+this core measurement. [The memory model](2_MEMORY_MODEL.md) gives the arena
+and allocator invariants.
 
-## 1.2 The Physical Constraints That Shape The Architecture
+## 1.2 Hardware and Runtime Constraints
 
-Three hardware limits bound the design space. Stating them first makes
-every architectural choice that follows deductive rather than accidental.
+Three constraints account for the core's layout and concurrency rules.
 
-1. **The L3 interconnect ceiling.** A Neoverse-V1 core retires instructions
-   at its issue width; the 32-core CMN-700 mesh can transport only a finite
-   number of cache lines per nanosecond between coherent L1/L2 caches.
-   Once a workload produces cross-core coherence traffic (store-owned cache
-   lines migrating between cores), throughput collapses to the interconnect's
-   serialized bandwidth rather than the aggregate issue rate. The legacy
-   single-locus SEC gate (`TestEliminationCrucibleScalingGate`)
-   measurably exhibits this: it caps at **1.1M ops/s 32c (1.6% parallel
-   efficiency)** because every free/recycle CAS funnels onto one cache line.
-2. **The Go garbage collector.** Go's concurrent mark-and-sweep collector
-   runs `gcBgMarkWorker` goroutines that scan the live object graph and apply
-   write barriers. At tens of millions of allocations per second, the
-   collector saturates the CPU and introduces stop-the-world pauses that
-   violate sub-millisecond tail latency. The only escape is to never allocate
-   on the hot path at all — the Zero-GC mandate (see §2 of this suite,
-   `2_MEMORY_MODEL.md`).
-3. **Major page faults.** A virtual page that is not resident in physical RAM
-   triggers a synchronous, un-schedulable disk I/O on first touch. The Go
-   cooperative scheduler is blind to this — a single deref of an evicted page
-   stalls the entire `GOMAXPROCS` thread pool. The engine pins its hot index
-   pages with `mlock(2)` (see `3_STORAGE_DURABILITY.md`).
+1. **Cache coherence.** When every core compares and swaps the same word,
+   ownership of its cache line moves between cores and serializes the
+   operation. The retained single-locus benchmark,
+   `TestEliminationCrucibleScalingGate`, measured **1.1M ops/s at 32 cores
+   (1.6% parallel efficiency)** because every free/recycle CAS targeted one
+   cache line. Sharding the heads gives different cores different lines.
+2. **Garbage collection.** Go's collector scans heap objects and applies write
+   barriers as the heap changes. Keeping HAMT nodes and entries off-heap
+   removes that work from the `HAMT.Set` path;
+   `TestHotPathZeroAllocations` checks its zero-allocation contract. The
+   [memory model](2_MEMORY_MODEL.md) describes the boundary rather than
+   extending the claim to networking or ingest.
+3. **Page residency.** A major page fault can block the calling OS thread on
+   synchronous I/O until the kernel resolves it. `LockHotPages` uses `mlock(2)`
+   to pin a selected arena range, but permission and memory limits can leave
+   the pin partial or denied. `ResidencyStatus` reports that outcome and the
+   engine continues without a complete pin; see
+   [storage and durability](3_STORAGE_DURABILITY.md).
 
 ## 1.3 System Topology
 
-The engine is organized as a **decoupled Supervisor–Worker process model**,
-a topology mandated by the physics of off-heap memory faults.
+The process-isolation harness in `internal/chaos` uses a decoupled
+Supervisor–Worker model. This is a testable deployment boundary, not a
+requirement imposed on every in-process embedding of `DeltaCRDTEngine`. The
+production daemon does not construct this Supervisor.
 
 ```
-┌────────────────────────────── SUPERVISOR PROCESS ──────────────────────────────┐
-│  net.Listener (owns all external TCP connections — NEVER handed to a worker)      │
-│  WAL path + Worker NodeID                                                      │
-│        │                                                                       │
-│        │  os/exec.Spawn  (piped stdin/stdout — survives child SIGSEGV)         │
-│        ▼                                                                       │
-└────────────────────────────── WORKER PROCESS ─────────────────────────────────┘
-┌────────────────────────────────────────────────────────────────────────────────┐
-│  DeltaCRDTEngine (off-heap δ-CRDT, mmap'd arena)                               │
-│  ┌───────────────┐  ┌──────────────────┐  ┌──────────────────────┐             │
-│  │  HAMT (Trie)  │  │  HamtArena (mmap)│  │ EBRManager           │             │
-│  │ path-copying  │  │  slab allocator  │  │ Epoch + Hazard Ptrs  │             │
-│  └───────────────┘  └──────────────────┘  └──────────────────────┘             │
-│  WAL (fsync-on-commit)                                                         │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────── Supervisor + external front end ─────────────────────┐
+│  net.Listener (external TCP connections stay outside the worker)         │
+│  Supervisor: WAL path + Worker NodeID                                    │
+│        │                                                                 │
+│        │  os/exec.Command (piped stdin/stdout; child crash closes pipe)  │
+│        ▼                                                                 │
+└────────────────────────────── WORKER PROCESS ────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  DeltaCRDTEngine (off-heap δ-CRDT, mmap'd arena)                         │
+│  ┌───────────────┐  ┌──────────────────┐  ┌──────────────────────┐       │
+│  │  HAMT (Trie)  │  │  HamtArena (mmap)│  │ EBRManager           │       │
+│  │ path-copying  │  │  slab allocator  │  │ Epoch + Hazard Ptrs  │       │
+│  └───────────────┘  └──────────────────┘  └──────────────────────┘       │
+│  WAL (fsync-on-commit)                                                   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-The Supervisor owns the listening socket. A worker process owns the engine
-and the WAL. When a worker suffers a fatal `SIGSEGV` in off-heap C-space —
-an event `recover()` cannot intercept, since `mmap`'d memory is outside
-Go's safety net — the worker dies and its stdout pipe closes; the
-Supervisor observes the `io.EOF`, replays the WAL into a freshly-spawned
-worker, and retransmits the last unacknowledged mutation. **No active
-client connection is dropped** across the crash + recovery cycle, because
-no connection ever transits the worker's address space. This property is
-mechanically proven by `TestSIGSEGVSurvival` (see `3_STORAGE_DURABILITY.md`).
+An external front end, or the test process in `TestSIGSEGVSurvival`, owns the
+listening socket and client connections; `chaos.Supervisor` is
+listener-agnostic. The worker owns the engine and WAL. A fatal `SIGSEGV` while
+accessing off-heap memory cannot be intercepted by Go's `recover()`. The worker
+exits and its stdout pipe closes. The Supervisor observes the read error,
+starts a fresh worker that replays the WAL, and retries the failed submit once.
+Because the listener never belonged to the worker, the worker's exit does not
+close those externally held client connections.
 
-## 1.4 The Bitemporal Property Graph And Data Model
+`TestSIGSEGVSurvival` is intended to check that an active connection still
+responds after recovery and that the recovered root matches the committed
+state. The current test uses `CHAOS_WORKER_BIN` only as a skip gate, then
+ignores the supplied path and unconditionally tries to build the absent
+`cmd/chaos-worker` command. When enabled, it fails before starting a worker
+rather than executing those checks. The storage implications are covered in
+[Storage and Durability](3_STORAGE_DURABILITY.md).
 
-The ledger's elementary unit of mutation is the `TriTemporalEvent`, a tuple
-that records three disjoint time dimensions to preserve an immutable,
-auditable historical trajectory. The engine brands the **three load-bearing**
-temporal axes — `SystemTime × ValidTime × AssertionTime` — as "tri-temporal";
-a fourth field, `DecisionTime`, is carried on the struct and the wire but is
-not yet a load-bearing query axis (see the table note below).
+## 1.4 Temporal Data Model
 
-| Temporal Axis | Source | Semantics |
-|:-------------------|:---------------------|:--------------------------------------------------------------------|
-| **Valid Time** | `[ValidTimeStart, ValidTimeEnd)` | The interval in the modeled reality during which the event is true. |
-| **Transaction Time** (`SystemTime`) | Lamport-stamped at `InsertLocal` | The instant the engine durably accepted the mutation. |
-| **Assertion Time** | `AssertionTime` | The instant a downstream authority attested the record (audit ledger). |
-| **Decision Time** | `DecisionTime` | A fourth temporal field on `CRDTEntry` (`pkg/sync/hamt.go:38`) and the wire (`decisionTime @10:Int64` in `api/capnp/api/capnp/schema.capnp`). Carried, round-tripped by the chaos codec/byzantine harness (`internal/chaos/codec.go`, `byzantine.go`), and persisted in the snapshot layout (`[104:112)` in `pkg/durability/snapshot.go`). **Reserved/currently non-load-bearing:** it is not consulted by any in-tree read, range, or AsOf selection — the three axes above are the active query dimensions. |
+Each stored mutation is a `CRDTEntry` carrying valid, transaction, and
+assertion timestamps. A fourth field, `DecisionTime`, is reserved. The current
+`AsOf` and `Range` query APIs filter on valid and transaction time; assertion
+time is stored and returned but is not a separate query predicate.
 
-An event is never overwritten. Two events describing the same entity at
-overlapping Valid-Time intervals are resolved by the **CRDT dot-join**:
-`Join(delta)` (`pkg/sync/crdt.go:1089`) is a merge-union over the per-shard
-HAMT — `perShardMerge` runs the per-entityID dot-merge and **drops nothing**;
-both the winner and the loser dot stay in the append-only HAMT. `HashCausalDot`
-(`pkg/sync/crdt.go:1580`) FNV-1a hashes `(DotNodeID, DotCounter, PayloadDigest)`
-for the IBLT. The lossless read-time tie-break is `selectLatestDot`
-(`pkg/mesh/gossip.go:531`), a pure 2-dimensional pick — larger `DotCounter`,
-then `bytes.Compare(DotNodeID)` — through which both `handleGet` and
-`LatestPayload` route so `/v1/get` and the accessor can never disagree.
-The engine never performs I/O inside the resolver.
+| Temporal axis | Stored field | Semantics |
+|:--|:--|:--|
+| Valid time | `[ValidTimeStart, ValidTimeEnd)` | The half-open interval during which the event applies to the modeled entity. |
+| Transaction time | `SystemTime` | A caller-supplied Unix-nanosecond timestamp. HTTP insertion defaults it to the write time. `AsOf` and `Range` exclude records above the requested transaction horizon. |
+| Assertion time | `AssertionTime` | A timestamp recorded with the mutation and returned in query responses. Current `AsOf` and `Range` APIs do not accept an assertion-time filter. |
+| Decision time | `DecisionTime` | A reserved fourth field on `CRDTEntry` and `CRDTDeltaEvent` (`decisionTime @10 :Int64`). The snapshot layout preserves it at `[104:112)`, but current read, range, and `AsOf` selection do not consult it. |
 
-> **Operator-algebra status (honest negative).** The **TOKI operator
-> algebra** (LWW, Evidence-Weighted, Await-Confirm) is a **planned,
-> not-yet-implemented** conflict policy. ADR-0033
-> (`docs/architecture/adr/0033_toki_closure_ghost_exorcism.md`)
-> **deleted** the `internal/temporal_store/` TOKI module precisely
-> because wiring its eager `Resolve` into `Join` is a CRDT convergence-law
-> regression; the shipped live HAMT read path IS the genuine lossless
-> conflict resolution. Likewise the **128-byte cache-aligned `AuditRecord`**
-> and the **Judge-Log** subsystem described in earlier drafts are **planned,
-> not implemented** — no such struct or subsystem compiles into the engine
-> (a tree-wide `grep -ri 'AuditRecord\|JudgeLog' .` returns zero hits). On
-> conflict the engine emits the dot-bearing `CRDTEntry`; the loser is
-> **not** dropped.
+The logical history is append-only. `(*DeltaCRDTEngine).Join` sorts incoming
+entries, deduplicates dot-equal entries, and lets `perShardMerge` union the
+remaining dots with the existing per-entity history. Concurrent entries with
+different dots both remain; choosing a current value does not delete the other
+entry. `HashCausalDot` applies FNV-1a to `(DotNodeID, DotCounter,
+PayloadDigest)` for IBLT reconciliation.
 
-| Dimension | Legacy CRUD Model | Sovereign Tri-Temporal Model |
-|:-----------------|:-----------------------------------|:-------------------------------------------------------------|
-| History | Destructive `UPDATE`/`DELETE` | Immutable; every mutation appends a new event |
-| Time semantics | Single `created_at` instant | Three disjoint axes (Valid / Transaction / Assertion) |
-| Conflict policy | Last-write-wins by wall clock | CRDT dot-join (merge-union, no drop) + lossless read-time `selectLatestDot` pick; the TOKI eager-lossy operator was evaluated and rejected — a CRDT convergence-law regression (ADR-0033) |
-| Auditability | Reconstructable from binlogs | The audit ledger is first-class state |
+Current point reads use `selectLatestDot`: the greatest `DotCounter` wins, and
+a tie selects the lexicographically smallest `DotNodeID`. Both `handleGet` and
+`LatestPayload` use this selector, so `/v1/get` and the accessor make the same
+choice without performing I/O inside the selection loop. Historical `AsOf`
+queries instead use the temporal dominance rules described above.
 
-### 1.4.1 H3 Hexagonal Spatial Index — Reserved Axis, Not a Live Subsystem
+> **Conflict-policy boundary.** The TOKI operator algebra (LWW,
+> Evidence-Weighted, Await-Confirm) is not implemented.
+> [ADR-0033](adr/0033_toki_closure_ghost_exorcism.md) records why eager TOKI
+> resolution was rejected: dropping the losing dot inside `Join` would violate
+> merge-union convergence. The engine instead retains dot-bearing `CRDTEntry`
+> values and selects a value at read time. There is no separate `AuditRecord`
+> or Judge-Log subsystem in the codebase.
 
-Each event carries an `H3Index uint64` field on `CRDTEntry`
-(`pkg/sync/hamt.go:39`) and on the wire (`h3Index` in
-`api/capnp/api/capnp/schema.capnp`); it is set by the mesh and snapshot paths
-and packed into the O2.2 memtable value layout. It is intended as a cell
-identifier in the H3 Hexagonal Hierarchical Spatial Index, so that spatial
-relationships could be expressed as integer cell arithmetic rather than
-floating-point polygon intersection (eliminating the non-determinism of
-IEEE-754 geometry). **H3 cells are not, however, computed on any in-tree
-engine path.** The `h3o`/uber-h3 dependency is absent from `go.mod` (the
-`zeebo/xxh3` entry is an unrelated hash library), the tree contains no
-`.c`/`.cpp`/`.h` source, and the only in-tree assignment of `H3Index` on a
-real path is a **synthetic key-derived value** in the chaos harness
-(`H3Index: uint64(k) << 8` at `internal/chaos/partition.go:336`) — not an H3
-cell. H3 is therefore a **reserved/passthrough spatial axis**, not a working
-native geospatial index.
+| Dimension | Legacy CRUD model | Sovereign temporal model |
+|:--|:--|:--|
+| History | An update replaces the previous row | Each mutation adds a dot-bearing event; reads select from retained history |
+| Time semantics | A single `created_at` instant | Valid, transaction, and assertion timestamps, with the query boundaries above |
+| Conflict policy | Last write wins by wall clock | Merge-union of distinct dots, then deterministic read-time selection |
+| Auditability | History is reconstructed from external logs | Every retained event carries its causal dot and temporal fields; no separate audit ledger is implemented |
 
-The in-tree Go producer that *would* feed a real H3 resolver ships in this
-repository but is currently **unwired**: `internal/spatial/h3_spsc_ring.go`
-is a pure-Go single-producer/single-consumer ring buffer (no `import "C"`,
-no `#include`) that `mmap`s a `memfd_create(2)` region and writes `(lat, lng)`
-into slots, expecting an **external C++ `h3_worker` binary** (referenced at
-`h3_spsc_ring.go:136,:328`) to drain the ring and write the computed cell
-back. That binary **does not exist anywhere in this repository** — it is an
-externally supplied, out-of-tree process boundary. The companion
-`internal/spatial/epoch_batcher.go` (`EpochBatcher`) batches `Stage(lat,lng)`
-calls into epochs and reads results back, but neither the ring nor the
-batcher is imported by any non-test file outside `internal/spatial/` itself
-(`grep -rHn 'supremum/internal/spatial' --include='*.go'` restricted to
-production callers returns zero hits). The Go-side `memfd_create` + `ExtraFiles`
-plumbing is real and is the reason the `memfd` route (rather than anonymous
-`mmap`) is used: anonymous mappings are **severed across `execve`
-boundaries**, so the child would receive `fd=-1` and the ring would diverge.
+### 1.4.1 H3 Cell Storage and Optional Secondary Index
 
-> **Open-source release note.** The Go-side SPSC ring and `EpochBatcher`
-> producer (`internal/spatial/`) ship in this repository as a **reserved,
-> currently-unwired** spatial axis — no engine path instantiates them, and no
-> H3 cell is computed in-tree. The standalone C++ `h3-worker` consumer binary
-> that drains the ring is **out-of-tree**: it is an externally supplied process
-> boundary, not a library concern, and is not present in this repo. The ring's
-> memory layout is documented at `internal/spatial/h3_spsc_ring.go` so a
-> deployment can build a compatible consumer against it. To wire H3 as a live
-> spatial index, a deployment must supply the `h3_worker` binary and add an
-> engine importer of `internal/spatial`; until then the `H3Index uint64` is
-> carried passthrough and (on the chaos path) seeded synthetically.
+Every `CRDTEntry` carries an `H3Index uint64`. `CRDTDeltaEvent` transmits it as
+`h3Index @5 :UInt64`, and the snapshot and memtable layouts retain it. The
+engine treats the value as an opaque H3 cell identifier; it does not infer a
+cell from latitude and longitude on this path.
 
-## 1.5 Consensus Mechanisms
+With `--secondary-index` enabled (default off), `internal/index` maintains a
+current-state candidate index over caller-supplied H3 cells and system time.
+`GET /v1/querybyh3` is then registered on the control server and returns exact
+cell matches after temporal resolution through the query tier. The route also
+requires that query tier; without a resolver it returns 503. Because the index
+tracks current placements, a historical query after an entity changes cells
+can miss that entity. The response exposes this `current_state` boundary and
+reports truncation or index-capacity degradation rather than presenting a
+partial answer as complete. [ADR-0058](adr/0058_secondary_index_production_wiring.md)
+defines the opt-in behavior.
+
+The insert API accepts `h3_index` only when the secondary index is enabled.
+Its validation checks H3 mode bits, not geographic validity. No radius, ring,
+or general geometry query is implemented.
+
+Coordinate-to-cell conversion is a separate, unwired component.
+`internal/spatial.SPSCRing` is a Go single-producer/single-consumer ring backed
+by `memfd_create(2)`; an external C++ `h3_worker` would consume coordinates and
+write cell IDs back. `EpochBatcher` batches `Stage(lat, lng)` calls around that
+ring. Neither component has a non-test importer outside `internal/spatial`,
+and the repository ships neither the worker nor an H3 library.
+
+The ring uses a memory file descriptor because `os/exec.Cmd.ExtraFiles` can
+pass it to the worker across `execve`; an anonymous mapping would not survive
+that process boundary. The slot layout in `internal/spatial/h3_spsc_ring.go`
+is the interface an external consumer must implement. These components are
+built but not connected to insertion, and `--secondary-index` does not enable
+them.
+
+## 1.5 Convergence Mechanisms
 
 The engine is a state-based $\delta$-CRDT replication substrate. Convergence
-is the **lattice-join** property, not a quorum vote.
+comes from lattice joins, not a leader election or quorum vote.
 
-- **Local mutation** is `InsertLocal(entityID, entry)`, which mints a
+- **Local mutation:** `InsertLocal(entityID, entry)` uses `NextDot` to assign a
   `CausalDot{DotNodeID, DotCounter}` from the source node's Lamport counter.
-- **Anti-entropy** is `GenerateDelta(remoteDigest)` → `Join(delta)`. The
-  delta encodes only the symmetric difference between the sender and the
-  receiver, computed via an Invertible Bloom Lookup Table (IBLT) subtract
-  and peel — a *sub-linear* reconciliation (see `4_NETWORK_CONSENSUS.md`).
-- **Merkle convergence** is asserted post-recovery: `Node[i].MerkleRoot() ==
-  Node[j].MerkleRoot()`. The root is `SHA-256` over the canonical sort of
-  `(DotNodeID, DotCounter)` pairs — it is **seed-independent**, so a worker
-  started from a fresh `maphash.MakeSeed()` reproduces the identical root
-  for the same mutation sequence.
+- **Anti-entropy:** `GenerateDelta(remoteDigest)` subtracts and peels an
+  Invertible Bloom Lookup Table to find entries the receiver lacks, and
+  `Join(delta)` merges them. An incompatible digest or failed peel falls back
+  to the full local set, so a small delta is not guaranteed; see
+  [Network and Consensus](4_NETWORK_CONSENSUS.md).
+- **Merkle comparison:** `MerkleRoot` and `MerkleRootFromShards` hash SHA-256
+  over canonically sorted `(DotNodeID, DotCounter)` pairs. The root does not
+  depend on Go's randomized `maphash` seed, so equal dot sets produce equal
+  roots across processes.
 
-## 1.6 Edge Ubiquity
+## 1.6 Edge Integration and Wire Encoding
 
-The engine runs on the edge as well as in the datacenter. The edge
-substrate (deliberately deferred from the core engine) is out of scope for the
-core ledger and is described at the architectural level only; it selects
-between three OPFS-backed
-SQLite-WASM VFSes — `AccessHandlePoolVFS` (exclusive, single-tab),
-`OPFSCoopSyncVFS` (leader-tab multiplexing), and `OPFSWriteAheadVFS`
-(dual-WAL, the chosen production VFS for multi-tab durability) — to perform
-offline-first bitemporal queries directly in the browser. Analytical
-workloads run on DuckDB-WASM, which issues HTTP range requests against Parquet
-files on decentralized object storage, bypassing centralized egress taxes.
-Inter-node traffic is encoded in Cap'n Proto for zero-copy RPC: the engine's
-`GenerateDelta` returns a `*CRDTDelta` whose `Entries` lazy iterator yields
-the (entityID, CRDTEntry) pairs the remote peer is missing; a transport
-encodes those pairs (see `internal/chaos/partition.go` for the canonical
-length-prefixed deltagram encoding) into the wire format the receiver
-`Join`s. The ingestion plane uses the `TriTemporalEvent` Cap'n Proto
-schema (see `api/capnp/api/capnp/schema.capnp`), whose bytes are readable
-directly from the network socket memory without CPU deserialization.
+No browser or edge runtime ships in this repository. SQLite-WASM with an OPFS
+VFS and DuckDB-WASM analytics over Parquet are possible integration points,
+not implemented components; no browser VFS has been selected or wired.
+
+The production mesh wire is independent of those ideas. `GenerateDelta`
+returns an in-memory `CRDTDelta` whose lazy `Entries` iterator yields missing
+`(entityID, CRDTEntry)` pairs. `BuildCRDTDeltaEvent` serializes an entry with
+the `CRDTDeltaEvent` schema. The batch path uses `CRDTDeltaBatch`; its receiver
+verifies the signed batch before reconstructing and joining its events. The separate
+`TriTemporalEvent` schema describes client ingestion rather than peer-to-peer
+CRDT synchronization. All three schemas live in
+`api/capnp/api/capnp/schema.capnp`; [Wire Protocol](8_WIRE_PROTOCOL.md) covers
+framing and attribution.
+
+Cap'n Proto provides typed views over message buffers without eagerly
+materializing every field. It does not remove socket reads, length framing,
+TLS, signature verification, or payload-digest checks. The binary deltagram
+codec in `internal/chaos` is test-harness traffic, not the production Cap'n
+Proto wire.
 
 ## 1.7 Document Suite Compass
 
 | File | Domain |
-|:------------------------------------|:------------------------------------------------------------------------|
-| `1_ARCHITECTURE.md` (this file) | Master overview, topology, data model |
-| `2_MEMORY_MODEL.md` | Zero-GC, off-heap physics, Home-Shard SEC, MESI, SPSC |
-| `3_STORAGE_DURABILITY.md` | `mmap` hazards, chunked `mlock`, WAL, `io_uring`/`O_DIRECT` |
-| `4_NETWORK_CONSENSUS.md` | $\delta$-CRDT, Birkhoff decomposition, TOKI (planned/closed-by-rejection, ADR-0033), IBLT, Edge compute |
-| `5_BENCHMARKS_AND_LIMITS.md` | Core microbench decomposition (50.7M–68.3M ops/s), silicon wall, scaling limits |
+|:--|:--|
+| [1_ARCHITECTURE.md](1_ARCHITECTURE.md) | System overview, process isolation, temporal model, and convergence |
+| [2_MEMORY_MODEL.md](2_MEMORY_MODEL.md) | Off-heap arena, allocation rules, cache-line layout, and memory ordering |
+| [3_STORAGE_DURABILITY.md](3_STORAGE_DURABILITY.md) | Page residency, WAL, snapshots, and recovery |
+| [4_NETWORK_CONSENSUS.md](4_NETWORK_CONSENSUS.md) | Delta-CRDT anti-entropy, IBLT reconciliation, and gossip |
+| [5_BENCHMARKS_AND_LIMITS.md](5_BENCHMARKS_AND_LIMITS.md) | Benchmark methods, measurement layers, and scaling limits |
+| [6_ENGINEERING_POST_MORTEM.md](6_ENGINEERING_POST_MORTEM.md) | Engineering failures, root causes, and measurements |
+| [7_FORMAL_VERIFICATION.md](7_FORMAL_VERIFICATION.md) | Formal specifications, enforced properties, and unverified areas |
+| [8_WIRE_PROTOCOL.md](8_WIRE_PROTOCOL.md) | Framing, Cap'n Proto schemas, attribution, and signatures |

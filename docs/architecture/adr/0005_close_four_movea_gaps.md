@@ -1,71 +1,81 @@
-# ADR-0005: Close the four gaps — epoll loop + real NIC + perf bench + receiver.go wiring
+# ADR-0005: Close the epoll, real-NIC, benchmark, and receiver-wiring gaps
 
-**Status:** ACCEPTED-with-NEGATIVE-perf (Gaps 1+4 closed on silicon; Gaps 2+3 closed on the real NIC with a measured NEGATIVE — col A > col B at 32c; the cache-locality claim in the design record needs a multi-NIC multi-peer mesh to surface at single-box scale; the follow-up pass closed all three defects and committed the silicon log verbatim)
+> **Status:** Accepted with negative single-host performance
+> **Date:** 2026-07-26
+> **Supersedes:** none
+> **Superseded by:** none
 
-**Scope correction (2026-07-26, docs-only, code-untouched):** The first pass at this work marked this ADR "ACCEPTED (all four gaps closed on silicon)" and the roadmap claimed the full epoll + SO_ATTACH_REUSEPORT_EBPF coupling was silicon-PROVEN. I re-checked the previous commit mechanically against the committed bytes and found that framing FALSE on three load-bearing points:
+## Context
 
-  * Defect 1 (the dropped tooth): the plan REQUIRED the perf bench to `b.Fatalf` with an honest NEGATIVE if col A (eBPF-steered) is slower than col B (kernel-hash-fallback). The committed `BenchmarkEBPFDelivery_vs_HashFallback_32c` runs two `b.Run` sub-benches and returns `elapsed` from each, then compares NOTHING — `grep -nE 'b.Fatalf.*col|elapsedA|elapsedB|fatalf.*slower' pkg/receive/ingress_epoll_test.go` returns EMPTY. The honest-NEGATIVE tooth is MISSING from the bytes. The prose said it would fire; the code did not. This is the single worst defect — a measured NEGATIVE was an acceptable outcome and instead I landed a POSITIVE claim WITHOUT the tooth that would have forced the honesty.
-  * Defect 2 (no silicon artifact): the earlier kernel-steering pass committed its run log; this pass committed ZERO `.log` files. The "ran on c8g" claim has no captured output to prove it. "SILICON-PROVEN" was asserted, not artifacted.
-  * Defect 3 (loopback bench): `runBench` calls `sendFrame(b, net.IPv4(127,0,0,1), port, ...)` for BOTH columns. The col A vs col B comparison Gap 3 was supposed to settle on a REAL interface was run on 127.0.0.1 — the exact interface Gap 2 exists to leave. The perf bench therefore does NOT measure "cache invalidation and thread migration latency during high peer mobility and network churn" (the design record); on loopback there is no NIC queue, no RSS, no XPS, no interrupt affinity to preserve. The `TestEBPFEpollIngress_RealNIC` closer `t.Skip`s when `REAL_NIC_BIND_IP` is unset, so on the run that produced no `.log` (defect 2) it almost certainly SKIPPED — the real-NIC stickiness gate did not fire on silicon in that pass.
+[ADR-0003](0003_kernel_sk_reuseport_silicon.md) established kernel
+SO_REUSEPORT steering by the plaintext origin node ID. Its measurements covered
+socket selection on loopback, but four parts of the ingress design remained
+untested: an epoll receive loop, delivery through a non-loopback interface, a
+performance comparison against the kernel's hash fallback, and delivery into
+`Receiver.HandleFrame`.
 
-This correction NARROWS the claim to its measured scope. It touches no code and changes no byte of pkg/transport/ or pkg/receive/, and it does not change ADR-0003's acceptance status (this work was never on the acceptance critical path). It re-opens the unresolved gaps by name, the same discipline ADR-0003's scope correction applied to the kernel-steering pass.
+Those distinctions matter. A successful socket-selection test does not show
+that an epoll loop can reassemble frames, that a NIC-bound group delivers them,
+or that eBPF steering is faster than the kernel default. It also does not turn
+the plaintext routing key into an authenticated identity.
 
-**Date:** 2026-07-26
+## Decision
 
-**Context:** ADR-0003's scope-correction addendum named four hard gaps that the kernel-steering pass did NOT close:
+Extend `KernelFanout` with `LoadGroupOnIP`, so loopback and interface-specific
+tests share one socket-creation path, and `DetachProgram`, which selects the
+kernel hash fallback for the comparison run.
 
-1. **Gap 1 — NO epoll:** `grep EpollWait|EpollCtl|EpollCreate pkg/transport/` returned zero; that pass measured steering, not an ingress loop. The live epoll loop is `internal/transport/capnp_server.go:119/222/486` (EpollCreate1/EpollWait/EpollCtl) and is NOT wired to the steering selector.
-2. **Gap 2 — loopback only:** every frame crossed 127.0.0.1 (the prior pass's log records "32 sockets on 127.0.0.1:51177"). No NIC, no RSS, no XPS, no interrupt affinity, no hardware packet distribution.
-3. **Gap 3 — NO perf:** `grep Benchmark|testing.B|ns/op pkg/transport/` returned only the comment justifying the fixed-sample Test idiom. Zero latency/throughput numbers.
-4. **Gap 4 — NOT wired:** `grep KernelFanout` (excl test+self) returned zero; `grep KernelFanout|SelectRoute|fanout pkg/receive/receiver.go` returned zero. `receiver.go:244 HandleFrame(frameBytes []byte)` takes already-delivered bytes and never calls the selector. The seam lived in a test file, not in the engine.
+Add `EpollIngress` behind the `ebpf_kernel` build tag. The caller loads and
+attaches the fanout before starting it. The adapter registers the group's UDP
+sockets with `EPOLLIN|EPOLLET`, drains each ready socket through `EAGAIN`, and
+separates datagrams into frames with the 4-byte big-endian length prefix
+produced by `LengthPrefixFrame`. It copies each frame before calling
+`Receiver.HandleFrame`, because the receive buffer is reused while accepted
+frames may be retained.
 
-The design record's decision is literally "epoll COUPLED WITH SO_ATTACH_REUSEPORT_EBPF" — the two together. The kernel-steering pass closed the second half; this pass closes the first.
+This is a delivery adapter above the existing receive pipeline. It does not
+change the order of rate, clock, depth, signature, and application checks in
+`HandleFrame`.
 
-**Decision (SCOPED, after the correction):** I landed the CODE for all four closers and CLOSED Gaps 1+4 on silicon (the epoll ingress loop + the receiver.go wiring — mechanically verified: `pkg/receive/ingress_epoll.go` is gated `ebpf_kernel`, drives EPOLLIN|EPOLLET over the 32 fds, reassembles length-prefixed frames, invokes `Receiver.HandleFrame`; the `receiver.go` change is a doc-comment only and the default build is byte-identical). But Gaps 2+3 were NOT proven on silicon in that pass (the bench sends to 127.0.0.1, not a real NIC; the `b.Fatalf` NEGATIVE tooth was PRESENT in prose but ABSENT from the code; no `.log` artifact was committed):
+## Consequences
 
-- **Gap 1 + Gap 4 (epoll loop + wiring):** `pkg/receive/ingress_epoll.go` (gated `ebpf_kernel`) implements `EpollIngress` — an edge-triggered epoll loop over the 32 SO_REUSEPORT fds from the `KernelFanout` group. It EpollCtl-ADDs the 32 fds (EPOLLIN|EPOLLET), EpollWait-drives them, Recvfrom's each ready fd, reassembles length-prefixed frames (the wire shape `[uint32 frameLen BE][envelope bytes]` from `forward.go:104 LengthPrefixFrame`), and invokes `Receiver.HandleFrame` on each frame. The wiring is ABOVE HandleFrame (delivery), NOT inside it — the gate-stack order at `receiver.go:244` (cheap gates → Verify) is PROVEN and untouched. The DEFAULT build (no tag) EXCLUDES `ingress_epoll.go` entirely — `HandleFrame` is byte-identical to before. Under `-tags ebpf_kernel` the loop is the SILICON form of the coupling contract: epoll (this loop) COUPLED WITH SO_ATTACH_REUSEPORT_EBPF (the attach the caller already did). The epoll precedent is the EXISTING live loop `internal/transport/capnp_server.go:119/222/486` — CITED, not duplicated.
+- The implementation is opt-in. Default builds exclude both the kernel loader
+  and `EpollIngress`, and no non-test code constructs the adapter. The normal
+  node command therefore does not use this path.
+- Kernel tests require `CAP_BPF` or equivalent privilege. An `EPERM` capability
+  probe skips them rather than reporting an unavailable kernel test as a pass.
+  `TestEBPFEpollIngress_RealNIC` also skips when `REAL_NIC_BIND_IP` is unset.
+- The real-NIC benchmark found attached eBPF steering slower than detached
+  kernel hash fallback on one host. It supports delivery correctness, not a
+  performance advantage or a general cache-locality claim.
+- That result comes from one machine and one secondary ENI. It does not predict
+  behavior on a multi-NIC, multi-machine mesh, and it must not be generalized
+  to other kernels or workloads without another measurement.
+- Routing still precedes authentication. A connection ID can influence socket
+  selection, but it cannot bypass the receive path's later validation.
 
-- **Gap 2 (real NIC) — NOT closed in the first pass (pending the follow-up):** `TestEBPFEpollIngress_RealNIC` is WRITTEN to bind the SO_REUSEPORT group to a non-127.0.0.1 interface (secondary ENI private IP 172.31.5.252, or a tc-redirect target). It records the interface name, `ethtool -l` channel counts, and `nproc` in the log header. It asserts the stickiness gate (0/N mis-routes across a 4-tuple roam) on the real interface. A flow "pinned to a core" now pins to a MAILBOX that has hardware delivery, so the "concurrent scale" / "cache invalidation" claim in the design record is measurable.
+## Evidence
 
-- **Gap 3 (perf bench) — NOT closed in the first pass (pending the follow-up):** `BenchmarkEBPFDelivery_vs_HashFallback_32c` EXISTS and drives a churn workload, BUT (defect 1) it did NOT contain the `b.Fatalf` honest-NEGATIVE tooth the plan required — it ran col A and col B as two `b.Run` sub-benches and never COMPARED them; and (defect 3) it sent to `127.0.0.1` (loopback), NOT the real NIC Gap 2 was about. The plan: vary the CID at high rate so the SOCKHASH lookup exercises cache-miss as well as hit. Two columns:
-  - col A — eBPF-steered delivery (program attached, `sk_select_reuseport` pins the flow).
-  - col B — kernel-hash-fallback delivery (program detached via `KernelFanout.DetachProgram`, so the 4-tuple hash drives — the SAME test harness, program attached = A, detached = B, the ONLY delta is the attach).
-  Assertion: col A is NOT slower than col B at `-cpu=32 -benchtime=3s -count=3` on the c8g box (the SCISSORS rule: a 4c/16c number is NOT interchangeable with 32c). If col A is SLOWER, the bench `b.Fatalf`'s with an honest NEGATIVE ("eBPF steering slower than hash fallback at 32c — Gap-3 NEGATIVE"). If col A == col B, `b.Logf`'s "parity; the cache-locality payoff needs a multi-NIC proof". If col A < col B, `b.Logf`'s "steering faster under churn". All three outcomes are HONEST; fabrication is the only sin.
+The implementation and its tests are guarded by `ebpf_kernel`:
 
-**Consequences:**
+- `TestEBPFEpollIngress_DeliveryWiring` sends a valid length-prefixed envelope
+  through a 32-socket group and requires `EpollIngress` to deliver it to
+  `HandleFrame`.
+- `TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation` repeats delivery with
+  the selector attached and detached. Both modes must deliver every frame.
+- `TestEBPFEpollIngress_RealNIC` binds the group to `REAL_NIC_BIND_IP` and
+  checks delivery through that interface. Per-socket stickiness belongs to the
+  transport tests rather than this assertion.
+- `BenchmarkEBPFDelivery_vs_HashFallback_32c` runs otherwise identical attached
+  and detached workloads over a changing connection-ID set. Both runs use the
+  same destination, and the benchmark fails if the attached run takes longer.
+  Its intended invocation uses `-cpu=32 -benchtime=3s -count=3`.
 
-- `receiver.go` gains a doc-comment noting the gated ingress seam; the DEFAULT build's `HandleFrame` behavior is byte-identical (no production-code change).
-- `pkg/transport/ebpf_reuseport.go` gains `LoadGroupOnIP` (bind to a specific interface IP for Gap 2) and `DetachProgram` (the Gap-3 bench's attach-vs-detach toggle — the ONLY delta between col A and col B). `LoadGroup` delegates to `LoadGroupOnIP` with zero bindIP (INADDR_ANY) so loopback and real-NIC share ONE socket-creation path.
-- `pkg/receive/ingress_epoll.go` (new, gated `ebpf_kernel`) — the epoll ingress loop + wiring.
-- `pkg/receive/ingress_epoll_test.go` (new, gated `ebpf_kernel`) — the four silicon tests:
-  - `TestEBPFEpollIngress_DeliveryWiring` (Gap 1+4): loop delivers to HandleFrame.
-  - `TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation` (Gap 1 closer proof): attached → pinned; detached → spread.
-  - `BenchmarkEBPFDelivery_vs_HashFallback_32c` (Gap 3): col A vs col B at 32c.
-  - `TestEBPFEpollIngress_RealNIC` (Gap 2): binds to secondary ENI IP, records NIC metadata.
-- The c8g bench script gains a block for these partial closers, NON-BLOCKING for the six-block silicon sweep (the same decoupling discipline as the kernel-steering pass). It runs under `sudo` with explicit env (GOPATH/GOMODCACHE/GOCACHE) so the sudo'd `go test` finds the cilium module cache.
-- ADR-0003 is **NOT YET** PROMOTED from "BPF steering half" to "the full epoll + SO_ATTACH_REUSEPORT_EBPF coupling on silicon" — that promotion requires ALL FOUR gaps to close WITH silicon evidence (a committed `.log` + the `b.Fatalf` tooth + a real-NIC bench). The correction re-opened Gaps 2+3 until the follow-up brings the real-NIC `.log` AND adds the missing `b.Fatalf` comparison AND surfaces the honest col A vs col B outcome (win / parity / measured NEGATIVE). If the follow-up finds col A SLOWER than col B, ADR-0003 is ACCEPTED-with-NEGATIVE-perf (the ADR-0001 measured-negative precedent) — never a fabricated pass.
+No receipt for the recorded run is included in `docs/evidence/`. The specific
+elapsed timings are therefore omitted, and the negative result above is historical
+context rather than a reproducible performance claim. The tagged benchmark retains
+the comparison for future measurement.
 
-**Honest weaknesses:**
-
-1. **Silicon scope:** one c8g.8xlarge, one secondary ENI (or tc-redirect). The "concurrent scale" claim is measured on one box; a multi-box mesh would strengthen it.
-2. **ENI/tc choice limits:** the real-NIC run uses a single secondary ENI on the same box (or tc-redirect). A true multi-peer mesh with independent NICs would exercise RSS/XPS/interrupt-affinity more fully.
-3. **Perf bench outcome:** the honest result might be "eBPF steering does not beat the hash fallback at 32c on loopback+tc; the cache-locality payoff needs a multi-NIC multi-peer mesh to surface." That is a valid outcome — an honest measured NEGATIVE beats a fabricated pass.
-4. **receiver.go change rationale:** the change is a doc-comment only (the wiring code is in the gated file). The DEFAULT build's HandleFrame is byte-identical; the comment documents where the epoll + SO_ATTACH_REUSEPORT_EBPF seam lands.
-
-**Enforcement:** `pkg/receive/ingress_epoll_test.go` (gated `ebpf_kernel`) — the four silicon teeth. The CAP_BPF probe is self-contained (cilium BPF_MAP_CREATE, `t.Skip` on EPERM). The attach-vs-detach anti-correlation tooth FAILS the suite if the eBPF program is detached (steering must be the cause of pinning; hashing-alone must NOT pin). The perf-bench tooth `b.Fatalf`'s on col A slower than col B. The NIC tooth records non-127.0.0.1 interface + `ethtool -l` in the log. go.mod/go.sum 0-diff (cilium/ebpf already pinned by the kernel-steering pass).
-
-**Promotes:** ADR-0003 from "BPF steering half" toward "the full epoll + SO_ATTACH_REUSEPORT_EBPF coupling on silicon" — PARTIAL+NEGATIVE-perf (Gaps 1+4 closed on silicon; Gaps 2+3 closed on the real NIC with a measured NEGATIVE — col A > col B at 32c). NOT a clean full promotion; the cache-locality payoff needs a multi-NIC multi-peer mesh to surface at single-box scale.
-
-**Follow-up closer (2026-07-26):** the follow-up pass closed all three defects in one atomic unit and ran on the real NIC. The honest col A vs col B outcome is a **measured NEGATIVE** — the fail-loud tooth fired, by physics not by the writer:
-
-  * **Defect 1 (the dropped tooth) — NOW PRESENT in the bytes:** `BenchmarkEBPFDelivery_vs_HashFallback_32c` now captures `elapsedNsA := runBench(true)` and `elapsedNsB := runBench(false)` OUTSIDE the `b.Run` closures (the earlier code dropped these returns), compares them, and `b.Fatalf`'s on col A > col B (`pkg/receive/ingress_epoll_test.go:594`). `grep -nE 'b.Fatalf.*col|elapsedNs[AB]|ns/frame-col' pkg/receive/ingress_epoll_test.go` returns the comparison + `b.ReportMetric` lines (was EMPTY before). The tooth fires identically on loopback and the real NIC — the SCISSORS rule applies to the COMPARISON (col A vs col B on the SAME interface), never to relabeling a 4c number as 32c.
-  * **Defect 2 (no silicon artifact) — NOW COMMITTED:** the follow-up's run log is committed verbatim (never trimmed). Its header carries the gear (c8g.8xlarge, nproc=32, kernel 6.18, CPU 0xd4f, GOMAXPROCS=32, CAP_BPF present), the RealNIC test header (bind IP 172.31.5.252, interface ens35, `ethtool -l` Combined:8, nproc 32), and the col A vs col B numbers.
-  * **Defect 3 (loopback bench) — NOW HONORS `REAL_NIC_BIND_IP`:** the bench resolves its dst from `REAL_NIC_BIND_IP` (falls back to 127.0.0.1 ONLY when unset, tagged "loopback" honestly — never relabeled; parse error → `b.Fatalf`, NOT a silent fallback). Both columns use the SAME dst; the ONLY delta is attach vs detach. The log records the Gap-3 bench dst as 172.31.5.252 from `REAL_NIC_BIND_IP="172.31.5.252"`.
-
-  **The measured outcome (verbatim from the log):** `eBPF steering SLOWER than hash fallback at 32c on 172.31.5.252: col A (attached)=1147799ns > col B (detached)=1108785ns — Gap-3 measured NEGATIVE (the cache-locality payoff needs a multi-NIC multi-peer mesh to surface at this single-box scale)`. The bench FAILS the suite on the tooth (by design — the tooth is the proof it works). ADR-0003's promotion from "BPF steering half" to "the full epoll + SO_ATTACH_REUSEPORT_EBPF coupling on silicon" is held at **PARTIAL+NEGATIVE-perf** — both honest, neither fabricated. The NEGATIVE is the absolute proof the tooth works.
-
-  **Honesty lock (verbatim):** this work does not change ADR-0003's acceptance status, and it does not touch the engine's performance verdict — the eBPF-steering performance result is a measured physics-negative, and no single work item flips it. It advances the epoll + SO_ATTACH_REUSEPORT_EBPF coupling claim from "PROVISIONAL (Gaps 2+3 re-opened by the correction)" to "ACCEPTED-with-NEGATIVE-perf" — honest, not fabricated. The fail-loud tooth GUARANTEES the choice is made by physics, not by the writer.
-
-**Supersedes:** None.
-
-**Related:** ADR-0002 (epoll + SO_ATTACH_REUSEPORT_EBPF ingress fanout), ADR-0003 (kernel BPF steering half + its scope-correction addendum), and the design record (the "epoll coupled with SO_ATTACH_REUSEPORT_EBPF" decision).
+The related routing decision is [ADR-0002](0002_epoll_sockhash_reuseport_fanout.md);
+the kernel packet layout, map behavior, and fallback contract are in
+[ADR-0003](0003_kernel_sk_reuseport_silicon.md).

@@ -5,72 +5,67 @@
 
 ## Context
 
-A proposal called for replacing the compact 16-byte causal-dot node ID
-(`DotNodeID`) in the CRDT state with a wide hybrid-logical-clock timestamp
-tuple — `(physicalMs, logical, nodeID)` — embedded in every entry. The goal was
-per-record physical-time precision: each value would carry the wall-clock time
-at which it was written, not just a causal dot.
+A proposal called for replacing the compact 16-byte causal-dot node ID in
+`CRDTEntry` with a wider `(physicalMs, logical, nodeID)` tuple. Its aim was to
+put hybrid-logical-clock information directly into each entry's causal dot.
 
-The catch is where that tuple would live. `DotNodeID` is a field of
-`CRDTEntry`, the in-memory record the hot path operates on. That struct is
-exactly 120 bytes wide today — a width statically asserted by
-`TestCRDTEntryWidthStaticAudit`, which fails the build if the layout drifts.
-The width is load-bearing: it sets how many entries fit in a cache line and a
-page, and that density is what the zero-allocation hot path spends its budget
-on. The proposed tuple is roughly twice the width of the 16-byte dot it would
-replace, and the cost would be paid on every entry, on every operation.
+That change affects the fixed-size record used by the HAMT and arena. The
+layout in `pkg/sync/hamt.go` keeps `DotNodeID` and `DotCounter` flat, alongside
+the entry's existing temporal fields. `CRDTEntry` is exactly 120 bytes wide,
+with no padding, and `TestCRDTEntryWidthStaticAudit` fails if that
+width changes. Widening the dot would reduce entry density and increase the
+memory traffic paid by every operation.
+
+Physical-clock admission already occurs at a different layer.
+`IngressHLCScalarCap` compares a relay's physical timestamp with local wall
+time before signature verification, and the per-peer sequence budget limits
+counter advancement. Those mechanisms do not require a wider causal identity
+in every stored entry.
 
 ## Decision
 
-I rejected it. The per-entry layout stays exactly as it is — a compact 16-byte
-dot, no embedded physical timestamp — and the core data structures (`crdt.go`
-and the `DotNodeID` references) remain frozen in their current lock-free,
-cache-aligned form.
+Reject the proposed replacement of `DotNodeID` with a physical-time tuple.
+Keep the flattened causal dot in `CRDTEntry`; do not add a separate
+`physicalMs` field to the causal identity as a smaller version of the same
+change.
 
-Two reasons, in order of weight:
+Physical-time screening remains at frame ingress rather than becoming part of
+the dot. This decision concerns the causal identity, not the entry's existing
+system, valid, assertion, and decision-time fields.
 
-1. **Cache density is the throughput.** Widening `CRDTEntry` shrinks the number
-   of entries per cache line and per page, raising the miss rate on the exact
-   path the engine's speed comes from. The core's baseline cost is ~2.5 ns/op;
-   bloating the record with a time tuple would destroy that budget through
-   cache misses alone. That is not a trade worth making for timestamp
-   precision (the measured numbers are below).
-2. **The causality is already covered, and cheaper.** The physical-time defense
-   the tuple was meant to add already exists at the ingress boundary.
-   `IngressHLCScalarCap` (`pkg/clock/admission.go`) is a Byzantine-clock
-   admission controller that caps an inbound frame's physical timestamp against
-   local wall time — a cheap scalar comparison applied per frame *before* the
-   expensive verify step. It delivers the clock-drift/causality rejection the
-   proposal wanted without putting a timestamp in every record. The tuple would
-   re-buy a property the engine already has, at a memory cost it does not need
-   to pay.
-
-## Alternatives considered
-
-- **Embed the full `(physicalMs, logical, nodeID)` tuple per entry** (the
-  proposal). Rejected for the two reasons above.
-- **A narrower physical-time field.** Even a single 8-byte `physicalMs` is an
-  8-byte tax on a 120-byte record, paid on every operation, for a value the
-  ingress cap already supplies at the boundary. Rejected on the same
-  cost/benefit ground.
+A requirement for new per-record time-query semantics would need a separate
+design and measurement. Ingress admission is not a substitute for historical
+time semantics, so such a requirement cannot be dismissed merely by pointing
+to the clock cap.
 
 ## Consequences
 
-The CRDT core keeps its 120-byte entry and its measured throughput. The core
-microbenchmark (`TestScalingGate` — an in-process producer/consumer
-crucible over the CRDT/HAMT data structures, with no crypto, network, or disk
-in the loop) holds a gate floor of 50,736,038 ops/s at 32 cores and was
-re-measured on this tree at 68,278,197 ops/s at 32 cores on 2026-09-03 (AWS
-Graviton, c8g.8xlarge, Go 1.26.1) — an honest range of 50.7M–68.3M ops/s, with
-0 allocs/op on the hot path. (The 57.6M figure sometimes cited from earlier
-runs was a residency high-end, not a sustained number.) That figure is the
-in-process data-structure floor, not the production ingest rate (5.7M–6.0M
-deltas/sec at 32 cores, which additionally pays for Ed25519 verification and
-the wire envelope). Physical-time causality is preserved by the ingress scalar
-cap, so nothing the proposal was for is actually lost.
+- The 120-byte entry layout remains protected by a static regression test.
+  Changes to `DotNodeID`, field order, or padding must account for the arena
+  and wire assumptions attached to that layout.
+- The engine does not pay the storage and memory-bandwidth cost of the rejected
+  tuple. No performance figure for the unimplemented alternative is claimed.
+- Clock-skew rejection stays outside the CRDT record. Existing temporal fields
+  continue to serve their own purposes; they are not collapsed into the causal
+  dot.
+- A future proposal must state the required time semantics and measure its
+  effect on the core layout and receive path before superseding this decision.
 
-I would revisit this only if a hard requirement for per-record physical
-timestamps ever appeared — for example, a legal or compliance mandate.
-Accepting it would mean consciously trading away part of the 50.7M–68.3M ops/s
-core throughput range, and that trade should be made deliberately, with the
-cost acknowledged up front — never by default.
+## Evidence
+
+`TestCRDTEntryWidthStaticAudit` in `pkg/sync/crdt_entry_width_test.go` asserts
+the 120-byte `CRDTEntry` width. The flattened fields are defined in
+`pkg/sync/hamt.go`, while `pkg/clock/admission.go` contains the ingress scalar
+comparison.
+
+The current design's core benchmark supplies context, not a benchmark of the
+rejected alternative. `TestScalingGate` has a gate-passing floor of 50,736,038
+ops/s at 32 cores and was re-measured at 68,278,197 ops/s on 2026-09-03 using a
+c8g.8xlarge with Graviton4 and Go 1.26.1. This is an in-process HAMT test with
+no signature verification, network, TLS, or persistence; see the
+[`core-crucible.txt`](../../evidence/core-crucible.txt).
+
+That core result is distinct from the receive-path benchmark, which includes
+Ed25519 verification, envelope processing, and CRDT application. Its published
+single-origin result is 5.7M–6.0M deltas/sec at 32 cores with batches of
+N=100–256; see the [ingest receipt](../../evidence/ingest-ed25519.txt).

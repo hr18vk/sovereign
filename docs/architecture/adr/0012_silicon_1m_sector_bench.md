@@ -1,110 +1,111 @@
-# ADR-0012: Silicon 1M/sec sector bench — the headline becomes MEASURED
+# ADR-0012: Measure batched ingest on Graviton4
 
-- **Status:** ACCEPTED (2026-07-29) — all silicon gates pass; the ≥1M/sec headline is a MEASURED silicon number (gear block: c8g.16xlarge, 64c, CPU part 0xd4f, Go 1.26.1 arm64); the verdict upgrades to unconditionally approved on the corrected formula
-- **Scope:** measuring the ≥1M/sec batched-sync headline on real silicon (c8g Graviton4), upgrading it from a derived ceiling to a measured number
-- **Predecessor:** ADR-0010 (the batched delta wire — the 1M/sec arithmetic unlock), ADR-0011 (the SDK control port)
-- **Verdict:** UPGRADES to unconditionally approved — the ≥1M/sec headline is a MEASURED silicon number (gear block, 64c), no longer a derived ceiling. The bench decided; the prose did not.
-- **CORRECTION (2026-07-30):** the first silicon run's `aggregate_deltas/sec` column was inflated 64× by a formula bug (`1e9 / nsPerDelta * GOMAXPROCS` — the `* GOMAXPROCS` double-counted the cores, since `b.RunParallel`'s ns/op is ALREADY the aggregate core-divided cost). The bench file is fixed (`reportAggregate` now emits `1e9 / nsPerDelta`, no `* GOMAXPROCS`); the §4 tables below are RECOMPUTED from the formula-independent `ns/delta` column of the SAME raw log (ns/delta = nsPerOp/N, untouched by the bug). The verdict survives the correction but on a NARROWER margin than the inflated draft claimed — see §4 and §5.
-- **RE-PROVEN on corrected silicon (2026-07-30, second run):** the fixed bench was re-run on a fresh c8g.16xlarge (64c, 0xd4f) with the corrected `reportAggregate`. The native `aggregate_deltas/sec` column is now self-consistent (no ×64): shared/N=256 = 1.38M–3.06M (6/6 above 1M), shared/N=100 = 848K–1.89M (4/6 above, straddles), ceiling/N=100 = 5.71M–7.69M (6/6 above). This INDEPENDENTLY confirms the recomputed §4 tables (the two runs agree within silicon variance). The authoritative corrected gate log records this run verbatim; the first run's log is retained as the inflated-draft artifact with a CORRECTION NOTICE banner.
-- **Enforced by:** `BenchmarkBatchedVerifyParallel` (the `b.RunParallel` aggregate bench, `pkg/receive/bench_silicon_test.go`), `c8g_silicon_bench.sh` (the silicon gear harness), a guard that the core merge-law/wire-schema files are untouched, and a post-commit check that the change is confined to its declared files
-- **Gate log (authoritative, corrected):** the corrected run's recorded output (verbatim — gear block, substrate asserts, anchors, headline with the CORRECT native aggregate column). First-run (inflated) log: retained with a CORRECTION NOTICE banner — its `aggregate_deltas/sec` column is ×64; its `ns/delta` column is authoritative and matches the corrected run.
+- **Status:** Accepted
+- **Date:** 2026-07-29; corrected 2026-07-30
+- **Predecessors:** [ADR-0010](0010_batched_delta_wire_v1.md), [ADR-0011](0011_sdk_control_port.md)
 
 ---
 
-## 1. Context
+## Context
 
-The ≥1M/sec headline verdict was conditionally approved because the number was DERIVED, not MEASURED:
+ADR-0010 amortizes one Ed25519 verification over a batch of deltas. Its
+four-core measurements showed per-delta latency falling by 26× at N=100, but
+the one-million-deltas-per-second target remained an extrapolation. An earlier
+32-core estimate of roughly 533K/sec for unbatched frames likewise came from
+an approximately 60us verification cost, not an aggregate-throughput
+measurement.
 
-- ADR-0010 proved the batch wire amortizes Ed25519: one verify covers N deltas (measured on a 4-core development box: ns/delta falls 26× at N=100).
-- The 533K/sec per-frame ceiling (1 / 60.19us) and the 1M/sec batched claim were ARITHMETIC from a CITED 32c anchor (`BenchmarkVerifyCRDTFrame_32c` = 60.19us) that was NEVER re-measured on silicon — the 4-core development box runs GOMAXPROCS=4 and the bench comment (`pkg/identity/bench_test.go:14`) tags it HONESTLY as 0xd40 / gear-light, NOT c8g Graviton4.
-
-This change makes the headline a MEASURED silicon number. An AWS quota for 96 vCPUs (c8g.24xlarge-class) was approved; a 96-core account limit then forced a downgrade to a **64-core c8g.16xlarge** (the scaling curve stops at 64, not 96 — the planned `-cpu=8,16,32,64,96` curve is run to 64). If the silicon bench proves ≥1M/sec, the verdict UPGRADES to unconditionally approved. If it does NOT, the verdict STAYS conditionally approved and the honest negative is RECORDED VERBATIM — that is a successful outcome, not a failure. A fabricated pass is the only failure.
-
-The two load-bearing questions:
-
-- **(a)** Is the CITED 60.19us actually the silicon per-verify at 32c?
-- **(b)** Does the batched AGGREGATE scale with cores (does `b.RunParallel` deliver ~cores × per-core rate, or does a backend lock — `stateViewMu`, the rate gate's per-shard mu, the admission EWMA — cap aggregate throughput BELOW cores × per-core)?
-
-The critical distinction (load-bearing): the existing `BenchmarkVerifyCRDTFrame_32c` (`pkg/identity/bench_test.go:29`) and `BenchmarkBatchedVerify` (`pkg/receive/batch_bench_test.go:131`) are BOTH SEQUENTIAL (`for i := 0; i < b.N; i++`). They measure PER-THREAD LATENCY (ns/op). They CANNOT prove an aggregate throughput claim — a sequential bench relabeled "1M/sec" is a FABRICATION (the comment at `bench_test.go:21-25` is explicit: "-cpu=4 already spawns 4 GOMAXPROCS workers; b.RunParallel would add a second layer of parallelism that confuses the per-op ns reading"). This change therefore adds a `b.RunParallel` bench that measures TRUE aggregate ops/sec.
-
----
-
-## 2. Decision (the bench DESIGN)
-
-**D1 — the parallel aggregate-throughput bench** (`pkg/receive/bench_silicon_test.go`, NEW, package `receive`):
-
-`BenchmarkBatchedVerifyParallel` is a `b.RunParallel` aggregate bench. It drives the SAME production receive path (`HandleBatchFrame` = Lookup + Verify + `ApplyCRDTDeltaBatch`) from N goroutines (pinned by `-cpu`) and reports the TRUE aggregate deltas/sec.
-
-- **Frame construction mirrors `BenchmarkBatchedVerify` exactly**: `buildBenchBatchWire` (the package-internal helper at `batch_bench_test.go:62`) mints N events with distinct entityIDs + a monotonic dotCounter; `identity.SignCRDTFrame` signs the batchWire ONCE outside the timer (the amortization target); `attribution.MarshalBatchEnvelope` wraps it. The bench does NOT re-derive the frame builder — it calls the existing, correct, package-internal helper.
-- **Two sub-benches per N** (the cleanest option — it answers directly):
-  - **"shared"**: ONE receiver is shared across all parallel goroutines. Every goroutine's frame shares `originNodeID rcvOriginNodeID`, so they all drain ONE rate bucket (`PeerBucket.Accept` takes the per-shard mu at `ewma.go:200`). This is the REAL production path for a single-origin node's batched self-originated deltas — the rate-gate contention is HONEST physics, not a bug. The shared number is the headline a real node sees.
-  - **"ceiling"**: each parallel goroutine mints its OWN receiver + engine + Directory, so the rate gate NEVER contends. This isolates the VERIFY+APPLY scaling — the CEILING a multi-origin (or per-shard) deployment could reach. It OVERSTATES a single-origin node's rate; both are reported so the curve shows where the gate bites.
-- **Sub-bench sizes**: N in {1, 10, 100, 256} (mirroring the ADR-0010 curve), each under {shared, ceiling}. That gives the aggregate scaling curve.
-- **The headline metric** (reported via `b.ReportMetric` so the bench table carries it verbatim — the gate reads this number):
-
-  ```
-  aggregate_deltas_per_sec = 1e9 / nsPerDelta
-  ```
-
-  where `nsPerDelta` is `ns/op / N`. **CRITICAL (the 2026-07-30 correction): NO `* GOMAXPROCS`.** Under `b.RunParallel`, `b.N` is the TOTAL iterations across ALL goroutines and `b.Elapsed()` is the WALL-CLOCK duration, so `nsPerOp = wall/total` is ALREADY the aggregate (core-divided) per-op cost — the cores are already in the denominator via wall/total. Multiplying by GOMAXPROCS double-counts the cores and inflates the headline by GOMAXPROCS× (64× at 64c); the first draft did exactly that and the §4 tables were recomputed without it. The corrected formula is stated here, in the bench doc-comment (`pkg/receive/bench_silicon_test.go:241-261`), and recomputed in §4.
-
-- **Concurrency audit** (verified against the physical repo before writing):
-  - `HandleBatchFrame`'s apply path goes `ApplyCRDTDeltaBatch` → `ReconstructEntryWithSkewBound` → per-shard CAS (`crdt.go:1057` "SHARD-LOCAL lock-free HAMT update"). It does NOT call `State()` (which takes `stateViewMu` at `crdt.go:1225`) — grep confirms the apply path never hits the merged view. So the aggregate is NOT `stateViewMu`-capped; the only shared-state contention in the "shared" sub-bench is the rate gate's per-shard mu (the documented contention source).
-  - The shared `*engine` / `*Receiver` in the "shared" sub-bench is safe: the idempotent re-join is sharded-CAS lock-free per shard (`crdt.go:1057`), and the rate gate's per-shard mu is the only lock (a real-path cost, not a correctness hazard — `-race` confirms no data race).
-  - `RecordIngest` is NOT called inside the timed loop (the production path has the Prometheus histogram cost; this bench isolates verify+apply, so the telemetry cost is ABSENT — a documented lower bound, not a mixed bench).
-  - **The `eng.DataDir` race (found + fixed)**: the first draft set the package-global `eng.DataDir` from inside `b.RunParallel` (each per-fn goroutine wrote it) — the `-race` detector caught it (a write/write race at `crdt.go:255`). The fix: resolve ONE temp dir in the SEQUENTIAL setup and pass it to `newBenchReceiver`, which calls the `persistMu`-guarded `engine.SetDataDir` (per-instance field, not the global). The timed loop never persists (`HandleBatchFrame`'s apply is in-memory per-shard CAS; `dataDir` is only touched by the lamport writer at `crdt.go:856,886`, which the bench never invokes), so a single shared dir is correct AND race-free. A bench that `-race`-fails under `RunParallel` is a bench that overstates — this one does not.
-
-**D2 — the silicon gear harness** (`c8g_silicon_bench.sh`, NEW; mirrors `c8g_run_bench.sh`):
-
-- instance-type assertion: `c8g.8xlarge` | `c8g.16xlarge` | `c8g.24xlarge` (exit 8 on a wrong family — the c7g gear-fabrication guard).
-- CPU part assertion: Graviton4 Neoverse V2 = `0xd4f` (exit 9 on mismatch — NOT `0xd09`; the `c8g_run_bench.sh` comment at line 50 explicitizes the earlier typo).
-- Core-substrate drift guard BEFORE the bench (exit 7 on drift): the harness asserts the 5 core merge-law/wire-schema files (`crdt.go`, `crdt_apply.go`, `schema.capnp`, `schema.capnp.go`, `envelope.go`) + the 2 receive-path files (`receiver.go`, `ingress_epoll.go`) are the expected versions on the box. A remote drift measures a DIFFERENT substrate — exit 7, no number published.
-- runs BOTH benches with `-cpu=<nproc>` `-benchtime=3s` `-count=3` (stability; mirrors `c8g_run_bench.sh:167-173`): (1) the sequential `BenchmarkVerifyCRDTFrame_32c` + `BenchmarkBatchedVerify` (the per-thread latency anchors); (2) the NEW `BenchmarkBatchedVerifyParallel` (the aggregate).
-- prints the gear block (instance-type, nproc, arch, CPU part, go version, GOMAXPROCS, kernel) VERBATIM — the report header pastes this. Labeled silicon.
+`BenchmarkVerifyCRDTFrame_32c` and `BenchmarkBatchedVerify` each run a single
+timed loop. Their `ns/op` results describe one goroutine even when `-cpu`
+allows more operating-system threads; multiplying that latency by the core
+count does not measure aggregate throughput. The new measurement therefore had
+to exercise concurrent receivers and report the total work completed per unit
+of wall-clock time.
 
 ---
 
-## 3. The in-process vs silicon distinction (the primary-honesty mitigation)
+## Decision
 
-The catastrophic-failure mode is a 4-core number relabeled silicon. The mitigation is mechanical, not prose:
+Add `BenchmarkBatchedVerifyParallel` in `pkg/receive/bench_silicon_test.go`.
+It uses `b.RunParallel` to drive `(*Receiver).HandleBatchFrame`, including
+identity lookup, Ed25519 verification, envelope decoding, and
+`ApplyCRDTDeltaBatch`. The existing `buildBenchBatchWire` helper constructs N
+events with distinct entity IDs and monotonic dot counters. Signing and
+envelope marshaling happen before the timed loop.
 
-- The new bench runs in-process on the 4-core development box, labeled plainly as a 4-core construction smoke (NOT silicon): `go test -run='^$' -bench=BenchmarkBatchedVerifyParallel -benchtime=200ms -count=1 ./pkg/receive/`. It reports ns/op + ns/delta + the derived aggregate for N=1..256. The 4-core number is a CONSTRUCTION smoke (the bench machinery works) — NOT a silicon number, NOT the headline. The gate log labels it as a 4-core smoke.
-- The harness is COMMITTED + `bash -n` clean; it asserts the c8g family + CPU part 0xd4f + the 7-file substrate-drift guard. The silicon RUN is on the instance, via D2's script.
-- The core merge-law/wire-schema files + the receive-path files are UNCHANGED PRE+POST (silicon touches zero core files). `go.mod`/`go.sum` 0-diff.
-- The verdict lock is mechanical: unconditionally approved IFF the gear block is silicon (c8g + 0xd4f) AND the aggregate @ N=100 ≥ 1,000,000 deltas/sec as a `b.ReportMetric` / verbatim bench line. Otherwise STAYS (or DEFERRED-AWS) — HONEST. The verdict is the bench's, not the prose's.
+Each N in {1, 10, 100, 256} has two configurations:
 
-The gear block is the load-bearing artifact: it is IMDSv2-asserted on the live instance (instance-type from metadata, CPU part from `/proc/cpuinfo`), not hardcoded. A c7g relabeled c8g fails the instance-type check (exit 8) AND the CPU-part check (exit 9) before any number is published.
+- **shared:** all goroutines use one receiver, engine, identity directory, and
+  origin. They contend on the same `PeerBucket` shard in the admission path,
+  as frames from one origin do on a node.
+- **ceiling:** each goroutine has its own receiver, engine, and directory.
+  This removes rate-bucket contention and isolates verification and apply
+  scaling. It is an upper-bound configuration, not a single-origin node's
+  receive rate.
+
+The reported rate is `1e9 / nsPerDelta`, where `nsPerDelta = ns/op / N`.
+Under `b.RunParallel`, `b.N` counts iterations across all goroutines and
+`b.Elapsed()` is wall-clock time. Thus `ns/op` already represents elapsed time
+divided by total completed batches; multiplying by `GOMAXPROCS` would count
+the cores twice. The initial report made that error and inflated its aggregate
+column by 64× on the 64-core host. `reportAggregate` now uses the formula
+above, and the first run's rates below were recomputed from its unaffected
+`ns/delta` column.
+
+The apply path reaches `ReconstructEntryWithSkewBound` and the sharded
+compare-and-swap loop in `(*DeltaCRDTEngine).Join`; it does not construct the
+merged view guarded by `stateViewMu`. The admission bucket's shard mutex is a
+deliberate point of contention in the shared configuration.
+
+Each receiver gets its persistence directory through
+`(*DeltaCRDTEngine).SetDataDir` during setup. The temporary directory is chosen
+before `b.RunParallel` starts, avoiding concurrent writes to the package-level
+`DataDir` default. The timed loop performs no persistence and does not call
+`RecordIngest`; those costs are outside this benchmark.
+
+Run the sequential reference benchmarks and the new parallel benchmark with
+`-cpu=<nproc> -benchtime=3s -count=3`. Record the instance type, CPU part,
+architecture, Go version, `GOMAXPROCS`, and kernel beside the results. The
+historical runs used a 64-core c8g.16xlarge with Graviton4 CPU part `0xd4f`.
+The four-core development run is only a construction check and is not included
+in the throughput claim.
+
+## Consequences
+
+The target is met on this host for the shared configuration at N=256: all six
+counts in the first run exceed one million deltas/sec. At N=100 the shared
+counts range from 862,812 to 1,883,239 deltas/sec; four of six exceed the
+target. The result is therefore specific to batch size and run, rather than a
+guarantee that every shared-path run at N=100 exceeds one million deltas/sec.
+The ceiling configuration measures scaling without bucket contention and must
+not be substituted for the shared result.
+
+These are in-process verification-and-apply measurements. The benchmark reuses
+frames after their initial insertion, so steady-state operations do not add new
+state. The measurements also omit network I/O, TLS, persistence, and ingest
+telemetry. The rates are not end-to-end durable-ingest measurements and apply
+only to the measured 64-core host; no 96-core result is claimed.
 
 ---
-## 4. The silicon numbers VERBATIM (do NOT round — copy the verbatim output)
 
-### Gear block (IMDSv2-asserted on the live instance) — silicon
+## Evidence
+
+### Host and benchmark configuration
+
+The first run recorded the following host details through instance metadata
+and `/proc/cpuinfo`:
 
 ```
-GEAR (IMDSv2-asserted on the live instance) — silicon
  instance-type : c8g.16xlarge
  nproc         : 64
- arch          : aarch64               (expect aarch64)
- CPU part      : 0xd4f   (Graviton4 / Neoverse V2 = 0xd4f)
+ arch          : aarch64
+ CPU part      : 0xd4f (Graviton4 / Neoverse V2)
  go version    : go1.26.1 linux/arm64
  GOMAXPROCS    : 64
  kernel        : 6.1.176-221.367.amzn2023.aarch64
 ```
 
-### Core + receive-path substrate ASSERT (all 7 OK — substrate guard)
-
-```
-  OK    pkg/sync/crdt.go
-  OK    pkg/sync/crdt_apply.go
-  OK    api/capnp/api/capnp/schema.capnp
-  OK    api/capnp/api/capnp/schema.capnp.go
-  OK    pkg/attribution/envelope.go
-  OK    pkg/receive/receiver.go
-  OK    pkg/receive/ingress_epoll.go
-  -> all 7 core + receive-path files asserted OK
-```
-
-### Q1a — per-verify latency anchor (sequential, -cpu=64) — IS silicon per-verify ≈ 60.19us?
+### Sequential per-verification latency, `-cpu=64`
 
 ```
 BenchmarkVerifyCRDTFrame_32c-64    59605   59814 ns/op   3.61 MB/s   2672 B/op   12 allocs/op
@@ -112,9 +113,10 @@ BenchmarkVerifyCRDTFrame_32c-64    60230   60006 ns/op   3.60 MB/s   4720 B/op  
 BenchmarkVerifyCRDTFrame_32c-64    59239   60499 ns/op   3.57 MB/s   2672 B/op   12 allocs/op
 ```
 
-**verdict: YES.** Silicon per-verify @ 64c = **59,814 / 60,006 / 60,499 ns/op ≈ 60.0us**, matching the cited 60.19us anchor within silicon variance (~0.3%). The derivation's foundation is MEASURED, not derived.
+The three verification counts are 59,814 / 60,006 / 60,499 ns/op, close to
+the earlier 60.19us reference. This remains a sequential latency measurement.
 
-### Q1b — batched per-thread latency (sequential, -cpu=64) — the amortization holds
+### Sequential batched latency, `-cpu=64`
 
 ```
 BenchmarkBatchedVerify/N=1-64     56312   67058 ns/op   67057 ns/delta
@@ -123,23 +125,28 @@ BenchmarkBatchedVerify/N=100-64  10000  308140 ns/op    3081 ns/delta
 BenchmarkBatchedVerify/N=256-64   5521  626165 ns/op    2445 ns/delta
 ```
 
-ns/delta falls 67us → 10.8us → 3.08us → 2.44us as N rises — the verify amortizes ~linearly with N (the ADR-0010 result, re-measured on silicon).
+Per-delta latency falls from 67us at N=1 to 10.8us at N=10, 3.08us at N=100,
+and 2.44us at N=256. This reproduces the amortization pattern from ADR-0010
+on the Graviton4 host.
 
-### — aggregate throughput (b.RunParallel, -cpu=64) — THE HEADLINE
+### Parallel aggregate throughput, `-cpu=64`
 
-The headline is the `aggregate_deltas/sec` metric. **CORRECTION (2026-07-30):** the first silicon run computed this as `1e9 / nsPerDelta * GOMAXPROCS` — the `* GOMAXPROCS` was a BUG. Under `b.RunParallel`, `b.N` is the TOTAL iterations across ALL goroutines and `b.Elapsed()` is the WALL-CLOCK duration, so `nsPerOp = wall/total` is ALREADY the aggregate (core-divided) per-op cost. Multiplying by GOMAXPROCS double-counts the cores and inflates the headline by 64× at 64c. The bench file is fixed (`reportAggregate` now emits `1e9 / nsPerDelta`, no `* GOMAXPROCS` — `pkg/receive/bench_silicon_test.go:241-261`).
-
-The tables below are RECOMPUTED from the formula-independent `ns/delta` column of the SAME raw gate log (`ns/delta = nsPerOp / N`, untouched by the `* GOMAXPROCS` bug). Corrected `aggregate_deltas/sec = 1e9 / ns/delta` = the inflated column ÷ 64. The `ns/op` and `ns/delta` columns are verbatim from the log; only the recomputed aggregate is new. Six counts per sub-bench (the `-count=3` ran the block twice). The first count of each invocation is COLD; counts 2-3 are WARM (see §7 weakness #5 — corrected).
+The first run executed the `-count=3` parallel block twice, giving six counts
+per configuration. The aggregate column uses `1e9 / ns/delta`, correcting the
+erroneous 64× multiplier described above. The retained `ns/op` and `ns/delta`
+values are copied from the raw output. One inherited `ns/op` transcription is
+omitted below because it conflicts with that output. The cold and warm labels
+distinguish the first count of each invocation from the remaining two.
 
 **N=100 (the batched claim — one Ed25519 verify amortized over 100 deltas):**
 
-| sub-bench | count | ns/op (aggregate) | ns/delta | aggregate_deltas/sec (CORRECTED) |
+| sub-bench | count | ns/op | ns/delta | aggregate_deltas/sec |
 |---|---|---|---|---|
 | shared/N=100-64 | 1 (cold) | 53,120 | 531 | 1,883,239 |
 | shared/N=100-64 | 2 (warm) | 115,920 | 1,159 | 862,812 |
 | shared/N=100-64 | 3 (warm) | 81,845 | 818 | 1,222,493 |
 | shared/N=100-64 | 4 (cold) | 53,954 | 539 | 1,855,287 |
-| shared/N=100-64 | 5 (warm) | 1,137 | 1,137 | 879,507 |
+| shared/N=100-64 | 5 (warm) | — | 1,137 | 879,507 |
 | shared/N=100-64 | 6 (warm) | 76,664 | 766 | 1,305,483 |
 | ceiling/N=100-64 | 1 (cold) | 17,283 | 172 | 5,813,953 |
 | ceiling/N=100-64 | 2 (warm) | 12,747 | 127 | 7,874,015 |
@@ -150,7 +157,7 @@ The tables below are RECOMPUTED from the formula-independent `ns/delta` column o
 
 **N=256 (the batched claim at higher amortization — one verify over 256 deltas):**
 
-| sub-bench | count | ns/op (aggregate) | ns/delta | aggregate_deltas/sec (CORRECTED) |
+| sub-bench | count | ns/op | ns/delta | aggregate_deltas/sec |
 |---|---|---|---|---|
 | shared/N=256-64 | 1 (cold) | 84,250 | 329 | 3,039,513 |
 | shared/N=256-64 | 2 (warm) | 183,634 | 717 | 1,394,700 |
@@ -167,7 +174,7 @@ The tables below are RECOMPUTED from the formula-independent `ns/delta` column o
 
 **N=10 (lower amortization — one verify over 10 deltas):**
 
-| sub-bench | count | ns/op (aggregate) | ns/delta | aggregate_deltas/sec (CORRECTED) |
+| sub-bench | count | ns/op | ns/delta | aggregate_deltas/sec |
 |---|---|---|---|---|
 | shared/N=10-64 | 1 (cold) | 13,799 | 1,379 | 725,163 |
 | shared/N=10-64 | 2 (warm) | 14,762 | 1,476 | 677,506 |
@@ -182,119 +189,64 @@ The tables below are RECOMPUTED from the formula-independent `ns/delta` column o
 | ceiling/N=10-64 | 5 (warm) | 2,203 | 220 | 4,545,454 |
 | ceiling/N=10-64 | 6 (warm) | 2,194 | 219 | 4,566,210 |
 
-**N=1 (per-frame, un-batched — the per-frame ceiling, labeled per-frame NOT batched):**
+**N=1, without batching:**
 
-| sub-bench | count | ns/op (aggregate) | ns/delta | aggregate_deltas/sec (CORRECTED) |
-|---|---|---|---|---|
-| shared/N=1-64 | 1 (cold) | 9,055 | 9,055 | 110,436 |
-| shared/N=1-64 | 2 (warm) | 2,818 | 2,818 | 354,861 |
-| shared/N=1-64 | 3 (warm) | 2,813 | 2,813 | 355,494 |
-| shared/N=1-64 | 4 (cold) | 8,871 | 8,871 | 112,728 |
-| shared/N=1-64 | 5 (warm) | 2,713 | 2,713 | 368,595 |
-| shared/N=1-64 | 6 (warm) | 2,759 | 2,759 | 362,449 |
-| ceiling/N=1-64 | 1 (cold) | 1,311 | 1,311 | 762,776 |
-| ceiling/N=1-64 | 2 (warm) | 1,181 | 1,181 | 846,740 |
-| ceiling/N=1-64 | 3 (warm) | 1,196 | 1,196 | 836,120 |
-| ceiling/N=1-64 | 4 (cold) | 1,487 | 1,487 | 672,494 |
-| ceiling/N=1-64 | 5 (warm) | 1,329 | 1,329 | 752,445 |
-| ceiling/N=1-64 | 6 (warm) | 1,202 | 1,202 | 831,946 |
+The first-run shared results span 110K–368K deltas/sec and the ceiling results
+span 672K–846K. Neither configuration reaches one million deltas/sec at N=1.
 
-### The headline (CORRECTED)
+### Second 64-core run
 
+A second c8g.16xlarge run on 2026-07-30 used the corrected `reportAggregate`
+directly rather than recomputing the aggregate column. Its ranges were:
+
+| configuration | aggregate_deltas/sec | counts above 1,000,000 |
+|---|---|---|
+| shared/N=256 | 1.38M–3.06M | 6/6 |
+| shared/N=100 | 848K–1.89M | 4/6 |
+| ceiling/N=100 | 5.71M–7.69M | 6/6 |
+
+The second run agrees with the recomputed first-run ranges. In both runs the
+N=100 shared results straddle the target and every N=256 shared count exceeds
+it.
+
+A later 32-core run on a c8g.8xlarge recorded 5.7M–6.0M deltas/sec for the
+shared configuration at N=100–256 and 12.5M–14.7M for the ceiling
+configuration. Those measurements have their own date and hardware conditions
+in [the ingest receipt](../../evidence/ingest-ed25519.txt); they are not part
+of the 64-core tables above.
+
+### Reproduction
+
+```bash
+go test -run='^$' -cpu=<nproc> -bench=BenchmarkBatchedVerifyParallel \
+  -benchtime=3s -count=3 ./pkg/receive/
 ```
-aggregate deltas/sec @ 64c @ N=100 (shared, real single-origin path)  = 862,812 – 1,883,239   (4/6 above 1M; 2/6 ~12% below)
-aggregate deltas/sec @ 64c @ N=256 (shared, real single-origin path)  = 1,390,820 – 3,076,923  (6/6 above 1M)
-aggregate deltas/sec @ 64c @ N=100 (ceiling, verify+apply)            = 5,813,953 – 7,874,015 (6/6 above 1M; OVERSTATES single-origin)
-aggregate deltas/sec @ 64c @ N=256 (ceiling, verify+apply)            = 7,042,253 – 8,620,689 (6/6 above 1M; OVERSTATES single-origin)
-```
 
-**Verdict (≥1M/sec): YES, but on a NARROWER margin than the inflated draft claimed.** The corrected headline is NOT "clears by 55×–503×" — that was the 64×-inflated draft. The corrected picture:
+A short construction check can use `-benchtime=200ms -count=1` without the
+`-cpu` override. Its output describes the local machine, not the Graviton4
+results in this record.
 
-- **The batched claim at N=100 on the REAL single-origin (shared) path STRADDLES 1M/sec**: 4 of 6 counts clear it (1.22M–1.88M, median 1.22M), 2 of 6 fall ~12% short (862K, 879K). The bar is met by the MEDIAN and the majority of counts, but NOT by every count — this is a MARGINAL pass at N=100, not a 55× blowout.
-- **The batched claim at N=256 on the shared path clears 1M/sec cleanly**: all 6 counts 1.39M–3.08M (1.4×–3× margin). N=256 is the batch size the ADR-0010 amortization curve targets for the headline; at that batch size the real path clears the bar with margin.
-- **The ceiling (verify+apply, no rate-gate contention) clears 1M/sec at every batch size ≥ N=10**: N=100 = 5.8M–7.9M, N=256 = 7.0M–8.6M. But the ceiling OVERSTATES a single-origin node (each goroutine has its own rate bucket — a single origin does not); it is the scaling-curve diagnosis, not the headline.
-- **N=1 and N=10 on the shared path are BELOW 1M/sec** (110K–368K and 677K–758K) — expected: less amortization. They are NOT the headline; they are the curve showing where amortization bites.
+### Measurement limits
 
-The ≥1M/sec headline is PROVEN on silicon at the batched batch sizes the design targets (N=256 shared: all counts above; N=100 shared: median above, majority above). It is NOT proven at every batch size on the shared path — the honest verdict is "the batched headline clears 1M/sec at N=256 on the real path and at N=100 on the median, with N=100 marginal on the cold/warm tail." Measured, not derived; the bench decided at a narrower margin than the inflated draft claimed.
+Before timing, `makeSignedFrame` applies the batch to a warm-up receiver. The
+shared configuration reuses that receiver. In the ceiling configuration, each
+fresh receiver inserts the frame on its first operation. Subsequent operations
+rejoin the same dots, so CRDT deduplication leaves state unchanged while the
+Ed25519 verification still runs in full. Reusing the frame bounds arena growth;
+it also means these tables do not measure steady-state insertion of fresh state.
 
----
+The shared configuration retains admission-bucket contention. The ceiling
+configuration removes it by constructing independent receivers, so the two
+results answer different questions. At N=1, neither configuration reaches one
+million deltas/sec; the target depends on batching.
 
-## 5. The verdict lock
+The corrected figures also retract the earlier claim of a large per-core
+speedup under parallel load. The shared configuration's per-core rate is below
+the sequential reference, consistent with contention and garbage collection
+costs; the benchmark does not isolate those causes. Cold and warm counts
+differ, and the shared configuration varies more. The tables retain every
+count rather than selecting a warm result.
 
-**The verdict UPGRADES to unconditionally approved — the ≥1M/sec headline is a MEASURED silicon number (gear block: c8g.16xlarge, 64c, CPU part 0xd4f, Go 1.26.1 arm64; 64c), no longer a derived ceiling.** The verdict survives the 2026-07-30 formula correction, but on a NARROWER margin than the inflated draft claimed — the honest verdict is recorded below, not the "55×–503×" of the first draft.
-
-The verdict-lock conditions, re-checked against the CORRECTED numbers:
-
-- **(a) the gear block is silicon**: instance-type `c8g.16xlarge` (c8g family), CPU part `0xd4f` (Graviton4 Neoverse V2), nproc 64. ✓ (IMDSv2-asserted on the live instance; the harness exits 8/9 on a wrong family/part.) Unchanged by the correction.
-- **(b) `BenchmarkBatchedVerifyParallel` @ 64c reports aggregate deltas/sec ≥ 1,000,000 as a `b.ReportMetric` / verbatim bench line**: ✓ on the corrected numbers, with the honest granularity:
-  - **N=256 shared (real single-origin path): 1.39M–3.08M, all 6 counts above 1M.** ✓ clean.
-  - **N=100 shared: 862K–1.88M, 4/6 above (median 1.22M), 2/6 ~12% below.** ✓ on the median/majority, MARGINAL on the tail — recorded honestly, not as a blowout.
-  - **N=100 ceiling (verify+apply, overstates single-origin): 5.81M–7.87M, all 6 above.** ✓ (diagnosis, not headline).
-  - The first draft's "shared = 55.2M–120.5M; ceiling = 372M–503M; every count ≥ 1M" was the 64×-inflated column. The corrected condition (b) is met at N=256 shared (clean) and N=100 shared (median), NOT "every count at N=100."
-- **(c) the per-verify anchor (`BenchmarkVerifyCRDTFrame_32c` on silicon) is ≈ 60.19us**: 59,814 / 60,006 / 60,499 ns/op ≈ 60.0us (within ~0.3% silicon variance). ✓ Unchanged by the correction (the anchor is a sequential per-thread measurement, not the aggregate). The headline does not depend on the exact anchor — it depends on the AGGREGATE — but the anchor confirms the derivation's foundation is real.
-
-**Why the verdict still UPGRADES despite the narrower margin:** the ≥1M/sec bar is a SUBSTEP headline (sync/sec on one node), and the design's target batch size for that headline is the high-amortization end of the ADR-0010 curve (N≥100). At N=256 on the REAL single-origin path, all 6 counts clear 1M/sec with 1.4×–3× margin — that is a clean measured pass at the design's target batch size, not a derivation. At N=100 the median clears it (1.22M) with the tail marginal — the bar is met at the median, the honest weakness is the tail. The verdict UPGRADES because the batched headline IS measured above 1M/sec at the design's target batch size on the real path; it does NOT upgrade on the "55×–503×" claim, which is retracted as the inflated draft.
-
-**Honest caveat on the 64c-vs-96c condition:** the planned verdict lock literally reads "aggregate @ 96c @ N=100 ≥ 1,000,000". The box is **64c** (c8g.16xlarge), not 96c — AWS hit a 96-core account limit and I provisioned 64c instead (the planned scaling curve stops at 64). The verdict is recorded at the MEASURED gear (64c), not the planned 96c. On the CORRECTED numbers, the 64c-vs-96c caveat is MORE load-bearing than the inflated draft claimed: at 64c the N=100 shared path is MARGINAL (median 1.22M, tail below), so a 96c run is not a guaranteed blowout — it would scale the aggregate roughly linearly in cores IF the per-core rate holds, but the rate-gate contention on the shared path (one origin, one bucket) may NOT scale linearly past 64c (the per-shard mu is the documented bottleneck). The honest position: 64c clears the bar at N=256 shared (clean) and N=100 shared (median); a 96c run would need to be MEASURED to confirm it clears at N=100 on the shared path, not assumed. No 96c number is fabricated; the verdict is recorded at the measured gear, and the 96c confirmation is left as a future measurement, not a derivation.
-
----
-
-## 6. IS-NOT (what this change does NOT deliver — scope discipline)
-
-- It does NOT touch a single core file (the 5 core merge-law/wire-schema files are unchanged PRE+POST). It does NOT touch the receive-path files (`receiver.go`, `ingress_epoll.go`).
-- It does NOT modify the production receive path (`receiver.go`, `batch_handle.go`, `bench_bench_test.go` are untouched). The new bench IMPORTS the existing `buildBenchBatchWire` helper + `HandleBatchFrame` — it is ADDITIVE.
-- It does NOT add a dependency (`go.mod`/`go.sum` 0-diff; the bench uses only the already-imported `testing` + the existing receive imports).
-- It does NOT prove the 10B ops/sec headline (that is a multi-region fan-out, out of scope here). It proves the ≥1M/sec SUBSTEP (sync/sec) on one node.
-- It does NOT measure the network (the bench is in-process; the wire is marshaled + unmarshaled but not TLS-sent — the net cost is ABSENT; the silicon headline is a VERIFY+APPLY bound, not a full transport bound — §7 weakness #4).
-- It does NOT widen the change's declared file scope (the new `bench_silicon_test.go` is an additive test file within that declared scope — the established pattern for additive test files).
-
----
-## 7. Honest weaknesses
-
-1. **The bench's apply is an idempotent re-join (a lower bound).** The warm applies ONE real insert of all N deltas, then the timed loop re-joins the SAME deltas idempotently (the CRDT Join dedupes — re-joining changes nothing). The timed apply is a NO-OP after the warm, so the measured ns/delta is a LOWER BOUND on the real per-delta cost — it can never fabricate a win the engine does not have. The verify (the amortization target, ~60us) runs FULLY every op (never cached), so the bench measures the VERIFY AMORTIZATION honestly. A real insert (unbounded) would exhaust the arena — a bench-construction artifact, not physics.
-
-2. **The shared-recv sub-bench's rate-gate contention is real.** A single origin drains one rate bucket (`PeerBucket.Accept` takes the per-shard mu at `ewma.go:200`). The shared number is the REAL single-origin path — the contention is HONEST physics, not a bug. The ceiling sub-bench isolates verify+apply and OVERSTATES a single-origin node's rate (each goroutine has its own origin bucket). Both are reported so the curve shows where the gate bites; the shared number is the conservative headline.
-
-3. **The network is NOT in the bench.** It is in-process; the wire is marshaled + unmarshaled but not TLS-sent. The net cost (TLS record framing, kernel socket copies, the planned AF_XDP zero-copy path) is ABSENT. The silicon headline is a VERIFY+APPLY bound, not a full transport bound. A real node's end-to-end ingest rate is LOWER than this number by the transport cost (not measured here).
-
-4. **`RecordIngest` (the Prometheus histogram) is NOT in the timed loop.** The production path records ingest latency + verdict per frame; this bench isolates verify+apply, so the telemetry cost is ABSENT. A real node's hot path includes the histogram observe — a documented lower bound, not a mixed bench. A "with-telemetry" bench would be a DIFFERENT bench (labeled as such); this one does not mix.
-
-5. **The "ed25519 verify is ~9× faster per-core under parallel load" claim was an ARTIFACT of the ×64 formula bug, NOT real physics (CORRECTED 2026-07-30).** The first draft asserted: sequential per-verify ~60us (15.6K verifies/sec/core) vs parallel per-core ~355K verifies/sec/core (the shared/N=1 warm aggregate of "22.7M/sec ÷ 64"), a "23× per-core speedup" attributed to the circl ed25519 precomputed base-point table staying hot in shared L3 cache. That arithmetic was wrong: the "22.7M/sec" was the INFLATED aggregate (×64), so dividing it by 64 gave 355K — but the CORRECTED shared/N=1 warm aggregate is 354,861/sec (not 22.7M), and per-core that is 354,861 ÷ 64 = **5,544 verifies/sec/core** — which is **3× SLOWER** than the sequential 16,666/sec/core, NOT 9× faster. The slowdown is contention + GC on the shared path (one origin, one rate bucket, the per-shard mu), not a cache-warmth speedup. The REAL cache effect (measured on the contention-free ceiling/N=1: count1 cold 762K vs count2 warm 846K) is ~10% warmup, not 9×. The cold/warm variance in the corrected tables is real but SMALL (~10–15% on the ceiling, larger on the shared path where contention dominates) — the first count of each invocation is marginally colder, counts 2-3 marginally warmer. The headline is NOT a "cache-warm steady-state 9× speedup"; it is a contention-bound aggregate where the shared path is SLOWER per-core than sequential. This STRENGTHENS the honesty of the verdict (no phantom cache effect inflates it) but WEAKENS the headline's margin (the shared path pays real contention cost).
-
-6. **GOMAXPROCS is settable from the box but the in-process harness pins cores via `-cpu`.** The bench's `-cpu=64` binds the `b.RunParallel` goroutines to 64 cores; `GOMAXPROCS=64` is exported before the gear header. A production node's GOMAXPROCS is a deploy knob; the bench measures the all-cores case. Thermal throttling over a 3s bench is possible on a sustained load (the gear temp was not logged — `/sys/class/thermal` was not read; a 3s bench is short enough that thermal headroom is unlikely to bind, but it is not asserted).
-
----
-
-## 8. Alternatives considered and rejected
-
-**The one that landed (2026-07-30): the aggregate formula double-counts the cores.**
-This criticism landed against the first draft and is the reason for the correction. The first `reportAggregate` computed `1e9 / nsPerDelta * GOMAXPROCS`. Under `b.RunParallel`, `b.N` is the TOTAL iterations across ALL goroutines and `b.Elapsed()` is the WALL-CLOCK duration, so `nsPerOp = wall/total` is ALREADY the aggregate (core-divided) per-op cost — multiplying by GOMAXPROCS double-counts the cores and inflates the headline by 64× at 64c. The bench file is fixed (`reportAggregate` now emits `1e9 / nsPerDelta`, no `* GOMAXPROCS` — `pkg/receive/bench_silicon_test.go:241-261`); the §4 tables are recomputed from the formula-independent `ns/delta` column of the SAME raw log. The verdict survives but on a narrower margin (N=100 shared straddles 1M; N=256 shared clears clean). The lesson recorded: a `b.RunParallel` aggregate is `1e9 / nsPerDelta` with NO core multiplier — the cores are already in the denominator via wall/total.
-
-**Rejected: use the SEQUENTIAL bench relabeled as aggregate.**
-Refuted by the NEW `b.RunParallel` bench. A sequential `-cpu=64` report is PER-THREAD latency (ns/op on ONE goroutine), NOT 64× throughput. The existing `BenchmarkBatchedVerify` at `-cpu=64` reports 308,140 ns/op for N=100 — that is ONE core's per-batch cost, NOT 64 cores' aggregate. D1 (`BenchmarkBatchedVerifyParallel`) is the aggregate; the sequential bench is the anchor, labeled as such. The two are DIFFERENT measurements; relabeling the sequential one as "aggregate" is the fabrication D1 exists to prevent. (The formula-bug item above is the inverse failure: D1 IS the aggregate bench, but its REPORTING formula re-injected the core multiplier the sequential bench correctly omits — the bench measured right, the metric was mis-derived.)
-
-**Rejected: drop the shared-recv sub-bench and report only the ceiling.**
-Refuted: the ceiling OVERSTATES a real node's rate. A single-origin node's batched self-originated deltas all drain ONE rate bucket; the ceiling sub-bench gives each goroutine its own bucket (no contention), which a single-origin node does NOT have. On the CORRECTED numbers, reporting only the ceiling (N=100 = 5.8M–7.9M/sec) would overstate the real shared path (N=100 = 862K–1.88M/sec) by ~4×–9×. Both are reported; the shared number is the conservative headline, the ceiling isolates verify+apply scaling. The §5 verdict holds on the SHARED number at N=256 (1.39M–3.08M, all above) and at N=100 on the median (1.22M) — the ceiling is not needed for the verdict, only for the scaling-curve diagnosis.
-
-**Rejected: claim 1M/sec from the per-frame path without batching.**
-This is ARITHMETICALLY TRUE on the ceiling but MARKETING-FALSE, and on the CORRECTED numbers it is no longer true on the shared path at all. The headline is the BATCHED claim (one verify over N deltas — the ADR-0010 amortization). The per-frame shared path (N=1) is 110K–368K/sec corrected — BELOW 1M (the first draft's "22.7M/sec per-frame shared" was the ×64 inflation). The per-frame CEILING (N=1) is 672K–846K/sec corrected — also below 1M. So the per-frame path does NOT clear 1M/sec on either sub-bench once corrected; only the BATCHED path (N≥100 ceiling, N=256 shared) clears it. Reporting the per-frame ceiling as the "batched 1M/sec" would be a double bait-and-switch (per-frame, and ceiling) — the discipline of labeling N=1 as per-frame and reporting the batched N=100/N=256 as the headline is the honesty guard. The first draft's parenthetical "at 64c even the per-frame path clears 1M/sec by 22×" is RETRACTED — it was the inflated number.
-
-**Rejected: the 64c box is not the 96c the verdict lock specifies, so downgrade the verdict to STAYS.**
-On the CORRECTED numbers this objection is STRONGER than the first draft admitted. The verdict lock's "96c" was the PLANNED gear; the MEASURED gear is 64c (AWS quota cap). The first draft dismissed this with "64c clears by 55×" — that was the inflated number, so the dismissal was built on the bug. On the corrected numbers, 64c clears the bar at N=256 shared (clean, 1.4×–3×) and at N=100 shared on the median (1.22×), but N=100 shared is MARGINAL on the tail (2/6 below). The honest position: the verdict UPGRADES on the 64c N=256 shared measurement (clean pass at the design's target batch size) and records the N=100 shared marginality honestly; a 96c run is NOT assumed to be a blowout (the shared-path rate-gate contention may not scale linearly past 64c) and is left as a future measurement. Downgrading to STAYS would ignore the clean N=256 shared pass; upgrading unconditionally on N=100 would ignore the marginal tail. The honest call: UPGRADE on the N=256 shared clean pass + N=100 shared median, record the N=100 tail marginality and the 96c-unmeasured caveat verbatim. The bench decided at the gear that was provisioned, at the margin it actually measured.
-
-**Rejected: tune `-benchtime` down to make the number look stable.**
-`-benchtime=3s -count=3` is the bar (mirrors `c8g_run_bench.sh:167-173`). A 0.1s count=1 number is noise — the cold/warm variance (§7 weakness #5, corrected to ~10–15%) would be invisible at 0.1s and the headline would look artificially stable. The 3s×3 run SURFACES the cold/warm variance honestly (the first count is marginally colder, counts 2-3 marginally warmer); a shorter run would HIDE it. The gate log carries all 6 counts per sub-bench verbatim; the reader sees the variance, not a single cherry-picked number.
-
----
-
-## 9. Verdict lock and bottom line
-
-**The verdict UPGRADES to unconditionally approved** — on the CORRECTED numbers, at the margin the bench actually measured. The ≥1M/sec headline is a MEASURED silicon number:
-
-- gear block: `c8g.16xlarge`, 64 cores, CPU part `0xd4f` (Graviton4 Neoverse V2), Go 1.26.1 arm64 — IMDSv2-asserted on the live instance (the harness exits 8/9 on a wrong family/part; a c7g relabel fails before any number is published).
-- anchor: silicon per-verify @ 64c = 59,814 / 60,006 / 60,499 ns/op ≈ 60.0us — matches the cited 60.19us within ~0.3%. The derivation's foundation is MEASURED. (Unchanged by the correction — the anchor is sequential per-thread, not the aggregate.)
-- headline (CORRECTED): `BenchmarkBatchedVerifyParallel` @ 64c reports aggregate deltas/sec = **1,390,820 – 3,076,923 (shared/N=256, real single-origin path, all 6 counts above 1M)** and **862,812 – 1,883,239 (shared/N=100, median 1.22M, 4/6 above, 2/6 ~12% below)** and **5,813,953 – 7,874,015 (ceiling/N=100, verify+apply, overstates single-origin)** as `b.ReportMetric` / verbatim bench lines. The batched headline clears 1M/sec CLEANLY at N=256 on the real path (1.4×–3× margin) and at N=100 on the median (1.22×); N=100 is MARGINAL on the tail. The first draft's "55M–503M, clears by 55×–503×" is RETRACTED as the 64×-inflated column.
-
-The 64c-vs-96c caveat is recorded verbatim: the box is 64c (AWS 96-core quota cap), not the planned 96c; the verdict is recorded at the MEASURED gear. On the corrected numbers, 64c clears the bar at N=256 shared (clean) and N=100 shared (median); a 96c run is NOT assumed to be a blowout (the shared-path rate-gate contention may not scale linearly past 64c) and is left as a future measurement. No 96c number is fabricated.
-
-**Bottom line:** the headline is MEASURED, not derived. The bench IS the claim. The gear block is silicon (c8g + 0xd4f). The batched aggregate clears 1M/sec at N=256 on the real single-origin path (clean, all counts) and at N=100 on the median (marginal on the tail). The verdict UPGRADES to unconditionally approved on the N=256 shared clean pass — the "derived, not measured" caveat that gated the earlier stages is removed. The 2026-07-30 correction retracted the inflated "55×–503×" margin and the phantom "9× cache-warmth speedup"; the honest margin (1.4×–3× at N=256 shared) and the real contention cost (shared per-core 3× SLOWER than sequential, not 9× faster) are recorded. Nothing fabricated; the formula bug, the cold/warm variance, the rate-gate contention, the absent network, and the absent telemetry are all recorded as honest weaknesses. The bench decided; the prose did not.
+`-cpu=64` sets `GOMAXPROCS` for the benchmark; it does not describe a
+production deployment setting. The 3-second counts did not record processor
+temperature, so these results do not establish sustained thermal behavior.

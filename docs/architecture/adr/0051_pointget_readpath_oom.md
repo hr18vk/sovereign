@@ -1,39 +1,79 @@
 # ADR-0051: A per-shard PointGet retires the production read-path OOM
 
-- **Status:** RESOLVED — `engine.State()` is off the production point-read path; the read path is O(log N) and leak-free.
-- **Date:** 2026-09-08
-- **Core files:** NONE touched — all five merge-law/wire-schema files byte-identical (`crdt.go`, `crdt_apply.go`, `envelope.go`, `schema.capnp`, `schema.capnp.go`) before and after the change.
-- **Scope:** `State()` becomes test/probe-only for point reads. It is left unchanged — not deleted, not redesigned.
-- **Severity framing (honesty):** this is a severity elevation of a bound already disclosed in ADR-0032 §6 (the `State()` O(total-entries) read cost), not a new discovery. The OOM/availability reframing and the dominant-leak mechanism are the new content.
+**Status:** Accepted  
+**Date:** 2026-09-08
 
-## 1. ROOT CAUSE (physics, one sentence)
-`engine.State()` (crdt.go:1457) rebuilds the FULL merged HAMT on every call, and `Set`'s functional path-copying (hamt.go:199) allocates O(log N) new path nodes + a wrapper per `Set` while never retiring the intermediate roots — the retired view's `DecRef` (hamt_arena.go:942) frees only the subtree reachable from the FINAL root — so each `State()` call leaks O(N·log N) arena bytes monotonically, independent of the EBR grace window, until the 64 MiB arena OOMs as an allocation panic.
+## Context
 
-## 2. The defect measured (pre-fix tree)
-`TestPointGet_StateLeakNegativeControl`: 64 `State()` calls over 512 entities grew the arena high-water **8,876,096 → 43,509,944 bytes = +34.6 MB, ~541 KB/call**. At the verify harness's ~2000 sequential `/v1/get`s that is >1 GB of monotonic leak against a 64 MiB arena → the OOM panic. This test is both the standing defect proof and the negative control for the fix guard.
+ADR-0032 §6 had already disclosed that `State()` costs O(total entries). The availability impact
+became clear when repeated point reads exhausted the arena.
 
-## 3. The fix (no core-file touch) — `pkg/sync/point_get.go` (new)
-I added `func (e *DeltaCRDTEngine) PointGet(entityID string) []CRDTEntry`. `routeShard` (crdt.go:561) is a deterministic pure function of (entityID, routeSeed), so all of an entity's entries live in ONE shard → `e.shards[routeShard(id)].ptr.Load().Get(id)` is an O(log N) per-shard read (the `InsertLocal` access pattern, crdt.go:1042, run as a read). `HAMT.Get` (hamt.go:170) path-copies nothing. crdt.go is not edited.
+Each `State()` call rebuilds the merged HAMT. `Set` uses functional path copying, allocating
+O(log N) path nodes and a wrapper for every inserted entity, but the intermediate roots produced
+during the rebuild are not retired. Retiring the previous merged view releases only the subtree
+reachable from its final root. Repeated calls therefore grow arena use by O(N·log N), independently
+of the EBR grace window, until allocation panics against the arena's 64 MiB limit.
 
-- **EBR pin:** PointGet self-pins (`Acquire`→`Enter`→read+copy→`Release`). A nested pin under a caller's existing pin is safe: `Acquire` returns a distinct pool `Participant` (reclamation.go:97-99) and reclamation holds frees until the minimum epoch across all active participants (Enter/Exit, reclamation.go:133-143) — the inner Release drops only its own hold. This makes the previously-unpinned `handleGet` safe.
-- **Slice lifetime (copy-out):** `HAMT.Get` returns an arena-backed `unsafe.Slice` (crdtEntries, hamt.go:107-112) that dangles the instant the pin Releases (a concurrent CAS retires the shard root; after the 3-epoch grace the arena reuses the leaf's bytes). PointGet therefore copies the entity's entries out under the pin into a caller-owned slice. `CRDTEntry` is a 120-byte value type (no pointers, hamt.go:29-40), so the copy is a pure O(k) memcpy, GC-reclaimed, off the write hot path — categorically not the O(N·log N) monotonic arena leak.
+The pre-fix `TestPointGet_StateLeakNegativeControl` measured 64 `State()` calls over 512 entities:
+the arena high-water grew from 8,876,096 to 43,509,944 bytes, an increase of 34.6 MB or about
+541 KB per call. Extrapolating that rate across the verify harness's approximately 2000 sequential
+`/v1/get` requests exceeds 1 GB against the 64 MiB arena.
 
-## 4. The re-routed production point-reads
-- `handleGet` (control.go:532) — the `/v1/get` read.
-- `engineHAMTAdapter.LiveRead` (main.go:2535) — the resolver's read-your-writes live source (`/v1/query`). Its now-redundant outer EBR pin (which protected only the old arena-backed `State().Get` view) was removed; PointGet self-pins and copies out, so the pin protected nothing else.
-- `LatestPayload` (gossip.go:1166) — zero callers (verified), routed for consistency.
-- **Not touched:** the production MerkleRoot path already uses `MerkleRootFromShards`. The only remaining `State()` callers are the MerkleRoot/crash probes (probe.go:202, partition.go:254, probe.go:99) — test/probe path, out of scope. `State()` is not deleted (left unchanged).
+## Decision
 
-## 5. Regression guards (all bug-injection-proven, `-race` green)
-- **`TestPointGet_StateLeakNegativeControl` (negative control):** `State()`-in-a-loop grows the arena (§2). Proves the gauge detects leaks → the fix guard's "flat" is not vacuous.
-- **`TestPointGet_ArenaStaysFlat` (fix guard):** 40,000 `PointGet` reads over 512 entities leave the arena high-water **exactly flat** (235,960 bytes). A pure read allocates zero arena bytes.
-- **`TestPointGet_MatchesStateGet` (correctness):** `PointGet(k)` == `State().Get(k)` dot-set for 256 entities (multi-dot). Bug-inject wrong-shard → fails (`got []`, `want [0100…:1]`).
-- **`TestHandleGetSustainedReadsNoOOM` (the OOM killer, pkg/mesh):** 5,000 sustained `/v1/get` through the real `handleGet` over 1,000 entities → all 200, arena **exactly flat** at 392,712 bytes. Bug-inject `handleGet` back to `State().Get` → 300 reads leak **+350 MB (~1.17 MB/read)** → the guard is load-bearing.
-- **Test surface:** `go test ./pkg/sync/ ./pkg/mesh/ ./internal/database/` green.
+Add `(*DeltaCRDTEngine).PointGet(entityID string) []CRDTEntry` in `pkg/sync/point_get.go` and route
+production point reads through it. Leave `State()` unchanged for callers that need a merged view.
 
-## 6. Gates
-`go build`/`go vet` clean (no new findings beyond the by-name `unsafe.Pointer` exemptions); guards `-race` green; `TestHotPathZeroAllocations` PASS; the merge-law/wire-schema files unchanged.
+`routeShard` is a deterministic function of `(entityID, routeSeed)`, so all entries for an entity
+reside in one shard. PointGet loads that shard's HAMT root and calls `HAMT.Get`, giving an O(log N)
+lookup without path copying or arena allocation. It then copies the entity's k entries in O(k).
 
-## 7. Honesty / future work
-- `State()` still leaks by design (it is unchanged); it is simply no longer on the production point-read path. The tripwire against regression is the negative-control guard plus the absence of any production `State().Get` caller.
-- The 4-core `pkg/sync` full-suite run flaked once in the scaling physics-stress tests — the documented 4-core arena non-determinism under that stress, not this change: this change's `pkg/sync` footprint is add-only (two new files, zero modifications), and the suite is green on two consecutive re-runs. The 32-core run is the authoritative full-suite result, because the `TestScalingGate` crucible self-skips below 32 cores and a 4-core box cannot run it.
+Each call acquires and enters a distinct EBR `Participant`, reads and copies under that pin, and
+releases it afterward. Reclamation waits for the minimum epoch across active participants, so an
+inner PointGet cannot release a caller's outer pin. This also protects the previously unpinned
+`handleGet` path.
+
+`HAMT.Get` returns an arena-backed `unsafe.Slice`. A concurrent root replacement and the three-epoch
+grace period can make that memory reusable after the pin is released. PointGet therefore copies the
+values before releasing its pin. The returned slice belongs to the caller and is reclaimed by the
+Go garbage collector. `CRDTEntry` is a 120-byte value type with no pointers, so the copy has no
+remaining arena references.
+
+## Consequences
+
+`ControlServer.handleGet` now uses PointGet for `/v1/get`.
+`engineHAMTAdapter.LiveRead` uses it as the resolver's read-your-writes source for `/v1/query`; its
+outer EBR pin was removed because it had protected only the old arena-backed `State().Get` result.
+`Gossiper.LatestPayload` was also migrated for consistency, although it had no callers when this
+change was made.
+
+Point reads no longer construct a merged HAMT or allocate arena nodes. They still allocate a
+caller-owned Go slice proportional to the number of dots for the requested entity. Callers must not
+use PointGet after engine teardown.
+
+`State()` retains its existing cost and arena-growth behavior. The production Merkle root paths use
+`MerkleRootFromShards`, not `State()`. Apart from tests, the remaining `State()` caller is
+`WorkerExecuteCrashProbe`, which uses a merged view to prepare a deliberate crash in the test
+harness.
+
+## Evidence
+
+The regression tests ran under the race detector:
+
+- `TestPointGet_StateLeakNegativeControl` repeats the pre-fix measurement above, demonstrating that
+  the arena gauge detects the leak.
+- `TestPointGet_ArenaStaysFlat` performs 40,000 PointGet reads over 512 entities. The arena
+  high-water remains 235,960 bytes; the reads allocate no arena memory.
+- `TestPointGet_MatchesStateGet` compares PointGet and `State().Get` dot sets for 256 entities,
+  including multi-dot entities. Selecting the wrong shard makes the test fail.
+- `TestHandleGetSustainedReadsNoOOM` issues 5,000 `/v1/get` requests through the real `handleGet`
+  over 1,000 entities. Every request returns HTTP 200 and the arena remains 392,712 bytes. Routing
+  the handler back through `State().Get` makes 300 reads grow the arena by 350 MB, about
+  1.17 MB per read.
+
+Build, vet, the package tests, and `TestHotPathZeroAllocations` passed. The full `pkg/sync` suite
+was also run on a 32-core machine because `TestScalingGate` skips below 32 cores; a 4-core run
+cannot exercise that gate.
+
+The arena-leak negative control and the sustained HTTP test guard against returning production point
+reads to `State().Get`. The CRDT merge-law and wire-schema files were unchanged by this decision.

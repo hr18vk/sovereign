@@ -1,43 +1,41 @@
 # 7. Formal Specifications & Mechanically-Enforced Properties
 
-Sovereign operates under the strict assumption that hardware fails, networks partition, and OS schedulers are adversarial. This document records the **design-level formal specifications** of the engine's convergence and durability invariants, and maps each to the **Go tests that mechanically enforce** those properties at runtime.
+Sovereign Engine is designed for hardware faults, network partitions, and arbitrary OS scheduling. This document records design-level specifications for convergence and durability and identifies the Go tests that exercise the corresponding properties.
 
-> **Honesty caveat — what is and is not mechanically verified here.** I check no `.tla` file into this repository (`find . -name '*.tla'` returns zero hits), and I have never run a TLC model-checker against the engine. The TLA+ blocks below are **design-level specifications**: hand-authored models of the intended invariants, not machine-checked proofs. The mechanical enforcement of every property named in this document is carried by **Go tests** (property tests and mesh loopback guards), cited per-section below — not by a model checker. The section "What is NOT formally verified" at the end of this document states the precise boundary.
+> **Verification boundary.** No `.tla` files are checked into this repository, and no TLC model-checker run backs the specifications below. They are hand-written models of intended invariants, not proofs. The executable checks cited below are Go tests; their scopes and skip conditions are stated with them.
 
 ---
 
 ## 1. Conflict Resolution: Dot-Merge-Union Join + Lossless Read-Time Pick
 
-I gave the engine **no eager/lossy conflict-resolution operator**, by design, and that choice is load-bearing. ADR-0033 (`docs/architecture/adr/0033_toki_closure_ghost_exorcism.md`) records why I deleted the `internal/temporal_store/` module — early scaffolding that exposed an `LWWOperator.Resolve` returning `(winner, loser, audit)` with the caller **dropping** the loser — precisely because wiring that eager-lossy operator into `Join` would violate the CRDT convergence law (a dropped dot cannot re-merge across a foreign `AdvanceLamportTo` replay, so the CRDT would not converge across a crash-recovery gap — a convergence-law regression / data-corruption class). That module no longer exists in the tree; `grep -rn LWWOperator --include='*.go'` returns zero hits.
+Conflict resolution has two layers: `Join` retains every distinct causal dot, and the read path selects one live entry only when a caller requests a single value. [ADR-0033](adr/0033_toki_closure_ghost_exorcism.md) records the removal of `internal/temporal_store/`, whose `LWWOperator.Resolve` returned a winner and loser for eager last-writer-wins resolution. Dropping the loser during `Join` would violate the merge law. In particular, a dot discarded before entering state cannot be reintroduced by `AdvanceLamportTo`; replay would advance the clock without restoring the missing state. The current merge does not use that operator.
 
-Conflict resolution in the engine is therefore two-layered, both **lossless** (no dot is ever dropped from the data path):
+**Merge layer: `Join` unions causal dots.** `(*DeltaCRDTEngine).Join` in `pkg/sync/crdt.go` groups incoming entries by entity and merges each entity's entries by `(DotNodeID, DotCounter)`. `HAMT.Set(entityID, merged)` stores the resulting slice in the HAMT. `HashCausalDot(dot, digest)` is used separately to key entries in the IBLT; it does not key the HAMT. Duplicate dots are ignored, while distinct dots remain in live state. The result is a join-semilattice modulo causal-dot identity: monotone, idempotent, commutative, and associative.
 
-**Write-path / merge layer — `Join` is a dot-merge-union, NOT last-writer-wins.** `DeltaCRDTEngine.Join` (`pkg/sync/crdt.go:1173`) runs `perShardMerge` (`crdt.go:1329`): every incoming `CausalDot` is **inserted** into the append-only HAMT, keyed by `HashCausalDot(dot, digest)` (`crdt.go:1695`). No dot is dropped. `Join` is a join-semilattice: $\text{Join}(a, b) = a \cup b$ modulo causal-dot identity — monotone, idempotent, and commutative. This is the CRDT convergence law; it is the reason replicas converge.
+**Read layer: `selectLatestDot` picks from live entries.** `(*ControlServer).handleGet` and `(*Gossiper).LatestPayload` call `PointGet(entityID)` and pass the resulting entry slice to `selectLatestDot` in `pkg/mesh/gossip.go`. The selector orders entries by two fields:
 
-**Read-path / resolution layer — `selectLatestDot` is a lossless 2-dimensional pick.** When the query/control layer must report *one* value for an entity, `selectLatestDot` (`pkg/mesh/gossip.go:1131`) selects from the full dot set returned by `engine.PointGet(key)`. It is a **2-dimensional** deterministic pick, not a 7-dimensional cascade:
+1. `DotCounter`: the entry with the larger counter wins.
+2. `DotNodeID`: on a counter tie, `bytes.Compare` chooses the lexicographically smaller 16-byte node ID.
 
-1. **`DotCounter`** — the entry with the larger counter wins.
-2. **`DotNodeID`** — on counter tie, `bytes.Compare` of the 16-byte `DotNodeID`; the lexicographically smaller wins.
+The selector depends only on the slice contents, not their order. The node-ID tie-break is deterministic, not a causal ordering between origins. Unselected entries remain in the HAMT. `e.ebr.Retire` reclaims replaced or unpublished HAMT roots after compare-and-swap; it does not remove dots from live state. `/v1/get` and `LatestPayload` always read current live state. Historical selection by `txTime` belongs to `/v1/query`, which calls `Resolver.AsOf`.
 
-The loser **stays** in the append-only HAMT: the only `Retire` on the data path is epoch-based reclamation (`e.ebr.Retire`) of a superseded or never-published HAMT root after a CAS, which reclaims the old root's memory without removing any dot, and there is no `Prune`/`Reset` on the data path. A future query at a different `txTime` may pick a different winner. Both `handleGet` and `LatestPayload` route through this one selector, so `/v1/get` and the standalone accessor can never disagree on "latest" for the same entry slice. The pick is a pure function of `entries` (deterministic; independent of slice/map iteration order); the tie-break is a documented deterministic choice, not a causal claim — dots from different origins are not totally ordered by counter alone.
-
-The set of concurrent updates to the same entity is resolved to a single response value, deterministically, **without dropping any update from the data path**. This pick replaces the deleted 7-dimensional `CompareEvents` cascade, which modeled code that no longer exists.
+Concurrent updates to one entity can therefore produce one deterministic response without deleting the other updates from CRDT state. The deleted `CompareEvents` cascade ordered seven fields; the current live-read selector uses only the two fields above.
 
 ---
 
 ## 2. $\delta$-CRDT Convergence & Anti-Entropy
 
-The synchronization topology relies on exact anti-entropy over causal graphs via an off-heap HAMT. In `pkg/sync/crdt.go`, synchronization uses Invertible Bloom Lookup Tables (IBLT) to subtract replica states and peel the symmetric difference.
+Anti-entropy uses Invertible Bloom Lookup Tables (IBLTs) to subtract replica summaries and peel set differences before sending missing deltas. `GenerateDelta` falls back to full local state when subtraction or peeling fails. The HAMT holds current dot sets; the IBLT is the synchronization summary, not the store of record.
 
 ### $\delta$-CRDT Convergence — Design-Level Specification
 
-This specification models the IBLT subtraction, peeling success constraints (bounded by the table capacity), and the subsequent delta merging that guarantees eventual state convergence. It is a **design-level TLA+ specification**, not a model-checked proof (no `.tla` file is checked in; no TLC run has been executed — see the honesty caveat above). The join-semilattice axioms it names — commutativity, associativity, idempotence of `Join` — are **mechanically enforced by Go property tests**, not by a model checker:
+The `Delta_CRDT_Sync` model below abstracts those exchanges as sets. It expresses capacity-bounded peeling, full-state fallback, and join-based receipt of deltas. It has not been model-checked. These Go property tests exercise the merge laws on generated deltas:
 
-- `TestCRDTJoinCommutativity` (`pkg/sync/crdt_property_test.go:160`)
-- `TestCRDTJoinAssociativity` (`pkg/sync/crdt_property_test.go:189`)
-- `TestCRDTJoinIdempotence` (`pkg/sync/crdt_property_test.go:221`)
+- `TestCRDTJoinCommutativity` in `pkg/sync/crdt_property_test.go`
+- `TestCRDTJoinAssociativity` in `pkg/sync/crdt_property_test.go`
+- `TestCRDTJoinIdempotence` in `pkg/sync/crdt_property_test.go`
 
-These hold because `Join` is the dot-merge-union of §1 (`crdt.go:1173` + `perShardMerge:1329` + `HashCausalDot:1695`): set-union modulo causal-dot identity is a join-semilattice by construction.
+The tests sample the implementation's behavior; they are not proofs for arbitrary inputs. The `EventualConvergence` predicate states the intended condition when no messages remain. It is not a temporal-liveness formula, and it has not been checked by TLC.
 
 ```tla
 --------------------------- MODULE Delta_CRDT_Sync ---------------------------
@@ -52,12 +50,12 @@ Vars == <<replicaState, networkBuffer>>
 TypeOK ==
     /\ replicaState \in [Replicas -> SUBSET Keys]
     /\ networkBuffer \in SUBSET [
-         src: Replicas,
-         dst: Replicas,
-         type: {"Digest", "Delta"},
-         digestSeed: Nat,
-         payload: SUBSET Keys,
-         ibltCapacity: Nat
+         src          : Replicas,
+         dst          : Replicas,
+         type         : {"Digest", "Delta"},
+         digestSeed   : Nat,
+         payload      : SUBSET Keys,
+         ibltCapacity : Nat
        ]
 
 Init ==
@@ -116,16 +114,16 @@ ReceiveDelta(dst, msg) ==
     /\ networkBuffer' = networkBuffer \ {msg}
 
 Next ==
-    \E A, B \in Replicas:
+    \E A, B \in Replicas :
         \/ /\ A /= B
            /\ SendDigest(A, B)
-        \/ \E msg \in networkBuffer:
+        \/ \E msg \in networkBuffer :
              \/ ReceiveDigest(B, msg)
              \/ ReceiveDelta(B, msg)
 
-(* Invariant: Replicas eventually converge to the supremum of all replica states *)
+(* Intended condition when no messages remain: all replica states are equal *)
 EventualConvergence ==
-    \A A, B \in Replicas: (networkBuffer = {}) => (replicaState[A] = replicaState[B])
+    \A A, B \in Replicas : (networkBuffer = {}) => (replicaState[A] = replicaState[B])
 =============================================================================
 ```
 
@@ -133,18 +131,18 @@ EventualConvergence ==
 
 ## 3. Deterministic Chaos Simulator Constraints
 
-The `internal/chaos/supervisor.go` component guarantees system survival and transaction durability across un-catchable process faults (e.g. `SIGSEGV` triggered during off-heap manipulation).
+`internal/chaos/supervisor.go` runs the engine in a separate worker process connected by stdin/stdout pipes. A worker crash closes its pipe; the supervisor starts a fresh worker that replays the WAL. The supervisor does not own a `net.Listener`: the daemon front end, or the test process, owns it outside the worker's failure domain.
 
-The primary safety invariant is: **The client listener must remain alive, and all unacknowledged or written WAL payloads must be durably replayed upon worker recovery.**
+The model below covers listener survival and reconstruction of database state from the WAL. In the implementation, `Submit` retries an interrupted submission once after recovery and returns an error if that retry fails.
 
 ### Supervisor/Worker Isolation — Design-Level Specification
 
-This is a **design-level TLA+ specification** of the supervisor/worker isolation invariants, not a model-checked proof (no `.tla` file is checked in; no TLC run has been executed — see the honesty caveat above). The invariants it names are **mechanically enforced by Go tests**:
+The following Go tests exercise specific parts of this design:
 
-- `TestSIGSEGVSurvival` (`internal/chaos/survival_test.go:62`) — the listener-survival + worker-reboot invariant under an un-catchable `SIGSEGV`.
-- `TestWALRecoveryDeterminism` (`internal/chaos/wal_test.go:49`) — WAL replay determinism across a worker crash/recovery.
-- `TestRecoveryDeterminism_KillRebuildMerkleEqual` (`pkg/durability/bridge_test.go:111`) — kill → rebuild yields a Merkle-equal recovered state.
-- `TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual` (`pkg/durability/snapshot_test.go:265`) — pre- and post-checkpoint recovery are Merkle-equal (snapshot determinism).
+- `TestSIGSEGVSurvival` in `internal/chaos/survival_test.go` is intended to check that a TCP connection remains usable while an external worker crashes and recovers with an equal Merkle root. It skips in `-short` mode or when `CHAOS_WORKER_BIN` is unset. When the variable is set, the test ignores the supplied path and unconditionally attempts to build `./cmd/chaos-worker/`. That directory is absent from this tree, so the test fails before creating a worker and provides no current end-to-end crash-survival result.
+- `TestWALRecoveryDeterminism` in `internal/chaos/wal_test.go` checks the recovered Merkle root and Lamport clock after WAL replay, without spawning a process.
+- `TestRecoveryDeterminism_KillRebuildMerkleEqual` in `pkg/durability/bridge_test.go` closes the live engine and WAL, rebuilds from the WAL, and compares roots and Lamport clocks.
+- `TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual` in `pkg/durability/snapshot_test.go` compares bounded and full recovery over the same origin-only WAL and requires both roots to equal the live root.
 
 ```tla
 --------------------- MODULE Supervisor_Worker_Isolation ---------------------
@@ -158,7 +156,7 @@ VARIABLES
     unackedSubmits,  \* SUBSET [id: Nat]
     supervisorState  \* {"Normal", "Recovering"}
 
-Transactions == [id: Nat]
+Transactions == [id : Nat]
 
 Init ==
     /\ workerState = "Alive"
@@ -168,7 +166,7 @@ Init ==
     /\ unackedSubmits = {}
     /\ supervisorState = "Normal"
 
-(* Client submits a transaction to the Supervisor's open socket *)
+(* Client submits a transaction while the front-end listener is open *)
 ClientSubmit(tx) ==
     /\ listenerState = "Listening"
     /\ supervisorState = "Normal"
@@ -198,42 +196,42 @@ SupervisorRecovery ==
     /\ supervisorState = "Recovering"
     /\ workerState' = "Alive"
     /\ supervisorState' = "Normal"
-    /\ dbState' = {wal[i]: i \in 1..Len(wal)}
+    /\ dbState' = {wal[i] : i \in 1..Len(wal)}
     /\ UNCHANGED <<listenerState, wal, unackedSubmits>>
 
 Next ==
-    \/ \E tx \in Transactions: ClientSubmit(tx)
-    \/ \E tx \in unackedSubmits: WorkerCommit(tx)
+    \/ \E tx \in Transactions : ClientSubmit(tx)
+    \/ \E tx \in unackedSubmits : WorkerCommit(tx)
     \/ WorkerCrash
     \/ SupervisorRecovery
 
 (* Formal Invariants *)
 
-(* Invariant 1: The Supervisor's TCP listener socket is NEVER closed by a crash *)
+(* Invariant 1: A worker crash does not close the front-end listener *)
 ListenerNeverClosed ==
     listenerState = "Listening"
 
 (* Invariant 2: No committed transaction in the WAL is ever lost *)
 NoCommittedDataLoss ==
-    \A i \in 1..Len(wal):
+    \A i \in 1..Len(wal) :
         (workerState = "Alive" /\ supervisorState = "Normal") => wal[i] \in dbState
 =============================================================================
 ```
 
-These design-level specifications model the intended runtime logic of Sovereign under edge-triggered network partitions and off-heap execution environments. They are not machine-checked; their invariants are enforced by the Go tests cited in §2 and §3.
+The first model covers set reconciliation; the second covers worker replacement and WAL reconstruction. Neither models the production network, storage format, or all crash timings. The Go tests exercise specific implementations and scenarios; they do not turn these design models into general proofs.
 
 ---
 
-## What is NOT formally verified
+## What is not formally verified
 
-To state the boundary precisely, the following are **not** mechanically proven for this engine:
+The boundary is as follows:
 
-- **No TLA+ / TLC.** No `.tla` file is checked into the repository (`find . -name '*.tla'` returns zero hits), and I have never executed a TLC model-checker run against the engine. Every TLA+ block in this document is a hand-authored design-level specification — design prose, not an extracted or checked artifact. The "formal verification" the engine actually performs is by Go test, not by model checker.
+- **No checked TLA+ artifact.** No `.tla` files are checked into the repository, and no TLC result backs the models in this document. They are hand-written specifications, not artifacts extracted from the Go implementation or checked by a theorem prover.
 
-- **No mechanical proof of the (now-deleted) 7-dimensional total order.** The `CompareEvents` cascade over `(SystemTime, PayloadDigest, ValidTimeStart, AssertionTime, ValidTimeEnd, H3Index, EntityID)` modeled a `LWWOperator` in `internal/temporal_store/toki.go` that no longer exists (ADR-0033). I never extracted it to `.tla`; it is now deleted dead code, and I rejected wiring its eager-lossy `Resolve` into `Join` as a CRDT convergence-law regression. The real read-path pick is the 2-dimensional `selectLatestDot` (`gossip.go:1131`) — see §1.
+- **No proof of the deleted seven-dimensional order.** The `CompareEvents` cascade over `(SystemTime, PayloadDigest, ValidTimeStart, AssertionTime, ValidTimeEnd, H3Index, EntityID)` belonged to the removed `internal/temporal_store/toki.go`. It was not extracted to `.tla`, and its eager-lossy `Resolve` is not part of `Join`. The current read-path selector is the two-field `selectLatestDot` described in §1.
 
-- **Convergence is enforced by Go property tests + mesh loopback guards, not a model checker.** The join-semilattice axioms are property-tested (`TestCRDTJoinCommutativity` / `Associativity` / `Idempotence`, §2). Cross-replica root-equality is enforced by the mesh loopback guards — `TestLoopbackConverges100` and `TestLoopbackConverges10K` (`pkg/mesh/loopback_convergence_test.go:717` / `:867`) assert that all nodes converge to one Merkle root (with `TestLoopbackConverges100NegativeControl` at `:776` as the `RED CONTROL` that proves the guard is not a tautology), and `TestPQ_HybridE2EConverges` (`pkg/mesh/pq_hybrid_test.go:365`) covers the hybrid-PQ transport. These are the mechanically-enforced convergence proofs.
+- **Convergence tests have defined scopes.** The property tests in §2 exercise the merge laws on generated deltas. In `pkg/mesh/loopback_convergence_test.go`, `TestLoopbackConverges100` inserts keys into one of 100 in-process engines and requires equal non-empty roots. It skips in `-short` mode and on hosts with fewer than 32 logical CPUs. `TestLoopbackConverges100NegativeControl` has the same skip conditions, drops every delta to one engine, and requires divergence. `TestLoopbackConverges10K` checks 10,000 keys across eight in-process engines and skips in `-short` mode. `TestPQ_HybridE2EConverges` in `pkg/mesh/pq_hybrid_test.go` covers a two-engine mesh with hybrid signing and verification enabled. These are in-process tests, not multi-machine or WAN results.
 
-- **The 3/5-node convergence tests check cardinality and key-presence, NOT Merkle-root equality.** `TestCRDTEngine_ThreeNodeConvergence` and `TestCRDTEngine_FiveNodeConvergence` (`pkg/sync/crdt_test.go:299` / `:357`) assert only `state.Len()` and `state.Get(key)!= nil` per node — i.e. that every node ends up holding every key. They do **not** assert that the nodes' Merkle roots are equal. Merkle-root equality across replicas is enforced by the mesh loopback guards named above, not by these unit tests. I do not claim root-equality for the 3/5-node tests.
+- **The three-node and five-node convergence tests check cardinality and key presence.** `TestCRDTEngine_ThreeNodeConvergence` and `TestCRDTEngine_FiveNodeConvergence` in `pkg/sync/crdt_test.go` assert `state.Len()` and `state.Get(key) != nil` for each engine. They do not compare Merkle roots. Root equality across replicas belongs to the loopback tests named above, not these unit tests.
 
-- **No mechanical proof of the durability invariants beyond the Go tests.** The supervisor/WAL/snapshot invariants of §3 are enforced solely by `TestSIGSEGVSurvival`, `TestWALRecoveryDeterminism`, `TestRecoveryDeterminism_KillRebuildMerkleEqual`, and `TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual` (cited in §3). There is no model-checker or theorem-prover artifact backing them.
+- **Durability checks are scenario-specific.** The other tests cited in §3 cover WAL replay, close-and-rebuild recovery, and bounded snapshot recovery. `TestSIGSEGVSurvival` is intended to add a process-crash scenario, but the build failure described above means it supplies no current end-to-end result. There is no model-checker or theorem-prover artifact backing a general durability claim.

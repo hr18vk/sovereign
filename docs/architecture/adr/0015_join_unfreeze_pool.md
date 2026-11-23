@@ -1,68 +1,73 @@
-# ADR-0015: Unfreeze crdt.go — Pool the Join Incoming Buffer + Per-Block Merge Scratch
+# ADR-0015: Pool the Join hot path's incoming buffer and per-block merge scratch
 
 **Status:** Accepted
 **Date:** 2026-08-01
-**Author:** Harsh Rawat
-**Supersedes:** ADR-0014 §6 (crdt.go frozen classification)
+**Supersedes:** The restriction on editing `Join` in [ADR-0014](0014_ingest_alloc_hardening.md)
 
 ---
 
 ## §1. Context
 
-The ingest alloc hardening recorded in ADR-0014 reduced the
-ingest alloc ceiling 638→538 allocs/op (−15.7%, FIX C: value-return `ReconstructedEntry`). The
-post-FIX-C alloc profile isolated the frozen-locked alloc ceiling owned by `crdt.go:1173-1446`
-(the Join body):
+[ADR-0014](0014_ingest_alloc_hardening.md) reduced the integrated receive path from 638 to
+538 allocs/op (−15.7%), measured with 100 deltas per frame on four cores, by returning
+`ReconstructedEntry` by value. The resulting allocation profile isolated two costs inside
+`(*DeltaCRDTEngine).Join`:
 
-| Source | Alloc % | Location |
-|--------|---------|----------|
-| `Join.func3` (perShardMerge) | 33.6% | `incomingBlock := make([]CRDTEntry, ...)` + `merged := make([]CRDTEntry, ...)` per block per shard per Join |
-| `Join` direct (incoming buffer) | 26.0% | `var incoming []incomingEntry` + `append` per yielded entry; escapes via `sort.Slice` capture |
-| `capnp.Ptr.Text` | 29.8% | `EntityId` `string(b)` retain — `api/capnp/api/capnp/schema.capnp.go` frozen; irreducible without a Join signature change |
-| `ReconstructEntry` | 7.5% | `string(payloadBytes)` retained field (ADR-0014 FIX A residual) |
-| `circl` verify | 2% | amortized |
+| Source | Allocation share | Cause |
+|--------|------------------|-------|
+| Per-block merge scratch in `Join` | 33.6% | A new incoming block and merged slice for every block, shard, and Join |
+| Incoming buffer in `Join` | 26.0% | Append growth while collecting entries from the delta |
+| `capnp.Ptr.Text` | 29.8% | The entity-ID string retained during reconstruction on the ingest path |
+| `ReconstructEntry` | 7.5% | The `string(payloadBytes)` retained in `ReconstructedEntry.Payload` |
+| `circl` signature verification | 2% | Amortized across the deltas in a frame |
 
-**Join-owned ceiling:** 33.6% + 26.0% = 59.6% of 538 allocs/op — ALL in the `Join` body.
+The first two sources account for 59.6% of the 538 allocs/op profile. Unlike the Cap'n Proto
+and reconstruction costs, they can be addressed inside `Join` without changing its signature.
 
-The `Join` body was frozen (deliberately not edited, ADR-0014 §6) to protect three
-physical contracts while the pipeline was being built out. I unfreeze it here BECAUSE those
-contracts are proven — and the pool is on the CALLER side of each contract boundary.
+`Join` had been left unchanged while the surrounding ingest path was built so that its merge,
+reclamation, and layout behavior had a stable reference point. This decision permits buffer
+reuse on the caller side of those boundaries; it does not change the merge rule or wire format.
 
 ---
 
-## §2. The 3 Proven Contracts (the teeth that gate the unfreeze)
+## §2. Contracts Preserved by the Change
 
 ### C1 — Determinism
-`Join` NEVER touches `stateViewMu` (grep-verified across the full body). The determinism
-contract is: `routeShard` (pure `maphash` over a fixed `routeSeed`) + `sort.Ints(shardOrder)`
-(deterministic shard order) + the per-shard dot-merge. A pooled buffer does NOT change
-the CAS order, the retire order, or the merge result. The Merkle root stays a pure
-function of the dot set. **PROVEN-CONTRACT SAFE.**
 
-### C2 — EBR Reclamation
-`maybeAdvanceEpoch()` is called ONCE per Join (`crdt.go:1441`) + `Retire` per successful
-per-shard CAS (`crdt.go:1418`). Pooling the incoming buffer does NOT touch either.
-Pool buffers recycle via `sync.Pool`, NOT `ebr.Retire` — a pool buffer passed through
-`Retire` would corrupt the arena freelist. `TestJoinPool_DoesNotRetirePoolBuffers` catches
-this. **PROVEN-CONTRACT SAFE.**
+`Join` does not acquire `stateViewMu`. It routes entity IDs with `routeShard`, using
+`maphash` and a fixed `routeSeed`, sorts the selected shard indices with
+`sort.Ints(shardOrder)`, and merges dots independently within each shard. Reusing a buffer
+does not change the CAS order, retirement order, or merge result. The resulting Merkle root
+remains a function of the applied dot set.
+
+### C2 — EBR reclamation
+
+`maybeAdvanceEpoch` runs once per Join after its EBR participant exits. A replaced shard root
+is retired after a successful CAS; an unpublished candidate is retired after a failed CAS.
+The pooled incoming and scratch slices have a separate owner: they return through
+`sync.Pool`, never through `(*EBRManager).Retire`. Retiring a Go heap pointer into the
+off-heap arena's free list would corrupt later allocations.
 
 ### C3 — 57.6M ops/s
-The 57.6M contract is per-shard `atomic.Pointer` CAS linearizability (`shardRoot` struct,
-`CacheLinePad`-padded at `crdt.go:78`). Pooling a Join-local incoming buffer is on the
-CALLER side of the CAS; it cannot change the CAS. **PROVEN-CONTRACT SAFE.**
+
+At the time of this decision, 57.6M ops/s was the residency high end of the separate
+in-process CRDT core benchmark at 32 cores. It was not a Join or ingest throughput
+measurement, and the number itself is not the linearizability contract. The relevant contract
+is the per-shard `atomic.Pointer` CAS in `shardRoot`. Buffer pooling takes place before that
+CAS and does not alter it.
 
 ### C4 — Alignment
-`CRDTEntry` size and alignment unchanged. `shardRoot` field layout unchanged. The
-`fieldalignment` CI gate and `TestCRDTEntry_SizeAndAlignment` confirm. **PROVEN-CONTRACT SAFE.**
+
+The change adds no fields to `CRDTEntry` or `shardRoot`. Their size, alignment, and cache-line
+padding remain unchanged, checked by `TestCRDTEntry_SizeAndAlignment` and the layout analysis.
 
 ---
 
 ## §3. Decision
 
-### FIX J1 — Pool the incoming buffer (claim the 26% Join-direct)
+### Pool the incoming buffer
 
-Replace `var incoming []incomingEntry` + append-per-entry with a `sync.Pool`-backed
-`joinBuffers` struct:
+Replace the function-local `var incoming []incomingEntry` with a `sync.Pool` of buffers:
 
 ```go
 type joinBuffers struct {
@@ -70,171 +75,188 @@ type joinBuffers struct {
     blockScratch []CRDTEntry
     mergeScratch []CRDTEntry
 }
+
 var joinBufPool = sync.Pool{New: func() any { return &joinBuffers{} }}
 ```
 
-- `buf := joinBufPool.Get().(*joinBuffers)` at Join entry
-- `incoming := buf.incoming[:0]` — zero-length slice backed by the pooled array
-- `buf.incoming = incoming` — store the final slice after sort+dedup
-- `defer` Put back to pool (reset `[:0]`)
+At Join entry, get a `joinBuffers` value and reslice `buf.incoming` to zero length. The delta
+iterator appends into that slice, reusing its backing array when capacity allows. Store the
+collected slice in `buf.incoming`. A deferred cleanup truncates it to zero length and returns
+the buffer to the pool.
 
-**Net:** The GROWTH reallocs (the append doubling) recycle across Join calls. The
-slice-header escape from `sort.Slice` SURVIVES (the closure captures the slice header)
-— honest scope: this is a POOLING win, not a zero-alloc win. The irreducible escape
-is removed by the follow-up PreSorted Seq contract that removes the sort.
+Pooling recycles append-growth allocations across Join calls. It does not make Join
+allocation-free: a cold pool still allocates, and the delta iterator can let the slice header
+escape. The initial analysis of the surviving sort allocation was later corrected, as §5
+explains.
 
-### FIX J2 — Pool the per-block merge scratch (claim the 33.6% func3)
+### Reuse per-block merge scratch
 
-Replace `incomingBlock := make([]CRDTEntry, r.end-r.start)` and
-`merged := make([]CRDTEntry, 0, needed)` in `perShardMerge` with the `joinBuffers`
-scratch slices:
+Use the remaining fields in `joinBuffers` instead of allocating an incoming block and merged
+slice for every entity block:
 
-- `buf.blockScratch` — checked/grown to `br.end-br.start`, sliced `[:needed]`
-- `buf.mergeScratch` — checked/grown to `len(existing) + len(incomingBlock)`, sliced `[:0]`
-- After `Set` (which copies into the HAMT arena), `buf.mergeScratch = merged[:0]` captures
-  any capacity growth from append
+- Grow `buf.blockScratch` to the incoming block length and copy that block into it.
+- Grow `buf.mergeScratch` to hold the existing and incoming entries, then reslice it to zero
+  length for the merge.
+- After `HAMT.Set` copies the merged entries into arena storage, assign `merged[:0]` back to
+  `buf.mergeScratch` so any capacity growth is retained.
 
-**Net:** The per-block `make()` calls recycle WITHIN one Join (the scratch is reused across
-blocks in the `perShardMerge` closure). The HAMT `Set` copies the data; the scratch is
-free to reuse immediately.
+The same scratch arrays serve subsequent entity blocks and CAS retries within the call.
+`HAMT.Set` does not retain these slices, so they can be reused immediately after it returns.
 
-### FIX J3 — NOT NOW (the 29.8% capnp Text + the Seq signature)
+### Defer sequence and entity-ID changes
 
-Deferred to the follow-up. Requires a Join signature change to accept arena-backed keys
-OR a pre-counted sorted batch. Ripples to `pkg/sync/crdt_apply.go` (frozen) + the capnp path.
+Changing the entity-ID string retention or the `Join` sequence signature is outside this
+decision. Those changes cross reconstruction, delta application, and Cap'n Proto decoding
+boundaries and require separate treatment. A pre-sorted sequence was proposed for later work,
+but this change neither implements nor depends on it.
 
-### Scope of the unfreeze
+### Scope
 
-This change unfreezes and edits `crdt.go` only (the Join buffer pool). The four other
-frozen files (`pkg/sync/crdt_apply.go`, `api/capnp/api/capnp/schema.capnp`,
-`api/capnp/api/capnp/schema.capnp.go`, `pkg/attribution/envelope.go`) are left
-unchanged.
-
----
-
-## §4. Cold-Start vs Steady-State
-
-A pool does NOT make the first Join zero-alloc. It recycles across sustained load.
-
-| Scenario | B/op | allocs/op | ns/op |
-|----------|------|-----------|-------|
-| **PRE (pre-fix):** JoinParallel, 4c, steady | 546 | 9 | 2725 |
-| **POST (this change):** JoinParallel, 4c, steady | 131 | 6 | 2765 |
-| **Delta:** | −415 (−76.0%) | −3 (−33.3%) | ±1.5% (noise) |
-
-The steady-state reclaims the growth reallocs. The cold-start cost (the first Join
-after a GC, when `sync.Pool` is cleared) is unchanged — `sync.Pool` is GC-weak
-and the New func grows fresh. The bench's `b.RunParallel` is steady-state by
-construction (the warm apply runs before measurement).
+The change is limited to `(*DeltaCRDTEngine).Join` and its private buffer types. It does not
+change `CRDTEntry`, `shardRoot`, the Cap'n Proto schema, or the dot-merge rule.
 
 ---
 
-## §5. The Post-Change Residual (honest ceiling)
+## §4. Cold Start and Steady State
 
-| Source | Alloc % | Status |
-|--------|---------|--------|
-| `capnp.Ptr.Text` (EntityId string retain) | 29.8% | deferred (arena-pooled PreSorted Seq) |
-| `ReconstructEntry` string(`payloadBytes`) | 7.5% | ADR-0014 FIX A residual (production path discards; 2 tests assert) |
-| `circl` verify | 2% | amortized |
-| Slice-header escape (`sort.Slice` capture) | irreducible | removed by the follow-up PreSorted Seq contract |
-| Pool cold-start (first Join after GC) | 1-2% | `sync.Pool` is GC-weak; documented, not fixable |
+Pooling reduces allocations after the buffers have grown; it does not eliminate first-use
+allocation. The recorded `BenchmarkCRDTEngine_JoinParallel` comparison used four cores and
+steady-state operation:
 
-The steady-state `incoming` GROWTH (J1) and per-block `make()` (J2) are recycled. The
-remaining per-Join allocs are the irreducible escape from `sort.Slice` (the closure
-captures the slice header) + the capnp string retain + the ReconstructEntry field.
+| Measurement | B/op | allocs/op | ns/op |
+|-------------|------|-----------|-------|
+| Before this change | 546 | 9 | 2725 |
+| After this change | 131 | 6 | 2765 |
+| Change | −415 (−76.0%) | −3 (−33.3%) | +1.5% (within run-to-run noise) |
+
+The reduction comes from reusing the incoming array and per-block scratch. A new buffer starts
+with zero-length, nil slices, and `sync.Pool` may discard retained buffers during garbage
+collection. A Join that receives a fresh buffer therefore pays the original growth cost again.
+These steady-state figures do not bound that cold path.
 
 ---
 
-## §6. Verification results
+## §5. Remaining Allocations and the Later Sort Change
 
-| Contract | Test | Verdict |
-|------|------|---------|
-| — | `go build ./...` | PASS |
-| — | `go vet` (pre-existing `unsafe.Pointer` only) | PASS |
-| — | `gofmt` (corrected 1 indentation drift) | PASS |
-| C1 | `TestJoinDeterminism_PooledVsUnpooledMerkleEqual` | PASS — Merkle `57cde666` == `57cde666` |
+| Source | Allocation share | Status after this decision |
+|--------|------------------|----------------------------|
+| `capnp.Ptr.Text` entity-ID retain | 29.8% | Unchanged; outside `Join`, on the integrated ingest path |
+| `ReconstructEntry` payload string | 7.5% | Unchanged; production applies the entry but discards this field |
+| `circl` signature verification | 2% | Unchanged and amortized across a frame |
+| Sort and iterator escapes | Not removed by pooling | The sort spill was addressed later by ADR-0022 |
+| Pool cold start after GC | 1-2% | Unchanged; a fresh buffer must grow its slices |
+
+The Cap'n Proto and reconstruction percentages describe the integrated ingest profile, not
+`BenchmarkCRDTEngine_JoinParallel`, which constructs its deltas directly and does not call
+either path.
+
+This decision initially attributed the surviving sort cost to comparator closure capture.
+Escape analysis later distinguished two mechanisms: `sort.Slice` spilled the slice header
+through its reflection-based interface parameter, while the `delta.Entries` yield callback
+was the escaping closure. [ADR-0022](0022_zero_alloc_join.md) replaced `sort.Slice` with
+`slices.SortFunc` and a package-level comparator, removing the sort spill. It retained a full
+sort because generated deltas walk HAMTs in hash order, not lexical entity order. The yield
+callback remains a separate allocation source.
+
+---
+
+## §6. Evidence
+
+The following results were recorded for this change. ADR-0022 records the later measurements
+for the sort change; they do not replace the baseline established here.
+
+| Contract | Check | Recorded result |
+|----------|-------|-----------------|
+| Build | `go build ./...` | PASS |
+| Build | `go vet` | PASS; existing `unsafe.Pointer` findings unchanged |
+| Build | `gofmt` | PASS |
+| C1 | `TestJoinDeterminism_PooledVsUnpooledMerkleEqual` | PASS; both Merkle roots began `57cde666` |
 | C1 | `TestRecoveryDeterminism_KillRebuildMerkleEqual` | PASS |
 | C1 | `TestWALRecoveryDeterminism` | PASS |
-| C2 | `TestJoinPool_DoesNotRetirePoolBuffers` | PASS — 2 Retire calls, ZERO on pool buffers |
+| C2 | `TestJoinPool_DoesNotRetirePoolBuffers` | PASS; two `Retire` sites, neither receiving a pool buffer |
 | C2 | `TestHAMTSetReclamationGuard` | PASS |
 | C2 | `TestTreiberStackABAImmunity` | PASS |
 | C2 | `TestEBRHazardPointerSequencing` | PASS |
 | C3 | `TestScalingGate` | PASS |
 | C3 | `TestHotPathZeroAllocations` | PASS |
 | C4 | `TestCRDTEntry_SizeAndAlignment` | PASS |
-| — | `BenchmarkCRDTEngine_JoinParallel` (no regression) | PASS — ns/op within noise (+1.5%) |
-| — | the alloc-regression tooth (`bench_alloc_regression_test.go`, 5.8 allocs/delta ceiling) | PASS |
-| — | the four other frozen files unchanged (no core bleed) | PASS |
+| C4 | `fieldalignment` | No layout change |
+| Benchmark | `BenchmarkCRDTEngine_JoinParallel` | Allocation reduction in §4; ns/op change +1.5%, within noise |
+| Ingest | `TestBenchAllocNoRegression` | PASS; 5.8 allocs/delta ceiling at N=100 |
 
 ---
 
-## §7. Honest Weaknesses
+## §7. Consequences and Limitations
 
-(a) **Slice-header escape survives `sort.Slice` capture.** The pool reduces GROWTH, not the
-escape — the sort.Slice closure captures `incoming` as a closure variable, which escapes
-the slice header to heap. A follow-up removes the sort via a PreSorted Seq contract.
+(a) **Pooling does not remove slice-header escapes.** It reuses backing arrays; it cannot by
+itself keep the incoming slice or iterator callback off the heap. ADR-0022 removed the
+reflection-based sort spill, while the yield-callback escape remains.
 
-(b) **`sync.Pool` is GC-pressure-sensitive.** Under `GOGC`, the pool is cleared on GC.
-The pool softens, not eliminates, the GC storm at `GOGC=off`. The first Join after a GC
-is a fresh grow (unpooled cost).
+(b) **Reuse depends on garbage-collection behavior.** `sync.Pool` may drop entries during GC,
+so the allocation benefit varies with pool survival and workload. It is not a stable memory
+reservation or a guarantee of reuse.
 
-(c) **Pool cold-start.** The first Join after a GC grows fresh — the pool's New function
-returns a zero-valued `joinBuffers`. The GROWTH amortizes across subsequent Joins
-(steady-state), but the cold-start cost is unchanged from the unpooled baseline.
+(c) **Cold calls still grow buffers.** The pool's `New` function returns a zero-valued
+`joinBuffers`. Its slices have no spare capacity until appended to, so steady-state figures
+do not describe the first use of a fresh buffer.
 
-(d) **The 29.8% capnp Text residual.** `EntityId` `string(b)` retain in
-`api/capnp/api/capnp/schema.capnp.go` (Orchestrator). The follow-up requires a Seq
-signature change to support arena-backed keys.
+(d) **The entity-ID string retain is unchanged.** The 29.8% allocation share belongs to the
+Cap'n Proto reconstruction path outside `Join`. Removing it requires a change to that path,
+not another Join-local cache.
 
-(e) **The 7.5% ReconstructEntry string retain.** The ADR-0014 FIX A kept the `Payload` field
-as a `string` because 2 tests assert it. The production path discards it; the unit
-tooth guards it.
+(e) **The payload string retain is unchanged.** `ReconstructedEntry.Payload` remains a string
+for the reconstruction tests and callers that inspect it, although the production apply path
+discards it. This accounts for 7.5% of the historical integrated profile.
 
-(f) **The crdt.go unfreeze widens the blast radius.** A future Join edit is no longer
-blocked by the freeze. The contract teeth (C1–C4) are the new guard.
+(f) **Later Join edits must re-verify the contracts.** Determinism, EBR ownership, CAS
+behavior, and layout checks remain necessary. The buffer-pool tests do not establish those
+properties for unrelated changes.
 
-(g) **Per-block scratch capacity retained across blocks.** If blocks within one Join
-have wildly different sizes, the merged scratch grows to the max (cap retained across
-blocks). This is a capacity retention, not a leak — the pool recycles it across Joins.
+(g) **Scratch capacity follows the largest block.** A large entity block grows the scratch
+arrays retained by later blocks and later calls. This is reachable capacity rather than a
+leak, but it can increase memory held until the pool entry is discarded.
 
-(h) **The per-shard shardBatches map allocates** (map[int][]blockRange) on every Join.
-A follow-up could pool this too, but it's a small allocation (<1% of the ceiling).
+(h) **Shard grouping still allocates.** The `map[int][]blockRange` and shard-order slice are
+outside the pool. The historical profile attributed less than 1% of the allocation ceiling to
+the map, so this decision leaves it unchanged.
 
 ---
 
-## §8. Self-Adversarial Review
+## §8. Objections Considered
 
-1. **A pool buffer Retire'd through EBR corrupts the freelist.** A pool buffer put through
-   `ebr.Retire` would write a GC-managed heap pointer into the EBR arena freelist. The next
-   `Alloc` from the arena would return a pointer into the Go heap, not the arena — eventual
-   double-free or use-after-free. `TestJoinPool_DoesNotRetirePoolBuffers` catches it: it
-   reads `crdt.go` source and asserts all `Retire` calls are on shard-pointer CAS targets only.
+### A pool buffer could enter the EBR free list
 
-2. **A pool shared across goroutines.** `sync.Pool` is per-P. Under `RunParallel`, each P has
-   its own pool, so the bench's goroutines do not contend on it. A production mesh with one
-   Join goroutine per CPU has the same benefit. Recorded honestly; no fix.
+That would put a Go heap pointer into the off-heap arena, allowing a later arena allocation
+to return that pointer and causing reclamation errors. `TestJoinPool_DoesNotRetirePoolBuffers`
+inspects every `Retire` call in `Join` and rejects references to the pool buffers. Only shard
+roots and unpublished HAMT candidates are retired.
 
-3. **The deferred Put runs AFTER the slice escaped to sort.** The deferred Put resets `[:0]`
-   then puts back. The `[:0]` on an escaped slice is safe (the backing array is preserved;
-   length resets). The sort-capture reference is gone by the time the defer runs (sort is
-   synchronous, defer runs after return). Safe by inspection.
+### Concurrent Join calls could share scratch space
 
-4. **The per-block scratch can race if Join were reentrant.** Join is NOT reentrant (it holds
-   no engine lock, but is single-threaded per delta). The pool is per-join-call-local (the
-   `buf` variable is local to the Join call), NOT engine-shared. Safe by construction.
+`sync.Pool` is safe for concurrent use, but its per-P implementation is not a guarantee that
+calls never contend or that a value returns to the same P. Buffer safety instead comes from
+ownership: once checked out, a `joinBuffers` value is referenced only by that Join call until
+its deferred return. Concurrent calls receive distinct values.
 
-5. **A frozen-file edit could be done silently (no disclosure).** The discipline is that
-   any edit to a previously-frozen file is disclosed openly in the ADR, not slipped in
-   quietly. This ADR discloses the crdt.go unfreeze explicitly and re-gates the contracts
-   it protects.
+### The deferred return could reuse an escaped slice too early
 
-One closing note on discipline: the engine's core had been frozen as a tripwire while the
-contracts were proven. Unfreezing it is an act of trust in the teeth, not a repeal of the
-discipline. If the C1–C4 teeth ever fail, the correct response is to revert and re-freeze.
+Delta iteration and sorting are synchronous and finish before the deferred cleanup runs.
+Truncating the slice changes its length without overwriting its backing array. The merge
+scratch is also safe to reuse because `HAMT.Set` copies its contents into arena storage before
+returning.
+
+### Reusing scratch across blocks could corrupt an earlier merge
+
+Each block is copied into the HAMT before the next block reuses the arrays. A failed CAS can
+repeat the merge with the same scratch because no candidate from the failed attempt is
+published, and the failed candidate itself is retired through EBR rather than through the
+pool.
 
 ---
 
 ## §9. References
 
-- `docs/architecture/6_ENGINEERING_POST_MORTEM.md` — the 57.6M/CSA/alignment contracts
-- `ADR-0014` — the ingest alloc hardening (the post-FIX-C baseline)
+- [ADR-0014](0014_ingest_alloc_hardening.md) — the integrated receive-path allocation baseline.
+- [ADR-0022](0022_zero_alloc_join.md) — the sort-spill analysis and `slices.SortFunc` change.
+- [Engineering post-mortem](../6_ENGINEERING_POST_MORTEM.md) — the core benchmark, CAS, and
+  alignment context.

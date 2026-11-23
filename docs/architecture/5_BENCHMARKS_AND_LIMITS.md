@@ -1,178 +1,166 @@
-# 5. Benchmarks and Limits — The Silicon Wall
+# 5. Benchmarks and Limits
 
-## 5.1 The Throughput Record
+## 5.1 Core Stack Throughput
 
-The authoritative throughput measurement is
-`TestScalingGate` (`scaling_gate_test.go`) executed with `RUN_CRUCIBLE=1`
-on a 32-core AWS Graviton (arm64, c8g.8xlarge) instance. The gate runs the
-rewritten asymmetric producer-consumer burst crucible across `GOMAXPROCS` tiers
-$\{4, 8, 16, 32\}$ and asserts both linearizability at every tier and an
-absolute throughput $\geq 50{,}000{,}000$ ops/s on the 32-core tier.
+[`TestScalingGate`](../../pkg/sync/stack_scaling_gate_test.go) is an opt-in,
+in-process benchmark of [`ShardedStack`](../../pkg/sync/sharded.go). With
+`RUN_CRUCIBLE=1`, it drives asymmetric producer, consumer and mixed bursts
+through `Push` and `Pop` at `GOMAXPROCS` tiers $\{4, 8, 16, 32\}$. Tiers above
+the host's `NumCPU` are omitted, and the test is skipped in short mode.
 
-The table below is this tree's recorded run (2026-09-03, Go 1.26.1; the full
-gate output is preserved in `docs/evidence/core-crucible.txt`):
+At every tier, the test walks the surviving stack and checks that its node
+count equals pushes minus successful pops. The walk also rejects cycles,
+duplicate nodes and out-of-pool indices. This is a conservation check, not a
+complete linearizability proof. The reported ops/s counts every push and pop
+attempt, including empty pops. The highest eligible tier must reach at least
+50,000,000 ops/s; the test does not require a minimum parallel efficiency.
 
-| `GOMAXPROCS` | Throughput (ops/s) | Speedup vs 4c | Parallel efficiency | Linearizable |
+The benchmark does not call `HAMT.Set`. It omits Ed25519 verification,
+envelope decoding, network I/O, TLS and WAL persistence.
+
+The published per-tier receipt is
+[`core-crucible.txt`](../evidence/core-crucible.txt), recorded on 2026-09-03
+on an AWS c8g.8xlarge (Graviton4, arm64) with Go 1.26.1:
+
+```bash
+RUN_CRUCIBLE=1 go test -v -run TestScalingGate -cpu=32 -count=1 ./pkg/sync/
+```
+
+| `GOMAXPROCS` | Throughput (ops/s) | Speedup vs 4c | Parallel efficiency | Conservation |
 |---:|---:|---:|---:|:---|
 | 4 | 45,722,911 | 1.00× | 100.0% | OK |
 | 8 | 59,481,186 | 1.30× | 65.0% | OK |
 | 16 | 85,096,809 | 1.86× | 46.5% | OK |
 | 32 | 68,278,197 | 1.49× | 18.7% | OK |
 
-> **PROVENANCE (read before quoting):** The table above is the recorded
-> `TestScalingGate` output from this tree's 32-core re-run on 2026-09-03
-> (`docs/evidence/core-crucible.txt`; AWS c8g.8xlarge, ARM64 Graviton4 CPU part
-> `0xd4f`, Go 1.26.1, `RUN_CRUCIBLE=1 go test -v -run TestScalingGate
-> -cpu=32 -count=1 ./pkg/sync/`). The gate asserts at least 50,000,000 ops/s
-> absolute; the recorded gate-passing **floor** across runs is **50,736,038
-> ops/s**, and this run measured **68,278,197 ops/s** at 32 cores, so the honest
-> reproducible range is **50.7M–68.3M ops/s**. These are **CORE microbench**
-> numbers — `HAMT.Set` push/pop only, NO Ed25519 verify, NO envelope unmarshal,
-> NO network, NO TLS, NO persistence. The production **ingest** path is a
-> different, lower layer: **5.7M–6.0M deltas/sec at 32 cores** (verified Ed25519
-> + CRDT apply + envelope, `docs/evidence/ingest-ed25519.txt`), roughly 8–12×
-> below the core figure precisely because it includes the per-frame signature
-> verify the core omits. Quoting the core number as the engine's ingest rate is
-> a **layer mismatch**.
-
-Two properties of the recorded run deserve emphasis:
-
-- **The 16-core tier out-runs the 32-core tier** (85.1M vs 68.3M ops/s; a 1.86×
-  speedup at 16 cores against 1.49× at 32). This is not a measurement error — it
-  is the silicon wall made visible. Past 16 cores the added cross-core coherence
-  traffic crosses the CMN-700 mesh saturation threshold, so the extra 16 cores
-  contribute more stall than useful work and the aggregate throughput *drops*.
-  §5.2 explains the mechanism.
-- **The gate is on absolute ops/s, not on parallel efficiency.** The 32-core
-  tier clears the 50M mandate at 1.49× speedup even though its parallel
-  efficiency is 18.7%.
-
-The recorded gate-passing floor of 50,736,038 ops/s is **1.015× the 50M absolute
-mandate (~1.5% headroom)**; this tree's 2026-09-03 re-run measured 68,278,197
-ops/s at 32 cores, ~37% above the mandate. Linearizability is verified at every
-tier (`drained == surplus`, drain OK).
+All four tiers passed the conservation check in this run. The 32-core tier
+reached 68,278,197 ops/s with 18.7% parallel efficiency, while the 16-core
+tier reached the higher aggregate rate. These are measurements of this
+benchmark on the named host, not a throughput guarantee for other machines.
 
 ### 5.1.1 Per-Core Decomposition
 
-The throughput figures above are *whole-engine* — i.e., they count push and pop
-operations across all producers and consumers. The per-core decomposition
-clarifies where the silicon budget is spent:
+The table reports aggregate attempts across all goroutines. Dividing that rate
+by the core count gives an average per-core operation interval, not a request
+latency:
 
-- At the 4-core baseline, throughput is **45,722,911 ops/s / 4 cores = 11.43M
-  ops/s/core** — each core completes one operation every ≈ 87 ns. At this tier
-  the working set is largely L1/L2-resident, so most of the per-core budget goes
-  to the operation itself rather than to coherence traffic.
-- At 32 cores, the per-core rate at the measured operating point is **68,278,197
-  / 32 = 2.13M ops/s/core** (one operation every ≈ 469 ns per core) — a *drop*
-  from the 4-core rate, not because software got slower, but because the
-  cross-core coherence traffic consumed the budget that the L1/L2 hit pools
-  dominated at 4 cores. The 16-core tier sits between at 5.32M ops/s/core while
-  posting the *highest* aggregate of the run. This is the empirical signature of
-  the silicon wall: the silicon scales only as long as the *cross-core* traffic
-  stays below the mesh saturation threshold.
+- At 4 cores, 45,722,911 ops/s is 11.43M ops/s per core, or approximately
+  87 ns per operation.
+- At 16 cores, 85,096,809 ops/s is 5.32M ops/s per core.
+- At 32 cores, 68,278,197 ops/s is 2.13M ops/s per core, or approximately
+  469 ns per operation.
 
-The throughput does not scale linearly with cores because the algorithm
-explicitly prioritizes the per-core latency bound over cross-core parallelism.
-The mandate was a *rate* bound, not a *speedup* bound.
+The falling per-core rate and the 16-core-over-32-core inversion show that
+adding cores does not provide linear scaling for this workload.
 
-## 5.2 The Silicon Wall
+### 5.1.2 In-Process Receive Path
 
-The barrier to infinite linear scaling is the physical interconnect, not any
-software lock. Three structural limits bound the 32-core result:
+[`BenchmarkBatchedVerifyParallel`](../../pkg/receive/bench_silicon_test.go)
+measures a different layer. Its timed loop calls `Receiver.HandleBatchFrame`,
+which performs origin lookup, Ed25519 verification, batch-envelope decoding
+and CRDT application. It does not include network I/O, TLS, WAL persistence
+or ingest metrics.
 
-### 5.2.1 L3 And CMN-700 Mesh Saturation
+The benchmark constructs and signs each frame before timing and warms the
+engine with one application. Timed iterations then reapply the same deltas,
+so the CRDT joins are idempotent. The result is an in-process receive-path
+measurement, not networked or durable production ingest throughput.
 
-The 32 cores share a single L3 instance and its CMN-700 mesh. Every
-cross-core cache-line migration — a free-path CAS hitting a shard not owned by
-the issuing core — is a HITM on the mesh. The mesh transports a finite number
-of such lines per nanosecond. Once the producers' cross-shard free rate exceeds
-the mesh's serialized line-transfer rate, the producers stall on the coherence
-protocol waiting for line ownership, and the aggregate throughput is capped by
-the mesh rather than the cores' issue width. The Home-Shard SEC Allocator
-maximizes the *ratio* of in-shard (private-L2) traffic to cross-shard (mesh)
-traffic by scattering frees across all 64 home shards, but it cannot reduce the
-cross-shard traffic to zero — the remaining traffic is the silicon wall, and it
-is exactly what the 16-core-over-32-core inversion in §5.1 measures.
+The [receive-path receipt](../evidence/ingest-ed25519.txt), recorded on
+2026-09-15 on the same instance type, reports the shared single-origin path at
+5,681,818 deltas/sec with N=100 and 6,024,096 deltas/sec with N=256. Each
+figure appears in two measured samples. These rates count deltas, while the
+core benchmark counts stack operation attempts; neither rate can be substituted
+for the other.
 
-### 5.2.2 Memory Bandwidth Limit
+## 5.2 Scaling Limits
 
-The off-heap arena is `mmap`'d anonymous memory. Every miss-bearing operation
-pulls a cache line from the DDR5 memory controller's bandwidth. A 128-byte
-arena allocation that is not L2-resident costs one full DRAM fetch per fill.
-At the measured operating points (the 50.7M–68.3M ops/s range) with a working
-set larger than L2, the fetch rate saturates the memory controller's concurrent
-request budget before the cores stall. The engine's hot-page pinning (`mlock` +
-`Prefault`) keeps the *index* pages resident so the working set fits the L3, but
-the data-window pages evict under churn and their re-fault competes for the same
-DRAM bandwidth.
+### 5.2.1 Cache-Coherence Traffic
 
-### 5.2.3 The Legacy Single-Locus Collapse — A Reference Limit
+`ShardedStack` has 64 stack shards with a 128-byte stride. A push normally uses
+the caller's P-local shard. A pop starts there but can probe other shards when
+the local stack is empty. Per-goroutine caches hold recycled node indices;
+cache refills and overflow drains use the caller's local pool shard, probing
+others when necessary.
 
-The legacy single-locus SEC gate
-(`TestEliminationCrucibleScalingGate`, deliberately superseded and skipped
-with an explicit recorded reason on `main`) is the *reference* silicon wall: it
-measures the same physical engine, but with the allocator's free locus
-collapsed to one shared cache line. Its result — **1.1M ops/s at 32 cores
-(1.6% parallel efficiency)** — is the throughput of the mesh bandwidth devoted
-to one shared-line HITM storm. The Home-Shard Allocator restores the throughput
-budget to the 50.7M–68.3M range (gate-passing floor 50,736,038; this-tree
-re-run 68,278,197) by dispersing that single locus across 64 home-shard lines.
-This demonstrates that the 32-core silicon wall under the single-locus design
-was *not* a memory-bandwidth limit but a *coherence-serialization* limit; the
-home-sharded design moves the wall to the next physical layer (DRAM bandwidth
-under L3 misses).
+This layout disperses contention, but cross-shard probes and pool spills still
+transfer cache-line ownership between cores. On Graviton4 those transfers use
+the CMN-700 interconnect. The recorded 16-core-over-32-core inversion is
+consistent with coherence traffic growing faster than useful work. The receipt
+contains no hardware-counter breakdown, so it does not quantify the separate
+contributions of the interconnect and memory system.
 
-## 5.3 The Sub-Millisecond Latency Story
+### 5.2.2 Arena and Residency Boundaries
 
-The design target is a sub-millisecond tail latency, not merely a high
-sustained rate. The engine clears it on six fronts:
+`TestScalingGate` measures `ShardedStack` over an `ElimNodePool`; it does not
+allocate HAMT nodes in the mmap-backed `HamtArena`. The 128-byte value above is
+the stack-shard stride, not an arena allocation size.
 
-| Latency tax | Standard Go engine | Sovereign Engine mitigation |
-|:--------------------------|:---------------------------------------|:---------------------------------------------|
-| GC pause | `gcBgMarkWorker` scan + STW sweeps | Zero-GC: hot path never allocates on heap |
-| Major page fault | Unbounded disk I/O stall | `mlock` hot index pages → `majorFaultsDelta = 0` |
-| Mutex contention | OS scheduler futex | Lock-free CAS + Home-Shard SEC |
-| Cache-coherence stall | False-shared line bouncing | 128-byte stride discipline |
-| Deserialization | Reflection / per-field decode | Cap'n Proto zero-copy, struct-level access |
-| Network round-trip | Synchronous quorum | Asynchronous $\delta$-CRDT lattice join |
+For HAMT storage, cache misses and page faults can add DRAM traffic and stalls,
+but the core table does not measure either effect. `HamtArena` provides
+`LockHotPages`, `PrefaultPages` and `PrefaultHot` helpers in
+[`residency.go`](../../pkg/sync/residency.go). The first two are exercised by
+residency tests; none of the three is called by production node startup. The
+published throughput therefore does not depend on a production `mlock` or
+prefault phase, and it does not establish a major-page-fault bound for a
+running node.
 
-## 5.4 Honest Caveats, Per "Absolute Honesty"
+### 5.2.3 Historical Single-Locus Baseline
 
-- **The 32-core gate-passing floor is 50,736,038 ops/s (~1.5% headroom over the
-  50M absolute mandate); this tree's 2026-09-03 re-run measured 68,278,197 ops/s
-  at 32 cores.** On repeated clean runs the figure ranged 50.7M–68.3M ops/s; the
-  gate passed on every retry, but the parallel *efficiency* at 32 cores is 18.7%
-  (the gate is on *ops/s*, not efficiency). The Home-Shard SEC allocator is a
-  real, measured improvement — throughput rose from the collapsed single-locus
-  1.1M ops/s floor to the 50.7M–68.3M range, roughly 46×–62× — with
-  linearizability preserved and `-race` clean. (A separate measurement records
-  ~13× over the 4.0M ops/s prior-design baseline, a different denominator for
-  the same allocator rewrite; both ratios are real, measured against different
-  baselines.) But the engine does **not** scale near-linearly: the 18.7%
-  efficiency at 32 cores is the silicon wall described in §5.2, not a tunable
-  defect.
-- **OS-level Chaos Mesh manifests are authored but not executed end-to-end.**
-  The in-memory `VirtualNet` half is verified. The chaos gate is driven entirely
-  by the in-repo `VirtualNet` in `internal/chaos/virtualnet.go` plus the
-  partition-injection logic in `internal/chaos/partition.go`; no external
-  manifests are required. The external half would require Chaos Mesh ≥ 2.x, but
-  no kubelet was present in the build sandbox. The convergence property is
-  identical across the two halves; only the failure-injection locus differs.
-- **Pre-existing unrelated environment gaps** — `internal/database` requires
-  CGo + the `jemalloc/jemalloc.h` header; `cmd/ocr-plugin` requires `pkg-config`
-  — are documented gaps unrelated to the verified gates and were not modified to
-  satisfy this benchmark.
+[`TestEliminationCrucibleScalingGate`](../../pkg/sync/elimination_test.go) is
+the retired single-locus scaling test. It remains in the tree but is skipped
+because `TestScalingGate` covers the current sharded implementation. The
+[engineering post-mortem](6_ENGINEERING_POST_MORTEM.md) records its historical
+result as 1.1M ops/s at 32 cores with 1.6% parallel efficiency.
 
-## 5.5 The Engine's Final State
+That baseline explains why the allocator was sharded; it is not a current
+performance result. Dispersing stack and free-list contention across 64 loci
+removes the single shared head, but it does not eliminate cross-shard
+coherence traffic or memory-bandwidth limits.
 
-The verification suite is complete. The test inventory across `pkg/sync` and
-`internal/chaos` is **145 `func Test` functions** (125 in `pkg/sync`, 20 in
-`internal/chaos`, per `grep -rhn '^func Test'`); the suite records **62 PASS / 0
-FAIL / 11 SKIP** for `pkg/sync` under `-short` (the 11 SKIPs are the heavy,
-opt-in stress tests, still asserting when enabled). The suite passes with exit
-0; the legacy superseded gate is retained as a historical record and skipped
-with a recorded reason. The work is measured, not marketed: every performance
-assertion in this suite traces to a physically executed `go test` on a named
-piece of silicon, and every design choice traces to a hardware constraint —
-cache lines, the MESI protocol, the L3/CMN-700 mesh, and the DRAM controller
-bandwidth. The silicon wall is real, named, and reached.
+## 5.3 Latency Scope
+
+The design includes several latency-related mechanisms, but the throughput
+tables do not measure end-to-end or tail latency:
+
+- The sharded stack has zero-allocation tests for its push/pop hot path. That
+  result does not extend to the receive benchmark, whose receipt reports heap
+  allocations.
+- The stack uses atomic compare-and-swap operations rather than a mutex. Other
+  parts of the receive path do take locks, so the stack's design is not a
+  lock-free claim for the whole engine.
+- Batch envelopes use Cap'n Proto struct-level access rather than reflection.
+  Envelope decoding is included in the receive benchmark; network transport is
+  not.
+- Delta-CRDT joins do not require a synchronous quorum. Convergence, read
+  freshness and WAL durability are separate properties with their own tests.
+
+A sub-millisecond tail remains a design target, not a result established by
+these benchmarks. The per-core intervals in §5.1.1 are arithmetic averages and
+must not be quoted as request-latency measurements.
+
+## 5.4 Reproduction and Interpretation
+
+Run the receive-path benchmark with the command recorded in its receipt:
+
+```bash
+go test -run '^$' -bench=BenchmarkBatchedVerifyParallel -benchmem \
+  -count=3 -cpu=32 ./pkg/receive/
+```
+
+Use the instance type and toolchain named in each receipt when comparing
+absolute rates. A host with fewer than 32 cores does not reproduce the full
+core table: `TestScalingGate` omits unsupported tiers and applies its absolute
+throughput threshold to the highest eligible tier. Host load and a different
+processor or memory system can change both results.
+
+The core command and the receive command measure different operations. Neither
+one measures a client-observed, networked, durable write rate.
+
+## 5.5 Fault-Injection Scope
+
+The partition tests use [`VirtualNet`](../../internal/chaos/virtualnet.go) and
+its [orchestrator](../../internal/chaos/partition.go) to drop, duplicate, delay
+and reorder messages in memory, then compare Merkle roots after healing. They
+do not inject operating-system network or filesystem faults. No external
+Kubernetes fault-injection result is claimed here.

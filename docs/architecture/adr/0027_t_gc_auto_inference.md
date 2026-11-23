@@ -1,134 +1,168 @@
-# ADR-0027: T_gc Auto-Inference — Track the Observed Live-Query txTime Frontier and Feed `max(operatorFloor, observedFrontier - backoff)` into the Unchanged DominancePrune
+# ADR-0027: Infer the GC floor from the observed live-query frontier
 
-**Status:** Accepted
+**Status:** Accepted  
 **Date:** 2026-08-08
-**Author:** Harsh Rawat
-**Builds on:** ADR-0020 §6a (which recorded the `T_gc` auto-inference as the next piece of work and the telemetry-honesty prerequisite for it), ADR-0025 (the DominancePrune O(N·H) sweep whose unchanged body this change feeds a new horizon source into), ADR-0026 (the OTel-Init work whose counter-fill discipline this change extends: the three new counters are constructed in `init()` AND `rebuildCounters()` AND listed in `allCounters()`), ADR-0023 §0.f (the property this change relies on: the metrics bridge auto-surfaces new counters on `/metrics` with no bridge edit).
 
-I designed this change against a written design draft, then re-verified each of the draft's load-bearing premises against the source before shipping. Five did not survive contact with the bytes. §0.b–§0.e record the corrections; §7 tabulates them. The load-bearing one is §0.c: the equivalence tooth as drafted cannot catch an inferrer off-by-one, because DominancePrune is a pure, unchanged function fed the same horizon on both sides — the byte-identity holds by construction and proves something narrower than the draft claimed.
+## Context
 
----
+ADR-0020 made `CompactionConfig.PruningHorizonInt64Ns` a static transaction-time
+retention floor. Dominance pruning drops a row only when a newer,
+interval-containing row is at or below that floor. Setting the floor too low
+allows pruning that the operator did not intend; setting it too high retains
+history the workload has moved past.
 
-## §0. Root cause (one sentence) + the premise corrections
+Every `Resolver.AsOf` call already carries the transaction time being served,
+but that observation did not reach the compactor. The operator therefore had to
+estimate the live-query frontier when configuring the floor. ADR-0025 retained
+automatic inference as follow-up work, and ADR-0026 supplied the telemetry
+initialization needed to expose it.
 
-**§0.a ROOT CAUSE:** the DominancePrune `(C3)` floor (`CompactionConfig.PruningHorizonInt64Ns`) was a static operator knob the engine never advanced — the operator had to guess the live-query txTime frontier (the highest txTime a live `AsOf` would ever serve) and set `T_gc` once; set too low, the prune admitted a dominator the operator forbade (the txTime-gap silent-data-loss class ADR-0020 closed, its ), and set too high, the prune refused a drop the workload had gone past (the Level-2 prune's value eroded to Preserve-All). The engine already observes the frontier — every `AsOf` call carries the txTime the query served — but never fed the observation back into the prune. This change closes that: the Resolver tracks the observed live-query txTime frontier at `AsOf` entry (`internal/database/query.go:237`, the `txTimeNs := transactionTime.UnixNano()` line); the compaction scheduler reads it and feeds `effective = max(operatorFloor, observedFrontier - backoff)` into the unchanged DominancePrune call (`internal/database/l1_compactor.go:710` — the load-bearing seam). The inferrer floors the operator knob (does not replace it): the operator-set `PruningHorizonInt64Ns` becomes the hard floor backstop the inferrer never goes below, and the inferrer advances the effective horizon above it as the workload's txTime frontier moves. The monotone clamp is loud: a retreat is refused, counted, and logged — the class stays closed; the horizon is never silently lowered.
+The inference must not lower a horizon after rows have been dropped at a higher
+one. Such a retreat would make previously removed rows necessary again for
+historical reads. It also must not enable pruning: the default remains
+preserve-all unless the operator explicitly enables it with a positive floor.
 
-**§0.b Premise correction #1 (the "a second call" misread).** The design draft's §2.b read: "Feed the inferrer with operatorFloor=1000 … a second call: operatorFloor=6000 …". Against the bytes: the operator floor is captured at construction (`NewL1Compactor` reads `cfg.PruningHorizonInt64Ns` before the loud coerce may zero it) and stored in the immutable `horizonInferrer.operatorFloor` field — it is not a per-call argument. A "second call" with a different operatorFloor is a second compactor (the floor is construction-time and immutable; `EffectiveHorizon` is a pure function of `observedFrontier` against the fixed floor and backoff). The honest tooth builds two compactors (one per operatorFloor) and asserts `EffectiveHorizon` on each. The "second call" framing was a misread of the construction-time floor capture; corrected in the tooth and disclosed in §7.
+## Decision
 
-**§0.c Premise correction #2 (the load-bearing one — the equivalence tooth as drafted cannot catch an inferrer off-by-one).** The draft's §2.c claimed the equivalence tooth "re-gates the prune-equivalence tooth at the inferrer-fed horizon," implying it might catch an inferrer off-by-one. Against the bytes: the tooth as drafted feeds the same inferrer-computed horizon to both the `dominancePruneReference` oracle and the `DominancePrune` sweep. `DominancePrune` is a pure, unchanged function, so identical input implies identical output by construction: `survivorsByteIdentical` cannot fail, and an inferrer off-by-one is invisible to this tooth (both sides get the same wrong int; the byte-identity holds vacuously). The draft's claim is false on the bytes. The off-by-one is caught by the floor tooth (asserts `max(1000, 5000-500) == 4500` directly) and by the real-LocalFS round-trip tooth (the no-op control proves the advance is load-bearing via the `RowsPruned` delta). The equivalence tooth's real value is proving the prune function is byte-identical under the new horizon source — the inferrer's `max()` output is a valid int64 horizon the unchanged `DominancePrune` consumes, with no type or order shift. The tooth is written honestly, with this disclosure baked into the test's doc-comment and the §7 table.
+### Observe a monotone query frontier
 
-**§0.d Premise correction #3 (the gauge-scrape scientific-notation trap).** The bridge tooth's first run failed: the gauge `QueryTxTimeHighWaterMark.Set(7_777_777)` scraped as `7.777777`, not `7777777`. Against the bytes: the Prometheus text format renders gauge values ≥ 1e6 in scientific notation (`7.777777e+06`); the `scrapeCounterValue` parser (`pkg/metrics/recorder_test.go:61`) stops at the `e` exponent marker (it parses the integer and fractional parts, not the exponent), so it returns `7.777777` for `7.777777e+06`. The earlier counters (small cumulative Inc-based counts) never triggered it; the large-nanosecond gauge values this change adds did. The fix: choose gauge values < 1e6 (e.g. `777777`) so the text format renders them as plain integers the parser handles; the "the gauge reports the last-Set value, live" claim is asserted identically at < 1e6 (the absolute magnitude is irrelevant to the claim). The `scrapeCounterValue` scientific-notation limitation is a pre-existing residual, not a defect this change introduced; a future change may extend the parser to handle the exponent. Disclosed in §6 and §7.
+Add the package-private `pruningFrontierObserved int64` field to `Resolver`.
+After computing `transactionTime.UnixNano()`, `AsOf` calls
+`observeQueryTxTime`, which implements an atomic maximum with a load and
+compare-and-swap loop. `QueryTxTimeFrontier` returns the atomic value.
 
-**§0.e Premise correction #4 (the counter-registry teeth hardcoded 12 and a 1-gauge split).** The registry count grew 12 → 15 (the three inferrer counters), so the distinct-count tooth was updated 12 → 15. A second tooth also hardcoded `const wantDistinct = 12` and asserted exactly one gauge (`OffHeapAllocatedBytes`). This change adds two more gauges (`QueryTxTimeHighWaterMark` and `PruningHorizonEffective`), so the gauge count grew 1 → 3 and the counter count 11 → 12 (the retreat-refuse counter is a `modeCounter`), and the second tooth's gauge assertion failed on the 12→15 shift. The fix: update both teeth — `wantDistinct` 12 → 15 and the gauge/counter split 1+11 → 3+12 — with the honest-growth disclosure (the invariant — no duplicate names, the bridge scales as append — is unchanged; only the counts and the split shifted). A sweep of all test files for hardcoded 12/24 count assertions caught the second tooth before the gate. (The count has grown further with later disclosure counters; the update discipline is unchanged.)
+The observation occurs before storage listing, so it advances even when the
+query later returns `ErrEntityNotFound`. A lower historical query cannot reduce
+the maximum. The stored value is an integer number of nanoseconds, not a
+`time.Time`, and a no-advance observation performs no allocation.
 
-**§0.f CONSTRAINT — the counter registry auto-surfaces new counters (ADR-0023 §0.f, byte-verified).** The bridge (`pkg/metrics/telemetry_bridge.go`) enumerates `telemetry.Counters()` at `NewTelemetryBridge` (line 110) and dispatches on `Mode()` at `Collect` (line 185: `ModeCounter` → `CounterValue`, `ModeGauge` → `GaugeValue`). A new counter added to `allCounters()` is auto-surfaced on `/metrics` with zero bridge edit. This change byte-verifies that: the bridge file is unchanged (the `TestBridgeAutoSurfacesNewCounters` tooth's git byte-identity check passed), yet the three new counters appear on `/metrics` (HELP + TYPE + value line) — the two gauges report the last-Set values, the counter the cumulative. The construction-vs-distinct trap (a counter missing from `rebuildCounters()` silently drops to nil under `--otel`) is disarmed for the three new counters: each is constructed in `init()` AND `rebuildCounters()` AND listed in `allCounters()` (the fill discipline from ADR-0026; the `TestInferCountersNonNilPostInit_Subproc` tooth asserts non-nil post-Init).
+The frontier describes queries already observed on this resolver. It is not a
+proof about future queries; the configured floor and backoff remain the
+operator's retention controls.
 
-**§0.g CONSTRAINT — the qualification posture is unchanged.** This change advances the Level-2 prune (the `T_gc` auto-inference). It does not touch the single-writer root-equality qualifier (the one the core `crdt.go` blocks; the foreign-state-not-WAL-captured residual). The honest-disabled posture is preserved — the inferrer is inert when pruning is off (`EnableDominancePruning=false`): `SetInferredHorizon` still advances the horizon, but `DominancePrune` is skipped at the seam (the `l1_compactor.go:540` enable gate), so the effective horizon advances but no rows drop, and the operator-visible gauges still surface the inferrer's state — the audit trail the static knob lacked.
+### Derive and clamp the effective horizon
 
-## §1. Context
+Give `L1Compactor` an immutable `horizonInferrer` containing the operator floor
+and `CompactionConfig.PruneBackoffInt64Ns`, both captured by `NewL1Compactor`.
+`EffectiveHorizon` computes:
 
-The engine's Level-2 prune (ADR-0020) drops a merged row R at the L0→L1 compaction seam iff a retained R′ satisfies `(C1) sysTime(R') > sysTime(R)` AND `(C2) [vs', ve') contains [vs, ve)` AND `(C3) sysTime(R') <= T_gc` — the `(C3)` floor `T_gc` is the transaction-time GC horizon (the load-bearing claw closing the txTime-gap silent-data-loss class: a row dropped at horizon H1 is in the gap if the horizon retreats to H0 < H1, so the floor is a floor, not a high-water mark, and a live query at txTime < T_gc must still see R). ADR-0020 made `T_gc` an operator-set static knob (`CompactionConfig.PruningHorizonInt64Ns`); the engine never auto-prunes (the operator's retention policy). ADR-0020 §6a named the `T_gc` auto-inference as the next piece of work: the engine should track the observed live-query txTime frontier itself and feed it back into the `(C3)` floor, so the operator's role moves from "guess the frontier" to "set the safety floor and the backoff window." The OTel-Init work (ADR-0026) made the telemetry honest under a real Meter — the prerequisite. This change implements the auto-inference.
+```text
+max(operatorFloor, observedFrontier - backoff)
+```
 
-The inferrer floors the operator knob (does not replace it): `effective = max(operatorFloor, observedFrontier - backoff)`. The operator-set `PruningHorizonInt64Ns` is the hard floor backstop (the inferrer never admits an effective horizon below it — the §0.a contract; the txTime-gap class stays closed); the backoff tolerates forensic queries `backoff` nanoseconds into the recent past (a burst of stale-txTime queries does not collapse the floor to the distant past in one pathological query). The monotone clamp is loud: `SetInferredHorizon` advances `cfg.PruningHorizonInt64Ns` (the same field `DominancePrune` reads at `l1_compactor.go:710` — unchanged) iff the candidate is strictly greater than the current effective; a retreat is refused, counted (`PruningHorizonRetreatRefused`), and logged. The `DominancePrune` function body is unchanged — this change replaces the horizon source, not the prune.
+The operator floor is not a per-call argument. Tests that need a different floor
+construct another compactor.
 
-## §2. The contract teeth (RED → GREEN)
+`SetInferredHorizon` advances `PruningHorizonInt64Ns` only when the candidate is
+strictly greater than the current value. A lower candidate leaves the horizon
+unchanged, increments `PruningHorizonRetreatRefused`, and writes a warning.
+`InferHorizon` reads the resolver frontier, computes and applies the effective
+horizon, and updates the two gauges described below. A nil resolver leaves the
+configuration unchanged.
 
-Eight new teeth, ten sub-teeth across four test files, all gated and green. The split across packages is import-cycle-forced: `internal/database/prune_horizon_inference_test.go` carries the in-package teeth (they reach the unexported `Resolver.observeQueryTxTime` seam, `L1Compactor.EffectiveHorizon`/`SetInferredHorizon`, and the `DominancePrune` pure function); `pkg/durability/tgc_infer_test.go` carries the real-`*LocalFS` round-trip tooth (the real-LocalFS helpers live there; the import cycle forces the route tooth out of `internal/database`); `internal/telemetry/infer_counters_test.go` carries the registry tooth; `pkg/metrics/bridge_inferrer_counters_test.go` carries the bridge-enumeration tooth (the bridge and scrape helpers live there).
+The scheduler calls `InferHorizon(resolver)` before per-entity
+`CompactionByHash8`. The setter and compaction run on the scheduler goroutine
+between sweeps; concurrent calls with compaction are not supported.
 
-- **T-INFER-ASOF-OBSERVES** (`TestInferAsOfObserves` + `TestInferAsOfObservesConcurrentRace`): drives `AsOf` with increasing txTime over an empty-dir Resolver (the seam fires at `AsOf` entry, `query.go:237`, before the storage list, so the frontier advances even though `AsOf` returns `ErrEntityNotFound`); asserts `QueryTxTimeFrontier()` equals the last/highest txTime; a forensic query (lower txTime) leaves the frontier unchanged — the observation is a max, not a last-writer. The concurrent sub-tooth drives 3,200 `AsOf` goroutines racing the atomic-max under `-race`; the frontier ends at the global max with 0 races (the CAS-loop atomic-max is race-free). RED control: a last-writer observation would collapse the frontier on the forensic query.
+The node exposes `--compaction-prune-backoff-ns` as a duration with a default of
+5m. `DefaultCompactionConfig` itself leaves the backoff at zero, while the node
+wires its flag into `PruneBackoffInt64Ns`.
 
-- **T-INFER-MONOTONE** (`TestInferMonotone` + `TestInferMonotoneRedControlNoClamp`): drives `SetInferredHorizon` with `[100, 500, 200, 800, 300]`; the effective after each is `[100, 500, 500, 800, 800]` (the retreats at 200 and 300 refused — the §0.c monotone clamp); `PruningHorizonRetreatRefused` advances by exactly 2. The RED control: a setter without the clamp accepts the retreat (cfg retreats 500→200) — the divergence the clamp prevents (a row dropped at 500 is in the gap if the horizon retreats to 200).
+When pruning is disabled, inference may still advance the stored horizon and
+its gauges, but the pruning call is skipped and no rows are dropped. A node
+without a query resolver retains its configured static floor.
 
-- **T-INFER-FLOOR** (`TestInferFloor` + `TestInferFloorRedControlIgnoreOperatorFloor`): asserts `EffectiveHorizon(5000)` with operatorFloor=1000, backoff=500 is 4500 (inferred dominates); with operatorFloor=6000 is 6000 (operator floor dominates); with operatorFloor=100 is 4500 (the stale-floor no-op, §6.3). The RED control: an inferrer that ignores the operator floor (`observed - backoff` with no `max`) produces 4500 for the 6000-floor case — below the operator floor, the divergence the backstop prevents.
+### Expose the inference state
 
-- **T-INFER-EQUIV** (`TestInferEquiv`): 10,000 fuzz cases (seed=22), all byte-identical at the inferrer-fed horizon. The horizon is `max(operatorFloor, observedFrontier - backoff)` (the production path); the fuzz feeds it to both the `dominancePruneReference` oracle and the `DominancePrune` sweep. Written honestly (§0.c): the byte-identity holds by construction (the prune is pure and unchanged, fed the same horizon); the tooth's real value is proving the inferrer's `max()` output is a valid int64 horizon the unchanged prune consumes with no type/order shift. The off-by-one burden is carried by T-INFER-FLOOR and T-INFER-REAL-LocalFS.
+Add three instruments to both counter initialization paths and to
+`allCounters()`:
 
-- **T-INFER-ALLOC** (`TestInferAlloc`): `testing.AllocsPerRun` over `AsOf` with the seam active vs a control (the same path; the seam is idempotent). The seam is a `LoadInt64` + `CompareAndSwapInt64` on a struct int64 — zero alloc by construction. Measured: `with-seam=2 == control=2` (delta=0; the 2 is the read-path residual from the empty-dir list path, not the write-path zero-alloc gate — §6.1). The honest zero, measured not asserted.
+- `QueryTxTimeHighWaterMark`, a gauge containing the raw observed frontier;
+- `PruningHorizonEffective`, a gauge containing the horizon applied by the
+  compactor; and
+- `PruningHorizonRetreatRefused`, a cumulative counter for rejected retreats.
 
-- **T-INFER-TELEMETRY** (`TestInferCountersInRegistry` + `TestInferCountersNonNilPostInit_Subproc`): `Counters()` carries 15 distinct (12→15), the three new names present, 0 dups. The subprocess tooth drives a real `Init` and asserts the three new counters are non-nil post-Init (the `rebuildCounters` fill held) and that the three new instruments appear in the OTel `Collect` output — the OTel callback observes `modeGauge` via `Value()`→`GaugeValue()` at `telemetry.go:209`, with no additional OTel wiring.
+The Prometheus bridge enumerates `telemetry.Counters()`, so these instruments
+need no bridge-specific cases. Counters and gauges are exported according to
+their existing modes, and OTel observes them through the same registration
+path as the earlier instruments.
 
-- **T-INFER-RETREAT-COUNTER-LOUD** (`TestInferRetreatCounterLoud` + `TestInferRetreatCounterGreen`): a retreat (5000→100) is refused (held at 5000); `PruningHorizonRetreatRefused` advances by 1; the WARN log line is emitted. The green control: a monotone-advancing sequence leaves the counter unchanged (delta=0 — zero retreats under correct operation).
+At the time of this decision, the registry grew from 12 to 15 instruments: from
+one to three gauges and from 11 to 12 counters. Subsequent decisions added more
+instruments; those earlier totals are not the current registry size.
 
-- **T-INFER-REAL-LocalFS** (`TestGCFloorInferRealLocalFS` + `TestGCFloorInferRealLocalFSNoOpControl`): the end-to-end route tooth. Writes R (sys=100) and R′ (sys=250, the dominator) to a real `*LocalFS`; drives `AsOf(txTime=2000)` (advancing the observed frontier to 2000); builds a compactor with operatorFloor=100 and backoff=400 (the inferrer computes `max(100, 2000-400)=1600`); runs `InferHorizon` and compacts → R dropped (`RowsPruned=1` — the operator floor alone (100) would have refused the drop since 250 > 100); a live `AsOf(txTime=2000)` resolves to R′ — no silent data loss. The no-op control: a compactor whose observed frontier is never driven (frontier=0) → effective = `max(100, 0-400)=100` (the operator floor) → R retained (`RowsPruned=0`). The divergence proves the inferrer's advance is load-bearing.
+## Consequences
 
-The two updated teeth: the distinct-count tooth (`TestCountersDistinctAfterDedup`, 12→15) and the no-duplicate-names tooth (`TestCountersNoDuplicateNames`, 12→15, gauges 1→3, counters 11→12) — the honest count growth of §0.e. The single-`Init`-caller guard from the OTel-Init work stays green: this change adds a reader of counters, not a second `Init` caller (the two-exporter separation holds).
+The horizon calculation and pruning configuration remain `int64`. Telemetry
+conversion to `float64` affects only the exported gauge values: integers above
+2^53 can be rounded in a scrape even though the horizon used by compaction is
+unchanged.
 
-## §3. The inferrer mechanism + the floor discipline (decided before code)
+The backoff is not inferred or auto-tuned. A workload that queries farther into
+the past needs an appropriate floor and backoff; the observed maximum alone
+cannot establish that no older query will arrive. Conversely, a workload with no
+historical reads can choose a smaller backoff or a higher floor.
 
-**The observation (§1.a).** The Resolver gains a new package-private field `pruningFrontierObserved int64` (not exported — the inferrer reads it through `QueryTxTimeFrontier()`, a plain `atomic.Int64.Load`). At `AsOf` entry (`query.go:237`, the `txTimeNs := transactionTime.UnixNano()` line), a new resolver method `observeQueryTxTime(txTimeNs)` runs the atomic-max CAS loop: `for { cur := Load(); if txTimeNs <= cur { return }; if CAS(cur, txTimeNs) { return } }`. The frontier is a number (int64 ns), not a `time.Time` — no alloc (the int64 lives on the Resolver struct, not the heap). A `Store` + `Load`-compare is not atomic as a pair (a concurrent `AsOf` could `Store` between the `Load` and the `Store`); the CAS loop is the atomic-max pattern. The observation is the §0.b monotone max (a forensic query does not collapse the frontier).
+Later mesh instrumentation added direct counter reads to
+`cmd/sovereign-node/main.go`. That does not add another `telemetry.Init` caller:
+`armOTel` remains the only initialization call site, and the bridge still
+receives its counters after that call.
 
-**The inferrer (§1.b).** The `L1Compactor` gains a new `horizonInferrer` field (struct: `operatorFloor int64`, immutable, captured at construction, plus `backoffNs int64` from `cfg.PruneBackoffInt64Ns`). `EffectiveHorizon(observedFrontier int64) int64` is the pure `max(operatorFloor, observedFrontier - backoffNs)` formula. `SetInferredHorizon(candidate int64) int64` is the monotonically advancing setter: it advances `cfg.PruningHorizonInt64Ns` (the same field `DominancePrune` reads at `l1_compactor.go:710` — unchanged) iff `candidate > current`; a retreat is refused, counted (`PruningHorizonRetreatRefused.Add(1)`), and WARN-logged. `InferHorizon(resolver *Resolver)` is the scheduler's single step: read `resolver.QueryTxTimeFrontier()`, compute `EffectiveHorizon`, call `SetInferredHorizon`, advance the two gauges (`QueryTxTimeHighWaterMark` = the raw observed; `PruningHorizonEffective` = the post-clamp applied). The retreat-refuse counter is advanced inside `SetInferredHorizon` (its loud path is the counter's sole responsibility); the gauges are advanced in `InferHorizon` (the scheduler has the observed frontier and the post-clamp effective). The operator floor is captured at construction (`NewL1Compactor` reads `cfg.PruningHorizonInt64Ns` before the loud coerce may zero it; the coerce-to-Preserve-All zeroes the cfg field so the prune stays off, and captures `operatorFloor=0` — the inferrer is inert while pruning is off). The `DominancePrune` function body is unchanged — this change replaces the horizon source, not the prune.
+The test helper `scrapeCounterValue`, defined in
+`pkg/metrics/telemetry_bridge_test.go`, does not parse exponent notation.
+Prometheus renders sufficiently large gauge values in that form, so the bridge
+test uses small integers. This is a limitation of the test parser, not of the
+production Prometheus encoder or of OTel collection, which walks
+`metricdata.ResourceMetrics` directly.
 
-**The telemetry (§1.c).** Three new counters, constructed in `init()` AND `rebuildCounters()` AND `allCounters()` (the fill discipline — a counter missing from `rebuildCounters()` silently drops to nil under `--otel`): `QueryTxTimeHighWaterMark` (`modeGauge` — the observed frontier), `PruningHorizonEffective` (`modeGauge` — the effective horizon fed to the prune), `PruningHorizonRetreatRefused` (`modeCounter` — the §0.c loud-path signal). The three reuse the existing `Counter` struct (no struct change); the two gauges use `Set(float64)` (the inferrer feeds int64 ns, converted via `float64(horizonNs)` — no precision loss for realistic ns < 2^53). The bridge auto-surfaces them (§0.f); the OTel callback auto-observes them (§6.1).
+## Evidence
 
-**The scheduler wiring (cmd).** `nodeConfig` gains `compactionPruneBackoff time.Duration`; the `--compaction-prune-backoff-ns` flag (`DurationVar`, default 5m — an honest conservative default: an operator whose workload queries deeper over-retains; one that never queries the past can lower it or raise the hard floor — §6.3); the `compactionCfg` block wires `cfg.PruneBackoffInt64Ns = cfg.compactionPruneBackoff.Nanoseconds()`; `compactionSchedulerLoop` and `runCompactionSweep` gain a `resolver *database.Resolver` param; the sweep calls `compactor.InferHorizon(resolver)` before the per-entity `CompactionByHash8`. The gauge-advance and counter reads live in `internal/database` (the package already imports `internal/telemetry` for the prune-seam counters); `cmd` does not import `internal/telemetry` directly (the two-exporter separation — the one `Init` caller is `armOTel` in `otel.go`; reading counters is not an `Init` call).
+The inference tests are divided by the APIs they exercise:
 
-**Gating.** `--compaction-prune-backoff-ns` is wired unconditionally (the inferrer's backoff defaults to 0 in `DefaultCompactionConfig`; the cmd wires the 5m production default). The inferrer is inert when pruning is off (`EnableDominancePruning=false`) — `SetInferredHorizon` advances the horizon but `DominancePrune` is skipped at the seam, so no rows drop (the gauges still surface the inferrer's state). A nil resolver (a node started without `--lsm-root` keeps `queryResolver` nil) leaves the inferrer inert — the horizon stands at the operator's static knob, byte-identical to the original prune behavior.
+- `TestInferAsOfObserves` checks increasing and historical query times on an
+  empty store. `TestInferAsOfObservesConcurrentRace` drives 3,200 concurrent
+  calls under `-race` and checks that the frontier equals their global maximum.
+- `TestInferMonotone` applies candidates `[100, 500, 200, 800, 300]` and expects
+  `[100, 500, 500, 800, 800]`, with two retreat refusals.
+  `TestInferMonotoneRedControlNoClamp` demonstrates the backward step that the
+  clamp rejects.
+- `TestInferFloor` checks an observed frontier of 5000 with backoff 500: the
+  result is 4500 at operator floors 1000 and 100, and 6000 at an operator floor
+  of 6000. `TestInferFloorRedControlIgnoreOperatorFloor` covers the unsafe
+  formula without the maximum.
+- `TestInferRetreatCounterLoud` checks the warning and counter increment, while
+  `TestInferRetreatCounterGreen` checks that an advancing sequence does not
+  increment the counter.
 
-## §4. The byte chain
+`TestInferEquiv` runs 10,000 seeded cases with seed 22. It supplies the same
+inferred horizon to the reference and sweep, so it checks pruning equivalence at
+that horizon but cannot detect incorrect inference arithmetic. The floor tests
+check the arithmetic directly, and the filesystem round trip below checks its
+effect on pruning.
 
-- `internal/database/query.go`: the Resolver struct gains `pruningFrontierObserved int64` (cache-clean — not flagged by `fieldalignment`); the `observeQueryTxTime(txTimeNs int64)` seam at `AsOf` entry (after `query.go:237`); the `QueryTxTimeFrontier() int64` accessor. The `AsOf` body is otherwise unchanged.
-- `internal/database/l1_compactor.go`: `CompactionConfig` gains `PruneBackoffInt64Ns int64` (cache-clean — not flagged); the `horizonInferrer` struct (`operatorFloor` + `backoffNs`); the `L1Compactor.inferrer` field; `NewL1Compactor` captures the operator floor and backoff before the loud coerce; the `EffectiveHorizon`, `SetInferredHorizon`, and `InferHorizon` methods. The `DominancePrune` function body is unchanged (the load-bearing call at `l1_compactor.go:710` reads `c.cfg.PruningHorizonInt64Ns` — the same field the setter advances; byte-identical call site).
-- `internal/telemetry/registry.go`: three new counter vars; three new constructions in `init()` + `rebuildCounters()`; the `allCounters()` slice grows 12 → 15 (the three new counters appended in stable order). The `Counter`/`CounterMode` structs are unchanged.
-- `cmd/sovereign-node/main.go`: `nodeConfig.compactionPruneBackoff`; the `--compaction-prune-backoff-ns` flag; the `compactionCfg.PruneBackoffInt64Ns` wire; `compactionSchedulerLoop` + `runCompactionSweep` gain the `resolver` param and the `compactor.InferHorizon(resolver)` call. The launch site passes `queryResolver`.
-- The two count-assertion teeth updated: the hardcoded distinct count 12 → 15 and the gauge/counter split 1+11 → 3+12, with the honest-growth disclosure.
-- `pkg/metrics/telemetry_bridge.go`: a comment-only update (the stale "12 distinct series" prose records the growth to 15 with this ADR). The bridge logic is unchanged — the §0.f auto-surfacing property means the bridge exposes the three new counters with no code edit; byte-verified unchanged.
-- The five core files: unchanged (none touched).
+`TestInferAlloc` compares two `testing.AllocsPerRun` measurements of the same
+warmed, no-advance `AsOf` path. The historical result was 2 allocs/op in both
+runs, a delta of zero. Because both runs include observation, this demonstrates
+allocation stability on that path rather than isolating the cost of adding it;
+the two allocations belong to the empty-store read path, not the write-path
+zero-allocation contract.
 
-## §5. The honest headline (no benchmark claim)
+`TestInferCountersInRegistry` checks registry membership and unique names.
+`TestInferCountersNonNilPostInit_Subproc` checks all three instruments after
+`Init` and their presence in OTel output. `TestBridgeAutoSurfacesNewCounters`
+checks HELP, TYPE, and value lines through a real Prometheus scrape. Its small
+integer samples avoid the test parser's exponent limitation.
 
-The deliverable is the `T_gc` auto-inference recorded as the next move in ADR-0020 §6a: the engine tracks the observed live-query txTime frontier (observed at `AsOf` entry, `query.go:237`) and feeds `effective = max(operatorFloor, observedFrontier - backoff)` back into the unchanged `DominancePrune` `(C3)` floor (`l1_compactor.go:710`). The operator's role moves from "guess the frontier" (the static knob) to "set the safety floor and the backoff window" (the §0.a knob promotion). The inferrer floors the operator knob; it does not replace it. The monotone clamp is loud (a retreat is refused, counted, and logged — the txTime-gap class stays closed). The three new counters are operator-observable on `/metrics` (the two gauges surface the inferrer's state — the audit trail the static knob lacked; the retreat-refuse counter is the loud-path signal) without a bridge edit (the §0.f auto-surfacing property). The `DominancePrune` function body is unchanged. There is no benchmark headline; the read-path observation seam is zero-alloc (measured delta=0), and the 2 allocs/op in the alloc tooth is the read-path residual (the empty-dir list path), not the write-path zero-alloc gate (§6.1). This change does not alter the engine's qualification posture: it does not touch the single-writer root-equality qualifier.
+The end-to-end evidence is in `pkg/durability/tgc_infer_test.go`:
 
-## §6. Honest deferred work and residuals
+- `TestGCFloorInferRealLocalFS` writes rows at system times 100 and 250, then
+  observes a query at transaction time 2000. It uses floor 100 with backoff 400.
+  The effective horizon becomes 1600 and the older row is pruned; the same live
+  query still returns the row at system time 250.
+- `TestGCFloorInferRealLocalFSNoOpControl` never advances the frontier. The
+  horizon stays at 100, below the dominator at 250, and both rows survive.
 
-1. **The read-path observation is zero-alloc, measured.** `TestInferAlloc` measured `with-seam=2 == control=2` (delta=0). The seam is a `LoadInt64` + `CompareAndSwapInt64` on a struct int64 — zero alloc by construction; the 2 allocs/op is the read-path residual (the empty-dir `noopLister22.ListObjects` returns a `nil` slice the `AsOf` path still allocates the response for — the list-path allocation, not the seam). The read-path residual is not the write-path zero-alloc gate: `TestHotPathZeroAllocations` (the write-path gate) is green and unaffected — this change touches the read path and the compaction scheduler, not the write path.
-
-2. **The `scrapeCounterValue` scientific-notation limitation (premise correction §0.d).** The Prometheus text format renders gauge values ≥ 1e6 in scientific notation (`7.777777e+06`); the `scrapeCounterValue` parser (`recorder_test.go:61`) stops at the exponent marker. The bridge tooth uses gauge values < 1e6 so the parser handles them; the "gauge reports the last-Set value, live" claim is asserted identically at < 1e6 (the magnitude is irrelevant to the claim). A future change may extend the parser to handle the exponent — the limitation is pre-existing, not a defect this change introduced. The OTel `Collect` path (the in-package subprocess tooth) does not use `scrapeCounterValue` (it walks the `metricdata.ResourceMetrics` directly), so the limitation does not affect the OTel-side claim.
-
-3. **The operator backoff default is an honest guess.** `--compaction-prune-backoff-ns` defaults to 5m (conservative: an operator whose workload queries deeper over-retains — the prune refuses drops the backoff would admit; one that never queries the past can lower it or raise the hard floor). The default is not auto-tuned — the inferrer floors the operator knob, it does not replace it; the backoff is the operator's "I may query up to now-minus-backoff into the past" contract. A future change may auto-tune the backoff from the observed query-depth distribution; the auto-inference here is the frontier, not the backoff.
-
-4. **The inferrer is inert when pruning is off (the honest-disabled posture, §0.g).** `SetInferredHorizon` advances `cfg.PruningHorizonInt64Ns` regardless of `EnableDominancePruning`, but `DominancePrune` is skipped at the seam (`l1_compactor.go:540` enable gate) when pruning is off — so the effective horizon advances but no rows drop. The gauges still surface the inferrer's state (the audit trail). The Preserve-All default from the original prune change is preserved: the inferrer does not auto-enable the prune (the operator's retention policy).
-
-5. **The single-writer qualifier is not lifted.** This change advances the Level-2 prune; it does not touch the single-writer root-equality qualifier (the one the core `crdt.go` blocks; the foreign-state-not-WAL-captured residual already disclosed). The inferrer is a compaction-scheduler step (single-goroutine; the set runs between sweeps, and `DominancePrune` reads the horizon once at `Compaction` entry — no race; `-race` verified). The root-equality qualifier is a different change.
-
-6. **The `TestJemallocAllocator_Reallocate` cgo flake is pre-existing** (recorded since the original prune work) under heavy-memtable-test memory pressure — not a regression from this change (this change touches `internal/database`'s query/compaction seam, `internal/telemetry`, `cmd`, and `pkg/metrics`/`pkg/durability` test files, not the allocator).
-
-7. **The equivalence tooth's byte-identity is by construction (§0.c).** The prune is pure and unchanged, fed the same inferrer-computed horizon on both sides; `survivorsByteIdentical` holds vacuously. The tooth's real value is proving the inferrer's `max()` output is a valid int64 horizon the unchanged prune consumes (no type/order shift). The off-by-one burden is carried by the floor tooth (asserts the arithmetic directly) and the real-LocalFS tooth (the no-op control proves the advance is load-bearing by the `RowsPruned` delta). Disclosed in the test's doc-comment and in §7.
-
-## §7. Design-draft corrections (the premise table)
-
-| # | Draft premise | Byte-verified finding | Disposition |
-|---|---|---|---|
-| M1 | §2.b "a second call: operatorFloor=6000" | The operator floor is captured at construction (`NewL1Compactor`) and stored in the immutable `horizonInferrer.operatorFloor` — not a per-call argument. A "second call" with a different operatorFloor is a second compactor. | The tooth builds two compactors (one per operatorFloor); the "second call" framing corrected (§0.b). Disclosed. |
-| M2 | §2.c "the equivalence tooth re-gates prune-equivalence at the inferrer-fed horizon" (implied: catches an inferrer off-by-one) | `DominancePrune` is pure and unchanged; feeding the same inferrer-computed horizon to both sides means the byte-identity holds by construction, so an inferrer off-by-one is invisible to this tooth. | The tooth is written honestly (§0.c): it proves the prune is byte-identical under the new horizon source; the off-by-one burden is carried by the floor tooth and the real-LocalFS tooth. Disclosed in the test's doc-comment. |
-| M3 | §2.f (implicit) the gauge value `7_777_777` scrapes as `7777777` | The Prometheus text format renders ≥ 1e6 in scientific notation (`7.777777e+06`); `scrapeCounterValue` stops at the `e` and returns `7.777777`. | Premise correction §0.d: the tooth uses gauge values < 1e6 so the parser handles them; the last-Set claim is asserted identically at < 1e6. The `scrapeCounterValue` exponent limitation is a pre-existing residual (§6.2). |
-| M4 | §1.c "update the distinct-count tooth 12 → 15" (named one tooth) | A second tooth also hardcoded `wantDistinct=12` and asserted exactly one gauge. This change adds two gauges, so the gauge count grew 1 → 3 and the counter count 11 → 12. | The second tooth updated `wantDistinct` 12 → 15 and the gauge/counter split 1+11 → 3+12 (§0.e). The invariant (no dups, the bridge scales as append) is unchanged. Disclosed. |
-| M5 | §2.h (implicit) the inferrer advances the horizon over the route | The operator floor alone (100) would refuse the drop (the dominator 250 > 100 → `RowsPruned=0`); the inferrer's advance to 1600 is what admits it (`RowsPruned=1`). | The real-LocalFS no-op control proves the advance is load-bearing (the no-op inferrer leaves `RowsPruned=0`; the advancing inferrer leaves `RowsPruned=1`). Disclosed. |
-
-**No contract flip.** This change flips no prior contract. It adds a new seam (the inferrer), extends the counter-fill discipline to three new counters, and updates two count-assertion teeth for the honest 12→15 growth. The ADR-0020 contract — "`T_gc` is an operator retention policy; the engine never auto-prunes" — is preserved: the inferrer floors the operator knob, it does not replace it; the operator's role moves from "guess the frontier" to "set the safety floor and the backoff window" (the §0.a knob promotion, not a contract flip).
-
-## §8. Self-adversarial — what this change does not close
-
-1. **Did the inferrer introduce a data race on `cfg.PruningHorizonInt64Ns` under `-race`?** The compaction scheduler is single-goroutine; `SetInferredHorizon` runs between sweeps; `DominancePrune` reads `cfg.PruningHorizonInt64Ns` once at `Compaction` entry — there is no race between the set and the read (the §1.b contract). `TestInferAsOfObservesConcurrentRace` drove 3,200 concurrent `AsOf` goroutines racing the atomic-max CAS loop under `-race` — 0 races. The `-race` gate ran the new and neighboring teeth across `internal/database`, `internal/telemetry`, `pkg/metrics`, and `pkg/durability` green. Closed for this scope; a future change that drives the inferrer off a concurrent path (e.g. the mesh-receive path) owns its own gate.
-
-2. **Did the count growth (12 → 15) break a count-assertion tooth?** Both affected teeth — the distinct-count tooth and the no-duplicate-names tooth — were updated 12 → 15 (plus the gauge/counter split). A full sweep of all test files for hardcoded 12/24 count assertions confirmed no other tooth breaks (the bridge tests use `len(cs)` dynamically; the `120`/`128` hits are unrelated transport/sync sizes). Closed.
-
-3. **Did the inferrer avoid the txTime-gap silent-data-loss class?** Yes — the inferrer floors the operator knob (`max(operatorFloor, observedFrontier - backoff)`); the operator floor is the hard backstop the inferrer never goes below (the §0.a contract; the floor tooth's operator-dominates case and its RED control prove it). The monotone clamp refuses a retreat (the monotone tooth plus the loud counter). A row dropped at horizon H1 is in the gap if the horizon retreats to H0 < H1 — the clamp prevents it. Closed; the class stays closed.
-
-4. **Did the bridge auto-surface the three new counters without an edit?** Yes — `TestBridgeAutoSurfacesNewCounters`'s git byte-identity check confirmed `telemetry_bridge.go` is unchanged, yet the three new `supremum_*` series appear on `/metrics` (HELP + TYPE + value line); the two gauges report the last-Set values, the counter the cumulative. Closed (the §0.f auto-surfacing property byte-verified).
-
-5. **Did this change touch a core file?** No — the five core files are unchanged; the change is confined to its six edit targets. The `DominancePrune` function body is unchanged — this change replaces the horizon source, not the prune. Closed.
-
-## §9. The gate — all green
-
-- (a) `go build ./...` — green.
-- (b) `go vet ./internal/database/ ./internal/telemetry/ ./pkg/metrics/ ./pkg/durability/ ./cmd/sovereign-node/` — green; adds nothing (the `unsafe.Pointer` findings in `internal/chaos`/`pkg/sync` are the pre-existing baseline, not in the six edit targets).
-- (c) `gofmt -l` on touched files — clean (all 11 touched files).
-- (d) `-race -count=1` over the new teeth and the neighboring prune/telemetry/bridge teeth across `internal/database`, `internal/telemetry`, `pkg/metrics`, `pkg/durability` — all pass (the 10k-case equivalence fuzz under `-race` is slow; the fuzz runs non-race, the concurrency and non-fuzz teeth under `-race` — the per-package split the 4-core development box requires).
-- (e) `TestHotPathZeroAllocations` (the write-path memory gate) — green (this change touches the read path and the compaction scheduler, not the write path).
-- (f) The five core files — unchanged.
-- (g) `fieldalignment` on `internal/database/` + `internal/telemetry/` — adds no new finding (the two `l1_compactor.go` findings are the pre-existing `mergedRowT` 144→32 and `CompactionResult` 56→40, line-shifted 213/226 → 382/395 by the added code; the new structs — `Resolver`+int64, `CompactionConfig`+`PruneBackoffInt64Ns`, `horizonInferrer`, `L1Compactor`+`inferrer` — are not flagged).
-- (h) Blast radius — the change is confined to its six edit targets; no core file touched.
-- (i) The eight new teeth (ten sub-teeth), the two updated count-assertion teeth (12→15, gauges 1→3), and the single-`Init`-caller guard (the inferrer reads counters, it does not call `Init`) — all pass.
-
-The engine tracks the frontier itself; the inferrer floors the operator knob; the monotone clamp is loud; the prune is unchanged. Trust is earned by the live frontier at the use site, not the operator's guess.
+The original acceptance record reports successful build, vet, and targeted
+race-enabled runs across the affected database, durability, telemetry, metrics,
+and command packages. The measured values above are fixtures and historical test
+results, not a production retention policy recommendation.

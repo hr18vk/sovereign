@@ -1,73 +1,50 @@
-# ADR-0048: Complete the WAL fsync lock-scope split (the reverse-convoy)
+# ADR-0048: Complete the WAL fsync lock-scope split
 
-- **Status:** ACCEPTED (mechanism fixed + regression-guarded; the 300s-causation question is still pending a silicon A/B)
+- **Status:** Accepted. The lock-scope fix stands, but [ADR-0049](0049_causation_checkpoint_flush.md) disproved the proposed cause of the 300-second stall.
 - **Date:** 2026-09-06
-- **Core-file integrity:** none of the five merge-law/wire-schema files changed (`crdt.go`, `crdt_apply.go`, `envelope.go`, `schema.capnp`, `schema.capnp.go` — all byte-identical)
+- **Scope:** `AppendClockAdvance`, `AppendMutation`, `AppendCheckpoint`, and their interaction with `AppendMutations` and `Close`
 
-## 1. Context — the incomplete fsync lock-scope split
+## Context
 
-The earlier WAL fix (ADR-0044/0045) was **one-directional**: `AppendMutations` (the origin's
-group-commit) releases `w.mu` before its fsync, so a concurrent `AppendClockAdvance` is not
-starved *by* the origin's inject. The **reverse** was left open: `AppendClockAdvance` (the
-receive path), `AppendMutation`, and `AppendCheckpoint` still held `w.mu` **across** their
-fsync. So one slow receive-path fsync held `w.mu` for its whole duration and the origin's
-`AppendMutations` blocked at `w.mu.Lock()` — a WAL-wide commit stall (the reverse-convoy).
-It surfaced in the 100-node convergence silicon run: the
-seed's `commit_in_flight` pinned at 1 for >300s → the quiescence probe never fired → the
-convergence SLO was INVALID (NOT-QUIESCED).
+The first group-commit change released `w.mu` before the origin batch's fsync, preventing that batch from starving a receive-side `AppendClockAdvance`. The reverse direction remained: `AppendClockAdvance`, `AppendMutation`, and `AppendCheckpoint` still held `w.mu` across fsync. A slow receive-path sync could therefore block the origin's `AppendMutations` at `w.mu.Lock()`.
 
-## 2. Why fix the mechanism before the 300s root cause is proven
+During a 100-process, three-machine convergence run, the seed's `commit_in_flight` stayed at 1 for more than 300 seconds. The origin never became quiescent, so that run could not supply a valid convergence-from-quiescence measurement. The WAL reverse-convoy was a plausible mechanism, but the observation alone did not establish that it caused the stall.
 
-I had previously deferred this: the 300s **causation** was unproven, and the rule is not to
-fix what has no proven root cause. But the convoy **mechanism** is now byte-evident — a mutex
-held across a blocking fsync is a lock-ordering fact, independent of timing — and its own root
-cause (the incomplete split above) is proven. So I fixed the **proven mechanism** as correct
-durability hygiene and deferred only the 300s-causation verdict (convoy-dominant vs
-NVMe-density-dominant at ~34 nodes/host) to a silicon A/B, because that causation cannot be
-settled by a cheap local experiment: a local repro stalls deterministically, so it cannot
-discriminate convoy from device. The convergence SLO is **not** claimed fixed.
+The lock-scope defect could be established directly from the code and a local blocking-fsync experiment. The decision was to fix that mechanism without claiming that the hardware causation question was settled. A local reproduction could not distinguish mutex convoying from NVMe contention at roughly 34 nodes per host because it stalled deterministically under the injected block.
 
-## 3. Decision
+## Decision
 
-Release `w.mu` **before** the fsync in `AppendClockAdvance`, `AppendMutation`, and
-`AppendCheckpoint`, using the exact captured-fd `syncFile(f)` pattern `AppendMutations` already
-uses: write + `nextSeq++` **under** the lock; capture `f := w.f` under the lock; `w.mu.Unlock()`;
-then `w.syncFile(f)` **outside** the lock. No `defer` (each error path unlocks explicitly — a
-defer would re-hold across the fsync or double-unlock). The `syncHook` test seam is consulted
-first in `syncFile`, byte-identical.
+All four append paths now use the same captured-file pattern:
 
-**Why safe:** (1) ordering — writes + seq-stamp under the lock; fsync is a durability barrier,
-not an ordering primitive. (2) durability floor — the call returns only after the fsync, so no
-ACK-before-durability. (3) concurrent fsyncs on a shared fd only ever flush MORE, never fewer.
-(4) the captured fd makes a concurrent `Close()` return `os.ErrClosed` (an error, not a panic),
-and `Close()`'s own final `Sync` under the lock flushes the tail regardless.
+1. Encode and write the record and increment `nextSeq` while holding `w.mu`.
+2. Capture `f := w.f` under the same lock.
+3. Unlock explicitly on every return path, then call `w.syncFile(f)` outside the critical section.
 
-**Regression-control consequence (handled, not vacuous):** fixing `AppendCheckpoint` removed the
-over-hold vehicle that `TestWALLockScopeRedControl` relied on. I re-anchored it:
-`holdMuAcrossSyncForTest` re-creates the over-hold in explicit test-only code, so the
-existing GREEN guard keeps a live apparatus-validation control. Bug-injection-proven (inject a
-non-over-holding helper → the control reports itself BROKEN; revert → it detects again).
+A deferred unlock would either hold the mutex through fsync or make an explicit unlock redundant and unsafe. The test hook remains the first branch in `syncFile`.
 
-## 4. Guards (all bug-injection-proven, all GREEN under -race)
+Record bytes and sequence numbers are ordered by the locked write section; fsync is a durability barrier, not the ordering primitive. Each call returns only after its sync completes, so acknowledgment does not move ahead of durability. Concurrent syncs on the shared descriptor may flush additional records but cannot flush fewer than the records already written by the caller.
 
-- `TestWALReverseConvoyOriginCommitNotBlockedByReceiveFsync` — the origin/receive pair (was RED at
-  500.8ms pre-fix; GREEN at ~200µs post-fix). It carries an honesty label: it confirms the
-  mechanism, it does NOT prove the 300s causation.
-- `TestWALMixedStreamOrderingPreserved` — the replay witness across all four paths.
-- `TestWALEachAppendPathReleasesLockBeforeFsync` — all four paths as the mutex-holder.
-- `TestWALCloseDoesNotRaceInflightFsync` — the captured-fd safety guard (40 iterations).
-- The four pre-existing WAL lock-scope guards stay GREEN.
+Capturing the descriptor also defines the race with `Close`: an in-flight sync can return `os.ErrClosed` instead of dereferencing a nil `w.f`, while `Close` performs its own final sync under the lock. [ADR-0053](0053_wal_snapshot_crc32c.md) later added default type `0x06` CRC32C framing to all four paths without changing this lock scope.
 
-## 5. The silicon A/B (designed, not run here)
+Fixing `AppendCheckpoint` removed the production over-hold used by `TestWALLockScopeRedControl`. The test-only `holdMuAcrossSyncForTest` helper now recreates that condition deliberately. Replacing the helper with a non-over-holding version makes the negative control report that it cannot detect the fault, so the control still tests its own apparatus.
 
-`{fix,no-fix} × {34,8}` nodes/host on the three-region diagnostic harness (100 nodes,
-3× c7gd.8xlarge, split 34,33,33), integrity checker armed, plus a pprof stack-capture of the
-seed's `PutLocals` (parked at the `AppendMutations` `w.mu.Lock()` ⇒ convoy; in `syncFile` ⇒
-device). **Convoy is convicted ⟺ (fix,34) clears AND (no-fix,34) stalls.** The cheap local
-guards ran before any silicon, so the test-before-silicon ordering held.
+## Evidence
 
-## 6. Consequences
+The regression checks exercise mechanism rather than claiming hardware causation:
 
-The "no mutex across a blocking fsync" class is removed from every production WAL append path.
-The WAL no longer lets a receive-path fsync starve the origin's commit at any node count. The
-300s-causation verdict and the convergence SLO remain OPEN pending the silicon A/B.
+- `TestWALReverseConvoyOriginCommitNotBlockedByReceiveFsync`: an injected receive-side sync blocked the origin for 500.8 ms before the fix and about 200 µs after it.
+- `TestWALMixedStreamOrderingPreserved`: replay order remains consistent across all four append paths.
+- `TestWALEachAppendPathReleasesLockBeforeFsync`: each path is checked while it holds the mutex.
+- `TestWALCloseDoesNotRaceInflightFsync`: 40 iterations cover the captured-descriptor shutdown race.
+- The four earlier WAL lock-scope checks remained green under `-race`.
+
+The planned hardware comparison used `{fix,no-fix} × {34,8}` nodes per host, with 100 processes in the 34/33/33 configuration on three c7gd.8xlarge machines. It also captured the seed's `PutLocals` stack: a park at `AppendMutations` would support the convoy hypothesis, while a park in `syncFile` would point toward the device.
+
+[ADR-0049](0049_causation_checkpoint_flush.md) executed that comparison with integrity verification and non-destructive profiling. Both 34-per-host arms reached the quiescence cap whether the convoy was fixed or restored, and the 8-per-host arm also stalled, ruling out host density alone as the explanation. No capture showed the seed parked on the WAL append mutex. The actual park was the synchronous per-entity checkpoint flush after the WAL commit. Disabling periodic checkpoints diagnostically allowed the run to quiesce and converge within the target; that diagnostic was not a production configuration.
+
+## Consequences
+
+No production WAL append path holds `w.mu` across its fsync. The change removes the reverse-convoy mechanism and preserves write ordering, batch error semantics, and shutdown behavior.
+
+The lock-scope fix did not resolve the 300-second origin stall, and this record no longer leaves that causation question open. [ADR-0049](0049_causation_checkpoint_flush.md) resolved it as checkpoint I/O on the commit path. [ADR-0050](0050_checkpoint_decouple_delta.md) moved periodic checkpoint work to a background runner and delta-batched the flush. Its seven consecutive 100-process, three-machine runs recorded six passes and one tail miss beyond the 10-second target, so the later result is not described as an unconditional convergence guarantee.
+

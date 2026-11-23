@@ -1,108 +1,83 @@
-# ADR-0044: WAL Group-Commit — Cutting the fsync Count for the Convergence SLO
+# ADR-0044: WAL group commit for the convergence objective
 
-- **Status:** Accepted. Verified on loopback, then re-run on 3-region AWS silicon 2026-08-15 — the convergence SLO was still not met (recorded honestly): the fsync-count cut is proven (inject 272.89s → 21.87s, 12.5×) but a deeper blocker surfaced (see the silicon verdict below).
-- **Date:** 2026-08-15
-- **Author:** Harsh Rawat
-- **Scope:** `internal/chaos/wal.go`, `pkg/durability/bridge.go`, `pkg/mesh/{gossip,control}.go`, `cmd/convergence-gate/main.go`, plus a new test file. None of the merge-law/wire-schema files are touched.
-- **Metrics:** unchanged — this change cuts the fsync *count* (a physical property), it adds no metric; the inter-region envelope counter `supremum_mesh_inter_region_envelopes` is untouched.
+- **Status:** Accepted. Group commit reduced injection time, but the 2026-08-15 hardware run still did not converge. Later transport and checkpoint decisions completed the diagnosis.
+- **Date:** 2026-08-15; the replay amendment is dated 2026-08-31
+- **Scope:** `internal/chaos/wal.go`, `pkg/durability/bridge.go`, `pkg/mesh/gossip.go`, `pkg/mesh/control.go`, and `cmd/convergence-gate`
 
 ## Context
 
-The previous change put the durable configuration on silicon: a 3× c7gd run with `--wal-path` on NVMe, `--lsm-root` on NVMe, the A/B/C durability checks, and an inject-failure honesty fix. Its silicon verdict:
+The preceding three-machine c7gd.8xlarge run placed the WAL and LSM on NVMe and enabled durable writes on every node. Boot liveness took 0.62 seconds and region isolation worked, but a 10,000-key injection took 272.89 seconds against a 10-second convergence objective.
 
-- **Boot liveness passed** (0.62s).
-- **The convergence SLO was not met** — the 10K-key inject blew the 10s budget. The measured inject fsync time was **~272.89s** (from the inject-failure log). Root cause: the gate binary chunked 10K keys into **10 batches of 1000** (`batchSize=1000`); each `/v1/batch-insert` hit the server's `handleBatchInsert`, which **looped `InsertLocalEvents` per entry** → `PutLocal` per entry → `AppendMutation` per entry → **one fsync per entry** = 1000 fsyncs/batch × 10 batches = **10,000 fsyncs** total. At the NVMe-measured **~2.1ms/fsync**, that is `10000 × 2.1ms ≈ 21s` of inject fsync time alone — already over the 10s budget.
-- **Region isolation was proven**, and the inter-region envelope counter was live (us=2344 / eu=7156 / ap=6858).
+The gate divided the write into 10 batches of 1,000. Each `/v1/batch-insert` handler called `InsertLocalEvents` for every entry, which reached `PutLocal` and `AppendMutation` per entry and forced one fsync per entry: 1,000 fsyncs per batch and 10,000 overall. At the measured NVMe cost of about 2.1 ms per fsync, the barriers alone accounted for about 21 seconds. The 272.89-second figure was total injection wall time, not a measurement of fsync alone. Inter-region envelope counts in that run were `us=2344`, `eu=7156`, and `ap=6858`.
 
-The post-mortem isolated the binding constraint: **the fsync count, not the fsync latency**. The durable config is correct (WAL on NVMe, fsync-on-commit); the per-mutation fsync count is the SLO killer. This change is the count cut.
+The binding cost inside the WAL was therefore the number of durability barriers, not a change in the cost of each barrier.
 
-## The Decision
+## Decision
 
-Collapse N fsyncs into **one fsync per batch**. The change is additive on the same WAL — one source of truth, not a second WAL. Four production edits, five falsifiable tests, and one silicon-infra fix.
+### Append a batch with one fsync
 
-### Edit A — `WAL.AppendMutations` + the `sync()` indirection (`internal/chaos/wal.go`)
+`WAL.AppendMutations` writes all mutation records under one `w.mu` critical section and issues one fsync for the batch. A 1,000-entry batch changes from 1,000 fsyncs to one; sending the gate's 10,000 keys as one batch instead of 10 batches changes the complete injection from 10,000 fsyncs to one.
 
-`AppendMutations(ms []WALMutation) (firstFailIdx int, err error)` writes N mutation records under one `w.mu.Lock`, then issues one fsync (`w.sync()`) for the whole batch — collapsing the per-mutation fsync count (the 1000× cut: 10,000 fsyncs → 1). It uses the same `encodeMutationRecord`, the same 13-byte header (seq+type+payloadLen), and the same `WALRecMutation` type byte as `AppendMutation`. `ReplayWAL` scans record-by-record via length-prefix, so it sees N individual `WALRecMutation` records and populates `Mutations[]` identically to N `AppendMutation` calls. The determinism contract of the time (replay `rebuiltInitial = LamportHigh - len(Mutations)`) is unchanged.
+At the time of this decision, each record used the existing `encodeMutationRecord`, 13-byte sequence/type/length header, and `WALRecMutation` type. Replay encountered the same sequence of individual mutation records as it did after repeated `AppendMutation` calls. [ADR-0045](0045_mesh_transport_invariants.md) later replaced scalar-counter re-minting with restoration of each recorded `(DotNodeID, DotCounter)` and selection of the recovery tail by WAL sequence. Group commit remains compatible with that rule: record and byte order are fixed under the mutex, while fsync order is not a recovery ordering primitive.
 
-> **Superseded 2026-08-31 (ADR-0045):** that determinism contract — a re-minting replay seeded from a scalar counter — is itself refuted. Group commit stands unchanged; the replay it preserved does not. Replay now restores each recorded `(DotNodeID, DotCounter)` and cuts the tail by WAL record sequence. Note the sharper hazard this ADR introduced for the new contract: `AppendMutations` releases `w.mu` *before* its fsync, so seq/byte ordering — not fsync ordering — is what a sequence cut may rely on.
+The original change routed single-record fsyncs through `sync()` and added a test-only `syncHook`, installed by `SetSyncHookForTest` and nil in production. [ADR-0048](0048_wal_split_completion.md) subsequently completed the captured-file `syncFile(f)` lock-scope split on every append path. [ADR-0053](0053_wal_snapshot_crc32c.md) later made CRC32C-framed type `0x06` records the default; the historical 13-byte outer header remains, but the record payload and replay rules described above are not the current complete format.
 
-The `sync()` indirection: the three per-record fsync call sites (`AppendMutation`, `AppendCheckpoint`, `AppendClockAdvance`) are routed through `func (w *WAL) sync() error`, which is `w.f.Sync()` when `syncHook == nil` (the production path, byte-identical to the pre-change code) — verified by diff: the only deletions in wal.go are the 3 `w.f.Sync()` lines, matched by 3 `w.sync()` additions; the encode/write/nextSeq++ bodies are byte-identical. The `syncHook` field is a **test-only fsync spy** (set via `SetSyncHookForTest`, never by production code): `TestGroupCommitCount` counts fsyncs (1 per batch vs 1000 per 1000 single-append loop); `TestGroupCommitAck` rigs a Sync failure (the per-batch 503 honesty test). The indirection is the only change to the single-fsync call sites.
+### Carry batch semantics through the write path
 
-### Edit B — `Bridge.PutLocals` + `LocalItem` (`pkg/durability/bridge.go`)
+`Bridge.PutLocals` performs `InsertLocal` for each item, builds each WAL mutation from the dot returned by that insert, and then calls `AppendMutations` once. The checkpoint mutation count advances by `len(items)`, not by one. The current bridge also feeds the secondary index synchronously after each insert and schedules periodic checkpoint flushing in the background under [ADR-0050](0050_checkpoint_decouple_delta.md); neither changes the one-fsync batch contract.
 
-`PutLocals(items []LocalItem) (dots []eng.CausalDot, failedFrom int, err error)` is the batch origin path: N × `InsertLocal` (stamps dots, in-memory HAMT advances) → one `AppendMutations` (N writes + one fsync). The per-item physical order is byte-identical to `PutLocal`: digest → `InsertLocal` (stamps the dot before the WAL carries it) → the `WALMutation` built from the engine-stamped dot. The determinism contract (replay re-mints the same dots) is preserved per item. The periodic checkpoint counter (`mutationsSinceCkpt`) advances by `len(items)` (not 1), with the same threshold check.
+`Gossiper.InsertLocalEventsBatch` uses `Bridge.PutLocals` when durability is configured and the existing per-item in-memory path when `--wal-path=""` selects the non-durable research mode. Payloads enter the gossip cache only after a successful WAL append. `handleBatchInsert` applies the single-insert temporal defaults and validation to each entry, assigning HTTP 400 to invalid entries before the batch call. Valid entries receive HTTP 200 and their dots on success; any write or sync failure assigns HTTP 503 to every valid entry. `/v1/insert` retains its single-entry behavior.
 
-### Edit C — `Gossiper.InsertLocalEventsBatch` + `BatchItem` (`pkg/mesh/gossip.go`)
+The gate changed `batchSize` from the constant 1,000 to `*numKeys`, making one request for a 10,000-key run and a one-item request for `-keys 1`. The estimated fsync contribution fell from about 21 seconds to one approximately 2.1 ms barrier, plus HTTP/TLS and processing costs. A measured WAN round trip was ~50-150ms; the estimate was not presented as the measured total injection time.
 
-`InsertLocalEventsBatch(items []BatchItem) (dots, failedFrom, err)` is the batch mesh seam. It mirrors `InsertLocalEvents`'s two-branch structure: the durable path (`g.bridge != nil`) routes through `Bridge.PutLocals`; the in-memory path (`g.bridge == nil`, the `--wal-path=""` opt-in research mode) does N × bare `engine.InsertLocal` (the original back-compat path). The per-item `cache.record` happens after the WAL append (the same order `InsertLocalEvents` keeps — cache and durable log stay consistent).
+### Make acknowledgment batch-wide
 
-### Edit D — `handleBatchInsert` routes through `InsertLocalEventsBatch` (`pkg/mesh/control.go`)
+Before this change, a failed entry could receive HTTP 503 while other entries in its request received HTTP 200. Group commit cannot establish durability for a subset after a failed batch sync. Entries before a write failure may remain only in the OS page cache, and entries after it were never written. `PutLocals` therefore returns an error for the batch, and the handler returns 503 for every valid entry. The response is not sent until `PutLocals` returns; an unacknowledged batch can be retried as a unit. This is an all-or-none acknowledgment contract, not a rollback of bytes already written.
 
-The `/v1/batch-insert` handler is restructured into three phases: (1) a per-entry **400** filter (empty keys stamped 400 before the batch call — per-entry validation stays per-entry); (2) the batch call (`InsertLocalEventsBatch`); (3) status stamping — on success all valid entries get `Code 200` with `DotHex`; on any failure all valid entries get `Code 503`. The bitemporal stamping per entry mirrors `handleInsert` verbatim. The single `/v1/insert` stays byte-identical (backward compat).
+The existing `TestBatchInsertWALFailPerEntry` remained valid because it posts separate homogeneous batches: one successful one-entry request, then a failed two-entry request. It does not distinguish per-entry from per-batch failure within a mixed batch. The group-commit acknowledgment test added that distinction with five valid entries and one injected sync failure: all five receive 503 and sync is called once.
 
-### Edit E — the gate-binary one-batch switch (`cmd/convergence-gate/main.go`)
+The current regression tests are `TestMeshGroupCommitCount`, `TestMeshGroupCommitAck`, and `TestMeshGroupCommitDeterminism` in `pkg/mesh/mesh_group_commit_test.go`:
 
-`batchSize` changes from `const 1000` to `*numKeys`, so the `for start := 0; start < *numKeys; start += batchSize` loop runs once → 10K keys → one `/v1/batch-insert` POST → one fsync. The loop structure and the per-entry status accounting are unchanged (a single 10K-item batch returns 10K per-entry statuses the same way 10 1K-batches did). A 1-key probe run (`-keys 1`) still sends one 1-item batch (degenerate but correct). The inject fsync time drops from `10000 × 2.1ms ≈ 21s` to `1 × 2.1ms ≈ 2.1ms` plus the cross-AZ HTTP RTT (~50–150ms) — a sub-second inject, well inside the 10s budget.
+- The count test measures one fsync for `AppendMutations` with 1,000 entries against 1,000 fsyncs for repeated `AppendMutation` calls.
+- The acknowledgment test checks the five-entry failure case above.
+- The determinism test replays a 64-entry batch and compares the recovered and live Merkle roots. Reversing the physical order so dots are minted before insertion makes that check fail. `TestWALRecoveryDeterminism` covers the single-append counterpart.
 
-### Edit F — the durability-check `grep -c` false-pass fix (the 3-region orchestrator script)
+### Count durable configurations by file
 
-The prior durability-config check used `grep -c -E '...'` over the per-node logs, but `grep -c` over a glob prints one integer per matching file (a multi-line blob), not a single integer. The `[ "${dur_on:-0}" -ne "${cnt}" ]` integer comparison then errors on the blob, the error is swallowed by `2>/dev/null`, and `check_a_pass` stays `true` — so a partial in-memory fallback (e.g. 95 nodes on, 5 off) **false-passed**. The fix: `grep -l -E '...' | wc -l` (files-with-matches → a clean single integer = the count of node logs containing the line). A partial fallback → `dur_on=95, dur_off=5` → `dur_on -ne 100` is a clean false → `check_a_pass=false` (caught, not false-passed). **Proven by simulation, not asserted:** the old form returns a blob `node-0.log:1\nnode-2.log:0\nnode-1.log:1` → the `-ne` errors → swallowed → false pass on a 2/3 partial fallback; the new form returns a clean `2` → correctly fails.
+The durability check originally used `grep -c` over all node logs. With multiple files, that prints one count per file rather than one fleet-wide integer. The subsequent integer comparison failed on the multiline value, its error was discarded, and the check could still report success with 95 nodes durable and 5 in memory.
 
-## §4 — The ACK-Granularity Disclosure (the honest semantic change)
-
-**Before this change (`TestBatchInsertWALFailPerEntry`) the endpoint reported per-entry 503**: a WAL-failed entry → 503 for that entry; the rest still 200 (the ACK-before-durability contract was per-entry, not per-batch).
-
-**This change reports per-batch 503**: a Sync failure means the whole batch is un-durable (the WAL atomic-batch model — no subset can be asserted durable), so all valid entries get `Code 503` and the client retries the whole batch. A Write failure at index i, or the final Sync failure, → `PutLocals` returns `(dots, 0, err)` → the caller ACKs all entries as 503. It does not return a partial `[0, firstFailIdx)` range: entries `[0, i)` sit in the OS page cache (may or may not survive a crash) and `[i, N)` were never written — I cannot assert durability of any subset. This is the standard WAL atomic-batch model (a transaction commits all-or-none on the durable log). It is not silent data loss: the HTTP response has not been sent until `PutLocals` returns; a crash before that loses the un-ACKed entries and the client retries the whole batch. `/v1/insert` keeps per-entry 503 byte-identical (`PutLocal`).
-
-**The existing `TestBatchInsertWALFailPerEntry` stays green under the per-batch semantic** — verified by running it. The test does two separate POSTs (batch `[entry0]` → 200, then close the WAL, then batch `[entry1,entry2]` → both 503); it never posts a *mixed* batch. So "all-success → all-200" and "all-fail → all-503" are produced identically by the per-entry and per-batch semantics — the test is agnostic to the ACK granularity. The new `TestGroupCommitAck` test distinguishes the two: it posts a batch of 5 valid entries and rigs the Sync to fail on the batch's single fsync, asserting all 5 are 503 — a per-entry 503 regression (the old semantic) would leave the pre-failure entries as 200, failing the "all 503" loop.
-
-## The Tests (falsifiable + bug-injection-proven)
-
-`pkg/mesh/group_commit_test.go` (package `mesh`, internal — it reaches the unexported types):
-
-1. **`TestGroupCommitCount`** — `AppendMutations(1000 entries)` issues **1 fsync**; 1000× `AppendMutation` issues **1000**. The 1000× count cut, measured via the `syncHook` spy (not asserted). RED: a per-mutation fsync inside `AppendMutations` → 1000, not 1 → fails.
-2. **`TestGroupCommitAck`** — a rigged Sync failure → all 5 valid entries `Code 503` (per-batch atomicity); the Sync called exactly once (the count cut holds on the failure path). RED: a per-entry 503 regression (the old semantic) → pre-failure entries get 200 → fails the "all 503" loop.
-3. **`TestGroupCommitDeterminism`** — a 64-entry batch written via `AppendMutations` replays into a fresh engine and the rebuilt `MerkleRoot == liveRoot` (the determinism contract preserved under group commit). RED: reversed physical order (dots minted before `InsertLocal`) → Merkle mismatch → fails. Mirrors `TestWALRecoveryDeterminism` byte-faithfully.
-
-## The Loopback Gate (the honest verdict)
-
-- **build / gofmt / vet** — clean (the 3 `internal/chaos/probe.go` vet warnings are pre-existing, proven by stash+vet on the pre-change tree; this change does not touch `probe.go`).
-- **All tests green** — `TestGroupCommitCount` (1 fsync / 1000 fsync = 1000× cut, measured), `TestGroupCommitAck` (5/5 entries 503, Sync called once), `TestGroupCommitDeterminism` (recovered root == live root). The `AppendMutation` encode/write/nextSeq++ body is byte-identical (the diff's only deletions are the 3 fsync-call lines).
-- **Regression green** — the existing batch tests (the crux: they pass under per-batch semantics), `TestWALRecoveryDeterminism` (`AppendMutation` unchanged), `TestHotPathZeroAllocations` (`InsertLocal` pinned), and the full `pkg/mesh` + `pkg/durability` + `internal/chaos` packages.
-- **`-race` green** on the tests (no data race introduced).
-- **The merge-law/wire-schema files** — byte-identical; the change leaves them untouched.
-
-## Silicon Verification — 2026-08-15 (the honest verdict)
-
-The silicon re-run (3× c7gd.8xlarge across us-east-1 / eu-west-1 / ap-southeast-2, with the one-batch gate binary and the Edit-F check fix) was executed. Numbers verbatim:
-
-- **Boot liveness passed** — all 100 nodes `/livecheck` OK over mTLS in **0.62s** (consistent with the prior run).
-- **The convergence SLO was not met** — roots did not equalize within 10s. The convergence poll: `poll 5/10/.../30: 99 nodes divergent (seed root d1406abf...)` — **node 0 holds the 10K keys; the other 99 stay empty (root = zero)** for the full 10s plus the 30s heal window (95 polls × ~0.5s). The cross-region proof: `[eu-west-1 node 34..66] /v1/query convergence-key-0 → HTTP 404 not found` — the seed key never crossed to any peer, not even the other 33 nodes in us-east-1 (intra-region full-mesh).
-- **Durability-config verdict: true** — check A **100/100 on** (the Edit-F `grep -l | wc -l` fix; no false-pass — the prior bug is closed), check B seed WAL = **1,348,951 bytes** (durable writes landed), check C all 3 regions on `/dev/nvme1n1` (the c7gd instance-store NVMe, not the EBS root).
-- **Region isolation proven** (us-east-1 root != eu/ap root during the partition); **heal re-convergence not detected within 30s** (40,930ms — the same zero-propagation).
-- **The inter-region envelope counter** (`supremum_mesh_inter_region_envelopes`) read us-east-1 **476**, eu-west-1 **914**, ap-southeast-2 **614** (grew to 530/2516/2216 after the heal) — **the gossip transport is shipping inter-region envelopes.**
-
-### The inject — this change's target — proven
-
-The inject dropped from the prior run's **272.89s** (10 batches × 1000 fsyncs) to **21.87s** (one batch → one fsync) — a **12.5× cut**. The loopback profile confirms the physics: `AppendMutations(10K)` (writes + one fsync) = **0.58µs/key** (the fsync is amortized to negligible); `PutLocals(10K)` total = **28.2ms** (the `InsertLocal` loop + the one fsync). **The fsync-count cut works** — the inject is no longer fsync-bound. (The residual 21.87s silicon inject vs 28ms loopback is a silicon-specific HTTP/TLS/100-process-contention overhead, not fsync — it is separate from the convergence SLO: the SLO clock starts at `convStart`, after the inject.)
-
-### The deeper blocker — necessary but not sufficient
-
-The convergence SLO's true blocker is **not the inject** (this change's target) — it is a **receive-side delta-apply failure**: the gossip sweep ships envelopes (476/914/614, non-zero and growing) but the **10K-key delta from node 0 never lands in any peer's HAMT** (99/99 stay root-zero; `convergence-key-0` 404s cross-region). The transport works; the deltas do not apply.
-
-**This is the same blocker the three prior silicon runs hit** — all three showed `99 nodes divergent` with node 0 holding the keys. The earlier analysis attributed the convergence failure to the inject time ("per-mutation fsync → inject 272.89s → blows the 10s SLO"), which was a real but secondary bottleneck. This change closed that secondary bottleneck (inject 272.89s → 21.87s) and **un-masked the primary one**: the receive-side delta-apply. The envelope counter (476/914/614 shipped) is the load-bearing evidence — a transport failure would read zero; a delta-apply failure reads non-zero envelopes plus zero convergence.
-
-**First-principles hypothesis for the follow-up:** the receiver `DropVerify`s the deltas (a verification-pubkey or payload-cache miss on the receive path makes the incoming delta unverifiable/unreconstructable → dropped, not applied), or a Merkle-sharding interaction (the sharded root the sweep compares diverges from the joined root), or a large-delta (10K-key) Join path that the loopback's small-delta tests do not exercise. `--peer-dir peerdir` is passed in the silicon launch (pubkey provisioning is wired), so the gap is downstream of provisioning — likely the payload-cache reconstruction on the receive side. This needs a targeted silicon experiment with node receive-path logs.
-
-### Honest summary
-
-- This change is **correct and necessary**: the fsync-count cut is proven (inject 12.5× faster; loopback 0.58µs/key for the one fsync), the Edit-F durability-check fix is proven (100/100 on, no false-pass), the loopback gate is green, the merge-law/wire-schema files are unchanged.
-- It is **not sufficient** to close the convergence SLO: the SLO is blocked by a receive-side delta-apply failure (envelopes ship, deltas don't land) that was the true primary blocker all along, masked across the three prior runs by the secondary inject bottleneck. The convergence gate stays not-met — recorded honestly, not fabricated.
-- **Teardown clean** — all 3 instances terminated, security groups and key pairs removed.
+The replacement uses `grep -l ... | wc -l`, which counts files containing the durable-configuration line. A simulated two-of-three partial configuration produced one multiline value under the old command and the integer 2 under the new one, allowing the expected mismatch to fail the check. On the hardware run, this check counted 100 of 100 nodes with durability enabled.
 
 ## Consequences
 
-- The `/v1/batch-insert` ACK granularity changes from per-entry 503 to per-batch 503 (disclosed in §4; the existing test's agnostic shape keeps it green; the new `TestGroupCommitAck` test pins the per-batch semantic).
-- `AppendMutation` stays byte-identical (verified by diff: only the 3 fsync-call lines were rerouted through `w.sync()`); `/v1/insert` is unchanged.
-- The fsync **count** is now 1 per batch (the count cut); the fsync **latency** (~2.1ms) is unchanged (the per-batch fsync is still a real `f.Sync()` when `syncHook == nil`). A per-batch fsync is not a durability downgrade — it is the standard WAL group commit: one fsync covers the whole batch's writes, and a crash after the writes but before the fsync loses the un-ACKed batch, which is the same loss window `PutLocal` has for a single entry.
-- The `syncHook` is a test-only seam; `OpenWAL` leaves it nil; production code never calls `SetSyncHookForTest`. The production path is byte-identical to the pre-change code.
+- Batch inserts use one WAL fsync and batch-wide acknowledgment; single inserts keep their existing per-entry semantics.
+- A sync failure does not prove that already-written prefix records survived a crash. Clients must retry the whole failed batch rather than treating a prefix as durable.
+- The test hook is not a production configuration path. Production calls the real file sync.
+- Exact-dot replay in [ADR-0045](0045_mesh_transport_invariants.md) supersedes the original scalar-counter replay contract, not group commit itself.
+- The unlocked-fsync completion in [ADR-0048](0048_wal_split_completion.md), asynchronous checkpointing in [ADR-0050](0050_checkpoint_decouple_delta.md), and CRC32C framing in [ADR-0053](0053_wal_snapshot_crc32c.md) are later changes. Statements in the original record about byte-identical single-append code or unframed records are historical, not descriptions of the current implementation.
+- The 2026-08-15 non-convergence observation did not by itself prove one receive-side root cause. [ADR-0045](0045_mesh_transport_invariants.md) records the connection-symmetry and foreign-payload relay fixes, while [ADR-0049](0049_causation_checkpoint_flush.md) identifies the independent checkpoint-flush stall.
+
+## Evidence
+
+### Loopback and 2026-08-15 hardware run
+
+The group-commit tests passed under `-race`, as did the relevant `pkg/mesh`, `pkg/durability`, and `internal/chaos` regression runs. At the time, vet also reported three pre-existing warnings in `internal/chaos/probe.go`; this change did not touch that file.
+
+The hardware run used 100 node processes in a 34/33/33 split on three c7gd.8xlarge machines in us-east-1, eu-west-1, and ap-southeast-2, with WAL and LSM files on instance-store NVMe:
+
+- All 100 nodes passed mTLS `/livecheck` in 0.62 seconds.
+- Injection fell from 272.89 seconds to 21.87 seconds, a 12.5-times reduction. The loopback profile measured `AppendMutations` with 10,000 entries at 0.58 µs per key and the complete `PutLocals` call at 28.2 ms. The remaining hardware injection time included HTTP/TLS and 100-process contention; it was not attributed to fsync alone.
+- Durability was enabled in 100 of 100 node configurations. The seed WAL contained 1,348,951 bytes, and all three regions used `/dev/nvme1n1` rather than the EBS root filesystem.
+- The seed held the 10,000 keys while the other 99 nodes retained zero roots throughout the 10-second convergence window and a further 30-second healing window. The latter covered 95 polls at roughly 0.5-second intervals. A cross-region query for `convergence-key-0` from nodes `34..66` returned HTTP 404; propagation also failed to the other 33 nodes in the seed's region.
+- Region isolation produced different roots during the partition. Healing did not re-converge the mesh within 30 seconds; the recorded elapsed value was 40,930ms.
+- `supremum_mesh_inter_region_envelopes` read `476/914/614` in us-east-1/eu-west-1/ap-southeast-2 order, increasing to `530/2516/2216` after healing. Envelopes were crossing regions, but envelope counts alone could not identify why state did not converge.
+- All three instances were terminated after the run.
+
+The convergence clock for this run started after injection. That distinguishes the 21.87-second injection measurement from the convergence objective and prevents the earlier serial-injection bottleneck from being counted as gossip time.
+
+The non-zero envelope counts and zero peer roots motivated investigation of payload reconstruction, verification keys, Merkle sharding, and large-delta joins. They did not prove that any one of those hypotheses was the sole cause. The later transport and checkpoint records linked above provide the resolutions without retrofitting them into this run's evidence.
+
+### Later convergence evidence
+
+[ADR-0050](0050_checkpoint_decouple_delta.md) records seven consecutive runs after checkpoint decoupling: six passed and one missed the 10-second target. Its published [100-node convergence receipt](../../evidence/convergence-100-node.txt) is a separate run on 2026-09-13 using 100 processes on three c7gd.8xlarge machines with production checkpointing and integrity checks enabled. All 100 roots matched 8.950 seconds after origin quiescence; end-to-end time including injection was 12.139 seconds. This later result meets the target under its stated conditions, while the tail miss remains part of the record.
+

@@ -1,53 +1,117 @@
-# ADR-0052: The resliced-buffer wrong-size free that corrupted the jemalloc heap
+# ADR-0052: Free resliced jemalloc buffers by usable size
 
-- **Status:** RESOLVED — the intermittent `internal/database` `SIGSEGV` "fault 0x30".
-- **Date:** 2026-09-10
-- **Core merge-law/wire-schema files:** UNCHANGED — the five files carrying the CRDT merge law and the wire schema are identical before and after this change.
-- **Severity framing (honesty):** this was a **TEST-CODE heap-corruption bug, not a production defect.** The production allocator and flush paths already honored the usable-size contract; the bug was a *test helper* that resliced a buffer before freeing it, corrupting the process-global jemalloc heap that every test in one `go test` process shares. The crash *victim* (the MemTable flush) is production code; the corruption *source* was test code. The fix is in the **production** allocator, so the wrong-size-free class is now impossible from ANY caller — present or future, test or production.
+**Status:** Accepted  
+**Date:** 2026-09-10
 
-## 1. ROOT CAUSE (physics, one sentence)
-`readAllIntoJemalloc` (`internal/database/l1_compaction_test.go`) returned `buf[:n]` — the jemalloc buffer resliced to the *content* length `n` — and `collectRowKeys` freed that reslice, so `sdallocx(ptr, n)` was handed a size (e.g. `3266`) that did **not** equal the usable size jemalloc recorded for the block (`32768`), returning a 32KB large block to the wrong (~3.2KB) size class and corrupting the heap metadata that a later 64KB MemTable-flush alloc/free tripped over at `addr=0x30`.
+## Context
 
-## 2. The mechanism (why it corrupts; why intermittent; why the flush is the victim)
-- `Allocate(32768)` → `mallocx` → usable `32768` (a 32KB *large* extent). `Free(buf[:3266])` → `sdallocx(ptr, 3266, 0)`: jemalloc computes the size class from `3266` (a *small* class) but the block is a 32KB large extent, so the free treats a large block as a small slab region and writes freelist/bitmap metadata into a non-slab extent → corrupted size-class bookkeeping.
-- The corruption is **latent** until a later alloc/free walks the poisoned size class. The MemTable flush is the heaviest 64KB-class churner in the suite (`TestMemTable_InsertAndFlush`: 50000 partitions → 50000 64KB `NewJemallocBuffer` alloc/free), so it is where the corruption detonates — "seed early, detonate later." The ~50% intermittency is whether the corrupted block happens to be reused in a way that trips a 64KB op.
-- The `TestJemallocAllocator_Reallocate` anomaly (`2048→32768`; see H4 below) is a **symptom** of the same corruption — `malloc_usable_size` reads the poisoned size-class metadata and returns a wrong value — not a separate bug. It is gone post-fix.
+An intermittent `internal/database` SIGSEGV at `addr=0x30` interrupted MemTable flush tests. The
+crash occurred in production flush code, but its source was a test helper that corrupted the
+process-global jemalloc heap shared by every test in the process.
 
-## 3. The instrument that caught the culprit (diagnosis before the fix)
-The fault is invisible to `-race` (cgo/jemalloc memory is outside the Go data-race model) and to the jemalloc redzone (this 5.3.0 build REJECTS `redzone:true`, so an OOB write was *not* ruled out by a redzone run). Isolated repros of the flush path were **CLEAN** (16/16: a pure 64KB buffer churn AND a faithful Arrow `RecordBuilder`+`JemallocBuffer`+ipc-writer mini-flush), proving the corruption is seeded by a *different* test and detonates in the flush (the process-global heap is shared across every test in the process). So I built a process-global **heap-audit instrument** (`memory_allocator_audit.go`, env-gated by `SUPREMUM_JEMALLOC_AUDIT`, zero-cost when unarmed) that registers every live block and validates every `Free`.
+`readAllIntoJemalloc` in `internal/database/l1_compaction_test.go` returned `buf[:n]`, reslicing
+the allocation to its content length. `collectRowKeys` freed that slice, so `sdallocx(ptr, n)`
+received a content length such as 3266 rather than the block's recorded usable size of 32768. This
+returned a 32KB large extent through the approximately 3.2KB small size class. A later 64KB
+MemTable allocation or free encountered the corrupted metadata and faulted.
 
-On the full suite it caught, **deterministically (4/4 runs)**, a `WRONG-SIZE-FREE`: `free_size=3266` vs recorded usable `32768`; the alloc stack pointed at `readAllIntoJemalloc`, freed in `collectRowKeys`.
+The production allocator and flush callers already observed the usable-size contract. The decision
+therefore had two parts: harden the production allocator against resliced lengths, and correct the
+test helper rather than relying on that defense.
 
-**CAUSATION PROOF:** a heal-mode audit (free with the recorded correct size, then continue) let the full suite run to completion with **0 SIGSEGV** and exactly **13** healed wrong-size frees — *all* from the one compaction test helper. Healing only the free *size* eliminated the crash ⇒ the wrong-size free is the (sole) cause.
+## Decision
 
-## 4. Hypothesis verdicts (CONFIRM/REFUTE, evidence-backed)
-- **H0 (OOB write): REFUTED** as the cause — healing only the free *size* removed the crash; an OOB write would not be healed by that. (The guard-band instrument variant was therefore not needed.)
-- **H1 (align flag dropped on sdallocx): REFUTED** — the allocator already passes the *usable* size to `sdallocx`, so the align flag is moot (analysis), and the pure-allocator stress (alloc-with-`ALIGN(64)` + free-`flags=0`, the exact H1 pattern) was clean 16/16 (empirical).
-- **H2 (uploader UAF): REFUTED** — the test mocks never escape the buffer; the culprit is upstream in the helper.
-- **H3 (Go data race): REFUTED** — full-suite `-race` clean (615s, 0 `DATA RACE`); the culprit is a deterministic single-goroutine wrong-size free.
-- **H4 (size-accounting drift → wrong-size sdallocx): CONFIRMED** — this is the mechanism, byte-anchored.
+`JemallocAllocator.Free` now derives the deallocation size from `malloc_usable_size(ptr)` rather
+than `len(b)`. A caller that reslices a buffer to a shorter length can no longer return the block
+through the wrong size class. `bytesAllocated` subtracts the same usable size, keeping the 256MB
+MemTable accounting ceiling accurate.
 
-## 5. The fix (the core files untouched)
-- **`memory_allocator.go` `Free`:** derive the freed size from `malloc_usable_size(ptr)` (jemalloc's ground truth), NOT `len(b)`. A caller that frees a resliced buffer can no longer corrupt the heap — the wrong-size-free *class* is eliminated, not just this instance. The `bytesAllocated` accounting now subtracts the true usable size, so a resliced free can no longer silently drift the 256MB MemTable ceiling either. **Cost: one radix lookup per free (~+6.5% on the alloc+free microbenchmark, 865→921 ns/op, 0 allocs/op).** This retires the earlier "trust the caller's size to skip the lookup" optimization — that optimization *was* the footgun. Justification: `JemallocAllocator` is **NOT** on the per-op CRDT hot path (`pkg/sync` uses its own `HamtArena`; 0 references — verified), so the lookup sits on the LSM/durability/transport paths where frees are per-checkpoint/per-connection/per-query, immaterial to engine throughput. `BenchmarkHAMTInsertZeroAlloc` + `TestHotPathZeroAllocations` (both `pkg/sync`) unaffected.
-- **`l1_compaction_test.go`:** `readAllIntoJemalloc` now returns the FULL buffer + `n`; `collectRowKeys` reads `buf[:n]` but frees the FULL `buf`. (Hygiene — the test no longer relies on the allocator's robustness; it models the correct pattern.)
+The change adds one radix lookup per free. The allocation-and-free microbenchmark increased by
+about 6.5%, from 865 to 921 ns/op, with 0 allocs/op. `JemallocAllocator` is not used by `pkg/sync`,
+whose CRDT write path uses `HamtArena`, so this lookup is not added to the CRDT hot path. The
+lookup applies to the LSM, durability, and transport allocation paths.
 
-## 6. Guards (bug-injection-proven, `-race` GREEN)
-- **T1 (culprit guard — `TestReslicedFreeIsSafeAndBalanced`, `jemalloc_free_audit_test.go`):** reslice-and-free a 32KB block ×512, then a 64KB sweep — asserts `BytesAllocated` returns to baseline and no corruption. Deterministic: it keys on the accounting drift, not the intermittent SIGSEGV. **Bug-inject RED:** reverting `Free` to trust `len(b)` → FAILS (`BytesAllocated=16134400, want 0`).
-- **T2 (accounting pin — `TestReallocateAccountingExact`):** alloc → realloc(grow) → realloc(shrink) → free; `BytesAllocated` tracks the usable size exactly and returns to 0.
-- **T4 (audit load-bearing — `TestAuditInstrumentIsLoadBearing`):** subprocess with the audit armed — a resliced free is logged `WRONG-SIZE-FREE-CALL`, a double free PANICS `INVALID-OR-DOUBLE-FREE`. Proves the diagnostic is not vacuous (the "no test is lying" guard for the instrument itself).
-- **T3 (coverage gap closed):** `internal/database` added to the standard verification battery (the WHOLE package, `-race` on) — the exact gap that let this bug hide for days.
+The test helper now returns the full buffer and its content length separately. `collectRowKeys`
+reads `buf[:n]` but frees the full buffer. This preserves the correct caller pattern even though
+`Free` now tolerates a shorter slice.
 
-## 7. Gates (all measured, none inherited)
-- `go build` / `go vet` clean (no NEW findings beyond the pre-existing `unsafe.Pointer` set).
-- Guards `-race` GREEN.
-- Full `internal/database` suite **N=12/12 clean post-fix** (0 SIGSEGV; pre-fix ~50% fault — 12 consecutive cleans ≈ p=0.5¹²≈0.02% if the bug persisted). Full-suite `-race`: 615s clean, 0 `DATA RACE`.
-- `fieldalignment`: 11 findings (baseline unchanged — the audit structs are field-reordered to stay clean; never `-fix`).
-- The core merge-law/wire-schema files remain unchanged; `TestHotPathZeroAllocations` PASS; `BenchmarkHAMTInsertZeroAlloc` unchanged.
-- Full verification battery on a 32-core machine: GREEN.
+## Consequences
 
-## 8. Honesty / open item
-- The wrong-size free was a **test-code** bug; production allocator/flush paths were already correct. The fix hardens the **production** allocator against the class (any future caller, any package).
-- The audit instrument is kept, env-gated, as a production-safe heap-forensics tool (its double-free/invalid-free detection is a class the fix does NOT cover — a double-free is still UB). Off the hot path (a single never-taken branch when unarmed).
-- The `+6.5%` `JemallocAllocator` microbenchmark cost is disclosed; it is off the CRDT hot path and immaterial to throughput.
-- Pre-existing gofmt drift in several unrelated test files predates this change and is NOT touched (out of scope).
-- An OOB-write guard-band instrument was designed but not needed (H0 refuted by the heal-causation proof); it remains a future option if a heap corruption ever survives the free-size fix.
+The original corruption came from test code, not a production flush caller. The production
+allocator is nevertheless the enforcement point because it can protect every caller that supplies a
+shorter slice. Double frees and invalid pointers remain undefined behavior; deriving the usable
+size does not make those calls safe.
+
+The optional heap audit remains available through `SUPREMUM_JEMALLOC_AUDIT`. It is disabled by
+default. When disabled, its call sites reduce to a predictable branch with no allocation. When
+enabled, it records live blocks and diagnoses length mismatches, invalid frees, and double frees.
+
+## Evidence
+
+### Heap corruption mechanism
+
+`Allocate(32768)` returns a block whose usable size is `32768`, a 32KB large extent. Passing
+`Free(buf[:3266])` to the old implementation called `sdallocx(ptr, 3266, 0)`. Jemalloc selected a
+small size class from 3266 even though the pointer referred to a large extent, corrupting the
+size-class bookkeeping.
+
+The fault appeared only when later allocation activity encountered that metadata.
+`TestMemTable_InsertAndFlush` performed 50,000 partitions of 64KB `NewJemallocBuffer` allocation
+and free activity, making the flush test the usual victim. The observed fault rate was about 50%.
+The anomalous 2048-to-32768 growth in `TestJemallocAllocator_Reallocate` was another symptom of
+the corrupted size metadata, not a separate defect.
+
+### Diagnosis
+
+The race detector cannot track cgo and jemalloc memory. The jemalloc 5.3.0 build used for these
+tests also rejected `redzone:true`, so that run had not ruled out an out-of-bounds write. Sixteen
+of sixteen isolated flush reproductions passed, covering both 64KB buffer churn and an Arrow
+`RecordBuilder`, `JemallocBuffer`, and IPC-writer path. This pointed to corruption seeded by a
+different test in the same process.
+
+The audit in `memory_allocator_audit.go` registers live blocks and validates frees. On four of four
+full-suite runs it identified `free_size=3266` against a recorded usable size of `32768`, allocated
+by `readAllIntoJemalloc` and freed by `collectRowKeys`.
+
+A healing mode freed those blocks with their recorded sizes and continued. The suite completed
+with zero SIGSEGVs and 13 healed wrong-size frees, all from that helper. Correcting only the free
+size removed the observed crashes and isolated the mechanism.
+
+### Alternative explanations
+
+Healing only the free size removed the observed crashes, which an out-of-bounds write would not
+explain. The allocator already passed usable sizes for aligned allocations, and sixteen of sixteen
+stress runs using `ALIGN(64)` allocation with `flags=0` on free passed. The uploader mocks did not
+let buffers escape. A full-suite race run completed in 615 s with no data-race report. These checks
+left the length mismatch, rather than alignment, uploader lifetime, or a Go data race, as the
+mechanism consistent with the evidence.
+
+### Regression guards
+
+`TestReslicedFreeIsSafeAndBalanced` in `jemalloc_free_audit_test.go` performs 512 resliced frees of
+32KB blocks followed by a 64KB sweep. It asserts that `BytesAllocated` returns to its baseline and
+that no corruption occurs, making the result deterministic rather than dependent on an intermittent
+SIGSEGV. Restoring the old `len(b)` behavior fails with `BytesAllocated=16134400, want 0`.
+
+`TestReallocateAccountingExact` checks allocation, growth, shrinkage, and free, requiring the
+accounting to track usable sizes and return to zero.
+
+`TestAuditInstrumentIsLoadBearing` runs a subprocess with the audit enabled. A resliced free emits
+a length-mismatch diagnostic; a double free panics with the audit's invalid-free diagnostic. These
+cases show that the instrument detects the conditions it reports.
+
+The complete `internal/database` package was added to the standard race-enabled verification run.
+
+### Verification runs
+
+The full `internal/database` suite passed twelve of twelve post-fix runs with zero SIGSEGVs, against
+an earlier fault rate of about 50%. If independent runs had retained that rate, twelve consecutive
+passes would have probability 0.5¹², approximately 0.02%. The full race-enabled suite completed in
+615 s with no data-race report.
+
+Build and vet passed, as did `TestHotPathZeroAllocations` and `BenchmarkHAMTInsertZeroAlloc`. The
+fieldalignment report retained the same 11 pre-existing findings and was not used to apply automatic
+layout changes. The full verification suite passed on a 32-core machine.
+
+The CRDT merge-law and wire-schema files were unchanged. An out-of-bounds guard-band diagnostic was
+not needed after the healing experiment isolated the free-size mismatch.

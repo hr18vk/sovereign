@@ -1,76 +1,106 @@
-# ADR-0045: Mesh Transport Correctness Invariants — the Two-Release Discipline
+# ADR-0045: Mesh transport correctness invariants
 
-- **Status:** Accepted. The invariants are implemented and silicon-gated.
-- **Date:** 2026-08-19 (recovery-law amendment through 2026-09-04)
-- **Author:** Harsh Rawat
-- **Scope:** `pkg/mesh/{peer,gossip}.go`, `pkg/receive/receiver.go`, `pkg/durability/{bridge,recovery,snapshot}.go`, `internal/chaos/wal.go`, `cmd/sovereign-node/main.go`. The five merge-law/wire-schema files are untouched.
-- **Supersedes:** the implicit assumption in the earlier multi-region design that the mesh transport "just worked."
+- **Status:** Accepted
+- **Date:** 2026-08-19; recovery amendments through 2026-09-04
+- **Scope:** `pkg/mesh`, `pkg/receive`, `pkg/durability`, `internal/chaos`, and the node wiring in `cmd/sovereign-node`
 
-The multi-region design specified the target topology (intra-region full-mesh, inter-region fan-out) and the reconciliation primitive (IBLT), but it never specified the transport-layer invariants that make a real TCP+TLS mesh physically converge. Silicon proved the gaps were live, not theoretical. This ADR records the invariants, the exact-WAL recovery law, and the honest limits.
+## 1. Context
 
-## 1. Context — three root causes
+The multi-region design specified an intra-region full mesh, inter-region fan-out, and IBLT reconciliation, but left three transport assumptions unchecked:
 
-- **Asymmetric connection graph.** The peer set's live map (which `Publish` queries) was populated only on outbound `Dial`; the accept loop received frames but never registered the inbound peer. A connection B→A was a publishable edge for B, not for A. At 100 nodes the boot-dial races 99 listeners and every lost dial permanently excluded that peer; at 3 nodes the race never bites. A cardinality cliff.
-- **Broken relay.** The ship path looked the payload up in an origin-side-only cache, so a peer that received a foreign delta could not forward it. The relay envelope with the embedded payload existed but was built only for 0-hop origin frames — so the O(log N) convergence the topology assumed never occurred; the origin had to reach every peer directly.
-- **Missing verification tier.** The loopback tests used an in-process mailbox model that bypasses the real PeerSet/Dial/Accept stack, so no loopback test could reproduce a connection-graph or relay defect. Silicon was the only tier that exercised the real transport — at 100 nodes, the worst place to find a cardinality bug.
+- **The connection graph was asymmetric.** The live-peer map used by `Publish` was populated only by outbound `Dial`. The accept loop could receive frames without registering the inbound peer, so a connection from B to A was a publishable edge for B but not for A. A lost boot dial could therefore exclude a peer permanently.
+- **Foreign deltas could not be relayed.** The ship path looked up payloads in an origin-side cache. A peer that had received a delta could not forward it, even though the wire format already carried an embedded payload. Partial-view topology could not converge while relaying depended on that cache.
+- **Loopback tests bypassed the transport under test.** The in-process network did not exercise `PeerSet`, TCP, TLS, or the accept path. Connection-graph and relay defects could pass every loopback test and appear only in a multi-node deployment.
 
-## 2. The invariants
+Recovery had a related identity problem. A checkpoint could observe state while concurrent writers were still appending to the WAL. Replaying those mutations through `InsertLocal` minted new dots instead of restoring their durable identities, producing duplicate state after a crash.
 
-```
-INV-1 (Connection Symmetry): every accepted TLS connection registers the inbound
-  peer into the live-peer map, keyed under the real nodeID decoded from the TLS
-  leaf CN — the same identity Dial reconciles on. A connection becomes a
-  bidirectional publishable edge; a lost outbound dial no longer permanently
-  excludes a peer that dialed us.
+## 2. Decision: transport invariants
 
-INV-2 (Relay With Payload): for a FOREIGN entry (received, not originated), the
-  ship path forwards the last-received relay envelope — payload embedded, not
-  regenerated from the HAMT + cache. The next hop reassembles and joins WITHOUT a
-  cache hit on the origin. This is what makes fan-out-N reach all N nodes in
-  O(log N) rounds.
+### INV-1: connection symmetry
 
-INV-3 (Real-TCP Verification Tier): the mesh transport is exercised over real
-  TCP+TLS before the silicon tier. A deterministic staggered-boot RED→GREEN test
-  (2–3 nodes, net.Listener, not net.Pipe) closes the coverage gap; a mailbox or
-  in-process test asserting convergence here would pass vacuously.
-```
+Every accepted TLS connection registers its inbound peer in the live-peer map, keyed by the node identity decoded from the leaf certificate CN. An accepted connection is consequently a publishable edge in both directions.
 
-Implementation: INV-1 lives in `pkg/mesh/peer.go` (`RegisterInbound`/`ReleaseInbound`/`nodeIDFromConn`). INV-2 lives in `pkg/receive/receiver.go` (the relay hook + retainer, fired before the accept returns) and `pkg/mesh/gossip.go` (the relay cache, `RetainForeign`, and the `shipDelta` FOREIGN branch that publishes the received envelope byte-identical — no re-origin-sign). INV-3 lives in `pkg/mesh/asymmetric_dial_test.go`. A `sync.Once`-guarded close on the peer connection closes a close-of-closed-channel race between the read-loop's deferred close and the inbound-release path that only surfaces under accept-loop churn at fleet scale.
+`RegisterInbound` keeps an already-live edge instead of evicting it. A declined registration returns no owned connection, and release is identity-checked so cleanup cannot close a newer edge. Connection completion is guarded by `sync.Once`; both read-loop exit and inbound release remove dead address entries. Reconnection checks both the address and peer-identity maps and waits after a successful dial, preventing a close or redundant registration from causing an immediate redial loop.
 
-## 3. The two-release ladder
+### INV-2: relay with payload
 
-- **Release A** (this ADR): INV-1 + INV-2 + INV-3 → the 100-node convergence gate. The dial graph is still O(N²) (halved by symmetry, still quadratic) — fine at 100 nodes, strained at ~1K, impossible at 10K. The honest claim is "proven at 100 nodes," not "planetary."
-- **Release B** (the planetary follow-up): partial-view membership — each node dials O(fanout) peers and deltas relay through the partial view in O(log N) rounds, dropping connections from O(N²) to O(N·fanout). INV-2's relay is the hard prerequisite: a partial view that cannot relay can never converge. Release B is gated on a ≥1K-node silicon run before any "planetary" restatement.
+A node retains a verified foreign envelope after applying it and forwards those received bytes on the next hop. It does not reconstruct the payload from local state or re-sign the envelope as a new origin. Per-frame, batch, and hybrid receive paths install their retainers through the same wiring used by production and tests. Batch entries without dots are not retained, and rejected batches are never retained.
 
-The ordering is physical, not a preference: relay (INV-2) is the prerequisite for partial-view membership, so the sequence is INV-1 → INV-2 → gate at 100 → partial view → gate at 1K+.
+The default TCP frame reader transfers ownership of a fresh frame buffer to the retainer. The build-tagged epoll ingress instead copies out of its reused receive buffer before delivery. Fan-out selection rotates its seed each sweep so a partial view does not pin every round to the same remote peers.
 
-## 4. The exact-WAL recovery law
+### INV-3: real TCP verification
 
-Crash recovery is rebuilt on identity, not counters. The load-bearing decision: **replay restores the recorded dot — it never re-mints.**
+Transport tests use `net.Listener`, TCP, and TLS before relying on a larger mesh run. The suite includes staggered connection setup and a three-node chain whose endpoints have no direct edge. Disabling relay retention must make the chain test fail; restoring it must let the terminal node converge.
 
-1. Every WAL record retains its sequence; the final checkpoint records its sequence cut; the post-checkpoint replay tail is selected by record position, never by a scalar Lamport counter.
-2. Replayed mutations are restored at their recorded (DotNodeID, DotCounter) via the synthetic-delta Join route; `InsertLocal` is forbidden on the replay path (re-minting double-mints and corrupts).
-3. The WAL persists the complete 120-byte CRDTEntry semantics, with the persisted origin/dot stamped from the returned CausalDot; format evolution is a versioned record type — old bytes are never reinterpreted, and a legacy log is announced as legacy, never silently zero-filled.
-4. Snapshots are bound to the exact checkpoint sequence and validated; local snapshot dots are cross-checked against durable WAL identity; local phantoms are rejected; foreign image state is kept only when safely anchored; any anchor failure takes the loud, machine-observable full-replay fallback.
-5. `RecoveryWitness` is extended (checkpoint cut, path, records applied, snapshot validation, fallback reason, legacy status); `ErrRecoveryRootMismatch` stays load-bearing; the concurrent-writer checkpoint race is closed without a write-path mutex.
+## 3. Decision: scale follows relay
 
-## 5. The integrity oracle
+The initial acceptance tier used a full-mesh dial graph. Its connection count grows as O(N²), even when symmetry makes each accepted connection useful in both directions. Embedded-payload relay was therefore a prerequisite for partial-view membership, not an optimization to add afterwards: once a node dials only O(fanout) peers, deltas must travel through intermediate nodes.
 
-Recovery is verified by an armed oracle, not assumed: a recovered root must re-equal the pre-crash root, and a corrupted or mismatched image refuses to boot loudly rather than silently serving wrong state. The oracle is armed on the snapshot path and the sequence contiguity of the WAL tail is asserted, so a skipped or forged record is caught at boot.
+The current implementation carries that design forward through [ADR-0062](0062_reconciliation_scale_limits.md), [ADR-0063](0063_partial_intra_view.md), [ADR-0064](0064_iblt_reconciliation.md), and [ADR-0067](0067_ingress_admission_and_relay_resolution.md). The hierarchical gateway topology and its later reconciliation changes are recorded in [ADR-0073](0073_hierarchical_gateway_topology_and_boot_dial.md) and [ADR-0074](0074_var_freelist_aba_and_v2_digest_requests.md). Measurements from those later systems must not be attributed to the original full-mesh design.
 
-## 6. Acceptance gates
+## 4. Decision: the exact-WAL recovery law
 
-- **Real-TCP RED→GREEN teeth** for INV-1 (a 3-node staggered boot) and INV-2 (a linear A→B→C chain with A partitioned from C: B must forward to C via the embedded-payload relay). Each tooth is proven load-bearing by a bug-inject control — disabling the mechanism turns the tooth red. The relay chain is proven load-bearing by `TestRelayChainLoadBearing`; the byAddr cardinality bound by `TestB1_ByAddrBoundedByLiveEdges`; the hybrid PQ convergence by `TestB7_ThreeNodeHybridConverges`.
-- **The 100-node silicon gate:** a 10K-key delta converges across 100 nodes / 3 regions, WAL-durable. Measured: all 100 nodes converged in 9.610 s against the 10 s SLO (batch-size 100, region-aware fan-out).
-- **The crash-recovery leg:** a seed node is killed mid-run and rejoins with its recovered root re-equaling the fleet.
+Recovery restores durable identity; it does not repeat local minting.
 
-## 7. Honest limits (open items, not closed)
+1. **Select the tail by record sequence.** A versioned checkpoint captures `CutSeq` before walking state, and bounded recovery replays records at or after that horizon. A scalar Lamport counter is not a WAL cut: concurrent writers can reserve dots in one order and append them in another. Legacy checkpoints use a repair pass for durable mutations missing below their less precise cut.
+2. **Restore the recorded dot.** Each replayed mutation keeps its WAL-recorded `(DotNodeID, DotCounter)` and enters through the synthetic-delta `Join` path. `InsertLocal` is forbidden during replay. The recovering node's identity becomes `OriginNodeID`, because this WAL contains local-origin mutations and recovered local payloads must use the local ship path.
+3. **Persist the complete entry.** The versioned mutation record carries the full 120-byte `CRDTEntry`, including its temporal and spatial fields. The versioned checkpoint carries the root, local-dot and clock high-water marks, sequence cut, and state fingerprint. New record types leave legacy mutation, checkpoint, and clock-advance records readable instead of reinterpreting their bytes.
+4. **Join image and tail separately, in that order.** On an equal `(EntityID, DotNodeID, DotCounter)`, `Join` retains the existing entry's non-dot bytes. The snapshot image therefore precedes the WAL tail in two calls. Combining them into one incoming buffer would leave the winner to an unstable sort when both copies share a dot.
+5. **Bind an image to its anchor.** The image header carries the checkpoint cut and root. A stale or mismatched image falls back to exact-WAL recovery with a witness reason; it is not treated as corrupt merely because it is stale. A duplicate image record is not writer-producible and refuses boot with `ErrRecoveryImageDuplicate`. Local image dots without durable WAL identity are rejected rather than allowed to become phantoms.
+6. **Capture a checkpoint in one pinned walk.** `CaptureShardsPinned` derives the root, image, local-dot horizon, and fingerprint without materializing a second merged HAMT. The EBR pin remains held through image encoding and upload because entity identifiers are zero-copy strings into the arena. Snapshot upload uses a temporary file, file and parent-directory fsyncs, and rename; interrupted upload files are hidden and reaped.
+7. **Check record continuity independently of state roots.** WAL sequence contiguity covers every record type and rejects a gap before state is rebuilt. A replay-only WAL has no foreign entries, so comparing its root with a checkpoint root that includes foreign state is invalid; that comparison is scoped to the snapshot path. [ADR-0053](0053_wal_snapshot_crc32c.md) adds CRC32C content checks to WAL records and snapshot images.
 
-- **Memory:** one gate run measured max node RSS 567,616 KB against a 512,000 KB threshold (a 10.9% breach). The relay-cache refcount is unit-proven, so the growth driver is elsewhere (the unbounded-by-intent payload cache and the arena high-water are candidates). This is root-caused before any production-memory claim; the convergence gate passing does not close it.
-- **Sweep cost:** the sweep hoist removed redundant delta generation, but per-peer build+sign still dominates a sweep.
-- **Budget refill:** the admission budget is a lifetime quota with no time-based refill; a long production run will eventually exhaust it. Time-based refill is Release-B work.
-- **Cold boot:** the gate ran with the Lamport absolute-slack raised (a scoped, disclosed stop-gap) so a cold peer's first 10K batch is admitted; the general verified-origin bulk-transfer catch-up is Release-B work.
+Recovery seeds the Lamport clock through the constructor from the persisted high-water marks. It does not call `AdvanceLamportTo` merely to raise the clock, because that method also updates ingress-rate state used by the skew bound. Implausible checkpoint clock values are clamped to the log's durable high-water and surfaced in the recovery witness.
 
-## 8. Status
+## 5. Decision: integrity checks must match their comparand
 
-Accepted. The invariants and the exact-WAL recovery law are implemented and silicon-gated at 100 nodes. Release B (partial-view membership) is the committed planetary follow-up, gated on a ≥1K-node run. The open items in §7 are disclosed, not closed.
+### 5.1 State fingerprint oracle and equal-root divergence (historical index §15.12)
+
+Because the Merkle root folds causal dots rather than payload bytes, fleet convergence gates (`cmd/fleet-gate`, indexed historically as §15.12) evaluate both root equality and state fingerprint equality. When roots converge but state fingerprints diverge across nodes, the diagnostic asserts an integrity breach.
+
+A Merkle root folds causal dots; it does not cover the payload digest or the other entry fields. A matching root therefore cannot detect equal dots carrying different bytes.
+
+A bound snapshot enables two checks before tail replay: root equality and equality of the payload-covering state fingerprint. An armed mismatch returns `ErrRecoveryRootMismatch` or `ErrRecoveryFingerprintMismatch`. The recovery witness records whether the checks were armed and whether the final checkpoint used a legacy form. Replay-only recovery has no image fingerprint to compare, so it relies on exact-dot restoration, WAL sequence continuity, and content checksums rather than claiming an image-bound check.
+
+## 6. Acceptance criteria
+
+- A staggered TCP+TLS setup must produce a symmetric publishable graph. On a three-node chain with no endpoint connection, the middle node must relay the embedded payload to the terminal node. Hybrid signing must pass the same convergence shape with both signature-verification counters advancing.
+- Recovery tests must cover non-quiescent checkpoints, concurrent mint/append reordering, a non-empty replay tail, legacy records, stale and damaged images, duplicate image records, clock corruption, and gaps in the WAL sequence. A check that can be disabled by malformed input is not accepted as an integrity guard.
+- A convergence measurement starts only after every injection is acknowledged and the origin is quiescent. Ingest duration is reported separately. Root equality is checked at every node, and scrape failures cannot be counted as agreement.
+- Checkpoint tests must show that repeated captures do not grow the arena through a merged-state copy. Shutdown must quiesce reclamation and in-flight state access before unmapping the arena.
+
+## 7. Consequences and current limits
+
+The transport invariants make partial-view relay possible and move connection and relay failures into tests that exercise their actual stack. Exact-WAL recovery makes replay idempotent by dot identity and preserves entry bytes that a dot-only root cannot see.
+
+Several limitations in the original record have since been resolved rather than carried forward:
+
+- [ADR-0047](0047_close_quiesce.md) closes the arena reclamation and teardown ordering hazard.
+- [ADR-0049](0049_causation_checkpoint_flush.md) identifies synchronous checkpoint flushing as the cause of the long origin commit stall; [ADR-0050](0050_checkpoint_decouple_delta.md) moves that work off the commit path and records the resulting convergence runs.
+- [ADR-0053](0053_wal_snapshot_crc32c.md) adds the content-integrity checks missing from the first exact-WAL implementation.
+- [ADR-0067](0067_ingress_admission_and_relay_resolution.md) changes ingress admission and relay resolution so a cold peer does not need the widened Lamport slack used by the early gate runs.
+
+Important boundaries remain. In-memory local state is published before its WAL fsync completes, while gossip payloads are recorded only after a successful append. Recovery can restore only what reached durable storage. Cache retention and digest sizing have their own resource bounds and later decisions; this ADR does not establish a general production memory limit. Hybrid frame signing remains opt-in. Acceptance here is not a claim of production readiness.
+
+### Quiescence amendment
+
+With state visible before the WAL append finishes, a stable root does not prove that no commit is in flight.
+
+`/v1/merkle` therefore exposes `commit_in_flight` and commit-latency statistics. The convergence gate requires both a stable root and `commit_in_flight == 0` throughout its stability streak before starting the convergence clock. Failed or timed-out appends can leave local state without a gossip payload, so sweep statistics distinguish those misses from relay-retention misses.
+
+## 8. Evidence
+
+The executable checks named here are in the current tree:
+
+| Property | Checks |
+|---|---|
+| Inbound registration and staggered setup | `TestAsymDialAcceptDoesNotRegister`, `TestAsymStaggeredConverges` |
+| Embedded-payload relay and connection cleanup | `TestRelayChainLoadBearing`, `TestCloseDoneExactOnce`, `TestB1_ByAddrBoundedByLiveEdges` |
+| Hybrid relay over TCP+TLS | `TestB7_ThreeNodeHybridConverges` |
+| Checkpoint horizon and arena use | `TestNoHoleBelowWatermark`, `TestCheckpointAllocatesZeroArena` |
+| Image binding and payload-covering integrity | `TestStaleImageBindingDisarmsNotBricks`, `TestHeaderRootRotBindingCatchesRootHalf`, `TestNonDotCorruptionBootRefused`, `TestCrashMidInjectOracleArmed`, `TestFingerprintWriterReaderAgreement` |
+| Legacy checkpoints and durable upload cleanup | `TestLegacyCheckpointTracksFinalRecord`, `TestOrphanWedgesCompactionAndReaperClosesIt` |
+| Commit observation and clock bounds | `TestCommitTailLocalShape`, `TestClockHighClampMaxUint64`, `TestClockHighClampOneBitFlip`, `TestClockHighClampBoundary` |
+
+The published [100-node convergence receipt](../../evidence/convergence-100-node.txt) and [crash-recovery receipt](../../evidence/crash-recovery.txt) describe their workloads, machines, commands, and results. Early convergence measurements are not acceptance evidence when their clocks began with writes still in flight or their crash checks did not arm the integrity comparison. The later records linked above supersede those readings rather than preserving them as passing results.
+

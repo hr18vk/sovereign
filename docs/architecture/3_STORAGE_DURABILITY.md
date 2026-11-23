@@ -1,275 +1,236 @@
-# 3. Storage and Durability — Kernel Bypass
+# 3. Storage and Durability
 
-## 3.1 The mmap Illusion And The Page-Fault Tax
+## 3.1 The mmap Illusion and the Page-Fault Tax
 
-The `mmap(2)` system call is routinely misused. Database engineers map a file
-into the process's virtual address space and let the Linux page cache lazily
-move pages between RAM and storage. This is attractive because it appears to
-remove a copy — the application reads the file as if it were memory. The trap
-is that `mmap`'s laziness is a *latency tax* paid in two hardware events the
-application cannot predict or hide:
+Mapping a file with `mmap(2)` lets an application read storage as memory, but
+the access still depends on kernel paging. Two hardware events matter to the
+latency of that design:
 
-- **Major page fault.** When the CPU dereferences a virtual address whose
-  physical page is not resident, the MMU raises a page-fault exception. The
-  kernel handles this by suspending the faulting OS thread in `D` (uninterruptible
-  disk wait) state while it schedules the disk I/O to bring the page in. The
-  Go runtime scheduler maps thousands of goroutines onto the `GOMAXPROCS`
-  thread pool; it is blind to the fact that a pointer dereference just became
-  a blocking I/O, so the stall backs onto the entire thread pool and freezes
-  the server.
-- **TLB shootdown.** A virtual-to-physical translation change (notably on
-  `munmap`, or a protection remap) requires every core that may have cached
-  the translation to flush it. The kernel signals this with an
-  inter-processor interrupt; on a 32-core machine a single shootdown can take
-  tens of microseconds.
+- **Major page fault.** If a dereference requires storage I/O, the kernel can
+  suspend the faulting OS thread in `D` (uninterruptible disk wait) until the
+  page arrives. Go schedules goroutines onto the `GOMAXPROCS` thread pool, but
+  a pointer dereference does not tell the scheduler that it is about to block
+  on I/O. Enough concurrent faults can therefore occupy the pool and stall
+  unrelated goroutines.
+- **TLB shootdown.** Changing a virtual-to-physical translation, during
+  `munmap` or a protection remap, requires cores that cached the translation
+  to flush it. The kernel uses inter-processor interrupts; on a 32-core
+  machine a single shootdown can take tens of microseconds.
 
-Both events violate the sub-millisecond latency mandate deterministically —
-not probabilistically. I call this the *Threat of mmap and the Go Scheduler
-Collapse*.
+The engine's HAMT arena uses anonymous `mmap` rather than a file-backed
+mapping. Residency still matters: first-touch faults, eviction, and address
+range teardown occur outside Go's memory model and are not visible as ordinary
+heap allocations.
 
-## 3.2 A Deeper Defect: Live Control Corruption
+## 3.2 Live Control Corruption
 
-Chaos Mesh-style fault injection (`MADV_DONTNEED` on a `MAP_PRIVATE`
-anonymous page) reveals a second failure mode that is a corruption, not a
-stall. `MADV_DONTNEED` on an anonymous page tells the kernel it may discard
-the page's modifications; the next access re-faults the page as **zero**. The
-HAMT root wrapper — its `seed`, `root` pointer, and `count` — lives in the
-same `mmap`'d region as the leaves. `MADV_DONTNEED` on a page containing the
-root wrapper zeroes the `seed`; the next `Get` panics with `maphash: use of
-uninitialized Seed`, an off-heap corruption with no `recover()` path. This
-is the SIGSEGV-class failure the process-level defense in §3.6 hardens against.
+Fault injection with `MADV_DONTNEED` exposes a second failure mode on a
+`MAP_PRIVATE` anonymous page. The kernel may discard the page's modifications,
+and the next access re-faults it as zero. The HAMT root wrapper — its `seed`,
+`root` pointer, and `count` — lives in the same mapped region as the leaves.
+Zeroing the wrapper's page can make the next `Get` panic with `maphash: use of
+uninitialized Seed`. Corrupting a raw pointer can instead produce a fatal
+`SIGSEGV`, which `recover()` cannot intercept. The process-isolation harness in
+§3.6 addresses the second case.
 
-## 3.3 Defense Layer: Chunked `mlock`
+## 3.3 Residency Controls
 
-The engine pins its hot index pages into physical RAM, defeating the OS page
-replacement algorithm entirely. The defense is `pkg/sync/residency.go`:
+`pkg/sync/residency.go` implements page-pinning and fault-injection primitives:
 
-- **`LockHotPages`** issues `syscall.Mlock` over the hot-path index page range
-  in chunks rounded to the OS page boundary (`os.PageSize`), because partial-page
-  `mlock` semantics are undefined. Graceful degradation: when the process
-  lacks `CAP_IPC_LOCK` (unprivileged container), `mlock` returns `EPERM`; when
-  the `RLIMIT_MEMLOCK` ceiling is hit, it returns `ENOMEM`. The engine records
-  both in `ResidencyStatus.PermDenied`/`PagesPinned` and proceeds — the gate
-  asserts the *correctness* of the residency control, not the capability's
-  availability.
-- **`UnlockHotPages` / `UnlockAllPages`** precedes `munmap` on a locked range,
-  because some kernels refuse to `munmap` a still-locked region.
-- **`EvictPages`** is the chaos hook: `MADV_DONTNEED` on a caller-specified
-  window injects the exact major-fault scenario the residency gate must survive.
-- **`PrefaultPages` / `PrefaultHot`** walk a window touching each byte to
-  fault pages in ahead of the timed read path — the "prefault fence".
+- **`LockHotPages`** rounds the requested range to `osPageSize` boundaries and
+  calls `syscall.Mlock` one page at a time. `EPERM`, normally from missing
+  `CAP_IPC_LOCK`, sets `ResidencyStatus.PermDenied`; `ENOMEM`, normally from
+  reaching `RLIMIT_MEMLOCK`, sets `Truncated`. Both leave already-pinned pages
+  locked and return a status rather than crashing.
+- **`UnlockHotPages` and `UnlockAllPages`** release locked pages. The arena's
+  production cleanup calls `UnlockAllPages` before `syscall.Munmap`; unlocking
+  an unlocked range is harmless.
+- **`EvictPages`** applies `MADV_DONTNEED` to a caller-specified window for
+  fault-injection tests.
+- **`PrefaultPages` and `PrefaultHot`** touch one 32-bit word per page, up to
+  the arena's allocation high-water mark, to move first-touch faults ahead of a
+  timed traversal.
 
-### 3.3.1 The Gate And Why It Is Deterministic
+These controls are built but are not enabled by node startup. Apart from
+`UnlockAllPages` during arena cleanup, their current callers are in
+`pkg/sync/residency_test.go`. In particular, the engine does not currently pin
+its hot index pages during normal operation.
 
-`TestResidencyPageFaultGate` proves the defense. The original gate used
-a worst-case-latency threshold (10 µs), which was flaky on the 32-core box — a
-non-faulting traversal ranged 1.4 µs ↔ 16 µs under scheduler jitter, so a
-passing run could trip the latency threshold on jitter alone. I reworked the
-gate to assert a **major-fault-count delta** read from field 10 of
-`/proc/self/stat` (`majflt`). A fault is a kernel-counted physical event immune
-to scheduler jitter; the gate asserts `majorFaultsDelta == 0` when hot pages
-are pinned, and reproduces the `MADV_DONTNEED` seed-corruption panic in the
-negative control (the §3.2 failure). The 10 µs mandate survives as the *judicial*
-`go tool trace` recipe (`ResidencyTraceRecipe`), run by a human on live traffic.
+### 3.3.1 What the Residency Test Checks
 
-| Strategy | Latency bound | Failure mode if violated |
-|:-------------------------|:-----------------------|:-------------------------------------------|
-| File-backed `mmap` only | Unbounded (disk I/O) | Scheduler-collapse on major fault |
-| `MADV_WILLNEED` hint | No bound (advisory) | Kernel may ignore; page may still evict |
-| `mlock` hot index pages | Bounded by page-pin | `EPERM`/`ENOMEM` → degrade, no crash |
+`TestResidencyPageFaultGate` builds a multi-page HAMT, evicts the whole arena
+as a negative control, then pins the control region and evicts a later data
+window. It checks that the pinned traversal does not panic and that the
+major-fault delta from field 10 of `/proc/self/stat` (`majflt`) is zero. If
+procfs is unavailable, it uses a P99 latency ceiling instead.
+
+The fault count avoids using a tight wall-clock threshold as the normal test
+oracle. On the 32-core machine where the earlier threshold was evaluated, a
+non-faulting traversal ranged from 1.4 µs to 16 µs under scheduler jitter, so a
+10 µs limit could fail without a major fault. `ResidencyTraceRecipe` retains a
+manual `go tool trace` procedure for inspecting that 10 µs bound; it is not an
+automated latency guarantee.
+
+The test skips when the host cannot perform the required `madvise` or `mlock`
+operation. The whole-arena control also logs, rather than requires, seed
+corruption because the kernel's response is host-dependent. A passing or
+skipping test therefore does not imply that production nodes have page pinning
+enabled.
 
 ## 3.4 The Write-Ahead Log
 
-Durability — the property that an acknowledged mutation survives a crash — is
-kept out of the off-heap arena and out of the page cache. The engine ships its
-**own WAL** (`internal/chaos/wal.go`), explicitly *not* PostgreSQL's WAL.
+The engine's WAL is implemented in `internal/chaos/wal.go` and re-exported by
+`pkg/durability/wal.go`. `Bridge.PutLocal` inserts a local mutation, appends
+the returned dot and complete entry, and returns only after the WAL append and
+fsync finish. This is separate from the off-heap arena and from PostgreSQL's
+WAL. WAL writes are buffered through the kernel page cache; fsync supplies the
+durability barrier.
 
-### 3.4.1 Framing And The Durability-Before-ACK Contract
+### 3.4.1 Framing and Durability Before Acknowledgment
 
-The WAL is an append-only file opened with `os.OpenFile(path, O_RDWR|O_CREATE,
-0644)` and prefixed with an 8-byte header (`magic = 0x57414C00`, `version = 1`).
-Each record is `[seq(8) | type(1) | len(4) | payload]`. Three record types are
-defined (`internal/chaos/wal.go:54-71`): `WALRecMutation` (an
-`(entityID, CausalDot, CRDTEntry)` tuple), `WALRecCheckpoint` (a
-`(MerkleRoot, LamportHigh)` tuple anchoring recovery), and
-`WALRecClockAdvance` (the foreign-advance record — an 8-byte
-advanced-to counter). `WALRecClockAdvance` records a peer-driven
-`AdvanceLamportTo` (`pkg/sync/crdt.go:1762`, reachable from the live receive
-path inside `Join` at `crdt.go:1106`); recovery's replay switches on all
-three (`internal/chaos/wal.go:557-591`). This third record is what makes the
-`firstMutation.Counter − 1` seed in §3.4.3 necessary — without it a foreign
-clock jump leaves an un-recorded counter gap and the two-record formula
-silently under-counts the seed.
+The WAL opens with `os.OpenFile(path, O_RDWR|O_CREATE, 0644)`. A new file
+receives an 8-byte header (`magic = 0x57414C00`, `version = 1`), and each
+record has the frame `[seq(8) | type(1) | len(4) | payload]`.
 
-`AppendMutation` is **synchronous**: it writes the record then calls
-`f.Sync()` before returning. The worker ACKs the client only after the fsync
-returns. This is the **durability-before-ACK contract**: a crash between the
-fsync and the ACK produces a duplicate replay on recovery, which
-`InsertLocal`'s dot identity deduplicates — no loss, no divergence. A crash
-between the ACK and a hypothetical subsequent fsync would lose an
-acknowledged mutation; the synchronous ordering eliminates that window.
+The record forms are:
 
-### 3.4.2 Tail-Tear Handling And Foreign-File Rejection
+- `WALRecMutation`, the legacy entry subset;
+- `WALRecMutationV2`, the full 120-byte `CRDTEntry` used by new appends;
+- `WALRecCheckpoint`, the legacy root and local Lamport watermark;
+- `WALRecCheckpointV2`, which adds a pre-snapshot `CutSeq`, the live clock
+  high-water mark, and an optional state fingerprint;
+- `WALRecClockAdvance`, a peer-driven Lamport advance; and
+- `WALRecChecksummed`, a Castagnoli CRC32C frame around another record.
 
-A crash mid-record leaves a partial trailing record. `ReplayWAL` reads with
-`io.ReadFull`; a short read on the trailing record returns `io.ErrUnexpectedEOF`
-and the replayer truncates that tail, returning the valid prefix and leaving
-the next sequence number at the last good record. A file with a bad magic is
-rejected explicitly by both `OpenWAL` and `ReplayWAL` — the engine never
-rebuilds state on a suspect log (`TestWALForeignFileRejected`,
-`TestWALTornTailTruncation`).
+New mutation, checkpoint, and clock-advance appends use the checksummed form.
+Replay still accepts the unframed legacy forms and marks legacy mutations so
+their unpersisted fields are not mistaken for recorded zeros.
+
+`AppendMutation` writes and sequence-stamps under the WAL mutex, captures the
+file handle, releases the mutex, and then fsyncs. Checkpoint and clock-advance
+appends follow the same order. `AppendMutations` writes a batch under one
+critical section and issues one fsync after unlocking. A batch failure rejects
+the whole batch for acknowledgment purposes; it does not roll back bytes that
+may already have reached the file. The group-commit and split-completion
+decisions are recorded in [ADR-0044](adr/0044_wal_group_commit.md) and
+[ADR-0048](adr/0048_wal_split_completion.md); checksum framing is in
+[ADR-0053](adr/0053_wal_snapshot_crc32c.md).
+
+A successful return establishes that the append's fsync completed. Only then
+may the caller acknowledge the write. A crash after fsync but before that
+acknowledgment can leave an unacknowledged record in the WAL; recovery applies
+that record at its recorded dot, and applying the same dot again is idempotent.
+Acknowledging before fsync would instead create a window in which an
+acknowledged write could be lost.
+
+### 3.4.2 Tail Tears, Corruption, and Foreign Files
+
+`ReplayWAL` reads record headers and payloads with `io.ReadFull`. A partial
+final header or payload is a crash boundary: replay stops and returns the valid
+prefix without modifying the file. `OpenWAL` separately scans to the last
+complete record, truncates a torn tail, restores the next sequence number, and
+seeks to the append boundary before new writes.
+
+Bad magic or an unsupported version is rejected by both readers. Replay also
+rejects excessive payload lengths, gaps or duplicates in the contiguous record
+sequence, unknown record types, and checksum mismatches. A checksum mismatch in
+a complete record returns `ErrWALCorrupt`; recovery refuses to rebuild from
+that authoritative log. `TestWALForeignFileRejected` and
+`TestWALTornTailTruncation` cover the format boundary cases.
 
 ### 3.4.3 The Recovery Determinism Contract
 
-> **I have since refuted the strategy this section records — read this note
-> first.** Everything below describes a **re-minting** replay: recovery boots at a
-> derived seed counter and re-runs `InsertLocal` so the engine re-mints dots that
-> are *supposed* to land on the recorded counters. That whole strategy is now
-> refuted, and with it BOTH seed formulas discussed below
-> (`firstMutation.Counter − 1` and `LamportHigh − len(Mutations)`). I constructed
-> and observed three independent counterexamples:
-> 1. **Mint order ≠ WAL append order.** Two concurrent writers mint dots 2 and 3;
-> the WAL mutex can serialize their *appends* in the opposite order. A seed
-> derived from the first recorded mutation then re-mints the second writer's
-> mutation at 4 instead of its durable 2 → `ErrRecoveryRootMismatch`.
-> 2. **A scalar counter is not a log position.** `InsertLocal` reserves a counter
-> *before* publication, so a checkpoint can record watermark N while that
-> mutation's record lands *after* the checkpoint record. Any counter-compared
-> tail cut then drops a durable mutation (observed: 10 recovered dots vs 11 live).
-> 3. **A non-quiescent checkpoint leaks dots into the snapshot image**, and
-> re-minting them produces a SECOND dot per entity — on one silicon run the
-> recovered seed carried 10,800 live dots for 10,000 keys and diverged
-> permanently from the root its 99 peers held.
->
-> **The corrected law:** replay **RESTORES the recorded dot; it never re-mints.**
-> Each mutation is re-applied at its WAL-recorded `(DotNodeID, DotCounter)` through
-> the exact-dot route (a synthetic-delta `Join`, which honours the recorded dot —
-> the same mechanism bounded recovery already uses for the snapshot image), and the
-> post-checkpoint tail is selected by **WAL record sequence** against the
-> checkpoint's sequence cut. Under exact-dot restore the ordering problem dissolves:
-> `Join` is a monotone, idempotent, commutative dot-union, so restored STATE is
-> order-independent and only the final clock (a max) depends on the advances.
-> A further defect surfaced in the same investigation: `WALEntry` persists only 5
-> of the 10 `CRDTEntry` fields, so `ValidTimeStart/End`, `AssertionTime`,
-> `DecisionTime` and `H3Index` replay as **zeros while the Merkle root still
-> matches** — the root folds causal dots only, so **root equality is not a
-> state-integrity verification**. The snapshot image (§3.3) already persists all
-> 120 bytes; the WAL does not.
->
-> I have kept the text below as the accurate record of the reasoning and of the
-> two formulas' relationship, not as the current contract.
+Recovery restores each mutation at its WAL-recorded `(DotNodeID, DotCounter)`
+through a synthetic-delta `Join`; it never calls `InsertLocal` to mint a
+replacement. The replacement engine starts at the maximum durable Lamport
+high-water mark, including the checkpoint's live `ClockHigh`, and recorded
+clock advances are applied as monotone maxima. Exact-dot restoration makes
+replaying an overlapping image and tail idempotent.
 
-`HAMT.MerkleRoot()` folds `SHA-256` over the canonical sort of `(DotNodeID,
-DotCounter)` pairs only; it does not depend on `maphash.Seed` (which Go marks
-as non-serializable across processes). A recovered worker started from a fresh
-seed therefore reproduces the identical root for the same mutation sequence —
-*provided* it replays with matching `(localNodeID, initialLamport)`. The
-subtle invariant: `InsertLocal` re-stamps `DotNodeID`/`DotCounter` from
-`NextDot()` (`pkg/sync/crdt.go:854`, the `lamportCounter.Add(1)`; the re-stamp
-is `crdt.go:966-968`), so the recovered engine must boot from
+The earlier approach derived an initial counter and replayed through
+`InsertLocal`. [ADR-0045 §4](adr/0045_mesh_transport_invariants.md) records
+why that cannot reproduce durable state: concurrent mint and WAL append orders
+can differ; a Lamport counter is not a WAL position; and re-minting dots already
+present in a non-quiescent snapshot creates duplicates. Record sequence, not a
+scalar counter, now defines the checkpoint tail. A V2 checkpoint starts the
+tail at its pre-walk `CutSeq`; a legacy checkpoint starts after the checkpoint
+record.
 
-    initialLamport = firstMutation.Counter − 1
+With a usable snapshot, `RecoverEngineWithSnapshot` joins the image before the
+tail in separate operations. Joining the full image first matters when an equal
+dot also occurs in a legacy tail record: an equal-dot merge retains the existing
+entry, so the image's full fields win. Local image dots must have corresponding
+WAL mutations. Missing or unusable images, binding mismatches, and local
+phantom dots select full WAL replay; `RecoveryWitness` records which path ran
+and which checks were available.
 
-i.e. `rebuiltInitial = rep.Mutations[0].Counter − 1` (`pkg/durability/recovery.go:229`
-for the full-replay path, `:221` for the bounded path). This is the counter the
-engine held immediately *before* the first durably-logged `InsertLocal`; the
-first recorded mutation minted `firstMutation.Counter = seed + 1` by
-construction, so `seed = firstMutation.Counter − 1` reproduces every
-subsequent origin dot exactly.
+`HAMT.MerkleRoot()` folds SHA-256 over sorted `(DotNodeID, DotCounter)` pairs;
+it does not depend on `maphash.Seed`. The same dot set therefore produces the
+same root with a fresh seed, but root equality does not establish entry-byte
+integrity. The root does not cover the payload digest or temporal fields.
 
-The *rejected* formula is `initialLamport = LamportHigh − len(Mutations)`.
-It is the defect `recovery.go:196-209` names "the defect, §0 root cause":
-`AdvanceLamportTo` jumps the Lamport clock forward via CAS consuming *no*
-counter, and it is reachable from the live receive path inside `Join`
-(`crdt.go:1106` calls `crdt.go:1762`). A foreign jump creates a counter
-**gap** — the N recorded mutations do NOT occupy the N consecutive counters
-ending at `LamportHigh`, so `LamportHigh − len(Mutations)` *under-counts* the
-seed; replay re-mints different dots; Merkle diverges (silently, or as a false
-`ErrRecoveryRootMismatch`). I first fixed the naive `LamportHigh` boot — which
-re-mints counters above all recorded ones and silently loses data — by switching
-to `LamportHigh − len(Mutations)`; I then generalized the seed to
-`firstMutation.Counter − 1` to close the foreign-advance gap that the earlier
-formula still missed. The `WALRecClockAdvance` record (§3.4.1) is the on-disk
-half of that fix.
+Current mutation records persist the complete entry. Legacy mutation records
+retain only the original subset, so their `ValidTimeStart`, `ValidTimeEnd`,
+`AssertionTime`, `DecisionTime`, and `H3Index` fields were not persisted;
+recovery marks and counts those records rather than treating their synthesized
+zero values as historical measurements.
 
-The two formulas **coincide** in the no-foreign-advance case: when no
-`AdvanceLamportTo` ever ran, the mutations ARE consecutive, so
-`firstMutation.Counter − 1 == LamportHigh − len(Mutations)` (`recovery.go:207-209`).
-This is why the determinism gate (`TestWALRecoveryDeterminism`,
-`internal/chaos/wal_test.go:42`) stays GREEN despite its scenario still using
-the formula (`wal_test.go:120-126`) — that scenario appends only
-`WALRecMutation` records with no `AppendClockAdvance`, so it has no counter
-gap and the two seeds are equal. The gate was the artifact that caught the
-original `LamportHigh` boot bug; the generalization closed the
-foreign-advance gap the original gate could not see.
+A fingerprint-bearing checkpoint also covers the entity ID and every entry
+field through `StateFingerprint`. When a snapshot is bound to such a
+checkpoint, recovery compares both the image root and fingerprint before
+applying the tail. `ErrRecoveryRootMismatch` and
+`ErrRecoveryFingerprintMismatch` refuse startup on their respective mismatches.
+After tail replay, root equality is checked only for bounded recovery from a
+final, intact checkpoint. Full replay contains local WAL entries but may omit
+foreign entries in the checkpoint root, so it relies on WAL sequence
+contiguity instead of making an invalid root comparison.
 
-## 3.5 The L0 Flush Path And The `io_uring` Roadmap
+Snapshot images use the same full-entry encoding and carry a whole-image
+Castagnoli CRC32C. `ErrSnapshotCorrupt` causes recovery to discard the derived
+image and rebuild from the authoritative WAL; a corrupt WAL checksum instead
+refuses recovery. `TestWALRecoveryDeterminism` exercises exact-dot restoration.
 
-The WAL's durability depends on `fsync` driving the dirty page to storage.
-`fsync` on a file opened with the default `O_RDWR` writes through the Linux
-**page cache**, incurring a kernel copy and a context-switching syscall tax.
-The WAL today accepts that tax: `internal/chaos/wal.go:161` opens the file
-with `os.OpenFile(path, O_RDWR|O_CREATE, 0644)` and `AppendMutation` /
-`AppendMutations` / `AppendCheckpoint` all call the synchronous `sync()`
-(`wal.go:149-154`) before returning — correctness-bound, not throughput-bound.
-Neither `O_DIRECT` nor `io_uring` is wired into the WAL data path.
+## 3.5 The L0 Flush Path and Kernel-Bypass Status
 
-The L0 flush — which durable-binds the LSM-Tree memtable to storage — is
-likewise **not** io_uring-driven and **not** `O_DIRECT`. `FlushArenaToIPC`
-(`internal/database/l0_flusher.go:135`) serializes a frozen `SkipListArena`
-into Apache Arrow IPC (schema `ArrowSchema`, `l0_flusher.go:41-54`, the
-9-field tri-temporal columnar layout) one per-entity partition at a time, and
-hands each serialized `L0Partition.Buf` to the `S3Uploader` interface
-(`l0_flusher.go:58-60`, `UploadPartition` at `:307`, the actual
-`f.uploader.Upload` call at `:319`). The destination is object storage, not a
-local block device, so there is no kernel page-cache copy to bypass and no
-`write(2)` to align. The `O_DIRECT` / `io_uring` framing below is therefore
-**roadmap, not the current data path**.
+The LSM query index is separate from both the WAL and the dot-bearing recovery
+image. `L0Flusher.FlushArenaToIPC` serializes a frozen `SkipListArena` into
+per-entity Apache Arrow IPC partitions using the 9-field `ArrowSchema`.
+`UploadPartition` passes each buffer to the `S3Uploader` interface. The
+implementation uploads one partition at a time and frees its buffer before
+starting the next. When the query index is enabled, periodic checkpoints select
+entities whose latest dot has changed since the previous durable query-tier
+flush. `LocalFS` provides a local
+implementation of the storage interface, while object-storage implementations
+perform network uploads. These Arrow files are a query index, not a payload
+store or a replacement for the recovery image.
 
-`O_DIRECT` and `io_uring` are planned but not started: `README.md` lists
-`io_uring` under "Planned," and a repo-wide search for `io_uring` in `*.go`
-returns only comment mentions (e.g. `pkg/transport/fanout.go:6` contrasts the
-*deployed* eBPF `SO_ATTACH_REUSEPORT_EBPF` program against io_uring) — there is
-no io_uring implementation. I describe the mechanisms here as the planned
-kernel-bypass evolution of the WAL's `fsync`, not as the live data path:
+The WAL uses buffered `O_RDWR` writes and fsync. Neither it nor the Arrow flush
+path uses `O_DIRECT` or `io_uring`; both mechanisms remain planned and have no
+implementation in this release. The existing eBPF reuse-port fanout is a
+separate network mechanism, not kernel-bypass storage I/O.
 
-| Axis | `O_RDWR` + `fsync` (deployed) | `O_DIRECT` (roadmap) | `io_uring` (roadmap) |
-|:--------------------|:--------------------------|:--------------------------|:-------------------------|
-| Data path | kernel page cache | bypass page cache | bypass + async submission|
-| Copy | user → page cache → disk | user → disk (DMA) | user → disk (DMA) |
-| Submission | blocking syscall | blocking syscall | submission queue, polled |
-| Tail latency noise | page-cache flush storms | bounded by disk | bounded by disk |
+## 3.6 Process-Crash Recovery
 
-- **`O_DIRECT`** (roadmap) would open the file with
-  `O_APPEND|O_WRONLY|O_DIRECT`, aligning writes to the device's logical block
-  size and `iovec` boundaries. The kernel copy into the page cache is
-  eliminated; the user buffer is DMA'd directly. The contract is mechanical:
-  the caller must align buffer addresses, lengths, and file offsets to the
-  block boundary or `write(2)` returns `EINVAL`.
-- **`io_uring`** (roadmap) would submit I/O asynchronously via a shared
-  ring between user space and the kernel, removing the syscall context switch
-  from the hot path. Submissions post to the Submission Queue; completions
-  arrive on the Completion Queue and are polled by an `IORING_SETUP_SQPOLL`
-  kernel thread, making the submission-to-completion loop zero-syscall under
-  steady load.
+A raw-pointer fault in the mapped arena can raise `SIGSEGV` and terminate the
+process; Go's `recover()` cannot intercept it. The process-isolation harness in
+`internal/chaos/supervisor.go` addresses this by spawning a worker, detecting
+its stdout EOF, and starting a replacement that replays the same WAL. A front
+end that owns the listeners and never hands them to the worker can keep client
+TCP connections open across the replacement.
 
-The `Merkle-root checkpoint` is WAL-appendant and fsync'd; the L0 flush
-durable-binds the memtable to object storage via Arrow IPC + the `S3Uploader`
-interface. The WAL is fsync-synchronous (correctness-bound); the L0 flush is
-network-serialized (throughput-bound by the S3 upload, not by any kernel
-ring).
+`TestSIGSEGVSurvival` is intended to compose that recovery with a listener
+owned by the test process. `OpCrashProbe` poisons a child pointer in the
+worker's arena; the intended assertions cover both the recovered Merkle root
+and a ping on the same client connection. The supervisor itself is
+listener-agnostic, so the connection property comes from the external listener
+owner as well as worker replacement. In this release, `CHAOS_WORKER_BIN` only
+controls whether the test skips. The supplied path is ignored: the test
+unconditionally tries to build `./cmd/chaos-worker/`, which is not included,
+and fails before starting a worker. It therefore provides no current
+end-to-end result for those assertions.
 
-## 3.6 SIGSEGV Survival
-
-Because `mmap`'d memory is outside Go's safety net, a pointer-arithmetic defect
-raises a `SIGSEGV` that `recover()` cannot intercept — the fault violently
-terminates the entire process. The Supervisor-Worker topology (see §1.3 of
-`1_ARCHITECTURE.md`) is the architectural defense: a worker that dies is
-restarted from the WAL, and the listening socket in the Supervisor survives
-the death. `TestSIGSEGVSurvival` drives `OpCrashProbe`, which corrupts a
-child pointer in the worker's arena via the deliberate fuzzer and
-dereferences the poisoned address; the worker dies, the Supervisor observes
-the stdout EOF, replays the WAL, spawns a pristine worker, and asserts the
-recovered Merkle root equals the pre-crash root — with the held client TCP
-connection surviving the entire cycle. The contract proven is crash-consistency,
-not merely liveness.
+This harness is distinct from normal `sovereign-node` startup recovery. With
+`--wal-path` configured, the node calls `RecoverEngineWithSnapshot` in process,
+using a snapshot only when `--lsm-root` supplies a store and falling back to
+full WAL replay when the image is unusable. The broader topology is discussed
+in §1.3 of [Architecture Overview](1_ARCHITECTURE.md).

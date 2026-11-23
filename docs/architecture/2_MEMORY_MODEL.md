@@ -1,207 +1,212 @@
-# 2. Memory Model — Zero-GC Off-Heap Physics
+# 2. Memory Model
 
-## 2.1 The Failure Of Standard Go At Scale
+## 2.1 Off-Heap Allocation and the Go Collector
 
-Go's runtime ships a concurrent, tri-color mark-and-sweep garbage collector.
-At steady state under light load it is efficient. Under the Sovereign
-Engine's target load — tens of millions of mutations per second, each
-touching a path-copied HAMT subtrie — it is the dominant cost. Every heap
-allocation registers with the runtime's `mspan`/`mcentral` hierarchy; every
-pointer write to a heap object that may be referenced concurrently is
-intercepted by a write barrier; and `gcBgMarkWorker` goroutines consume one
-P each to scan the live object graph. At the measured core rate of
-50.7M–68.3M ops/s the collector would
-run continuously, its mark assist goroutines stealing application CPU and
-its periodic stop-the-world sweeps inserting tail latencies incompatible
-with the sub-millisecond mandate.
+Go's concurrent, tri-color mark-and-sweep collector finds and scans objects
+on the Go heap. Path-copying a HAMT on every mutation would make that work
+part of the write path: new nodes would need runtime allocation bookkeeping,
+and heap pointer writes could require write barriers. Sovereign Engine
+instead keeps the trie and its payloads in an anonymous mapping that the
+collector does not scan.
 
-The engine's response is structural, not tunable. The hot path **does not
-allocate on the Go heap, ever**. The `TestHotPathZeroAllocations`
-gate is a compile-time-enforced CI assertion reporting `0 allocs/op` on the
-`HAMT.Set` path; `go test -run TestArenaUsagePerSet` logs per-op arena
-consumption (observed ~1,153 B/Set at shallow trie depth; the test logs a
-second batch to show the per-op figure grows with trie depth), all of it in
-the `mmap`'d region the collector does not scan. The result is a strict Zero-GC runtime
-state — the collector sees no live root set on the hot path and turns
-itself off.
+This is a property of a specific path, not a global collector switch. The
+in-process core benchmark measured 50.7M–68.3M ops/s at 32 cores; that is
+not the network ingest rate. `TestHotPathZeroAllocations` uses
+`testing.AllocsPerRun` to assert `0 allocs/op` for `HAMT.Set` when the race
+detector is off. Other engine paths still allocate Go heap objects, and the
+runtime collector remains enabled.
+
+`go test -run TestArenaUsagePerSet ./pkg/sync/` measures the other side of
+this design: arena consumption. It logs the per-op figure for one batch,
+then repeats the measurement after more insertions have deepened the trie.
+The mapping avoids Go heap allocation for these writes; it does not make
+their storage free.
 
 ## 2.2 The Off-Heap Substrate
 
-The engine obtains memory directly from the kernel via
+`NewHamtArena` obtains memory with
 `syscall.Mmap(-1, 0, size, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE)`.
-The returned slice's base address is captured into a `uintptr`
-(`HamtArena.base`); all subsequent access is raw `unsafe.Pointer` arithmetic
-into this region. Because the Go runtime has no metadata describing these
-pages, the garbage collector cannot scan them, and the write barrier is
-never engaged for arena traffic.
+It records the mapping's base address in `HamtArena.base` and uses
+`unsafe.Pointer` arithmetic to reach nodes and payloads. The Go runtime has
+no heap metadata for these pages, so the collector does not scan them.
 
 ### 2.2.1 HamtNode Layout
 
-The fundamental allocation unit is the `HamtNode`, a struct whose layout is
-fixed at compile time and intentionally cache-aligned at the field level:
+The fixed allocation unit for a trie branch is `HamtNode`:
 
 ```go
 type HamtNode struct {
-    refCount    atomic.Int32   // 4 B  — EBR reference count
-    bitmap      uint32          // 4 B  — HAMT child-presence bitmap
-    _           uint32          // 4 B  — explicit pointer alignment
-    childrenPtr NodePtr         // 8 B  — offset to children array
-    entriesPtr  NodePtr         // 8 B  — offset to leaf entries array
-    merkleHash  [32]byte       // 32 B — cached branch hash (O(1) MerkleRoot)
-    nextFree    NodePtr         // 8 B  — intrusive Treiber free-list link
+    refCount    atomic.Int32 // 4 B  — reference count
+    bitmap      uint32       // 4 B  — HAMT child-presence bitmap
+    _           uint32       // 4 B  — explicit pointer alignment
+    childrenPtr NodePtr      // 8 B  — children array address
+    entriesPtr  NodePtr      // 8 B  — leaf entries array address
+    merkleHash  [32]byte     // 32 B — reserved branch-hash field
+    nextFree    NodePtr      // 8 B  — reserved free-list field
 }
 ```
 
-`NodePtr` is defined as `uintptr` deliberately — using a non-pointer type
-prevents the Go runtime from treating arena offsets as roots the collector
-must trace. The compiler therefore never inserts a write barrier for
-`childrenPtr`/`entriesPtr` updates, even mid-CAS-loop.
+`NodePtr` is a `uintptr` holding an address in the arena, not a Go pointer.
+Storing a `NodePtr` therefore does not create a collector-visible heap
+reference or require a heap write barrier. Code that places a Go pointer in
+an off-heap wrapper must keep its target reachable elsewhere; `HAMT.arena`
+is the important example.
+
+The reserved fields do not imply unused fast paths are active.
+`HAMT.MerkleRoot` currently walks leaf entries, sorts their dots, and hashes
+them instead of reading `merkleHash`. Class-0 recycling writes the next
+free-list link into a dead node's first machine word, not into `nextFree`.
 
 ### 2.2.2 The Segregated Slab Allocator
 
-The arena is a **segregated slab allocator** of 17 size classes: one
-dedicated class for `HamtNode` (the `nodeSize` constant, measured by
-`unsafe.Sizeof`) and 16 power-of-two variable classes for payloads.
+The arena has 17 size classes: one dedicated to `HamtNode` (the `nodeSize`
+constant, measured by `unsafe.Sizeof`) and 16 power-of-two variable classes.
+Every variable block has an 8-byte allocator header before its payload.
 
 | Class | Block size (B) | Payload capacity (B) | Typical occupant |
-|------:|:----------------|:---------------------|:-------------------------------------|
-| 0 | `nodeSize` | — | `HamtNode` (cache-aligned fixed) |
+|------:|:---------------|:---------------------|:-----------------|
+| 0 | `nodeSize` | — | `HamtNode` |
 | 1 | 16 | ≤ 8 | next-pointer / small scalar |
-| 2 | 32 | ≤ 24 | `allocString` short-key bytes (≤24 B payload + 8 B header) |
-| 3 | 64 | ≤ 56 | `hamtLeaf` arrays (8 B length prefix + N×32 B leaves), classed by total size — a single 32 B leaf + 8 B header = 40 B → 64 B class-3 block |
+| 2 | 32 | ≤ 24 | `allocString` short-key bytes |
+| 3 | 64 | ≤ 56 | `hamtLeaf` arrays: one 32 B leaf plus its 8 B length prefix uses 40 B of payload before the separate slab header |
 | 4 | 128 | ≤ 120 | `CRDTEntry` (exactly 120 B) |
 | … | … | … | power-of-two doubling |
 | 16 | 524,288 | ≤ 524,280 | large payloads / bulk transfer |
 
-Free memory in each class is managed by a **lock-free Treiber stack** whose
-ABA immunity does **not** rely on a packed generation word — it relies on
-**EBR epoch-pinning**: each pop wraps its Treiber CAS in
-`participant.Enter/Exit` (`hamt_arena.go` AllocNode, ~:483-486), pinning the
-goroutine to the current epoch so no concurrent `RetireBlock` can recycle
-the `head` offset back onto the stack during the CAS ("eliminating ABA
-without generation counters," `hamt_arena.go` ~:482; "Pure 64-bit CAS — no
-generation counter needed," ~:512). "ABA immunity is provided by the
-EBRManager" (`hamt_arena.go` ~:165). (The packed `(generation, offset)`
-tagged-counter ABA scheme belongs to the **elimination pool** allocator of
-§2.3.3, `elimPackIndex` in `elimination.go` ~:1031-1053 — a *different* ABA
-mechanism from the arena slab.) Allocation falls back to a linear bump
-pointer (`bumpOffset`) when a class's free stack is empty, guaranteeing
-$O(1)$ amortized allocation with zero contention.
+Both node and variable free-lists are sharded lock-free Treiber stacks, but
+they use different ABA protection. `AllocNode` holds an EBR participant
+across each pop. Its untagged 64-bit head cannot revisit a retired node
+while that participant prevents reclamation.
 
-## 2.3 Cache-Coherence Physics
+Variable-class heads pack a generation with the block's word offset. Each
+block's 8-byte header atomically packs the next word offset and class index.
+This protects both EBR-deferred reclamation and direct `pushFreeVar` calls
+that do not hold an EBR pin. `allocVar` sweeps a bounded set of shards under
+one pin before falling back to the atomic `bumpOffset` allocator.
 
-A modern multi-core die is not a flat memory. Each Neoverse-V1 core owns a
-64-byte-line L1 and a 128-byte-pair L2; the 32 cores share an L3 and its
-CMN-700 mesh interconnect. Coherence is maintained by the **MESI protocol**
-(Modified, Exclusive, Shared, Invalid). The economically significant event
-in this protocol for a write-heavy workload is a **HITM** — a Hit In a
-Modified cache line — which forces the owning core to push the line across
-the interconnect to the requesting core, serializing two cores onto the
-mesh bandwidth.
+## 2.3 Cache Coherence
+
+The allocator layouts target Neoverse-V1 systems with 64-byte L1 cache
+lines and 128-byte L2 spatial-prefetch pairs. On the 32-core CMN-700 system,
+writes to shared lines require coherence transfers across the mesh. A HITM
+(Hit In a Modified cache line) identifies the case where the requested line
+is modified in another cache.
 
 ### 2.3.1 False Sharing
 
-False sharing occurs when two logically independent variables land in the
-same 64-byte cache line. A store by Core A invalidates the line in Core B's
-cache; Core B's next read of *its own* variable misses and must pull the
-line back from Core A. The two cores execute sequentially at interconnect
-speed rather than in parallel. `perf c2c`
-measures this directly via HITM counters.
+False sharing occurs when logically independent variables occupy the same
+cache line. A store by one core invalidates that line in another core's
+cache, even when the second core accesses a different field. Its next
+access must fetch the line again. Repeated writes can therefore serialize
+otherwise independent operations on coherence traffic. `perf c2c` reports
+HITM events for measuring this behavior.
 
 ### 2.3.2 The 128-Byte Stride Discipline
 
-The engine defeats false sharing with a **128-byte stride discipline**,
-chosen because the Neoverse-V1 L2 spatial prefetcher pulls *pairs* of
-adjacent 64-byte lines. A 64-byte pad between two structures is insufficient
-— the prefetcher would still pair them. The engine therefore aligns every
-hot data structure to **128 bytes (two cache lines)**:
+A structure that occupies its own 128-byte prefetch pair cannot share that
+pair with a neighboring structure. The pool uses this layout for its
+free-list shards:
 
 ```go
 type ElimPoolShard struct {
-    free  atomic.Uint64   // 8 B  — the locus of all free/recycle CAS
-    _pad  [120]byte       // 120 B — fill the remaining line pair
+    free atomic.Uint64 // 8 B   — packed free-list head
+    _pad [120]byte     // 120 B — fill the prefetch pair
 }
 // sizeof(ElimPoolShard) == 128 B exactly
 ```
 
-The free-list is an array `[64]ElimPoolShard`, so adjacent allocator shards
-sit on disjoint 128-byte line pairs — the prefetcher cannot engender
-cross-shard coherence traffic. This same discipline is applied to the engine
-proxy structs, the elimination slots (`ElimSlot` at 128 B, asserted by
-`TestEliminationSlotSize`), and the home-shard stack shards (`secShard` at
-128 B, asserted by `TestShardedShardSize`). (An earlier plan referenced a
-`JudgeLogRingBuffer` here; that type was never built — it was sketched in
-a file that has since been deleted. The
-128-byte stride is carried by the three real structs above, not by a phantom
-ring buffer.)
+The free-list array is `[64]ElimPoolShard`, so adjacent heads start on
+separate 128-byte boundaries. `ElimSlot` and `secShard` use the same stride;
+`TestEliminationSlotSize` and `TestShardedShardSize` assert their sizes.
+Other padded structures use different layouts where a full prefetch pair is
+not required.
 
-### 2.3.3 The Home-Shard SEC Allocator
+### 2.3.3 The Sharded Stack Allocator
 
-The allocator's free path is the most contentious locus in a producer-heavy
-workload. The legacy single-locus design (one Treiber stack head for the
-whole pool) collapses to 1.6% parallel efficiency on the 32-core mesh because
-every producer's free CAS funnels onto one `head` cache line, recreating the
-coherence storm the per-core sharding was meant to defeat.
+The legacy single-locus design measured 1.1M ops/s at 1.6% parallel
+efficiency on 32 cores. Its free and recycle operations contended on one
+pool-head cache line. `ShardedStack` instead routes P-local operations to
+64 padded stack heads and spreads the index pool across the same number of
+`ElimPoolShard` heads, which occupy 8 KiB in total.
 
-The **Home-Shard SEC Allocator** replaces it with a **multi-locus free-list**:
+A per-goroutine `secDeepCache` keeps most index recycling local. On a cache
+miss, `deepAlloc` refills from the caller's shard and probes later shards if
+necessary. `deepFreeLocal` retains a popped index in that cache and drains
+overflow to the caller's shard. Thus the sharded pop path does not route
+through `freeIndexHome(idx)`. That helper remains for callers without a P
+ID and returns an index to shard `idx % 64`.
 
-| Property | Legacy single-locus | Home-Shard SEC |
-|:--------------------|:--------------------------------|:---------------------------------------------------|
-| Free locus | 1 shared `head` cache line | 64 sharded `ElimPoolShard` heads (8 KiB total) |
-| Free routing | push to executing thread's shard | `freeIndexHome(idx)` → shard `idx % 64` |
-| Alloc routing | pop from shared stack | local-shard-first, probe `(pid+1, +2, …)` on miss |
-| Stride | unguarded (false-shared) | 128 B (defeats Neoverse-V1 L2 prefetcher pair) |
-| 32c throughput | **1.1M ops/s** (1.6% eff.) | **50.7M–68.3M ops/s** (`RUN_CRUCIBLE=1`; range, gate floor 50,736,038; this tree re-measured 68,278,197 ops/s on 32-core AWS Graviton c8g.8xlarge, Go 1.26.1) |
+Both stack heads and pool free-list heads pack a generation with an index.
+When the successor is non-empty, a CAS derives the new generation from the
+observed head. A recycled index therefore does not by itself make a stale
+non-empty head compare equal.
 
-The "Home-Shard" naming reflects the routing rule: a producer freeing index
-`i` pushes to shard `i % 64`, not to its own executing thread's shard. Under
-skew (many producers, few consumers) the consumers scatter their frees across
-all 64 home shards, continuously refilling every producer's local shard and
-defeating the work-stealing trap. ABA immunity is preserved: the sharded
-stacks reuse the identical packed `(gen, idx)` encoding and the strict
-monotonic generation discipline of the legacy stack.
+The in-process sharded benchmark has a published range of 50.7M–68.3M ops/s
+at 32 cores, with a gate-passing floor of 50,736,038 ops/s. The
+[core benchmark receipt](../evidence/core-crucible.txt) records 68,278,197
+ops/s on a 32-core AWS Graviton4 c8g.8xlarge with Go 1.26.1. It measures
+stack and allocator work without network, cryptographic verification, or
+persistence; it is not an ingest throughput measurement.
 
-## 2.4 Concurrency Physics: Elimination And Hazard Pointers
+## 2.4 Epoch-Based Reclamation and Hazard Pointers
 
-The engine combines two complementary lock-free primitives.
+`RetireBlock` places a block on a sharded list in a three-epoch ring.
+`AdvanceEpoch` refuses to advance while an active participant records an
+older epoch. After a successful advance, it detaches the list that has
+completed its grace interval and reclaims entries that are not protected by
+a hazard pointer. Reclamation therefore requires later epoch advances; a
+retirement is not simply delayed by counting three calls.
 
-- **Epoch-Based Reclamation (EBR)** batches node retirement: a retired node
-  is not freed until three epochs have passed, after which no reader whose
-  `Participant.Enter()` preceded the retirement can still hold a reference.
-  This bounds reclamation cost and removes the mutex from the free path.
-- **Hazard Pointers** protect the single-pointer hand-off on the read path:
-  a reader publishes the `NodePtr` it is about to dereference into a hazard
-  slot before reading; a retiree scans the hazard slots and defers reclaiming
-  any node a reader has published. The mutual ordering is the EBR epoch
-  barrier, guaranteeing the dereference cannot observe a freed node.
+Each participant has four hazard slots. `DetachAndProtect` publishes a
+pointer in a slot and marks the participant inactive, allowing a read to
+continue without holding an EBR pin. Reclamation snapshots the published
+hazards and requeues a matching block for a later epoch instead of freeing
+it while the reader can still dereference it.
 
-These two compose: EBR amortizes retirement; hazard pointers close the
-read-vs-reclaim race. `TestEBRHazardPointerSequencing` and
-`TestConcurrentInsertLocalRace` (`-race` clean) are the
-mechanical witnesses.
+`TestEBRHazardPointerSequencing` exercises the ordering between protection
+and reclamation. `TestConcurrentInsertLocalRace` exercises concurrent
+insertion and root retirement under the race detector.
 
-## 2.5 Cross-Core Lock-Free Message Passing — The SPSC Ring
+## 2.5 Cross-Process SPSC Ring
 
-Where mutation must cross a process boundary (Go parent ↔ C H3 worker) the
-engine uses a **Single-Producer Single-Consumer ring buffer** backed by
-`memfd_create(2)` and mapped `MAP_SHARED` in both processes. The ring is
-split into a header (`head`, `tail`, cache-line-padded on each side) and a
-slot array. The producer advances `tail` with a single `atomic` store; the
-consumer advances `head` with a single `atomic` store; the visibility of
-those stores across processes is the `MAP_SHARED` kernel page-cache coherence
-guarantee — no message-passing system call, no context switch. The SPSC
-invariant (exactly one producer, one consumer) is what removes the lock:
-there is no CAS, only `Store`/`Load`, which the architecture allows without
-a coherence-invalidation storm because each side writes a *disjoint* cache
-line. An `Elimination-Array` (the SEC layer) supplements this intra-core via
-parallelism where a SPSC contract is too restrictive.
+`internal/spatial` contains a single-producer, single-consumer ring for
+sending coordinates to an external C++ H3 worker. This package is built but
+not wired into the production engine: no non-test engine path constructs
+the ring or its `EpochBatcher`, and the worker binary is not in this
+repository. It does not currently compute H3 cells for engine writes.
 
-## 2.6 Honest Limits
+`NewSPSCRing` creates a `memfd`, sizes it, and maps it with
+`MAP_SHARED|MAP_POPULATE`. The file descriptor can be passed to a child
+through `os/exec.Cmd.ExtraFiles`, allowing both processes to map the same
+pages. A steady-state slot handoff uses shared-memory atomics rather than a
+message-passing syscall.
 
-The Zero-GC mandate is bought with the loss of Go's safety net in `mmap`'d
-space. A single off-by-one in arena pointer arithmetic raises a `SIGSEGV`
-that `recover()` cannot intercept (see `3_STORAGE_DURABILITY.md`). The
-128-byte stride doubles the memory footprint of every padded structure
-relative to a naive layout. The slab allocator's static class boundaries
-incur internal fragmentation up to 2× the requested size at class edges.
-These are accepted costs of the latency bound, not defects to be tuned away.
+The header reserves cache-line-padded `WriterCursor` and `ReaderCursor`
+fields, but Go does not currently use those cursors for coordination.
+Instead, `RingSlot.State` tracks each slot:
+
+- `Submit` waits for `SlotEmpty`, writes the request, and stores `SlotReady`.
+- The external consumer changes ready slots through `SlotProcessing` to
+  `SlotDone` after writing the result.
+- `Collect` waits for `SlotDone`, reads the result, and returns the slot to
+  `SlotEmpty`.
+- `EpochBatcher` adds a bounded collection wait and uses compare-and-swap
+  when recovering or reclaiming a timed-out slot.
+
+The SPSC contract limits each ring to one producer and one consumer. It does
+not imply that every wait is spin-only: a full submission can park on a Go
+condition variable.
+
+## 2.6 Limits
+
+Off-heap pointer arithmetic bypasses Go's memory safety. An invalid arena
+address can raise a fatal `SIGSEGV` rather than a panic that `recover()` can
+handle; the process boundary and recovery path are described in
+[Storage and Durability](3_STORAGE_DURABILITY.md). Off-heap wrappers also
+require an explicit Go-heap owner for any Go pointers they contain.
+
+The memory costs are visible in the layouts. Cache-pair padding increases
+the footprint of sharded heads and slots. Power-of-two slab classes can
+waste up to 2× the requested space at class boundaries. Reclamation is
+deferred by epoch and hazard safety, so protected blocks remain allocated
+until their readers finish.
