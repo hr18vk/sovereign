@@ -11,96 +11,48 @@ import (
 	"sort"
 )
 
-// This file is the convergence-root sharded-direct path.
+// MerkleRootFromShards computes the convergence root directly from the shard
+// HAMTs. It collects each entry's (DotNodeID, DotCounter) pair, then uses the
+// same global ordering and SHA-256 encoding as HAMT.MerkleRoot. Unlike State,
+// it does not construct a merged HAMT or allocate arena nodes.
 //
-// MerkleRootFromShards computes the engine's Merkle root by collecting the
-// (DotNodeID, DotCounter) dot pairs DIRECTLY from every shard's root HAMT
-// and sorting+hashing them with the EXACT same algorithm HAMT.MerkleRoot
-// (hamt.go:265) uses. It does NOT build the merged *HAMT view that State()
-// (crdt.go:1348) builds — so it allocates ZERO arena nodes. This closes the
-// arena-exhaustion root cause: stampConvergence() (gossip.go) called
-// State().MerkleRoot() every sweep, and State() duplicated every live entry
-// into a fresh merged HAMT whose arena nodes pile up inside the EBR grace
-// window (3 epochs = 192 ops) faster than maybeAdvanceEpoch reclaims them —
-// at 100 nodes × 10K keys that is the hamt_arena.go:638 "arena exhausted
-// (variable alloc)" OOM. MerkleRootFromShards reads the shard roots that
-// ALREADY exist (the per-shard atomic.Pointer[HAMT] the engine maintains) and
-// touches only the Go heap (one slice of 24-byte dot pairs), so the arena's
-// high-water mark (bumpOffset) does not move at all.
+// Each entity belongs to exactly one shard because routeShard depends only on
+// its entity ID. The union of the shard entries therefore equals the merged
+// view's entries. Sorting all pairs by node ID and counter makes the hash
+// independent of shard boundaries, so both paths return identical roots.
 //
-// BYTE-IDENTITY: the 256 shards are DISJOINT by entityID (routeShard is a
-// pure function of entityID; Join partitions incoming blocks by it). State()
-// stitches every shard's entries into one merged HAMT via merged.Set — a
-// verbatim byte-copy — so the merged HAMT's (entityID→entries) multiset equals
-// the union of the shards' multisets. HAMT.MerkleRoot (hamt.go:265) collects
-// EVERY entry's (DotNodeID, DotCounter) pair, sorts globally by (nodeID bytes
-// ASC, counter ASC), and SHA-256-hashes each 24-byte big-endian pair
-// sequentially. Collecting the same pairs directly from the shards yields the
-// SAME multiset → the SAME global sort → the SAME hash. QED by construction.
-// This was EMPIRICALLY CONFIRMED by merkle_sharded_test.go on both
-// 1-entry/entityID and multi-entry/entityID seeded engines: byte-identical
-// roots.
+// State remains available to callers that need the merged view, including the
+// chaos partition probe and small live-set tests. Callers that need only the
+// root can avoid the merged view's arena growth without changing the root
+// format or the convergence comparison.
 //
-// Because the root is byte-identical to State().MerkleRoot(), the silicon
-// check (/v1/merkle) and any caller that switches to this method produce the
-// SAME root under BOTH paths — NO migration, NO root-format change, NO "old
-// root vs new root" ambiguity. The convergence proof (same root on convergent
-// nodes) is UNCHANGED. State() is NOT deleted: it stays for the chaos probe
-// (internal/chaos/partition.go MerkleRoots), the WAL checkpoint test, and the
-// loopback check's MerkleRoots() which need the merged view for SMALL live
-// sets (the documented State() boundary). The 100×10K path is the ONLY
-// path that OOMs, and it now uses this sharded-direct path.
+// An EBR participant pin protects every shard root for the duration of the
+// walk. A concurrent InsertLocal or Join may retire a root, but reclamation
+// cannot free it until the pin is released. Participants come from
+// participantPool, so the pin does not allocate in steady state.
 //
-// RACE SAFETY (the upgrade over State()): State() takes NO EBR participant
-// pin — it relies on the 3-epoch grace window being much larger than the
-// synchronous ForEach+copy duration to make a use-after-free astronomically
-// unlikely. MerkleRootFromShards instead takes an EBR participant pin
-// (mirroring GenerateDelta, GenerateDigestWithSeed, and
-// GenerateStrataEstimator): Enter BEFORE loading the shard
-// roots, Exit (deferred) after the ForEach+collect completes. The pin holds
-// freeRetiredList back for the whole call, so a concurrent InsertLocal/Join
-// CAS that retires a shard root mid-ForEach CANNOT free it until the pin
-// Exits. This is FORMALLY race-free (not merely grace-window-safe), strictly
-// stronger than State(). The pin is off the hot path (one Enter/Exit per
-// sweep, the same single-writer SweepLoop discipline stampConvergence already
-// runs under), and the participant is recycled through participantPool — zero
-// steady-state allocation.
+// The collected pairs occupy 24 bytes each on the Go heap, approximately
+// 240 KB for 10,000 entries. The capacity hint sums HAMT.Len across the shards;
+// it counts entities rather than dots and is only a lower bound. This method
+// is used by convergence and checkpoint paths, not the zero-allocation write
+// path covered by TestHotPathZeroAllocations.
 //
-// ALLOCATION HONESTY: the only allocation is a single Go-heap slice of dot
-// pairs (24 bytes each). At 10K entries that is ~240KB on the Go heap,
-// reclaimed by the GC. This is OFF the hot path (the hot path is
-// Join/InsertLocal/GenerateDelta, NOT stampConvergence) so the 0-allocs/op
-// hot-path invariant (TestHotPathZeroAllocations) is UNAFFECTED. The Go-heap
-// alloc is the honest cost of NOT building the merged arena view (which was
-// OOM-ing). 240KB on the Go heap is trivial; the merged arena view was
-// duplicating 10K entries × arena node size into the mmap arena with NO
-// synchronous reclaim. The capacity hint sums per-shard HAMT.Len() (entityID
-// count, a lower bound on the entry count) to reduce slice growth reallocs;
-// exact capacity is irrelevant to the hash.
-//
-// FUTURE WORK (an alternative, NOT shipped here): for 1M+ keys a per-shard
-// root + concat (a Merkle tree of shard roots) would hash in O(shards) per-
-// shard hashes with NO global sort. That root is DIFFERENT but EQUALLY
-// DETERMINISTIC, and cheaper. This file ships the byte-identical root (the
-// honest closure) and leaves the sharded-root-tree variant as deferred work.
+// Hashing a tree of shard roots could avoid the global sort, but it would
+// define a different root format. This implementation preserves compatibility
+// with State().MerkleRoot.
 
-// shardDotPair is the per-entry (DotNodeID, DotCounter) pair collected for
-// the global sort+hash. It is the byte-identical twin of the unexported
-// dotPair inside HAMT.MerkleRoot (hamt.go:266): same fields, same 24-byte
-// big-endian hash layout, so the two paths produce byte-identical roots.
+// shardDotPair holds the two dot fields used by HAMT.MerkleRoot. Encoding the
+// node ID followed by the counter produces the same 24-byte hash input.
 type shardDotPair struct {
 	nodeID  [16]byte
 	counter uint64
 }
 
-// hashShardDotPairs is the verbatim sort+hash tail of HAMT.MerkleRoot
-// (hamt.go:282-311), extracted so MerkleRootFromShards AND the
-// checkpoint capture (CaptureShardsPinned) share ONE implementation: the same
-// multiset + the same comparator ⇒ the same sorted sequence ⇒ the same hash
-// (byte-identity with State().MerkleRoot(), as documented above).
+// hashShardDotPairs applies HAMT.MerkleRoot's ordering and encoding. Both
+// MerkleRootFromShards and CaptureShardsPinned use it so identical pair sets
+// produce identical roots.
 func hashShardDotPairs(pairs []shardDotPair) [32]byte {
-	// Verbatim sort from HAMT.MerkleRoot (hamt.go:282-289): nodeID bytes ASC,
-	// then counter ASC.
+	// Match HAMT.MerkleRoot: node ID bytes first, then counter.
 	sort.Slice(pairs, func(i, j int) bool {
 		for b := 0; b < 16; b++ {
 			if pairs[i].nodeID[b] != pairs[j].nodeID[b] {
@@ -110,10 +62,8 @@ func hashShardDotPairs(pairs []shardDotPair) [32]byte {
 		return pairs[i].counter < pairs[j].counter
 	})
 
-	// Verbatim hash loop from HAMT.MerkleRoot (hamt.go:291-311): each pair
-	// serialized as 16-byte nodeID || 8-byte big-endian counter, written
-	// sequentially into one SHA-256. Empty multiset → zero [32]byte (matches
-	// HAMT.MerkleRoot's empty-path return).
+	// Hash each node ID followed by its big-endian counter. The empty set returns
+	// the zero array, matching HAMT.MerkleRoot.
 	var buf [24]byte
 	var result [32]byte
 	if len(pairs) == 0 {
@@ -136,15 +86,14 @@ func hashShardDotPairs(pairs []shardDotPair) [32]byte {
 	return result
 }
 
-// MerkleRootFromShards returns the engine's current Merkle root computed
-// directly from the per-shard root HAMTs WITHOUT building the merged view
-// State() builds. Byte-identical to State().MerkleRoot() (see the file
-// doc). Race-free under concurrent InsertLocal/Join via the EBR participant
-// pin (see the file doc). Off the hot path; zero arena growth.
+// MerkleRootFromShards returns the same root as State().MerkleRoot without
+// building State's merged view. An EBR participant pin protects the shard roots
+// against reclamation during concurrent InsertLocal and Join calls. The method
+// allocates a Go-heap slice but no arena nodes.
 func (e *DeltaCRDTEngine) MerkleRootFromShards() [32]byte {
-	// EBR pin: Enter before loading shard roots so a concurrent CAS that
-	// retires+freelist-reclaims a shard root mid-ForEach cannot free it
-	// until the deferred Exit. Mirrors GenerateDelta/GenerateDigestWithSeed.
+	// Enter before loading shard roots. A concurrent compare-and-swap may retire
+	// a root during ForEach, but deferred Exit keeps it allocated until the walk
+	// and collection are complete.
 	participant := e.participantPool.Get().(*Participant)
 	participant.Enter(e.ebr)
 	defer func() {
@@ -152,9 +101,8 @@ func (e *DeltaCRDTEngine) MerkleRootFromShards() [32]byte {
 		e.participantPool.Put(participant)
 	}()
 
-	// Capacity hint: sum of per-shard HAMT.Len() (entityID count). This is a
-	// LOWER bound on the entry count (each entityID may carry >1 dot); exact
-	// capacity does not affect the hash, only the number of slice reallocs.
+	// HAMT.Len counts entity IDs, so its sum is a lower bound when entities hold
+	// multiple dots. It is only a capacity hint and does not affect the hash.
 	hint := 0
 	for si := range e.shards {
 		if r := e.shards[si].ptr.Load(); r != nil {
@@ -163,9 +111,8 @@ func (e *DeltaCRDTEngine) MerkleRootFromShards() [32]byte {
 	}
 	pairs := make([]shardDotPair, 0, hint)
 
-	// Collect every entry's (DotNodeID, DotCounter) directly from the shard
-	// roots. ForEach yields the arena-backed entry slice per leaf; we read
-	// only the two dot fields (24 bytes), never copying into an arena node.
+	// ForEach yields arena-backed entry slices. Copy only the two dot fields into
+	// the Go-heap pairs; no arena node is created.
 	for si := range e.shards {
 		shardRoot := e.shards[si].ptr.Load()
 		if shardRoot == nil {
@@ -185,35 +132,21 @@ func (e *DeltaCRDTEngine) MerkleRootFromShards() [32]byte {
 	return hashShardDotPairs(pairs)
 }
 
-// CaptureShardsPinned is the checkpoint capture (ADR-0045):
-// it walks every shard's root HAMT EXACTLY ONCE — no merged view, zero arena
-// allocation — invoking fn(entityID, entries) per entity, and derives from
-// THAT SAME WALK both outputs a checkpoint needs:
+// CaptureShardsPinned walks each shard once without building a merged view or
+// allocating arena nodes (ADR-0045 §7). It returns the Merkle root and the
+// greatest DotCounter belonging to e.localNodeID in the walked view. The local
+// watermark is therefore derived from visible state rather than LamportCounter,
+// which can include minted dots that are not yet visible.
 //
-//	root — the Merkle root, byte-identical to State().MerkleRoot()
+// The caller must hold an EBR participant pin throughout the walk and for as
+// long as it retains yielded entity IDs or entry slices. Those values are
+// arena-backed views, not copies. AppendCheckpoint keeps its pin through the
+// WAL append and image write, so this method does not acquire a shorter pin of
+// its own.
 //
-// (same multiset + same sort + same hash; the file-doc proof).
-//
-//	maxLocalDot — the max DotCounter among entries whose DotNodeID ==
-//
-// e.localNodeID observed IN THE WALKED VIEW. A checkpoint
-// watermark derived this way can never sit ABOVE the image:
-// every local dot ≤ maxLocalDot that the WAL durably holds is
-// a dot the walk could have seen; LamportCounter() (a mint
-// high-water, not a visibility high-water) has no such
-// property — that gap was the checkpoint skew source.
-//
-// PIN CONTRACT (ADR-0045): the caller MUST hold an EBR participant
-// pin (EBR().Acquire + Enter) for the whole call AND for as long as any
-// yielded data is retained — the entityID strings and entries slices are
-// ARENA-BACKED views of the live shards, not copies. AppendCheckpoint holds
-// the pin across the walk, the WAL append, and the entire image write. This
-// function deliberately does NOT take its own pin: the pin's span is the
-// caller's checkpoint, not the walk.
-//
-// fn may be nil (root + watermark only). fn's bool return mirrors
-// HAMT.ForEach: false stops the walk early (the root/watermark of a PARTIAL
-// walk are meaningless — early-stop callers must discard them).
+// If fn is nil, only the root and watermark are computed. A false return from
+// fn stops the walk as in HAMT.ForEach; callers that stop early must discard
+// the root and watermark because they describe only a partial view.
 func (e *DeltaCRDTEngine) CaptureShardsPinned(fn func(entityID string, entries []CRDTEntry) bool) (root [32]byte, maxLocalDot uint64) {
 	hint := 0
 	for si := range e.shards {

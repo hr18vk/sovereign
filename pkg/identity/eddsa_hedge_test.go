@@ -15,11 +15,9 @@ import (
 	ed25519 "github.com/cloudflare/circl/sign/ed25519"
 )
 
-// TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame is the load-bearing
-// verifier-compat test (GB12.g). It proves the hedged signature produced by
-// SignCRDTFrame verifies under the UNCHANGED VerifyCRDTFrame. If this test
-// fails, the construction is WRONG -- do NOT weaken the verifier to make it
-// pass; fix the construction per FINDING-C.
+// TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame verifies that randomized-nonce
+// signatures produced by SignCRDTFrame verify under VerifyCRDTFrame and vary
+// across repeated calls with the same key and message.
 func TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame(t *testing.T) {
 	// Generate a seed
 	seed := make([]byte, ed25519.SeedSize)
@@ -34,7 +32,7 @@ func TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame(t *testing.T) {
 	// Test message
 	msg := []byte("test CRDT delta frame message")
 
-	// Sign with hedged signing
+	// Sign with randomized-nonce Ed25519
 	sig, err := SignCRDTFrame(seed, msg)
 	if err != nil {
 		t.Fatalf("SignCRDTFrame failed: %v", err)
@@ -44,9 +42,9 @@ func TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame(t *testing.T) {
 		t.Fatalf("signature length: got %d, want %d", len(sig), ed25519.SignatureSize)
 	}
 
-	// Verify with the UNCHANGED VerifyCRDTFrame
+	// Verify with VerifyCRDTFrame
 	if !VerifyCRDTFrame(pub, msg, sig) {
-		t.Fatal("VerifyCRDTFrame rejected valid hedged signature -- construction is BROKEN per FINDING-C")
+		t.Fatal("VerifyCRDTFrame rejected valid randomized-nonce signature")
 	}
 
 	// Verify non-determinism: two signatures on the same message should differ
@@ -61,12 +59,12 @@ func TestSignCRDTFrame_VerifiesUnderVerifyCRDTFrame(t *testing.T) {
 
 	// Both should verify
 	if !VerifyCRDTFrame(pub, msg, sig2) {
-		t.Fatal("VerifyCRDTFrame rejected second valid hedged signature")
+		t.Fatal("VerifyCRDTFrame rejected second valid randomized-nonce signature")
 	}
 
 	// Signatures should be different (non-deterministic)
 	if string(sig) == string(sig2) {
-		t.Fatal("hedged signatures are identical -- nonce is NOT randomized")
+		t.Fatal("randomized-nonce signatures are identical -- nonce is not randomized")
 	}
 }
 

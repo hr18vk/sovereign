@@ -6,21 +6,16 @@
 
 package durability
 
-// — (the LegacyCheckpoint witness lie) + (the publish
-// is atomic but not durable + the.upload-* orphan wedge) guards.
+// These tests cover checkpoint replay metadata and local-object durability.
 //
-// internal/chaos/wal.go set out.LegacyCheckpoint=true for ANY
-// fingerprint-less 0x05 and never cleared it, while both doc sites promised
-// "TRUE iff the FINAL checkpoint is legacy". The fix tracks the FINAL record's
-// own form: each 0x02 sets it, each 0x05 assigns `!c.HasFingerprint`.
+// LegacyCheckpoint describes the final checkpoint record: a 0x02 record is
+// legacy, and a 0x05 record is legacy when it has no fingerprint. Earlier
+// records do not affect the value.
 //
-// localfs.Upload did temp -> fsync -> rename(2): atomic, not durable (no
-// parent-directory fsync), and an interrupted upload orphaned a `.upload-*`
-// that ListObjects returned, which sorts BEFORE the real Arrow files
-// ('.'=0x2E < '0'=0x30) and hard-errors CompactionByHash8 on every sweep —
-// forever. The fix: fsync the parent dir after the rename; filter `.upload-*`
-// out of ListObjects (uncommitted uploads are not objects); reap orphans at
-// construction and on demand.
+// LocalFS publishes an upload by syncing a temporary file, renaming it, and
+// syncing the parent directory. ListObjects excludes temporary files left by
+// interrupted uploads, and ReapUploadOrphans removes them. This matters for
+// compaction because a temporary filename sorts before Arrow filenames.
 
 import (
 	"context"
@@ -35,7 +30,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// guards
+// LegacyCheckpoint witness tests
 // ---------------------------------------------------------------------------
 
 // rawLegacy48Checkpoint builds the 48-byte legacy 0x05 payload (root ||
@@ -48,9 +43,8 @@ func rawLegacy48Checkpoint(root [32]byte, lamportHigh, cutSeq uint64) []byte {
 	return p
 }
 
-// TestLegacyCheckpointTracksFinalRecord is the guard: the witness flag
-// must describe the FINAL checkpoint record's own form, not ANY record's.
-// Sub-test 1 fails at HEAD (the sticky set) — RED proven by injection.
+// TestLegacyCheckpointTracksFinalRecord verifies that the witness describes
+// the final checkpoint record rather than any earlier record.
 func TestLegacyCheckpointTracksFinalRecord(t *testing.T) {
 	var rootA, rootB [32]byte
 	rootA[0] = 0xAA
@@ -94,75 +88,73 @@ func TestLegacyCheckpointTracksFinalRecord(t *testing.T) {
 	t.Run("LegacyThenFingerprinted_IsFalse", func(t *testing.T) {
 		rep := build(t, legacy05, full05)
 		if rep.LegacyCheckpoint {
-			t.Fatalf("first 0x05 fingerprint-less, FINAL fingerprinted => LegacyCheckpoint must be FALSE; the sticky set lied (the final anchor's fingerprint check IS armed)")
+			t.Fatalf("final checkpoint has a fingerprint but LegacyCheckpoint is true")
 		}
 	})
 	t.Run("FingerprintedThenLegacy_IsTrue", func(t *testing.T) {
 		rep := build(t, full05, legacy05)
 		if !rep.LegacyCheckpoint {
-			t.Fatalf("final 0x05 is fingerprint-less => LegacyCheckpoint must be TRUE")
+			t.Fatalf("final checkpoint has no fingerprint but LegacyCheckpoint is false")
 		}
 	})
 	t.Run("Final02_IsTrue", func(t *testing.T) {
 		rep := build(t, full05, legacy02)
 		if !rep.LegacyCheckpoint {
-			t.Fatalf("a final legacy 0x02 carries no fingerprint => LegacyCheckpoint must be TRUE (the check has nothing to compare)")
+			t.Fatalf("final legacy 0x02 checkpoint must set LegacyCheckpoint")
 		}
 	})
 	t.Run("FingerprintedOnly_IsFalse", func(t *testing.T) {
 		rep := build(t, full05)
 		if rep.LegacyCheckpoint {
-			t.Fatalf("control: a fingerprinted-only log must report LegacyCheckpoint=false (this held at HEAD too — the anti-tautology control)")
+			t.Fatalf("fingerprinted checkpoint unexpectedly marked legacy")
 		}
 	})
 }
 
 // ---------------------------------------------------------------------------
-// guards
+// Publish durability tests
 // ---------------------------------------------------------------------------
 
-// TestOrphanWedgesCompactionAndReaperClosesIt is the wedge guard:
-// plant an orphan under l0/<hash8>/, run CompactionByHash8, show
-// it fails today, then show it passes after the reaper. The RED at HEAD is
-// proven by INJECTION (neuter the ListObjects filter): with the filter live,
-// the orphan never reaches the compactor; with the reaper, the orphan is gone.
+// TestOrphanWedgesCompactionAndReaperClosesIt verifies that ListObjects hides
+// temporary uploads and ReapUploadOrphans removes them. Compaction must succeed
+// while an orphan is present beside the entity's L0 files.
 func TestOrphanWedgesCompactionAndReaperClosesIt(t *testing.T) {
 	ctx := context.Background()
 	lfs := newSnapshotStore(t)
 	alloc := database.NewJemallocAllocator()
 	entity := "d-o-wedge-entity"
-	// A REAL L0 Arrow file via the production flusher (the idiom).
+	// Write real L0 Arrow files through the production flusher.
 	writeNCheckpoints(t, alloc, lfs, entity, 5)
 
 	hash8 := database.EntityHash8(entity)
 	l0dir := filepath.Join(lfs.Root(), "l0", database.EntityHash8Hex(entity))
 	if _, err := os.Stat(l0dir); err != nil {
-		t.Fatalf("apparatus: no L0 dir for the entity: %v", err)
+		t.Fatalf("L0 directory missing for entity: %v", err)
 	}
 
-	// PLANT THE ORPHAN: an interrupted upload's temp file (unparseable garbage,
-	// the dominant interrupt case) that sorts BEFORE the real.arrow files.
+	// Plant an interrupted upload containing partial data; its name sorts before
+	// the Arrow files.
 	orphan := filepath.Join(l0dir, ".upload-1863045766")
 	if err := os.WriteFile(orphan, []byte("torn-partial-upload"), 0o640); err != nil {
 		t.Fatalf("plant orphan: %v", err)
 	}
-	// Premise: the orphan really does sort first (the wedge mechanics).
+	// Confirm that the temporary file is absent from object listings.
 	keys, err := lfs.ListObjects(ctx, "", "l0/", 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	for _, k := range keys {
 		if strings.Contains(k, ".upload-") {
-			t.Fatalf("the orphan leaked into ListObjects (%s) — the filter is off", k)
+			t.Fatalf("temporary upload appeared in ListObjects: %s", k)
 		}
 	}
 
 	compactor := database.NewL1Compactor(lfs, lfs, lfs, alloc, "test", database.DefaultCompactionConfig())
 	if _, err := compactor.CompactionByHash8(ctx, hash8); err != nil {
-		t.Fatalf("WEDGE PRESENT: CompactionByHash8 failed with a.upload-* orphan under l0/<hash8>/: %v", err)
+		t.Fatalf("CompactionByHash8 failed with a .upload-* orphan under l0/<hash8>/: %v", err)
 	}
 
-	// The reaper: a second orphan planted post-boot is deleted on demand.
+	// A second temporary file created after construction is removed on demand.
 	orphan2 := filepath.Join(l0dir, ".upload-99999")
 	if err := os.WriteFile(orphan2, []byte("torn"), 0o640); err != nil {
 		t.Fatalf("plant orphan2: %v", err)
@@ -179,14 +171,11 @@ func TestOrphanWedgesCompactionAndReaperClosesIt(t *testing.T) {
 			t.Fatalf("orphan %s survived the reaper", p)
 		}
 	}
-	t.Logf("GREEN: orphan filtered from listings, compaction un-wedged, %d orphans reaped", reaped)
+	t.Logf("temporary files excluded from listings and %d removed", reaped)
 }
 
-// TestParentDirFsyncInThePublishPath proves the directory fsync is in
-// Upload's publish path: one Upload => the counter advances by exactly one.
-// (The fsync's PHYSICAL effect is POSIX-delegated and stated as such in the
-// fork report; this guard pins that the call exists and runs. Injection:
-// delete the fsyncParentDir call from Upload and this fails.)
+// TestParentDirFsyncInThePublishPath checks that each successful Upload issues
+// one parent-directory sync and leaves the object available for download.
 func TestParentDirFsyncInThePublishPath(t *testing.T) {
 	lfs := newSnapshotStore(t)
 	before := uploadDirSyncs.Load()
@@ -195,23 +184,23 @@ func TestParentDirFsyncInThePublishPath(t *testing.T) {
 	}
 	after := uploadDirSyncs.Load()
 	if after-before != 1 {
-		t.Fatalf("one Upload produced %d dir fsyncs, want exactly 1 — the parent-dir fsync is not in the publish path", after-before)
+		t.Fatalf("one Upload produced %d directory syncs, want 1", after-before)
 	}
-	// And the object is really there, readable, with the right bytes.
+	// Verify that the published object is available for download.
 	rc, err := lfs.Download(context.Background(), "", "ckpt/7")
 	if err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	defer rc.Close()
-	t.Logf("GREEN: parent-dir fsync is in the publish path (counter %d -> %d)", before, after)
+	t.Logf("parent-directory sync counter advanced from %d to %d", before, after)
 }
 
-// TestDirFsyncCost measures the added fsync cost per publish, stated as a
-// measured number per checkpoint. One Upload = one added dir fsync; measured directly.
+// TestDirFsyncCost reports the parent-directory sync cost on the test
+// filesystem. Each upload performs one such sync after publishing its object.
 func TestDirFsyncCost(t *testing.T) {
 	dir := t.TempDir()
 	const iters = 200
-	// Warm the page cache / ext4 dir entry.
+	// Warm the page cache and directory entry before measuring.
 	if err := fsyncParentDir(dir); err != nil {
 		t.Fatalf("warm fsync: %v", err)
 	}
@@ -222,5 +211,5 @@ func TestDirFsyncCost(t *testing.T) {
 		}
 	}
 	d := time.Since(start)
-	t.Logf("COST: %d parent-dir fsyncs in %s => %.1f µs/fsync on this box's filesystem (one per upload; a checkpoint publishes 1 image + N l0 partitions)", iters, d, float64(d.Microseconds())/iters)
+	t.Logf("%d parent-directory syncs in %s: %.1f µs/sync on this filesystem (one per upload; a checkpoint publishes 1 image + N L0 partitions)", iters, d, float64(d.Microseconds())/iters)
 }

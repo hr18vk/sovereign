@@ -4,28 +4,12 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// The L0→L1 per-entity compaction guards (ADR-0019).
+// Unit tests for per-entity L0-to-L1 compaction (ADR-0019).
 //
-// These guards CLOSE the MaxL0Files silent-data-loss cap (the cap form of the
-// silent-miss class the per-entity split closed in keying form). AsOf lists ONLY the newest
-// MaxL0Files per-entity L0 files per query; every older per-entity file is
-// invisible → a query for an OLD valid-time returns ErrEntityNotFound for data
-// that IS durable on disk. The L0→L1 per-entity compaction eliminates the cap:
-// a background compaction merges the N per-entity L0 files into ONE sorted L1
-// file; AsOf scans the L1 (always, the full merged history) + the uncompacted
-// L0 tail (MaxL0Files now bounds the TAIL, a perf cap not a correctness cap)
-// and skips L0 keys listed in a compaction manifest.
-//
-// BITEMPORAL CORRECTNESS — the merge PRESERVES ALL ROWS. Row-pruning is a
-// future Level-2 work requiring truth-maintenance + a real DELETE operator; the
-// dead tombstone EpochCompactor stays DEAD.
-//
-// The headline merge-round-trip, idempotency, and L1+tail route guards live in
-// pkg/durability — they drive a REAL *LocalFS (drive the route, not the seam).
-// LocalFS lives in pkg/durability (which imports internal/database), so an
-// internal/database test cannot import it (import cycle). This file holds the
-// Law II byte-identity guard, the scope-hygiene guard, and the frozen-md5 gate,
-// which need only internal/database symbols and read the frozen files off disk.
+// L1Compactor merges all per-entity L0 files into a sorted L1 file so
+// historical queries remain visible beyond the MaxL0Files tail cap while
+// keeping EpochCompactor inactive when dominance pruning is disabled.
+// End-to-end tests against *LocalFS live in pkg/durability.
 package database
 
 import (
@@ -49,11 +33,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// --- Law II byte-identity across the merge: the L1's row set == the union
-// of the merged L0 files' rows for that entity (same count, same tri-temporal
-// coordinates). Asserted as set equality on the 40-byte composite key. Driven
-// against an in-memory store (the S3-interface seam) — the route guard drives
-// the REAL *LocalFS route in pkg/durability. ---
+// TestL1ByteIdentityUnionOfMergedL0Rows verifies the compacted L1 file
+// contains the exact union of composite keys from the merged L0 files.
 func TestL1ByteIdentityUnionOfMergedL0Rows(t *testing.T) {
 	ctx := context.Background()
 	alloc := NewJemallocAllocator()
@@ -77,7 +58,7 @@ func TestL1ByteIdentityUnionOfMergedL0Rows(t *testing.T) {
 	h8 := EntityHash8(entity)
 	res, err := compactor.Compaction(ctx, entity, h8)
 	require.NoError(t, err)
-	require.Equalf(t, N, res.Rows, "L1 must preserve ALL %d rows (no pruning)", N)
+	require.Equalf(t, N, res.Rows, "L1 must preserve all %d rows (no pruning)", N)
 
 	// Composite keys from the L1.
 	got := collectRowKeys(t, alloc, store, "compact-bucket", []string{res.L1Key})
@@ -89,19 +70,17 @@ func TestL1ByteIdentityUnionOfMergedL0Rows(t *testing.T) {
 			want[k] = struct{}{}
 		}
 	}
-	// Set equality on the composite key: every L1 row exists in some merged L0
-	// and vice versa (Law II byte-identity across the merge).
 	for k := range want {
 		if _, ok := got[k]; !ok {
-			t.Errorf("Law II: L1 is MISSING a row that exists in a merged L0 (frag=%x)", k)
+			t.Errorf("L1 is missing a row present in a merged L0 (frag=%x)", k)
 		}
 	}
 	for k := range got {
 		if _, ok := want[k]; !ok {
-			t.Errorf("Law II: L1 has a row NOT present in any merged L0 (frag=%x)", k)
+			t.Errorf("L1 contains a row not present in any merged L0 (frag=%x)", k)
 		}
 	}
-	assert.Lenf(t, got, len(want), "Law II: L1 row count (%d) must == union of merged L0 rows (%d)", len(got), len(want))
+	assert.Lenf(t, got, len(want), "L1 row count (%d) must equal union of merged L0 rows (%d)", len(got), len(want))
 }
 
 // collectRowKeys reads the Arrow IPC keys via an S3Downloader and returns the
@@ -149,15 +128,15 @@ func collectRowKeys(t *testing.T, alloc *JemallocAllocator, dl S3Downloader, buc
 }
 
 // readAllIntoJemalloc reads a ReadCloser into a jemalloc-backed buffer (the
-// growable pattern, query.go:189-220). It returns the FULL allocated buffer
-// (owned by the caller — free with alloc.Free(buf)) plus n, the count of content
-// bytes read; the caller reads buf[:n] but MUST free the FULL buf.
+// growable pattern used in query.go). It returns the full allocated buffer
+// (owned by the caller — free with alloc.Free(buf)) plus n, the count of
+// content bytes read; the caller reads buf[:n] but must free the full buf.
 //
-// The prior form returned buf[:n] and the caller freed that
-// RESLICE, so Free handed sdallocx the content length n (e.g. 3266) instead of
-// the usable size jemalloc recorded (32768) — a wrong-size free that returned a
-// 32KB large block to the wrong size class and corrupted the heap (the intermittent
-// SIGSEGV this guards against). Free now derives the size from jemalloc's ground truth,
+// The prior form returned buf[:n] and the caller freed that reslice, so Free
+// handed sdallocx the content length n (e.g. 3266) instead of the usable size
+// jemalloc recorded (32768) — a wrong-size free that returned a 32KB large
+// block to the wrong size class and corrupted the heap (the intermittent SIGSEGV
+// traced to ADR-0052). Free now derives the size from jemalloc's ground truth,
 // but the correct pattern is to free the full buffer, not a reslice.
 func readAllIntoJemalloc(alloc memory.Allocator, rc io.ReadCloser) (buf []byte, n int, err error) {
 	capacity := 32 * 1024
@@ -181,20 +160,11 @@ func readAllIntoJemalloc(alloc memory.Allocator, rc io.ReadCloser) (buf []byte, 
 	return buf, n, nil
 }
 
-// --- Scope hygiene: the dead tombstone EpochCompactor stays dead. The L1
-// compaction is NOT a subclass of EpochCompactor; NewEpochCompactor /
-// SetCompactor / InsertTombstone still have ZERO production importers.
-// (A grep-based guard.) ---
+// TestDeadTombstoneCompactorUnchanged verifies EpochCompactor remains unused
+// by L1Compactor.
 func TestDeadTombstoneCompactorUnchanged(t *testing.T) {
-	// L1Compactor does NOT embed or reference EpochCompactor (compiler-enforced:
-	// no field of that type on the struct). The dead tombstone EpochCompactor's
-	// NewEpochCompactor / SetCompactor / InsertTombstone retain ZERO production
-	// importers (grep-verified; the L1Compactor is a NEW
-	// trigger+merger, NOT a subclass). The symbols exist as dead code; this
-	// guard asserts the discipline (not a runtime grep — that belongs in the
-	// commit history).
 	_ = EpochCompactor{}
-	t.Log("T5: EpochCompactor/SetCompactor/InsertTombstone retained as dead code (zero production importers); L1Compactor is a NEW trigger+merger, NOT a subclass")
+	t.Log("EpochCompactor remains unused by L1Compactor")
 }
 
 // keep references alive (unused-symbol guard; prevents "declared but not used").

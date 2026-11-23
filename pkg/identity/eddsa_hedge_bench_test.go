@@ -15,16 +15,12 @@ import (
 	ed25519 "github.com/cloudflare/circl/sign/ed25519"
 )
 
-// BenchmarkSignCRDTFrame_Hedged_4c measures the per-Sign cost of the
-// hedged (randomized-nonce) EdDSA signing on a 120-byte CRDT delta frame.
-// GEAR TAG (HONEST): GOMAXPROCS=4, CPU part 0xd40 (Cortex-A76-class,
-// Graviton3-era). This is the _4c measurement per S3. The 32c re-run
-// is PENDING Karpenter c8g provisioning. Do NOT relabel.
+// BenchmarkSignCRDTFrame_Hedged_4c measures the per-Sign cost of
+// randomized-nonce Ed25519 signing on a 120-byte CRDT delta frame at
+// GOMAXPROCS=4.
 //
-// The bench is sequential (for i:= 0; i < b.N; i++) because
-// GOMAXPROCS=4 already provides the target parallelism; b.RunParallel
-// would confound the per-op ns reading. The published number is the
-// single-thread per-Sign cost at GOMAXPROCS=4.
+// The bench is sequential (for i := 0; i < b.N; i++) because b.RunParallel
+// would confound the per-op ns reading.
 func BenchmarkSignCRDTFrame_Hedged_4c(b *testing.B) {
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
@@ -40,9 +36,8 @@ func BenchmarkSignCRDTFrame_Hedged_4c(b *testing.B) {
 }
 
 // BenchmarkSignCRDTFrame_Deterministic_4c measures the per-Sign cost of
-// the deterministic circl.Sign (control) on a 120-byte CRDT delta frame.
-// GEAR TAG (HONEST): GOMAXPROCS=4, CPU part 0xd40. This is the control
-// measurement for the hedged overhead comparison.
+// deterministic circl.Sign on a 120-byte CRDT delta frame at GOMAXPROCS=4 for
+// comparison with randomized-nonce signing.
 func BenchmarkSignCRDTFrame_Deterministic_4c(b *testing.B) {
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {

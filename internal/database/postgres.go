@@ -4,10 +4,10 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package database implements the PostgreSQL substrate for the Ingestion Engine.
-// It enforces the simple_protocol execution mode to prevent PgBouncer transaction
-// pooling session collisions, and implements the Temporary Staging Promotion pattern
-// to bypass WAL serialization bottlenecks during civilizational-scale bulk ingestion.
+// Package database provides PostgreSQL connection and bulk-ingestion helpers.
+// Pools use simple_protocol to avoid prepared-statement collisions under
+// PgBouncer transaction pooling. Bulk ingestion copies rows into a temporary
+// staging table before upserting them into the target table.
 package database
 
 import (
@@ -19,19 +19,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// InitializeSwarmPool creates a new PostgreSQL connection pool optimized for PgBouncer.
-//
-// ARCHITECTURAL MANDATE: simple_protocol is enforced programmatically on the
-// parsed ConnConfig struct. We do NOT manipulate the raw URI string, as production
-// passwords may contain URL-special characters (?, @, &, #) that would corrupt
-// naive string.Contains/append logic.
+// InitializeSwarmPool creates a PostgreSQL connection pool for PgBouncer.
+// Setting simple_protocol on the parsed configuration avoids modifying the URI,
+// whose password may contain URL-special characters.
 func InitializeSwarmPool(ctx context.Context, connectionURI string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(connectionURI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse connection string: %w", err)
 	}
 
-	// Single, authoritative enforcement point. No URI mutation needed.
+	// Apply the execution mode to the parsed configuration used by the pool.
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
@@ -42,17 +39,13 @@ func InitializeSwarmPool(ctx context.Context, connectionURI string) (*pgxpool.Po
 	return pool, nil
 }
 
-// UnloggedStagingPromotion executes a multi-row bulk UPSERT operation via a
-// session-scoped temporary table, bypassing WAL and statement planning.
+// UnloggedStagingPromotion executes a multi-row bulk upsert through a
+// session-scoped temporary table. COPY avoids per-row INSERT planning and WAL
+// logging for staging rows; promotion into the target is a normal WAL-logged
+// INSERT.
 //
-// ARCHITECTURAL FIXES (v2):
-//  1. Uses CREATE TEMPORARY TABLE instead of CREATE UNLOGGED TABLE.
-//     Temp tables write to pg_temp_N (session-local catalog), NOT pg_class.
-//     This eliminates AccessExclusiveLock contention on the shared system catalog.
-//  2. Temp tables are session-scoped — two transactions can use identical names
-//     without collision, solving the swarm concurrency name collision.
-//  3. ON COMMIT DROP ensures automatic cleanup even on error paths.
-//  4. No explicit DROP TABLE needed — the transaction commit handles it.
+// Each session has its own temporary schema, so concurrent calls can use the
+// same staging name. ON COMMIT DROP removes the staging table at commit.
 func UnloggedStagingPromotion(ctx context.Context, pool *pgxpool.Pool, targetTable string, conflictConstraint string, columns []string, payload [][]any) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -64,10 +57,9 @@ func UnloggedStagingPromotion(ctx context.Context, pool *pgxpool.Pool, targetTab
 	// Name collisions are impossible because each session has its own pg_temp schema.
 	tempStage := fmt.Sprintf("%s_temp_stage", targetTable)
 
-	// Step 1: Create session-scoped temporary staging table.
-	// ON COMMIT DROP ensures automatic cleanup when the transaction commits.
-	// LIKE ... INCLUDING ALL replicates indexes and constraints from the target.
-	// Writes to pg_temp_N catalog — NO contention on shared pg_class.
+	// Create the staging table in this session's temporary schema. LIKE ...
+	// INCLUDING ALL copies the target's indexes and constraints; ON COMMIT DROP
+	// cleans up the table when the transaction commits.
 	createTempSQL := fmt.Sprintf(
 		"CREATE TEMPORARY TABLE %s (LIKE %s INCLUDING ALL) ON COMMIT DROP;",
 		tempStage, targetTable,
@@ -76,7 +68,7 @@ func UnloggedStagingPromotion(ctx context.Context, pool *pgxpool.Pool, targetTab
 		return fmt.Errorf("failed to create temporary staging table: %w", err)
 	}
 
-	// Step 2: Stream payload via COPY protocol (bypasses SQL parse/plan).
+	// COPY streams the payload without planning an INSERT for every row.
 	copyCount, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{tempStage},
@@ -91,7 +83,7 @@ func UnloggedStagingPromotion(ctx context.Context, pool *pgxpool.Pool, targetTab
 		return fmt.Errorf("failed to copy all rows: copied %d out of %d", copyCount, len(payload))
 	}
 
-	// Step 3: Set-based promotion into production table.
+	// Promote all staged rows in one set-based upsert.
 	cols := strings.Join(columns, ", ")
 	upsertSQL := fmt.Sprintf(`
 		INSERT INTO %s (%s)
@@ -104,8 +96,7 @@ func UnloggedStagingPromotion(ctx context.Context, pool *pgxpool.Pool, targetTab
 		return fmt.Errorf("failed to promote staging data: %w", err)
 	}
 
-	// Step 4: Commit — ON COMMIT DROP auto-sterilizes the temp table.
-	// No explicit DROP TABLE needed.
+	// Commit also drops the temporary staging table.
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}

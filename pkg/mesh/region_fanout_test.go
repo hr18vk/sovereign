@@ -31,34 +31,24 @@ import (
 	"github.com/hr18vk/sovereign/pkg/transport"
 )
 
-// region_fanout_test.go is the (ADR-0039) region-aware gossip data-plane
-// gate — the loopback guards that PROVE the fan-out selector is correct,
-// deterministic under the seed, byte-identical-to-HEAD when OFF, and
-// fires the disclosure counter on the inter-region arm. The guards build a
-// 2-node in-process harness (the antiEntropyHarness pattern, REAL peerIDs via
-// identA.NodeID / identB.NodeID) + a TopologyManager, then drive
-// AntiEntropySweep under --region-aware ON + OFF + the seeded-deterministic
-// fan-out.
+// The region-aware gossip tests (ADR-0039) cover seeded peer selection,
+// full-mesh behavior when --region-aware is disabled, convergence within and
+// across regions, and the inter-region envelope counter. Two loopback nodes use
+// their actual node IDs in both the peer connections and topology registry.
 //
-// The HONEST N=2 NO-OP the guards encode: a 2-node mesh with BOTH
-// peers intra-region (the default — sameRegion(1,1)==true) routes the fan-out
-// selector to intra-only (NO inter-region arm), so the counter stays 0 — the
-// byte-identical-to-OFF property at N=2. The guards that assert the inter-region
-// arm fires TAG the two peers DIFFERENT regions (region 1 vs region 2) so the
-// fan-out selector routes the cross-region peer as the inter-region arm — the
-// counter fires. The SIMULATED N=100 mesh round-count (the O(log N)
-// convergence) is a SEPARATE guard that runs the selector over a 100-peer
-// registry (NO TLS, NO dial — pure Select over a synthetic registry) + asserts
-// the round-count to convergence is O(log_3 100) ≈ 4-5 (NOT a 2-node binary
-// run — the multi-node AWS arc is separate work).
+// With two peers in the same region, selection is intra-region only and the
+// inter-region counter remains zero. Assigning different regions exercises the
+// inter-region selection and its counter. A separate simulation drives Select
+// over a synthetic 100-node registry without TLS or sockets; its round count
+// tests the selector's epidemic-spread model, not a deployed fleet.
 
-// regionHarness is the 2-node in-process harness with a TopologyManager bound to
-// each gossiper (the antiEntropyHarness pattern + the topology seam).
-// The two peers carry REAL peerIDs (identA.NodeID / identB.NodeID) via the dial
-// (ps.Dial(ctx, addr, "localhost", peerID)), so the TopologyManager is keyed by
-// real peerIDs — the load-bearing in-process path the cmd dial loop's zero-
-// peerID placeholder CANNOT exercise (the N=2 no-op).
-type regionHarness struct {
+// RegionFanoutHarness is the 2-node in-process harness with a TopologyManager
+// bound to each gossiper (the stratified anti-entropy harness pattern plus the
+// region-aware topology seam). The two peers carry real peerIDs
+// (identA.NodeID / identB.NodeID) via the dial (ps.Dial(ctx, addr, "localhost",
+// peerID)), so the TopologyManager is keyed by real peerIDs — the in-process
+// path the cmd dial loop's zero-peerID placeholder cannot exercise.
+type RegionFanoutHarness struct {
 	dir       string
 	caPath    string
 	identA    *NodeIdentity
@@ -80,31 +70,26 @@ type regionHarness struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        *sync.WaitGroup
-	interA    int32 // counter shim (inter-region envelopes shipped by A)
-	interB    int32 // counter shim (inter-region envelopes shipped by B)
+	interA    int32 // inter-region counter shim (envelopes shipped by A)
+	interB    int32 // inter-region counter shim (envelopes shipped by B)
 	regionA   RegionTag
 	regionB   RegionTag
 	regionArm bool
 }
 
-// newRegionHarness builds the 2-node harness with a TopologyManager on each
-// gossiper. regionArm arms the region-aware sweep (g.regionAware=true); the
-// two peers are tagged regionA / regionB (when these DIFFER, the fan-out
-// selector routes the cross-region peer as the inter-region arm — the
-// counter fires; when SAME, intra-only — the byte-identical-to-OFF N=2 no-op).
-func newRegionHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) *regionHarness {
+// newRegionFanoutHarness builds the 2-node harness with a TopologyManager on
+// each gossiper. regionArm enables the region-aware sweep; the two peers are
+// tagged regionA and regionB. When the regions differ, the fan-out selector
+// routes the cross-region peer through the inter-region arm and increments its
+// counter; when they are the same, selection is intra-region only and matches
+// the disabled path.
+func newRegionFanoutHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) *RegionFanoutHarness {
 	t.Helper()
-	// FIXED identity seeds so the byte-identity guard can give the ON + OFF
-	// paths the SAME nodeIDs (the CausalDot includes OriginNodeID crdt.go:969 —
-	// two harnesses with different random nodeIDs produce different
-	// MerkleRoots even for byte-identical logical entries; the byte-identity
-	// comparison is INVALID without shared nodeIDs — the precedent).
+	// Fixed seeds give both enabled and disabled harnesses the same node IDs.
+	// CausalDot includes OriginNodeID, so different IDs would change Merkle roots
+	// even when the logical entries are identical.
 	seedA := make([]byte, ed25519.SeedSize)
 	seedB := make([]byte, ed25519.SeedSize)
-	// FIXED seeds (deterministic — the byte-identity guard needs the SAME
-	// nodeIDs across the ON + OFF harnesses; a random seed would break the
-	// root-equality comparison). These are the SAME fixed seeds the
-	// byte-identity guard uses (the antiEntropyHarnessSeeded precedent).
 	for i := range seedA {
 		seedA[i] = byte(0xAA)
 	}
@@ -188,12 +173,9 @@ func newRegionHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) 
 	_ = gA.RegisterPeer(identB.NodeID, identB.Pub)
 	_ = gB.RegisterPeer(identA.NodeID, identA.Pub)
 
-	//: the TopologyManager on each gossiper. The self-region is regionA
-	// for A / regionB for B; the peer (the OTHER node) is registered under its
-	// REAL peerID (identB.NodeID for A's topology, identA.NodeID for B's) with
-	// the OTHER's region tag. When regionA != regionB, the peer is CROSS-region
-	// = the inter-region fan-out arm (the counter fires); when SAME, the
-	// peer is intra = the byte-identical-to-OFF N=2 no-op.
+	// Each gossiper records its own region and the peer's region under the peer's
+	// verified node ID. Different tags select the inter-region arm; equal tags
+	// retain full intra-region selection.
 	topoA := NewTopologyManager(regionA)
 	topoA.SetRegion(identB.NodeID, regionB)
 	topoB := NewTopologyManager(regionB)
@@ -203,7 +185,7 @@ func newRegionHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) 
 	gA.SetRegionAware(regionArm)
 	gB.SetRegionAware(regionArm)
 
-	h := &regionHarness{
+	h := &RegionFanoutHarness{
 		dir: dir, caPath: caPath, identA: identA, identB: identB,
 		engineA: engineA, engineB: engineB, recvA: recvA, recvB: recvB,
 		lnA: lnA, lnB: lnB, addrA: lnA.Addr().String(), addrB: lnB.Addr().String(),
@@ -211,18 +193,17 @@ func newRegionHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) 
 		ctx: ctx, cancel: cancel,
 		interA: 0, interB: 0, regionA: regionA, regionB: regionB, regionArm: regionArm,
 	}
-	// Wire the inter-region reporters to the harness counters (the closures
-	// capture the harness's counter addresses; the Gossiper stores the func, the
-	// harness owns the int32 — the SetStratifiedFallbackReporter shim
-	// pattern). The guards assert the MECHANISM fires; the telemetry-counter
-	// wiring is the cmd path, proven by separately.
+	// Capture inter-region reports in harness-owned atomic counters. Production
+	// wires these callbacks to telemetry; TestTopologyCounter checks that counter's
+	// registration separately.
 	gA.SetInterRegionReporter(func() { atomic.AddInt32(&h.interA, 1) })
 	gB.SetInterRegionReporter(func() { atomic.AddInt32(&h.interB, 1) })
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go runAcceptLoop(ctx, lnA, recvA, gA, &wg)
-	go runAcceptLoop(ctx, lnB, recvB, gB, &wg)
+	// The PeerSet-threaded accept loop (challenge handshake + egress).
+	go runAcceptLoopWithPeerSet(ctx, lnA, recvA, gA, &wg, psA)
+	go runAcceptLoopWithPeerSet(ctx, lnB, recvB, gB, &wg, psB)
 	h.wg = &wg
 
 	if err := psA.Dial(ctx, h.addrB, "localhost", identB.NodeID); err != nil {
@@ -236,15 +217,15 @@ func newRegionHarness(t *testing.T, regionArm bool, regionA, regionB RegionTag) 
 	return h
 }
 
-func (h *regionHarness) close() {
+func (h *RegionFanoutHarness) close() {
 	h.cancel()
 	_ = h.lnA.Close()
 	_ = h.lnB.Close()
 }
 
-// insertEvents inserts n events split evenly between A and B (the
-// antiEntropyHarness.insertEvents pattern — i%2==0 -> A, else B).
-func (h *regionHarness) insertEvents(t *testing.T, n int) int {
+// insertEvents inserts n events split evenly between A and B (the stratified
+// anti-entropy harness pattern — i%2==0 -> A, else B).
+func (h *RegionFanoutHarness) insertEvents(t *testing.T, n int) int {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		eid := fmt.Sprintf("civic-%d", i)
@@ -262,17 +243,17 @@ func (h *regionHarness) insertEvents(t *testing.T, n int) int {
 	return n
 }
 
-// sweepUntilConverged runs concurrent AntiEntropySweep rounds (A + B in
-// parallel) until the engines' MerkleRoots match OR maxRounds is hit (the
-// antiEntropyHarness.sweepUntilConverged pattern).
-func (h *regionHarness) sweepUntilConverged(t *testing.T, maxRounds int, tick time.Duration) (int, bool, [32]byte, [32]byte) {
+// sweepUntilConverged runs concurrent AntiEntropySweep rounds (A and B in
+// parallel) until the engines' MerkleRoots match or maxRounds is hit (the
+// stratified anti-entropy harness pattern).
+func (h *RegionFanoutHarness) sweepUntilConverged(t *testing.T, maxRounds int, tick time.Duration) (int, bool, [32]byte, [32]byte) {
 	t.Helper()
 	tickA := tick
 	if tickA <= 0 {
 		tickA = 20 * time.Millisecond
 	}
 	for round := 0; round < maxRounds; round++ {
-		// Stamp the per-sweep seed into BOTH topologies (the sweep round number
+		// Stamp the per-sweep seed into both topologies (the sweep round number
 		// — the seeded-deterministic tie-break; the selection varies across
 		// rounds but is reproducible per round).
 		h.topoA.SetSeed(uint64(round) + 1)
@@ -283,121 +264,96 @@ func (h *regionHarness) sweepUntilConverged(t *testing.T, maxRounds int, tick ti
 		go func() { defer sweepWG.Done(); h.gB.AntiEntropySweep(h.ctx) }()
 		sweepWG.Wait()
 		time.Sleep(tickA)
-		ra := h.engineA.State().MerkleRoot()
-		rb := h.engineB.State().MerkleRoot()
+		ra := h.engineA.MerkleRootFromShards()
+		rb := h.engineB.MerkleRootFromShards()
 		t.Logf("round %d: rootA=%x rootB=%x interA=%d interB=%d", round, ra, rb, atomic.LoadInt32(&h.interA), atomic.LoadInt32(&h.interB))
 		if ra == rb {
 			return round + 1, true, ra, rb
 		}
 	}
-	ra := h.engineA.State().MerkleRoot()
-	rb := h.engineB.State().MerkleRoot()
+	ra := h.engineA.MerkleRootFromShards()
+	rb := h.engineB.MerkleRootFromShards()
 	return maxRounds, false, ra, rb
 }
 
-// TestTopologyOffIsByteIdentical is the guard:
-// --region-aware OFF (the opt-IN default) converges the SAME 1000-event split
-// the existing TestTwoNodeConvergence_InMemory does, in the SAME <=10 rounds —
-// the wiring did NOT regress the byte-identical full-mesh path. The
-// TopologyManager is built + bound (SetTopology) but the selector is NOT armed
-// (SetRegionAware(false)), so AntiEntropySweep takes the full-mesh peers.Peers
-// path = byte-identical. The counter stays 0 (the region-aware path
-// is OFF — no inter-region arm fires).
+// TestTopologyOffIsByteIdentical checks the default full-mesh path with a
+// TopologyManager attached but region-aware selection disabled. Both nodes must
+// converge on the same 1,000 events within ten rounds without reporting any
+// inter-region envelopes.
 func TestTopologyOffIsByteIdentical(t *testing.T) {
-	h := newRegionHarness(t, false, RegionUnset, RegionUnset) // OFF + untagged
+	h := newRegionFanoutHarness(t, false, RegionUnset, RegionUnset)
 	defer h.close()
 	const total = 1000
 	h.insertEvents(t, total)
 	rounds, converged, ra, rb := h.sweepUntilConverged(t, 10, 20*time.Millisecond)
 	if !converged {
-		t.Fatalf("topology-off-byte-identical: OFF did NOT converge in <=10 rounds (rootA=%x rootB=%x) — the wiring regressed the byte-identical full-mesh path", ra, rb)
+		t.Fatalf("region-aware routing disabled: roots differ after 10 rounds (A=%x B=%x)", ra, rb)
 	}
 	gotA := cardinality(t, h.engineA)
 	gotB := cardinality(t, h.engineB)
 	if gotA != total || gotB != total {
-		t.Fatalf("topology-off-byte-identical: converged but cardinality A=%d B=%d, want both=%d (a JOIN bug, not a sign bug)", gotA, gotB, total)
+		t.Fatalf("region-aware routing disabled: cardinalities are A=%d B=%d, want %d on both", gotA, gotB, total)
 	}
 	if atomic.LoadInt32(&h.interA) != 0 || atomic.LoadInt32(&h.interB) != 0 {
-		t.Fatalf("topology-off-byte-identical: OFF path fired the inter-region counter (A=%d B=%d) — the OFF path is full-mesh, NOT a fan-out; the reporter shim should be silent", h.interA, h.interB)
+		t.Fatalf("full-mesh path reported inter-region envelopes: A=%d B=%d, want zero", h.interA, h.interB)
 	}
-	t.Logf("GATE PASS: topology-off-byte-identical — OFF converged %d events in %d rounds, byte-identical to full-mesh, inter-region counter silent", total, rounds)
+	t.Logf("full-mesh path converged %d events in %d rounds with no inter-region reports", total, rounds)
 }
 
-// TestTopologyOnIntraRegionConverges is the guard:
-// --region-aware ON with BOTH peers SAME region (the N=2 no-op the guards
-// encode) converges the SAME 1000-event split in the SAME <=10 rounds —
-// the fan-out selector routes BOTH peers as intra (sameRegion(1,1)==true), so
-// the sweep is byte-identical to the full-mesh path (the topology seam is armed
-// but the selection is intra-only). The counter stays 0 (NO inter-region arm
-// — both peers are SAME-region; the honest N=2 no-op).
+// TestTopologyOnIntraRegionConverges checks region-aware selection when both
+// peers share a region. The selector must retain full-mesh behavior for that
+// peer, converge within ten rounds, and leave the inter-region counter at zero.
 func TestTopologyOnIntraRegionConverges(t *testing.T) {
-	h := newRegionHarness(t, true, RegionTag(1), RegionTag(1)) // ON + both region 1
+	h := newRegionFanoutHarness(t, true, RegionTag(1), RegionTag(1))
 	defer h.close()
 	const total = 1000
 	h.insertEvents(t, total)
 	rounds, converged, ra, rb := h.sweepUntilConverged(t, 10, 20*time.Millisecond)
 	if !converged {
-		t.Fatalf("topology-on-intra-converges: ON (both region 1) did NOT converge in <=10 rounds (rootA=%x rootB=%x) — the fan-out selector regressed the intra-region full-mesh path", ra, rb)
+		t.Fatalf("same-region sweep: roots differ after 10 rounds (A=%x B=%x)", ra, rb)
 	}
 	if gotA, gotB := cardinality(t, h.engineA), cardinality(t, h.engineB); gotA != total || gotB != total {
-		t.Fatalf("topology-on-intra-converges: converged but cardinality A=%d B=%d, want both=%d", gotA, gotB, total)
+		t.Fatalf("same-region sweep: cardinalities are A=%d B=%d, want %d on both", gotA, gotB, total)
 	}
-	// The N=2 no-op: both peers SAME-region -> intra-only -> NO inter-region
-	// arm -> the counter stays 0 (the honest disclosure the design names).
 	if atomic.LoadInt32(&h.interA) != 0 || atomic.LoadInt32(&h.interB) != 0 {
-		t.Fatalf("topology-on-intra-converges: ON with both peers SAME-region fired the inter-region counter (A=%d B=%d) — sameRegion(1,1)==true so NO inter-region arm should fire (the N=2 no-op)", h.interA, h.interB)
+		t.Fatalf("same-region sweep reported inter-region envelopes: A=%d B=%d, want zero", h.interA, h.interB)
 	}
-	t.Logf("GATE PASS: topology-on-intra-converges — ON (both region 1) converged %d events in %d rounds, the N=2 no-op (intra-only, inter-region counter silent)", total, rounds)
+	t.Logf("same-region sweep converged %d events in %d rounds with no inter-region reports", total, rounds)
 }
 
-// TestTopologyOnInterRegionConverges is the guard:
-// --region-aware ON with the two peers in DIFFERENT regions (region 1 vs 2)
-// converges the SAME 1000-event split — the fan-out selector routes the
-// cross-region peer as the inter-region arm (the counter fires), and the
-// CRDT-idempotent Join absorbs the cross-region delta (convergence holds — the
-// fan-out selector changes WHICH peers the delta reaches, NOT the delta shape).
-// The counter fires on BOTH nodes (each ships its delta to the cross-region
-// peer; the counter is the operator-VISIBLE proof the region-aware path is in
-// USE). This is the load-bearing guard: it PROVES the inter-region arm fires +
-// convergence holds under the fan-out.
+// TestTopologyOnInterRegionConverges checks a region-aware sweep between
+// regions 1 and 2. Selection changes the recipient set, not the delta encoding;
+// both nodes must converge on all 1,000 events and report inter-region traffic.
 func TestTopologyOnInterRegionConverges(t *testing.T) {
-	h := newRegionHarness(t, true, RegionTag(1), RegionTag(2)) // ON + region 1 vs 2
+	h := newRegionFanoutHarness(t, true, RegionTag(1), RegionTag(2))
 	defer h.close()
 	const total = 1000
 	h.insertEvents(t, total)
 	rounds, converged, ra, rb := h.sweepUntilConverged(t, 10, 20*time.Millisecond)
 	if !converged {
-		t.Fatalf("topology-on-inter-converges: ON (region 1 vs 2) did NOT converge in <=10 rounds (rootA=%x rootB=%x) — the fan-out selector's inter-region arm broke convergence", ra, rb)
+		t.Fatalf("cross-region sweep: roots differ after 10 rounds (A=%x B=%x)", ra, rb)
 	}
 	if gotA, gotB := cardinality(t, h.engineA), cardinality(t, h.engineB); gotA != total || gotB != total {
-		t.Fatalf("topology-on-inter-converges: converged but cardinality A=%d B=%d, want both=%d (a JOIN bug under the inter-region arm)", gotA, gotB, total)
+		t.Fatalf("cross-region sweep: cardinalities are A=%d B=%d, want %d on both", gotA, gotB, total)
 	}
-	// The counter fires on BOTH nodes (each ships its delta to the cross-
-	// region peer every round until convergence). At least ONE fire per node
-	// (the first round ships the full delta cross-region; subsequent rounds may
-	// ship nothing if already converged — the counter is the SELECTION
-	// disclosure, fires once per inter-region peer per round that ships a delta).
+	// The first round ships each node's delta to its cross-region peer. Later
+	// rounds may ship nothing once the roots match.
 	if atomic.LoadInt32(&h.interA) == 0 || atomic.LoadInt32(&h.interB) == 0 {
-		t.Fatalf("topology-on-inter-converges: ON with region 1 vs 2 did NOT fire the inter-region counter (A=%d B=%d) — crossRegion(1,2)==true so the inter-region arm SHOULD fire on BOTH nodes", h.interA, h.interB)
+		t.Fatalf("cross-region sweep did not report on both nodes: A=%d B=%d", h.interA, h.interB)
 	}
-	t.Logf("GATE PASS: topology-on-inter-converges — ON (region 1 vs 2) converged %d events in %d rounds; the inter-region counter fired A=%d B=%d (the region-aware path is in USE)", total, rounds, h.interA, h.interB)
+	t.Logf("cross-region sweep converged %d events in %d rounds; reports A=%d B=%d", total, rounds, h.interA, h.interB)
 }
 
-// TestTopologyDeterministic is the guard: the fan-out
-// selector is DETERMINISTIC under the seed — same seed → same Select output
-// EVERY run (the fuzz-seed discipline; a flaky selector is a
-// violation). The guard builds a TopologyManager with a 10-peer registry (1
-// intra + 9 inter, fan-out 3) + asserts Select(ctx) returns the SAME peerIDs
-// under the SAME seed, but DIFFERENT peerIDs under a DIFFERENT seed (the
-// epidemic-spreading property — a different per-sweep seed routes a different
-// inter-region subset). NO TLS, NO dial — pure Select over a synthetic registry
-// (the selector is the unit under test, NOT the mesh plumbing).
+// TestTopologyDeterministic calls Select on a synthetic ten-peer registry.
+// Repeating a seed must return the same peer set. A different seed usually
+// selects a different inter-region subset, but that comparison is logged rather
+// than failed because the two subsets can coincide.
 func TestTopologyDeterministic(t *testing.T) {
 	topo := NewTopologyManager(RegionTag(1))
 	topo.SetFanout(3)
-	// 1 intra peer (region 1) + 9 inter peers (regions 2-10). The intra peer
-	// is always selected (full-mesh); 3 of the 9 inter peers are selected under
-	// the seeded tie-break.
+	// 1 intra peer (region 1) + 9 inter peers (regions 2-10). The intra peer is
+	// always selected (full-mesh); 3 of the 9 inter peers are selected under the
+	// seeded tie-break.
 	var intraPeer [16]byte
 	intraPeer[0] = 0x01
 	topo.SetRegion(intraPeer, RegionTag(1))
@@ -406,58 +362,44 @@ func TestTopologyDeterministic(t *testing.T) {
 		interPeers[i][0] = byte(0x02 + i)
 		topo.SetRegion(interPeers[i], RegionTag(2+RegionTag(i)))
 	}
-	// Seed 42: run Select twice, assert SAME output (deterministic under seed).
+	// Repeating seed 42 must return the same set.
 	topo.SetSeed(42)
 	out1 := topo.Select(context.Background())
 	topo.SetSeed(42)
 	out2 := topo.Select(context.Background())
 	if !samePeerSet(out1, out2) {
-		t.Fatalf("topology-deterministic: Select(seed=42) is NOT deterministic — run1=%v run2=%v (same seed MUST yield same output; a flaky selector is a Law IV violation)", out1, out2)
+		t.Fatalf("Select(seed=42) returned different peer sets: first=%v second=%v", out1, out2)
 	}
-	// The intra peer MUST be in the selection (full-mesh intra).
+	// Same-region selection is independent of fan-out.
 	if !containsPeer(out1, intraPeer) {
-		t.Fatalf("topology-deterministic: Select(seed=42) dropped the intra-region peer %x — the intra arm is full-mesh (always selected)", intraPeer)
+		t.Fatalf("Select(seed=42) omitted same-region peer %x", intraPeer)
 	}
-	// The selection MUST be exactly 1 (intra) + 3 (inter fan-out) = 4 peers.
 	if len(out1) != 4 {
-		t.Fatalf("topology-deterministic: Select(seed=42) returned %d peers, want 4 (1 intra + 3 inter fan-out at fan-out=3)", len(out1))
+		t.Fatalf("Select(seed=42) returned %d peers, want 1 same-region + 3 cross-region", len(out1))
 	}
-	// A DIFFERENT seed yields a DIFFERENT inter-region subset (the epidemic-
-	// spreading property — the per-sweep seed routes a different inter-region
-	// subset each round, spreading the delta to DISTINCT regions). The intra
-	// peer is the SAME (full-mesh); the 3 inter peers DIFFER.
+	// A different seed can select a different cross-region subset, but equal
+	// subsets are possible and are logged rather than treated as failure.
 	topo.SetSeed(99)
 	out3 := topo.Select(context.Background())
 	if !containsPeer(out3, intraPeer) {
-		t.Fatalf("topology-deterministic: Select(seed=99) dropped the intra-region peer %x — the intra arm is seed-independent (always selected)", intraPeer)
+		t.Fatalf("Select(seed=99) omitted same-region peer %x", intraPeer)
 	}
 	if len(out3) != 4 {
-		t.Fatalf("topology-deterministic: Select(seed=99) returned %d peers, want 4", len(out3))
+		t.Fatalf("Select(seed=99) returned %d peers, want 4", len(out3))
 	}
-	// The inter subsets (out1 vs out3, minus the intra peer) SHOULD differ for
-	// different seeds (the epidemic-spreading property). They MIGHT collide by
-	// chance at fan-out 3 over 9 candidates, but the probability is low; this
-	// assertion is the honest check that the seed actually varies the selection.
-	// If it collides, the guard logs it (NOT a hard failure — the determinism
-	// under the SAME seed is the load-bearing assertion; the across-seed
-	// difference is the epidemic-spreading property, which is probabilistic).
 	inter1 := interSubset(out1, intraPeer)
 	inter3 := interSubset(out3, intraPeer)
 	if samePeerSet(inter1, inter3) {
-		t.Logf("topology-deterministic: Select(seed=42) + Select(seed=99) yielded the SAME inter subset (a low-probability collision at fan-out 3 over 9 candidates — the determinism-under-same-seed is the load-bearing assertion; the across-seed difference is the probabilistic epidemic-spreading property, NOT a hard failure)")
+		t.Logf("seeds 42 and 99 selected the same cross-region subset; this collision is permitted")
 	} else {
-		t.Logf("GATE PASS: topology-deterministic — Select(seed=42) + Select(seed=99) yielded DIFFERENT inter subsets (the epidemic-spreading property holds — the per-sweep seed routes a different inter-region subset)")
+		t.Logf("seeds 42 and 99 selected different cross-region subsets")
 	}
-	t.Logf("GATE PASS: topology-deterministic — Select(seed=42) is deterministic (same seed -> same output EVERY run); %d peers (1 intra + 3 inter fan-out)", len(out1))
+	t.Logf("Select(seed=42) returned the same %d peers on both calls", len(out1))
 }
 
-// TestTopologyConnectionCut is the guard: the
-// connection-count cut — the fan-out selector reduces the per-sweep
-// connection count from the full-mesh O(N) (every peer every round) to the
-// intra-region + inter-region-fan-out-N (O(k + N) where k=intra, N=fan-out).
-// At a 10-peer registry (1 intra + 9 inter), fan-out 3 selects 1 + 3 = 4 peers
-// (NOT 10) — the connection-count cut the O(N²)->O(log N) names.
-// fan-out 0 selects intra-only (1 peer — the honest degenerate case).
+// TestTopologyConnectionCut checks selection counts for a ten-peer registry.
+// With one same-region peer and nine cross-region peers, fan-out 3 selects four
+// peers instead of all ten. Fan-out 0 selects only the same-region peer.
 func TestTopologyConnectionCut(t *testing.T) {
 	topo := NewTopologyManager(RegionTag(1))
 	topo.SetFanout(3)
@@ -471,27 +413,24 @@ func TestTopologyConnectionCut(t *testing.T) {
 	}
 	topo.SetSeed(7)
 	got := topo.Select(context.Background())
-	// fan-out 3: 1 intra + 3 inter = 4 (NOT 10 — the connection-count cut).
+	// Fan-out 3 selects one same-region and three cross-region peers.
 	if len(got) != 4 {
-		t.Fatalf("topology-connection-cut: fan-out 3 selected %d peers, want 4 (1 intra + 3 inter — the O(N)->O(k+fanout) cut at 10 peers)", len(got))
+		t.Fatalf("fan-out 3 selected %d peers, want 4 out of 10", len(got))
 	}
-	// fan-out 0: intra-only = 1 (the honest degenerate case).
 	topo.SetFanout(0)
 	got0 := topo.Select(context.Background())
 	if len(got0) != 1 {
-		t.Fatalf("topology-connection-cut: fan-out 0 selected %d peers, want 1 (intra-only — the honest degenerate case)", len(got0))
+		t.Fatalf("fan-out 0 selected %d peers, want only the same-region peer", len(got0))
 	}
 	if !containsPeer(got0, intraPeer) {
-		t.Fatalf("topology-connection-cut: fan-out 0 dropped the intra peer — intra is always selected regardless of fan-out")
+		t.Fatalf("fan-out 0 omitted the same-region peer")
 	}
-	cut := 10 - 4 // full-mesh 10 vs fan-out-3 4
-	t.Logf("GATE PASS: topology-connection-cut — fan-out 3 selected 4/10 peers (a %d-connection cut, %.0f%% of full-mesh); fan-out 0 selected 1 (intra-only)", cut, 100.0*float64(cut)/10.0)
+	cut := 10 - 4
+	t.Logf("fan-out 3 selected 4/10 peers, reducing selection by %d peers (%.0f%%); fan-out 0 selected only the same-region peer", cut, 100.0*float64(cut)/10.0)
 }
 
-// TestTopologyRace is the guard: the TopologyManager is race-free
-// under concurrent SetRegion (the register seam) + Select (the sweep reader) +
-// SetSeed (the per-sweep seed stamp) — the RWMutex discipline. Runs under
-// -race; a data race fails the build. The precedent.
+// TestTopologyRace concurrently calls SetRegion, SetSeed, and Select. Run it
+// with -race to check the TopologyManager's RWMutex synchronization.
 func TestTopologyRace(t *testing.T) {
 	topo := NewTopologyManager(RegionTag(1))
 	topo.SetFanout(3)
@@ -499,7 +438,7 @@ func TestTopologyRace(t *testing.T) {
 	defer cancel()
 	const N = 200
 	var wg sync.WaitGroup
-	// Writer 1: SetRegion (the register seam — concurrent with Select).
+	// One writer updates region registrations while Select reads them.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -509,7 +448,7 @@ func TestTopologyRace(t *testing.T) {
 			topo.SetRegion(p, RegionTag(2+RegionTag(i%10)))
 		}
 	}()
-	// Writer 2: SetSeed (the per-sweep seed stamp — concurrent with Select).
+	// The second writer updates the per-sweep seed.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -517,11 +456,8 @@ func TestTopologyRace(t *testing.T) {
 			topo.SetSeed(uint64(i))
 		}
 	}()
-	// Reader: Select (the sweep reader — concurrent with the writers). A FIXED
-	// iteration count (NOT loop-until-cancel) so the reader terminates alongside
-	// the writers (a cancel-loop reader would deadlock the wg.Wait — the reader
-	// is part of the wg, so it must self-terminate, not wait for an external
-	// signal that is only set AFTER wg.Wait returns).
+	// Select uses a fixed iteration count so this goroutine finishes with the
+	// writers. Waiting for cancellation here would deadlock the Wait below.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -530,23 +466,19 @@ func TestTopologyRace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
-	t.Logf("GATE PASS: topology-race — TopologyManager is race-free under concurrent SetRegion + SetSeed + Select (the RWMutex discipline)")
+	t.Logf("completed concurrent SetRegion, SetSeed, and Select calls")
 }
 
-// TestTopologyCounter is the guard: the 24th distinct telemetry counter
-// (InterRegionEnvelopesShipped) is PRESENT in telemetry.Counters + named +
-// a modeCounter (NOT a gauge — the gauge count STAYS 3). The counter is the
-// operator-VISIBLE proof the region-aware path is in USE (the surface).
-// The guard NAME embeds "24" (the 24th counter); the distinct-COUNT
-// assertion is held at 24 by the telemetry counter-count guards separately
-// (this guard asserts the 24th slot is BOUND, not the total count).
+// TestTopologyCounter checks that InterRegionEnvelopesShipped is registered as
+// a counter and that telemetry counter names are unique. The reporter uses this
+// counter to disclose inter-region envelopes.
 func TestTopologyCounter(t *testing.T) {
 	cs := telemetry.Counters()
-	const wantDistinct = 24 // (ADR-0039) grew 23 -> 24 (InterRegionEnvelopesShipped — the inter-region envelope disclosure); ADR-0037 grew 22 -> 23 (HybridFrameAccepted); ADR-0036 grew 21 -> 22 (PQHandshakeNegotiated); ADR-0035 grew 19 -> 21 (CertRotationTriggered + CertRevokedRejected); ADR-0034 grew 18 -> 19 (the stratified fallback)
+	const wantDistinct = 25 // current telemetry registry size, including the inter-region counter
 	if len(cs) != wantDistinct {
-		t.Fatalf("topology-counter-24: Counters() len=%d, want %d (ADR-0039 grew the Counter 23->24 via the inter-region envelope counter InterRegionEnvelopesShipped; ADR-0037 grew 22->23 via HybridFrameAccepted; ADR-0036 grew 21->22 via PQHandshakeNegotiated; ADR-0035 grew 19->21 via TWO PKI counters; grew 18->19 via the stratified fallback)", len(cs), wantDistinct)
+		t.Fatalf("telemetry.Counters() returned %d counters, want %d", len(cs), wantDistinct)
 	}
-	// The 24th counter MUST be present + named + a modeCounter.
+	// The inter-region counter must be present and monotonically increasing.
 	var found *telemetry.Counter
 	for _, c := range cs {
 		if c.Name() == "supremum.mesh.inter_region_envelopes" {
@@ -555,25 +487,25 @@ func TestTopologyCounter(t *testing.T) {
 		}
 	}
 	if found == nil {
-		t.Fatalf("topology-counter-24: the inter-region envelope counter (supremum.mesh.inter_region_envelopes) is MISSING from telemetry.Counters() — the 24th Counter slot is unbound; the cmd SetInterRegionReporter wires a non-existent counter")
+		t.Fatalf("supremum.mesh.inter_region_envelopes is missing from telemetry.Counters()")
 	}
 	if found.Mode() != telemetry.ModeCounter {
-		t.Fatalf("topology-counter-24: counter mode mismatch: got %v, want ModeCounter (the inter-region envelope disclosure is a modeCounter, NOT a gauge — the gauge count STAYS 3)", found.Mode())
+		t.Fatalf("inter-region counter mode=%v, want ModeCounter", found.Mode())
 	}
 	// Distinct-names check (no duplicate "supremum.mesh.inter_region_envelopes").
 	seen := make(map[string]bool, len(cs))
 	for _, c := range cs {
 		if seen[c.Name()] {
-			t.Fatalf("topology-counter-24: duplicate counter name %q in Counters() — the bridge's MustRegister would PANIC at boot on the duplicate Desc", c.Name())
+			t.Fatalf("duplicate telemetry counter name %q; MustRegister would reject it", c.Name())
 		}
 		seen[c.Name()] = true
 	}
-	t.Logf("GATE PASS: topology-counter-24 — the 24th Counter counter (supremum.mesh.inter_region_envelopes) is PRESENT + ModeCounter; Counters() carries %d distinct", len(cs))
+	t.Logf("inter-region counter is registered with ModeCounter among %d distinct counters", len(cs))
 }
 
-// samePeerSet reports whether two peer-ID slices contain the SAME peers
+// samePeerSet reports whether two peer-ID slices contain the same peers
 // (order-independent — the intra subset is sorted, the inter subset is
-// randomized under the seed; the determinism guard compares the SET, not the
+// randomized under the seed; the determinism test compares the set, not the
 // order).
 func samePeerSet(a, b [][16]byte) bool {
 	if len(a) != len(b) {
@@ -612,41 +544,26 @@ func interSubset(s [][16]byte, intra [16]byte) [][16]byte {
 	return out
 }
 
-// TestTopologyRoundCount is the guard (/, the LOAD-BEARING
-// headline): a SIMULATED N=100-region mesh (NOT silicon — the loopback gate),
-// fan-out 3, seeded, the region-aware selector ON, demonstrates the mesh
-// converges a delta in K rounds — K is a NUMBER. The guard asserts
-// K ≤ the predicted O(log_3 100) ≈ 4-5 rounds. The SIMULATED mesh is a pure
-// epidemic-spread model (NO TLS, NO dial — the selector's convergence property
-// is the unit under test, NOT the mesh plumbing): each round, each "infected"
-// node's Select(seed=round) picks fan-out inter-region peers + the intra-region
-// full-mesh, marking them infected; count rounds until all 100 nodes infected.
-// The 100-node loopback gate measures K at N=100 + discloses the honest measured
-// map (the 1000-node prediction the design names is the 1000-node arc; the
-// 100-node loopback is the honest coverage-discipline line — a simulated
-// round-count is a NUMBER, NOT a silicon proof). DETERMINISTIC (seeded — same
-// seed → same K EVERY run; the fuzz-seed discipline). Compare against the
-// full-mesh baseline (K=1 round BUT 10,000 connections — the infeasible-at-scale
-// baseline the fan-out path trades connections for rounds against).
+// TestTopologyRoundCount models epidemic spread through 100 synthetic nodes in
+// ten regions. Each round, selected nodes use fan-out 3 plus full same-region
+// selection. The model must reach every node within five rounds and produce the
+// same count when repeated with the same seeds.
+//
+// This is a selector simulation without sockets or TLS, not a deployed-fleet
+// measurement. It also reports the 9,900 edges of the full-mesh baseline for
+// comparison with the fan-out model's connection count.
 func TestTopologyRoundCount(t *testing.T) {
 	const N = 100
 	const regions = 10 // 10 regions × 10 nodes/region = 100 nodes
 	const fanout = 3
-	// Build a TopologyManager PER NODE (each node's self-region is its own; the
-	// peers are the OTHER 99 nodes, tagged by their region). The per-node topology
-	// mirrors what cmd would build if the dial loop carried real peerIDs.
-	// CRITICAL: use region tags 1..regions (NOT 0..regions-1) — RegionTag(0) is
-	// RegionUnset (the sentinel), and sameRegion(RegionUnset, X) returns true for
-	// ALL peers (the "untagged = local" conservative default), so a 0-region node
-	// would route EVERY peer as intra = full-mesh (the N=2 no-op applies to ANY
-	// node whose selfRegion is RegionUnset). Region tags 1..10 avoid the sentinel
-	// so the fan-out selector actually routes inter-region peers.
+	// Each node has its own topology containing the other 99 node IDs. Tags start
+	// at 1 because RegionUnset is treated as same-region with every peer, which
+	// would bypass cross-region selection.
 	topologies := make([]*TopologyManager, N)
 	peerIDs := make([][16]byte, N)
 	for i := 0; i < N; i++ {
 		var id [16]byte
-		// Deterministic peerID: encode i in the first 8 bytes (big-endian) so the
-		// sort order is stable + the IDs are distinct.
+		// Encode the index in the first 8 bytes for stable, distinct peer IDs.
 		binary.BigEndian.PutUint64(id[:], uint64(i+1))
 		peerIDs[i] = id
 	}
@@ -662,11 +579,9 @@ func TestTopologyRoundCount(t *testing.T) {
 		}
 		topologies[i] = topo
 	}
-	// Epidemic-spread simulation: node 0 starts infected (the delta origin). Each
-	// round, every infected node's Select(seed=round) picks peers; those peers
-	// become infected (the delta reaches them). Count rounds until all N infected.
-	// The seed per round is the round number (the same per-sweep seed discipline
-	// the SweepLoop uses) — DETERMINISTIC under the seed.
+	// Node 0 starts with the delta. On each synchronous round, every node that
+	// already has it selects recipients; newly reached nodes participate in the
+	// next round. The seeds are deterministic functions of round and node index.
 	infected := make(map[int]bool, N)
 	infected[0] = true
 	// Map peerID -> node index (the simulation's bookkeeping).
@@ -681,22 +596,16 @@ func TestTopologyRoundCount(t *testing.T) {
 			rounds = round
 			break
 		}
-		// Snapshot the infected set (the fan-out spreads from the CURRENTLY
-		// infected; newly infected this round spread NEXT round — the synchronous
-		// epidemic model).
+		// Only nodes infected before this round select peers; newly infected
+		// nodes wait for the next round.
 		newlyInfected := make(map[int]bool)
 		for i := 0; i < N; i++ {
 			if !infected[i] {
 				continue
 			}
-			// PER-NODE-PER-ROUND seed: each node uses a DISTINCT seed in a given
-			// round so different infected nodes fan-out to DIFFERENT inter-region
-			// peers (the epidemic-spreading property — if every node used the
-			// SAME round-based seed, the distinct-region tie-break would route
-			// them ALL to the SAME 3 regions → no additional spread). The
-			// production SweepLoop stamps the seed per-sweep; a per-node seed
-			// component is the honest model (the nodeID XOR the round, or the
-			// round*N + nodeIndex — both yield distinct per-node seeds in a round).
+			// Include the node index in each round's seed. Using only the round
+			// would make all nodes with the same region view choose the same three
+			// cross-region peers and reduce spread.
 			topologies[i].SetSeed(uint64(round)*uint64(N) + uint64(i) + 1)
 			selection := topologies[i].Select(context.Background())
 			for _, selPeer := range selection {
@@ -719,19 +628,15 @@ func TestTopologyRoundCount(t *testing.T) {
 		}
 	}
 	if len(infected) != N {
-		t.Fatalf("topology-round-count: the simulated N=%d mesh did NOT converge in %d rounds (only %d/%d infected) — the fan-out selector broke the epidemic-spread convergence", N, maxRounds, len(infected), N)
+		t.Fatalf("simulated %d-node mesh did not converge in %d rounds: reached %d/%d nodes", N, maxRounds, len(infected), N)
 	}
-	// The gate: K ≤ 5 (O(log_3 100) ≈ 4-5; the "~7 rounds at 1000
-	// nodes" is the 1000-node prediction). The fan-out-3 over 10 regions spreads
-	// ~3 new regions/round + the intra-region full-mesh infects the whole region
-	// in 1 round → ~ceil(log_3(10)) + 1 ≈ 3-4 rounds for inter-region + 1 for the
-	// last intra sweep. The gate is GENEROUS (≤5) to absorb the seeded-tie-break
-	// variance; if K diverges, the ADR records WHY.
+	// Five rounds leaves room for seeded variation around the expected
+	// logarithmic spread across ten regions followed by same-region dissemination.
 	const wantMaxRounds = 5
 	if rounds > wantMaxRounds {
-		t.Fatalf("topology-round-count: the simulated N=%d mesh converged in %d rounds, want ≤ %d (O(log_3 100) ≈ 4-5; the fan-out-3 region-aware selector's epidemic-spread convergence diverged from the design doc's prediction)", N, rounds, wantMaxRounds)
+		t.Fatalf("simulation reached all %d nodes in %d rounds, want at most %d (ADR-0039)", N, rounds, wantMaxRounds)
 	}
-	// DETERMINISM: re-run the simulation with the SAME seeds, assert the SAME K.
+	// Determinism: re-run the simulation with the same seeds, assert the same K.
 	infected2 := make(map[int]bool, N)
 	infected2[0] = true
 	rounds2 := 0
@@ -764,53 +669,38 @@ func TestTopologyRoundCount(t *testing.T) {
 		}
 	}
 	if rounds != rounds2 {
-		t.Fatalf("topology-round-count: the simulated round-count is NOT deterministic — run1=%d run2=%d (same seeds MUST yield the same K; a flaky round-count is a Law IV violation)", rounds, rounds2)
+		t.Fatalf("identical seeds produced different round counts: first=%d second=%d", rounds, rounds2)
 	}
-	// The full-mesh baseline: K=1 round BUT 10,000 connections (N*(N-1)); the
-	// fan-out path trades connections for rounds (the cut).
 	fullMeshConnections := N * (N - 1)
-	fanoutConnections := N * (10 + fanout) // ~10 intra + fanout inter per node (10 regions × 10 intra + fanout inter)
-	t.Logf("GATE PASS: topology-round-count — the simulated N=%d mesh (fan-out %d, %d regions) converged in K=%d rounds (gate ≤ %d; O(log_3 100) ≈ 4-5); DETERMINISTIC under the seed (run1==run2==%d); full-mesh baseline K=1 BUT %d connections vs fan-out ~%d (the connection-count cut the rounds trade against)", N, fanout, regions, rounds, wantMaxRounds, rounds2, fullMeshConnections, fanoutConnections)
+	fanoutConnections := N * (10 + fanout) // approximate same-region peers plus fan-out per node
+	t.Logf("simulation: nodes=%d fanout=%d regions=%d rounds=%d (limit %d), repeated=%d; full-mesh=%d connections, fan-out~%d", N, fanout, regions, rounds, wantMaxRounds, rounds2, fullMeshConnections, fanoutConnections)
 }
 
-// TestTopologySubstrateUnchanged is the guard: the
-// guards + the PQ guards + the hybrid guards are
-// GREEN post-(the selector is the iteration-source swap; the per-peer
-// body + the wire shape + the read path are UNCHANGED). This guard is a
-// META-assertion that the named substrate guards EXIST + run GREEN (it does NOT
-// re-run them — they run in their own test functions; this guard asserts the
-// wiring did not REMOVE or BREAK their compilation by building the mesh
-// package + the named test files). The build-only check is the honest
-// substrate-unchanged signal (a removed symbol would fail the build).
+// TestTopologySubstrateUnchanged checks that the stratified anti-entropy,
+// post-quantum signature, and hybrid-frame test symbols remain present. Their
+// own functions exercise behavior; compilation here catches stale references
+// after region-aware selection changes.
 func TestTopologySubstrateUnchanged(t *testing.T) {
-	// The substrate guards are compiled into the SAME package (pkg/mesh) — if the
-	// wiring broke a symbol they reference, the package would NOT compile.
-	// The build above already proved this; this guard is the META-disclosure that
-	// the named substrate guards are PRESENT (the grep is the symbol-gate).
 	subs := []string{
-		"TestStratifiedOffIsByteIdentical",      //
-		"TestStratifiedOnConvergesByteIdentity", //
-		"TestPQ_Counter22",                      //
-		"TestPQ_HybridE2EConverges",             //
+		"TestStratifiedOffIsByteIdentical",
+		"TestStratifiedOnConvergesByteIdentity",
+		"TestPQ_Counter22",
+		"TestPQHybridCounter",
 	}
 	for _, s := range subs {
-		// The guards are in the SAME package; a build break would fail the whole
-		// package. This grep confirms the symbol is PRESENT (not removed by a
-		// refactor).
-		if !strings.Contains(readTestFile(t, "stratified_antientropy_test.go")+readTestFile(t, "pq_hybrid_test.go"), "func "+s+"(") {
-			// The PQ counter guard is in pkg/transport, not pkg/mesh — check there too.
-			if !strings.Contains(readTestFile(t, "../transport/tls_pq_test.go"), "func "+s+"(") {
-				t.Logf("topology-substrate-unchanged: substrate guard %s not found in the mesh/transport test files (it may be in a different file; the build-green is the load-bearing signal — this guard is the META-disclosure, NOT a hard gate)", s)
+		if !strings.Contains(readTestFile(t, "stratified_antientropy_test.go")+readTestFile(t, "pq_hybrid_test.go")+readTestFile(t, "tls_pq_test.go"), "func "+s+"(") {
+			// The post-quantum transport tests live outside pkg/mesh.
+			if !strings.Contains(readTestFile(t, "../../transport/tls_pq_test.go"), "func "+s+"(") {
+				t.Logf("test symbol %s not found in the mesh or transport source files", s)
 			}
 		}
 	}
-	t.Logf("GATE PASS: topology-substrate-unchanged — the stratified + PQ-hybrid substrate guards compile + run GREEN (the build-green is the load-bearing signal; the selector is the iteration-source swap, the per-peer body + wire shape + read path UNCHANGED)")
+	t.Logf("checked stratified, post-quantum, and hybrid test symbols")
 }
 
-// readTestFile reads a test file relative to the pkg/mesh package dir (the
-// substrate-unchanged guard's symbol-gate helper). Returns "" if unreadable
-// (the caller logs + treats as not-found, NOT a hard failure — the build-green
-// is the load-bearing signal).
+// readTestFile reads a source file relative to the package directory. It
+// returns an empty string when the file cannot be read; the caller reports the
+// corresponding symbol as absent.
 func readTestFile(t *testing.T, rel string) string {
 	t.Helper()
 	wd, err := os.Getwd()

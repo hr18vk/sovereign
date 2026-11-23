@@ -6,14 +6,10 @@
 
 package durability
 
-//wal_v2_format_test.go — the guards (ADR-0045).
-//
-// The round-trip guard is written against the OLD API only (no new witness
-// fields, no StateFingerprint), so its RED is a HEAD-revert: on HEAD the
-// tail replay re-mints via InsertLocal from the 80-byte record and the five
-// temporal/H3 fields come back ZERO. The fingerprint/format-edge guards
-// reference the new check/fields; their REDs are bug-injects, each named in
-// the guard's doc comment.
+// Tests for the full-fidelity WAL format and its compatibility edges
+// (ADR-0045 §4 and ADR-0053). They cover complete entry restoration, state
+// fingerprints, mixed legacy and current records, torn tails, and unknown
+// record types.
 
 import (
 	"encoding/binary"
@@ -25,24 +21,13 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// ---------------------------------------------------------------------------
-// full/bounded entry round-trip: all ten fields survive the WAL tail
-// ---------------------------------------------------------------------------
+// Full and bounded recovery must preserve every entry field.
 
-// TestTailRoundTripsAllTenFields: three quiescent puts,
-// a checkpoint, three TAIL puts whose entries carry all five temporal/H3
-// fields, crash, recover — and EVERY recovered entry must equal the live entry
-// byte-for-byte (CRDTEntry is ==-comparable; one comparison covers all ten
-// fields), on the BOUNDED path AND on the FULL path (store == nil: the tail is
-// then restored from the WAL ALONE — the path where the pre-§6 80-byte record
-// was the only source and the loss was total). The tri-temporal moat and the
-// H3 index either survive a crash or they do not — this guard watches both
-// doors.
-//
-// RED on HEAD: the tail records are 80-byte (0x01); replay re-mints via
-// InsertLocal with ValidTimeStart/End, AssertionTime, DecisionTime, H3Index
-// ZERO — and the dot itself is re-minted, so the entry equality fires (dot
-// mismatch or zeroed temporal fields) on the first tail entity.
+// TestTailRoundTripsAllTenFields writes entries with temporal and H3 fields on
+// both sides of a checkpoint. Bounded and full recovery must reproduce every
+// entry exactly, including its original dot, and return the live Merkle root.
+// A legacy 80-byte tail record cannot satisfy this contract because it omits
+// ValidTimeStart, ValidTimeEnd, AssertionTime, DecisionTime, and H3Index.
 func TestTailRoundTripsAllTenFields(t *testing.T) {
 	lfs := newSnapshotStore(t)
 	walPath := filepath.Join(t.TempDir(), "t6.wal")
@@ -84,7 +69,7 @@ func TestTailRoundTripsAllTenFields(t *testing.T) {
 				t.Fatalf("%s: entity %s carries %d dots (live %d), want exactly 1", path, id, len(got), len(want))
 			}
 			if got[0] != want[0] {
-				t.Errorf("%s: entity %s entry mismatch —\n got %+v\n want %+v\n (a WAL replay that loses temporal/H3 bytes is NOT a round-trip)",
+				t.Errorf("%s: entity %s entry mismatch —\n  got  %+v\n  want %+v\n  (a WAL replay that loses temporal/H3 bytes is not a round-trip)",
 					path, id, got[0], want[0])
 			}
 		}
@@ -103,82 +88,51 @@ func TestTailRoundTripsAllTenFields(t *testing.T) {
 	assertRecovered(t, recF, "full")
 }
 
-// ---------------------------------------------------------------------------
-// equal root, wrong bytes ⇒ the second check REJECTS
-// ---------------------------------------------------------------------------
+// A fingerprint must distinguish equal roots with different entry bytes.
 
-// TestFingerprintRejectsEqualRootWrongBytes: the
-// Merkle root folds ONLY dots, so two states can share a root while carrying
-// different bytes (the pre-§6 WAL made this real: replayed entries had zeroed
-// temporal fields and matching roots). StateFingerprint (the second check)
-// folds the entityID + ALL TEN fields of every entry — it MUST discriminate
-// what the root cannot. This guard is what makes the round-trip guard
-// non-vacuous: it proves the check can fail.
-//
-// Three assertions: (1) the PREMISE — the two states' Merkle roots are EQUAL
-// (the root really is blind to the flipped field); (2) the ORACLE — the
-// fingerprints DIFFER; (3) the CONTROL — two independently-built engines with
-// IDENTICAL content fingerprint EQUAL (the check is deterministic and
-// order-independent, not a random distinguisher).
-//
-// RED (bug-inject): make StateFingerprint fold only the dot (drop entityID +
-// the 120-byte encoding from the per-entry hash) → the fingerprints collide →
-// assertion (2) fires.
+// TestFingerprintRejectsEqualRootWrongBytes changes ValidTimeStart while
+// preserving the entry's dot. The Merkle roots must remain equal because they
+// contain only dots, while StateFingerprint must distinguish the entries.
+// Independently constructed engines with identical content must also produce
+// equal fingerprints regardless of insertion order.
 func TestFingerprintRejectsEqualRootWrongBytes(t *testing.T) {
 	nodeID := testNodeID()
 	base := exactRec(utf8EntityID(1), nodeID, 5, stagedDigest(1))
 	alt := base
-	alt.Entry.ValidTimeStart = 42 // different temporal bytes, SAME dot
+	alt.Entry.ValidTimeStart = 42 // different temporal bytes, same dot
 
 	a := engineWith(t, nodeID, 1, base)
 	b := engineWith(t, nodeID, 1, alt)
 
 	if a.State().MerkleRoot() != b.State().MerkleRoot() {
-		t.Fatalf("PREMISE BROKEN: roots differ (%x vs %x) — the guard requires the root to be blind to the temporal bytes", a.State().MerkleRoot(), b.State().MerkleRoot())
+		t.Fatalf("roots %x and %x differ despite equal dots", a.State().MerkleRoot(), b.State().MerkleRoot())
 	}
 	if StateFingerprint(a) == StateFingerprint(b) {
-		t.Errorf("ORACLE BLIND: fingerprints equal for byte-different states — the second check is not a state-integrity verification")
+		t.Errorf("fingerprints are equal for entries with different ValidTimeStart")
 	}
 
 	// Control: identical content, independently constructed (different engine,
-	// different insertion order across two entities) → SAME fingerprint.
+	// different insertion order across two entities) → same fingerprint.
 	c1 := exactRec(utf8EntityID(1), nodeID, 5, stagedDigest(1))
 	c2 := exactRec(utf8EntityID(2), nodeID, 6, stagedDigest(2))
 	x := engineWith(t, nodeID, 1, c1, c2)
 	y := engineWith(t, nodeID, 1, c2, c1) // reverse insertion order
 	if StateFingerprint(x) != StateFingerprint(y) {
-		t.Errorf("CONTROL FAILED: identical states fingerprint differently (order-dependent or nondeterministic — the check would flap)")
+		t.Errorf("identical states have different fingerprints after reversed insertion order")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// format and durability edges: mixed formats, torn tail, unknown type
-// ---------------------------------------------------------------------------
+// Mixed formats, torn tails, and unknown record types.
 
-// TestMixedFormatTornTailUnknownType: the four
-// format-edge contracts in one place:
+// TestMixedFormatTornTailUnknownType covers three format edges:
 //
-//	(a) MIXED: a legacy 0x01 record and a full 0x04 record in ONE log replay
-//
-// correctly — the legacy one marked (witness.LegacyRecords), its five
-// unpersisted fields UNKNOWN-surfaced-as-zero; the V2 one's full bytes
-// intact.
-//
-//	(b) TORN TAIL on a mixed log: replay stops at the tear; OpenWAL truncates
-//
-// it; NextSeq stays monotonic across the reopen; the next append lands
-// clean.
-//
-//	(c) UNKNOWN TYPE BYTE: a record with type 0x7F is a loud error, never a
-//
-// skip — the downgrade contract (an old binary cannot read a V2 log; a
-// corrupt type byte is never silently misparsed). This is the FIRST test
-// to cover ReplayWAL's default case (wal.go) — it had ZERO coverage.
-//
-// RED (bug-injects): (a) drop the `legacyRecords++` in recovery.go's replay
-// loop → the witness count assertion fires; (c) turn the default case's error
-// into a `continue` → replay SUCCEEDS on a garbage type and the error
-// assertion fires.
+//   - A legacy 0x01 and full 0x04 record can share a log. Recovery counts the
+//     legacy record, exposes fields it never stored as zero, and preserves all
+//     fields of the full record.
+//   - Replay stops at a torn tail. OpenWAL removes the partial bytes, preserves
+//     NextSeq, and accepts a subsequent append.
+//   - An unknown 0x7F type returns an error rather than being skipped. An older
+//     binary therefore cannot silently misread a newer log format.
 func TestMixedFormatTornTailUnknownType(t *testing.T) {
 	nodeID := testNodeID()
 
@@ -206,8 +160,8 @@ func TestMixedFormatTornTailUnknownType(t *testing.T) {
 			t.Fatalf("close: %v", err)
 		}
 
-		// The recovered expectations: e1 is the legacy shape (temporal fields
-		// UNKNOWN-zero, origin synthesized); e2 keeps every byte.
+		// The legacy entry has zero values for fields absent from its record
+		// and receives a synthesized local origin. The full entry is unchanged.
 		wantE1 := exactRec(utf8EntityID(1), nodeID, 2, stagedDigest(1))
 		wantE2.DotNodeID = nodeID
 		wantE2.DotCounter = 3
@@ -217,16 +171,16 @@ func TestMixedFormatTornTailUnknownType(t *testing.T) {
 		rec, witness := recoverFull(t, walPath)
 		ents := collectEntries(t, rec)
 		if got := ents[utf8EntityID(1)]; len(got) != 1 || got[0] != wantE1.Entry {
-			t.Errorf("legacy record: got %+v, want the 5-field shape %+v (temporal UNKNOWN-as-zero, origin synthesized)", got, wantE1.Entry)
+			t.Errorf("legacy record = %+v, want five stored fields, zero for the rest, and local origin: %+v", got, wantE1.Entry)
 		}
 		if got := ents[utf8EntityID(2)]; len(got) != 1 || got[0] != wantE2 {
 			t.Errorf("V2 record: got %+v, want full-fidelity %+v", got, wantE2)
 		}
 		if witness.LegacyRecords != 1 {
-			t.Errorf("MARKER: LegacyRecords=%d, want 1 (the legacy record must be COUNTED, not silently zero-filled)", witness.LegacyRecords)
+			t.Errorf("LegacyRecords = %d, want 1", witness.LegacyRecords)
 		}
 		if got := rec.State().MerkleRoot(); got != wantRoot {
-			t.Errorf("ROOT: %x != reference %x", got, wantRoot)
+			t.Errorf("recovered root %x differs from reference root %x", got, wantRoot)
 		}
 	})
 
@@ -260,7 +214,7 @@ func TestMixedFormatTornTailUnknownType(t *testing.T) {
 
 		rep, err := ReplayWAL(walPath)
 		if err != nil {
-			t.Fatalf("ReplayWAL on torn tail: %v (a torn TAIL must be tolerated)", err)
+			t.Fatalf("ReplayWAL rejected a torn tail: %v", err)
 		}
 		if len(rep.Mutations) != 2 {
 			t.Fatalf("torn-tail replay got %d mutations, want 2 (the clean prefix)", len(rep.Mutations))
@@ -294,14 +248,9 @@ func TestMixedFormatTornTailUnknownType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read hdr: %v", err)
 		}
-		// A fabricated record with an unknown type byte after a REAL header.
-		// (C5): the seq is 0, not 1 — this subtest isolates the
-		// UNKNOWN-TYPE defect. added a first-record-must-be-seq-0 guard
-		// (wal.go) that fires on a non-zero leading seq BEFORE the type dispatch;
-		// a seq=1 record would trip that header-corruption guard and never reach
-		// the unknown-type refusal this test asserts. seq=0 keeps a SINGLE defect
-		// (the unknown type byte) so the assertion below tests exactly what it
-		// claims. (The C5 first-record guard has its own dedicated guard.)
+		// Use sequence zero so the first-record sequence check passes and this
+		// subtest reaches the unknown-type dispatch (ADR-0053). A nonzero leading
+		// sequence would be rejected earlier for a different reason.
 		rec := make([]byte, 13+4)
 		binary.BigEndian.PutUint64(rec[0:8], 0)
 		rec[8] = 0x7F
@@ -312,7 +261,7 @@ func TestMixedFormatTornTailUnknownType(t *testing.T) {
 			t.Fatalf("write bad: %v", err)
 		}
 		if _, err := ReplayWAL(badPath); err == nil {
-			t.Fatalf("an unknown record type byte must HARD-ERROR (the downgrade contract), not replay")
+			t.Fatalf("ReplayWAL accepted unknown record type 0x7F")
 		} else if !strings.Contains(err.Error(), "unknown record type") {
 			t.Fatalf("error = %v, want the unknown-record-type refusal", err)
 		}

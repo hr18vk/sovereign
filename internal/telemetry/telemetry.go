@@ -4,48 +4,30 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package telemetry implements the Zero-GC, lock-free telemetry counter layer
-// for the Sovereign Engine ingestion hot path.
+// Package telemetry provides allocation-free counter and gauge updates for the
+// ingestion path.
 //
-// PHYSICS:
+// Counter follows the LongAdder design: updates are distributed across padded
+// stripes instead of invalidating one shared cache line on every write. Each
+// 64-byte stripe contains a 56-byte pad and an 8-byte atomic value. A hash of a
+// stack-local address selects the stripe, so different goroutines usually write
+// to different lines; collisions are handled by the compare-and-swap loop.
 //
-// - 57.6M ops/s leaves an ~17.34ns/op budget. A single contended atomic
-// counter under cross-core MESI invalidation costs 40–80ns per increment
-// (a HITM storm); at 32 cores it collapses throughput by ~98%. The
-// LongAdder design (after Java's java.util.concurrent.atomic.LongAdder)
-// disperses the write locus across one stripe per P, so the common
-// Add/Inc path touches ONLY the local stripe's cache line — no
-// cross-core coherence on the hot path.
+// Add and Inc are lock-free and use no mutexes or heap allocations. Set and
+// GaugeValue access a single stripe. Value aggregates the stripes for telemetry
+// collection and is not intended for the ingestion path. Construction allocates
+// the stripe arrays during package initialization and, when OpenTelemetry is
+// enabled, during the single call to Init.
 //
-// - Each stripe is exactly 64 bytes (one Graviton cache line): a 56-byte
-// lead pad + the 8-byte value. Two stripes never share a line, so adjacent
-// counters cannot false-share. The `_ [56]byte` pad is honored verbatim
-// (56B pad + 8B value = 64B line).
+// Every stripe stores the IEEE-754 representation of a float64. Add and Inc
+// decode the current value, add the delta, and store the new representation with
+// compare-and-swap. FloatValue decodes and sums the stripes; ordinary float64
+// rounding still applies.
 //
-// - sync.Mutex / sync.RWMutex are NEVER used on the telemetry hot path;
-// Add/Inc/Set are pure atomic operations on per-P memory. Aggregation
-// (Value()) is rare — it is invoked only by the OpenTelemetry
-// asynchronous poller, which runs off the data plane.
-//
-// - The package-level Counter values (ArrowSerialBytes, MemTableFlushTotal,
-// OffHeapAllocatedBytes) are constructed once at package init. Their
-// backing stripe arrays are the only heap allocation this package ever
-// performs, and it happens before the first Write — never per-call. The
-// data-plane methods Add/Inc/Set are zero-alloc (verified with
-// `go build -gcflags="-m -m"`: escape analysis reports "c does not escape"
-// for every hot-path method).
-//
-// STORAGE MODEL: every stripe stores the IEEE-754 bit pattern of a float64.
-// Add/Inc perform a decode-add-encode CAS loop confined to one stripe's line,
-// so FloatValue()'s per-stripe decode-and-sum is exact for any mix of
-// Add(float64)/Inc use. (Adding the *bit pattern* of a delta would be integer
-// arithmetic on float bits and decode to garbage — the CAS loop is the
-// correct, still-one-line write path.)
-//
-// OpenTelemetry integration: each Counter registers an asynchronous
-// Observable instrument (ObservableCounter for cumulative Add/Inc counters,
-// ObservableGauge for Set-backed gauges) whose callback reads the counter on
-// the collector's schedule — never on the ingestion hot path.
+// When Init supplies a Meter, counters register asynchronous OpenTelemetry
+// instruments whose callbacks run on the collector's schedule. Int64 counter
+// callbacks report per-interval deltas through lastReported. The Prometheus
+// bridge independently reads cumulative values through Value.
 package telemetry
 
 import (
@@ -58,13 +40,13 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-// cacheLineBytes is the cache-line width on the recorded silicon (AWS
-// Graviton, 64-byte lines). A stripe is sized so exactly one atomic value
-// owns a line, with no accidental neighbor.
+// cacheLineBytes is the cache-line width on 64-byte cache hardware (AWS
+// Graviton). A stripe is sized so exactly one atomic value owns a line with
+// no adjacent neighbor sharing it.
 const cacheLineBytes = 64
 
 // stripePadding pads a stripe so the atomic value is alone on its cache line.
-// 56 bytes of lead pad + 8 bytes of value = 64 = one Graviton line.
+// 56 bytes of lead pad + 8 bytes of value = 64 = one cache line.
 type stripePadding struct {
 	_ [cacheLineBytes - 8]byte
 }
@@ -86,13 +68,11 @@ const (
 
 // CounterMode is the exported alias for the unexported counterMode, so the
 // prometheus bridge (cross-package, in pkg/metrics) can read a Counter's Mode
-// without reaching into the unexported type. This is an ALIAS, not a new type
-// — ModeCounter / ModeGauge below are the SAME constants as modeCounter /
-// modeGauge. The alias adds zero churn to the 24 construction sites in
-// registry.go (they continue to pass modeCounter / modeGauge); only the
-// bridge reads Mode() through the alias. (ADR-0023 documents the choice of
-// alias-over-export: exporting counterMode itself would require renaming
-// every construction-site literal and is a non-goal.)
+// without reaching into the unexported type. This is an alias, not a new type
+// — ModeCounter / ModeGauge below are the same constants as modeCounter /
+// modeGauge. The alias avoids churn at the construction sites in registry.go,
+// which continue to pass modeCounter and modeGauge; only the bridge reads
+// Mode() through the alias (ADR-0023 §3).
 type CounterMode = counterMode
 
 // ModeCounter / ModeGauge are the exported const aliases the bridge compares
@@ -105,7 +85,7 @@ const (
 // Counter is a lock-free, sharded counter (LongAdder) with OpenTelemetry
 // asynchronous-registration hooks.
 //
-// Concurrency: Add / Inc / Set are concurrent-safe and wait-free. Each writer
+// Concurrency: Add / Inc / Set are concurrent-safe and lock-free. Each writer
 // selects a stripe deterministically and touches only that stripe's line.
 // Value() iterates all stripes and is intended for the rare OTel callback pull,
 // not the ingestion path.
@@ -119,9 +99,8 @@ type Counter struct {
 	// value[i] from value[i+1].
 	stripes []counterStripe
 
-	// lastReported records the most recent OTel scrape, so the next scrape
-	// reports the additive delta over its interval (never double-counts).
-	// Off the hot path; touched only by the async callback.
+	// lastReported is the cumulative integer value seen by the previous int64
+	// OpenTelemetry callback. Only that callback reads and advances it.
 	lastReported atomic.Uint64
 
 	name        string
@@ -131,7 +110,7 @@ type Counter struct {
 }
 
 // counterStripe is one LongAdder stripe: a lead cache-line pad followed by an
-// 8-byte value. Size: 56 + 8 = 64 bytes — one Graviton cache line.
+// 8-byte value. Size: 56 + 8 = 64 bytes — one cache line.
 //
 //go:align 64
 type counterStripe struct {
@@ -139,17 +118,14 @@ type counterStripe struct {
 	value atomic.Uint64 // the counter; alone on the tail of its line.
 }
 
-// numStripes must be >= GOMAXPROCS so independent Ps rarely collide, and a
-// power of two so stripe selection is a single AND (no div instruction).
-// 64 covers the recorded 32-core silicon with headroom.
+// numStripes is a power of two so stripe selection needs only a bitwise AND.
+// The fixed set of stripes spreads updates without sizing or reallocating the
+// counter when GOMAXPROCS changes.
 const numStripes = 64
 
-// stripeIndex selects a stripe for the current goroutine. It must be cheap and
-// allocation-free. We hash a stack-local address through Knuth's golden-ratio
-// multiplier for dispersion; this approximates per-P affinity without
-// depending on the unstable runtime_procPin private API, and never touches
-// the heap (the address is of a stack-local — escape analysis confirms it
-// stays on the stack).
+// stripeIndex selects a stripe without allocating or pinning the goroutine to a
+// P. It hashes a stack-local address with Knuth's golden-ratio multiplier. The
+// local remains on the stack, and no private runtime API is required.
 //
 //go:nosplit
 //go:noinline
@@ -161,10 +137,9 @@ func stripeIndex() int {
 	return int(addr) & (numStripes - 1)
 }
 
-// addFloat performs the decode-add-encode CAS loop on a single stripe. It
-// touches exactly one cache line, so the cross-core MESI cost is confined to
-// that stripe's writers. Uncontended in the common case (one active writer per
-// P per stripe), so it degenerates to a single load + CAS.
+// addFloat performs the decode-add-encode CAS loop on one stripe. A writer
+// retries only when another update changes that stripe between its load and
+// compare-and-swap.
 //
 //go:nosplit
 func (c *Counter) addFloat(delta float64) {
@@ -178,9 +153,9 @@ func (c *Counter) addFloat(delta float64) {
 	}
 }
 
-// Add increments the counter by delta on the current goroutine's stripe.
-// Zero-GC, wait-free, no mutex. A delta of 0 is a no-op. Only meaningful for
-// modeCounter; for modeGauge, use Set.
+// Add increments the counter by delta on a stack-selected stripe. It allocates
+// no memory and uses no mutex. A delta of zero is a no-op. Add is intended for
+// modeCounter; use Set for modeGauge.
 //
 //go:nosplit
 func (c *Counter) Add(delta float64) {
@@ -215,8 +190,9 @@ func (c *Counter) GaugeValue() float64 {
 	return math.Float64frombits(c.stripes[0].value.Load())
 }
 
-// FloatValue aggregates every stripe as the float64 sum of the per-stripe
-// float-bit-decoded values. Exact for counters used via Add(float64) and/or Inc.
+// FloatValue decodes and sums every stripe as a float64. The sum has ordinary
+// floating-point rounding and is not a point-in-time snapshot during concurrent
+// updates.
 func (c *Counter) FloatValue() float64 {
 	var total float64
 	for i := range c.stripes {
@@ -234,16 +210,13 @@ func (c *Counter) Value() float64 {
 	return c.FloatValue()
 }
 
-// The read-only accessors below are for the prometheus bridge (pkg/metrics)
-// to surface Counter metadata at scrape time. They expose ONLY the immutable
-// construction fields — Name, Description, Unit, Mode — and the cumulative
-// Value() above. They do NOT expose lastReported (that field belongs to the
-// OTel int64-observable callback; the bridge reads CUMULATIVE via Value() and
-// MUST NOT touch lastReported, or a future change that wires a real OTel Meter
-// would arm the callback, advance lastReported, and double-count / diverge —
-// the double-count trap (ADR-0023). There is no exported Delta() / Reset() and
-// there never will be: those would tempt a future bridge into the
-// double-count trap. The bridge is CUMULATIVE-ONLY.
+// The read-only accessors below allow the Prometheus bridge (pkg/metrics) to
+// surface Counter metadata at scrape time. They expose the immutable fields —
+// Name, Description, Unit, Mode — and cumulative Value(). They omit
+// lastReported (owned by the OTel int64-observable callback; touching it from
+// the bridge while an OTel Meter is active would advance lastReported out of
+// cadence and double-count or drift per ADR-0023). There is no Delta() or
+// Reset(); the bridge is cumulative-only.
 
 // Name returns the telemetry metric name (dots, e.g. "supremum.l0.arrow_serial_bytes").
 // The bridge maps '.' -> '_' to form the legal prometheus name.
@@ -253,7 +226,8 @@ func (c *Counter) Name() string { return c.name }
 // the prometheus Desc Help line.
 func (c *Counter) Description() string { return c.description }
 
-// Unit returns the OTel unit token set at construction ("By" or "1").
+// Unit returns the OpenTelemetry unit token set at construction, such as "By",
+// "ns", or "1".
 func (c *Counter) Unit() string { return c.unit }
 
 // Mode returns the counter mode (modeCounter or modeGauge) via the exported
@@ -262,10 +236,8 @@ func (c *Counter) Unit() string { return c.unit }
 func (c *Counter) Mode() counterMode { return c.mode }
 
 // newCounter constructs a Counter and registers its asynchronous OpenTelemetry
-// observable against the supplied Meter. Called exactly once per counter at
-// package init — the stripe backing array allocation is paid at startup,
-// never per-op. The escapes here (Counter, stripes, callback closures) are
-// the permitted startup allocations; the data-plane methods do not escape.
+// observable against meter. Package initialization and rebuildCounters call it
+// during startup; data-plane updates do not allocate.
 func newCounter(meter metric.Meter, name, description, unit string, mode counterMode) *Counter {
 	c := &Counter{
 		stripes:     make([]counterStripe, numStripes),

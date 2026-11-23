@@ -8,22 +8,13 @@
 
 package fuzz
 
-// bugInjectSeedsOrNil returns nil in the DEFAULT build (the fault-injection target's
-// seed builder bugInjectSeeds lives in bug_inject_test.go, which is behind the
-// `fuzzbuginject` build tag — so the builder does NOT exist in the default
-// build). The byte-equality guard TestSeedCorpusMatchesBuilders calls this for
-// FuzzBugInjectControl: in the default build it returns nil → the guard SKIPS
-// the byte-equality check for that target with an honest log (the corpus is
-// still PRESENT + PARSEABLE — TestSeedCorpusIsValid covers the no-panic
-// property); under -tags fuzzbuginject the build-tagged override in
-// bug_inject_test.go returns the real bugInjectSeeds list + the byte-equality
-// check runs. This is the SAME opt-in discipline as the no-panic proof
-// (TestBugInjectControlProof): the fault-injection path is operator-opt-in, the
-// default build does NOT compile it (so the bug-injected unmarshaler copy NEVER
-// ships in the production binary).
+// bugInjectSeedsOrNil returns nil without the fuzzbuginject build tag, so
+// TestSeedCorpusMatchesBuilders skips byte comparison for the fault-injection
+// target. TestSeedCorpusIsValid still checks that its committed files parse.
+// The tagged implementation in bug_inject_test.go returns the actual seeds and
+// enables both the byte comparison and the deterministic control.
 //
-// The build-tag exclusion (!fuzzbuginject) ensures ONLY ONE of this file or
-// bug_inject_test.go compiles per build — no redeclaration.
+// The complementary build constraints compile exactly one implementation.
 func bugInjectSeedsOrNil() [][]byte {
 	return nil
 }

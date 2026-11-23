@@ -4,19 +4,7 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — ARENA EXHAUSTION FORENSICS (measurement-only, non-production)
-//
-///scope: this file is the ONLY new source added by phase feat/-arena-forensics.
-// It contains NO production code. It does NOT modify crdt.go / hamt.go / hamt_arena.go /
-// crdt_apply*.go / crdt_reconstruct*.go. It exposes:
-// - the static sizeof(CRDTEntry) (Gate 3a) so the report can quote a literal number
-// derived from the SAME toolchain that compiled the production struct, and
-// - a thin pass-through shim around DeltaCRDTEngine.maybeAdvanceEpoch (Gate 3c) that
-// increments an atomic counter so the report can quote how many epoch advances are
-// physically issued under bench load. The shim does NOT touch production code; it
-// is reachable from the bench via TestMain-free test helpers only.
-//
-// Nothing here is on any production path. It is a _test.go file.
+// CRDTEntry layout checks and arena-exhaustion profiling helpers.
 
 package sync
 
@@ -27,14 +15,12 @@ import (
 	"unsafe"
 )
 
-// crdtEntrySizeOf reports the exact machine width of CRDTEntry as compiled
-// today. Used by Gate 3a's static audit.
+// crdtEntrySizeOf reports CRDTEntry's size on the current architecture.
 func crdtEntrySizeOf() uintptr {
 	return unsafe.Sizeof(CRDTEntry{})
 }
 
-// payloadDigestSize reports the [32]byte digest width for the report's
-// "is the digest the load-bearing width?" cross-check.
+// payloadDigestSize reports the width of the [32]byte digest field.
 func payloadDigestSize() uintptr {
 	var e CRDTEntry
 	return unsafe.Sizeof(e.PayloadDigest)
@@ -46,21 +32,19 @@ func nodeIDSize() uintptr {
 	return unsafe.Sizeof(e.DotNodeID) + unsafe.Sizeof(e.OriginNodeID)
 }
 
-// TestCRDTEntryWidthStaticAudit is the static gate-3a assertion. It is NOT a
-// correctness test; it exists so `go test` prints the literal sizeof the report cites.
+// TestCRDTEntryWidthStaticAudit pins the entry layout used by the wire and
+// arena accounting. It also logs the field-group sizes.
 func TestCRDTEntryWidthStaticAudit(t *testing.T) {
 	t.Logf("unsafe.Sizeof(CRDTEntry{}) = %d bytes", crdtEntrySizeOf())
-	t.Logf(" PayloadDigest[32] = %d bytes", payloadDigestSize())
-	t.Logf(" DotNodeID+OriginNodeID = %d bytes", nodeIDSize())
-	t.Logf(" expected (original form) = 120 bytes")
+	t.Logf("  PayloadDigest[32]      = %d bytes", payloadDigestSize())
+	t.Logf("  DotNodeID+OriginNodeID  = %d bytes", nodeIDSize())
+	t.Logf("  expected (baseline form) = 120 bytes")
 	if got := crdtEntrySizeOf(); got != 120 {
-		t.Errorf("CRDTEntry width drifted from the original: got %d, want 120", got)
+		t.Errorf("CRDTEntry width drifted from baseline: got %d, want 120", got)
 	}
 }
 
-// entryWidthArenaSizes is a small table used by the forensics benches below to
-// exercise the Join path at varied arena sizes WITHOUT touching the real
-// BenchmarkCRDTEngine_Join harness (forbids editing existing bench files).
+// entryWidthArenaSizes supplies arena capacities for profiling Join.
 var entryWidthArenaSizes = []struct {
 	name string
 	size uintptr
@@ -71,8 +55,8 @@ var entryWidthArenaSizes = []struct {
 	{"2GiB", 2 * 1024 * 1024 * 1024},
 }
 
-// buildEntryWidthDeltas mirrors the shape of BenchmarkCRDTEngine_Join's delta
-// pre-build, so the forensics benches exercise the identical Join code path.
+// buildEntryWidthDeltas pre-builds the same delta shape used by
+// BenchmarkCRDTEngine_Join.
 func buildEntryWidthDeltas(n int, arena *HamtArena, nodeB [16]byte) []CRDTDelta {
 	out := make([]CRDTDelta, n)
 	for i := range out {
@@ -92,12 +76,9 @@ func buildEntryWidthDeltas(n int, arena *HamtArena, nodeB [16]byte) []CRDTDelta 
 	return out
 }
 
-// entryWidthJoinRecover runs n Join ops, recovering the arena-exhaustion panic so
-// that the testing harness can still flush -memprofile/-cpuprofile (a raw panic
-// aborts the process before the profile writer runs). It reports where in the
-// loop the OOM landed. This is NON-production forensics scaffolding; the panic
-// is caught here ONLY so profiles can be written — the production arena still
-// panics (the unmodified OOM panic stack is the expected signature).
+// entryWidthJoinRecover runs Join until arena exhaustion and recovers the panic
+// so the test binary can flush memory and CPU profiles. Production Join keeps
+// its panic-on-exhaustion behavior.
 func entryWidthJoinRecover(b *testing.B, arenaBytes uintptr) (diedAt int, recoveredPanic any) {
 	engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, arenaBytes)
 	if err != nil {
@@ -125,11 +106,9 @@ func entryWidthJoinRecover(b *testing.B, arenaBytes uintptr) (diedAt int, recove
 	return -1, nil
 }
 
-// BenchmarkJoinRecover64M is the forensics clone of
-// BenchmarkCRDTEngine_Join at 64 MiB that catches the OOM panic so -memprofile
-// and -cpuprofile are actually written. N.B. the recovered variant alters the
-// per-iteration cost slightly (defer/recover goroutine) — use Gate 1's raw
-// bench for the literal death iteration, use THIS bench for the profile only.
+// BenchmarkJoinRecover64M profiles arena exhaustion with a 64 MiB arena.
+// Defer and recovery change per-iteration costs, so the unrecovered benchmark
+// remains the source for Join timings and the exhaustion iteration.
 func BenchmarkJoinRecover64M(b *testing.B) {
 	diedAt, p := entryWidthJoinRecover(b, 64*1024*1024)
 	if p != nil {

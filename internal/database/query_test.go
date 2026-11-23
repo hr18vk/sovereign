@@ -212,7 +212,7 @@ func TestAsOf_HistoricalRetrieval(t *testing.T) {
 	// Expected: Farmer B (v2), because:
 	//   - v1's valid time covers 1995 (1990-2000), SystemTime=2015 <= 2020
 	//   - v2's valid time covers 1995 (1995-2005), SystemTime=2018 <= 2020
-	//   - v3's valid time does NOT cover 1995 (starts 2005)
+	//   - v3's valid time does not cover 1995 (starts 2005)
 	//   - v2.SystemTime (2018) > v1.SystemTime (2015) -> v2 dominates v1.
 	result, err := resolver.AsOf(ctx, "land-001", mustTime("1995-06-01"), mustTime("2020-12-31"))
 	require.NoError(t, err)
@@ -327,7 +327,7 @@ func TestAsOf_ValidTimeExclusiveEnd(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
-	// Query at validTime = 2020-01-01 (AT the exclusive end) -> should NOT find.
+	// Query at validTime = 2020-01-01 (at the exclusive end) -> should not find.
 	result2, err := resolver.AsOf(ctx, "land-001", mustTime("2020-01-01"), mustTime("2021-01-01"))
 	assert.ErrorIs(t, err, ErrEntityNotFound)
 	assert.Nil(t, result2)

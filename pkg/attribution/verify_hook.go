@@ -13,54 +13,46 @@ import (
 	"github.com/hr18vk/sovereign/pkg/identity"
 )
 
-// SetVerifyHook installs a test-only indirection over identity.VerifyCRDTFrame
-// for the receiver-composition gate (). When set, Open calls
-// the hook instead of identity.VerifyCRDTFrame on each outer relay hop, so a
-// test can count how many Verify calls fire on a cheap-reject path and prove
-// the depth/rate/clock reject-before-Verify ordering EXECUTED (not prose-
-// asserted, per the F2 lesson). The hook is nil in production (Open calls
-// identity.VerifyCRDTFrame directly); tests SetVerifyHook to a counting
-// wrapper and MUST ClearVerifyHook when done. It is guarded by verifyHookMu
-// (the same mutex the package-level verifyHook var uses), so concurrent
-// Open/HandleFrame callers observe a consistent hook.
+// SetVerifyHook installs a test hook in place of identity.VerifyCRDTFrame.
+// Open calls it for each outer relay hop, allowing receiver tests to count
+// verification calls on acceptance and rejection paths. Production leaves the
+// hook nil, so Open calls identity.VerifyCRDTFrame directly.
 //
-// This is the exported seam the pkg/receive test uses to instrument the
-// composed receiver's Verify count; the package-level verifyHook var stays
-// unexported (the existing 3.2 tests set it directly within the package).
+// Tests must call ClearVerifyHook when finished. verifyHookMu protects the
+// hook so concurrent Open and HandleFrame callers observe a consistent value.
+// The hook is exported for tests in pkg/receive; package-local tests can set
+// verifyHook directly.
 func SetVerifyHook(hook func(pub ed25519.PublicKey, msg, sig []byte) bool) {
 	verifyHookMu.Lock()
 	verifyHook = hook
 	verifyHookMu.Unlock()
 }
 
-// ClearVerifyHook removes the test-only verify hook, restoring Open's direct
-// identity.VerifyCRDTFrame call. Tests MUST call this when done (defer it) so
-// a leaked hook does not affect later tests.
+// ClearVerifyHook restores Open's direct identity.VerifyCRDTFrame call.
+// Tests should defer it after installing a hook so later tests are unaffected.
 func ClearVerifyHook() {
 	verifyHookMu.Lock()
 	verifyHook = nil
 	verifyHookMu.Unlock()
 }
 
-// VerifyHookCount is a convenience counting hook a test installs via
-// SetVerifyHook: it counts every Verify call and delegates to
-// identity.VerifyCRDTFrame. The caller reads the count via Load and MUST
-// ClearVerifyHook when done.
+// VerifyHookCount counts verification calls and delegates each one to
+// identity.VerifyCRDTFrame. Install Hook with SetVerifyHook, read the total
+// with Load, and call ClearVerifyHook when finished.
 //
 // Example:
 //
-//	count:= new(VerifyHookCount)
+//	count := new(VerifyHookCount)
 //	attribution.SetVerifyHook(count.Hook)
 //	defer attribution.ClearVerifyHook()
-//	... run a forged-deep frame through the receiver...
+//	... run a forged-deep frame through the receiver ...
 //	if count.Load() != 0 { t.Fatalf("depth reject must issue zero Verifies") }
 type VerifyHookCount struct {
 	mu    sync.Mutex
 	count int64
 }
 
-// Hook is the counting indirection: increment the counter, delegate to
-// identity.VerifyCRDTFrame.
+// Hook increments the counter and delegates to identity.VerifyCRDTFrame.
 func (c *VerifyHookCount) Hook(pub ed25519.PublicKey, msg, sig []byte) bool {
 	c.mu.Lock()
 	c.count++

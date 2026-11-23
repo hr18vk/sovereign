@@ -1,19 +1,22 @@
-# Network & Epoll Cap'n Proto Boundary
+# Network and epoll Cap'n Proto boundary
 
-**Code-Locality Architecture Document**
-*Reference: `docs/architecture/4_NETWORK_CONSENSUS.md`*
+**Code-locality architecture document**
+*Reference: [Network and consensus](../../docs/architecture/4_NETWORK_CONSENSUS.md)*
 
-This directory (alongside `internal/transport/` and `internal/chaos/`) defines the raw physical network entry points to the Sovereign Engine.
+`internal/network/` contains the read-only Cap'n Proto arena adapter and network clients. The edge-triggered listener is in [`internal/transport/capnp_server.go`](../transport/capnp_server.go); process-isolation helpers are in `internal/chaos/`.
 
-## Supervisor & Worker SIGSEGV Isolation
+## Supervisor and worker isolation
 
-The engine is mathematically guaranteed to survive a `SIGSEGV` in the off-heap `C-space` because the network listener is physically isolated from the runtime failure domain.
+`internal/chaos/supervisor.go` manages an external `chaos-worker` process for the crash-survival harness. That worker binary is not included in this repository; `TestSIGSEGVSurvival` skips unless `CHAOS_WORKER_BIN` supplies it.
 
-- **Supervisor Pattern:** `internal/chaos/supervisor.go` boots the `chaos-worker` as a child process. The actual TCP socket and OS-level `net.Listener` is held by the Supervisor, **not** the worker.
-- **Crash Survival:** If the worker faults, the Supervisor's OS pipe receives an `EOF`. The Supervisor instantly spawns a pristine worker, initiates a WAL replay to the exact Merkle Root checkpoint, and re-submits the in-flight payloads. 
-- **The Client Experience:** The TCP connection remains completely intact. The client simply experiences a brief spike in latency, totally unaware that the server suffered a fatal core dump.
+The Supervisor communicates with the worker over stdin/stdout pipes. EOF marks worker death; recovery starts a new worker that replays the WAL. An unacknowledged submit is retried once, and a failed retry is returned to the caller as an error.
 
-## Cap'n Proto Zero-Copy Integration
+The Supervisor does not own a `net.Listener`. The front end retains listeners and client connections outside the worker process, so a worker exit does not itself close those sockets.
 
-Defined in `capnp_arena.go`, incoming packets are bound directly from the `jemalloc` block into an immutable `capnp.Arena`.
-The engine does NOT deserialize objects. The pointers mapping the `TriTemporalEvent` schema physically point to offsets in the Linux socket buffer, achieving $O(1)$ memory mapping with $0$ Go GC overhead.
+## Read-only Cap'n Proto arenas
+
+`EpollServer` reads socket bytes into a jemalloc-backed reassembly buffer. After parsing single-segment framing, it passes exactly the segment bytes to `NewIngestionArena` in `capnp_arena.go`.
+
+`NewIngestionArena` uses `capnp.SingleSegment` to read the message in place; it does not copy the segment into a Go heap allocation or map a kernel socket buffer. Arena allocation is disabled. Schema fields are decoded as views over the received segment rather than deserialized into a separate object graph.
+
+The caller dispatches the decoded `TriTemporalEvent` synchronously and releases the message before reusing the buffer. Releasing the message does not free the jemalloc allocation.

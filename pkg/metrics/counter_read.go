@@ -11,12 +11,9 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-// readCounterValue reads a prometheus counter's current value via its Write
-// method (the dto.Metric path). It is OFF the hot path — used only by the 1s
-// poller that feeds the sovereign_ingest_pps gauge. The Write call is the
-// prometheus client's sanctioned read; it does not contend with the hot-path
-// atomic Inc (the counter's internal value is read under its own lock, not the
-// ingest path's).
+// readCounterValue reads a Prometheus counter through its Write method. Only
+// the poller that feeds sovereign_ingest_pps calls it; frame ingestion does not.
+// A write error or a non-counter metric produces zero.
 func readCounterValue(m prometheus.Metric) uint64 {
 	pb := &dto.Metric{}
 	if err := m.Write(pb); err != nil {

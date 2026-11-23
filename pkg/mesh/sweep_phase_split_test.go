@@ -6,9 +6,9 @@
 
 package mesh
 
-// sweep_phase_bench_test.go — sweep-phase attribution bench. Times the THREE phases of a
-// stratified-OFF sweep round at a silicon-run scale so the decision is made on
-// measurement, not on the assumption that build+sign dominates.
+// SweepPhaseSplit measures the three phases of a stratified-OFF sweep round
+// at the 100-node 3-region scale (Gate-1 ratification) so the hoisting decision
+// rests on measurement, not on the assumption that build+sign dominates.
 import (
 	"context"
 	"fmt"
@@ -21,7 +21,7 @@ import (
 
 func TestSweepPhaseSplit(t *testing.T) {
 	const keys = 10000
-	const peers = 35 // the selected-peer count per sweep
+	const peers = 35 // selected-peer count per sweep at the 100-node scale
 	seed := make([]byte, 32)
 	for i := range seed {
 		seed[i] = byte(i + 3)
@@ -34,11 +34,11 @@ func TestSweepPhaseSplit(t *testing.T) {
 	g := NewGossiper(NewPeerSet(nil, nopFrameSink{}, owner, engN), owner, engN, identity.NewDirectory())
 	g.SetBatchSize(DefaultBatchSize)
 	for i := 0; i < keys; i++ {
-		g.InsertLocalEvents(fmt.Sprintf("sweep-key-%d", i), fmt.Sprintf("%010d", i),
+		g.InsertLocalEvents(fmt.Sprintf("z3-key-%d", i), fmt.Sprintf("%010d", i),
 			eng.CRDTEntry{SystemTime: int64(1_700_000_000 + i), H3Index: uint64(i)})
 	}
 
-	// — generate (hoisted this OUT of the per-peer loop: once/sweep).
+	// First phase — generate (hoisted out of the per-peer loop: once per sweep).
 	t0 := time.Now()
 	d := g.generateSweepDelta(context.Background(), [16]byte{})
 	genMs := float64(time.Since(t0).Microseconds()) / 1000.0
@@ -47,9 +47,9 @@ func TestSweepPhaseSplit(t *testing.T) {
 	}
 	n := countDeltaEntries(t, d)
 
-	// — per-peer BUILD + SIGN. This is what did NOT hoist: ShipBatch
-	// calls BuildCRDTDeltaBatch + SignCRDTFrame + g.batchSeq++ once PER PEER.
-	// Time it by replaying the same work `peers` times over the same entry set.
+	// Second phase — per-peer build + sign. ShipBatch calls BuildCRDTDeltaBatch,
+	// SignCRDTFrame, and increments batchSeq once per peer. Time it by replaying
+	// the same work for each peer over the same entry set.
 	var built [][]byte
 	d.Entries(func(id string, e eng.CRDTEntry) bool {
 		if len(built) < DefaultBatchSize {
@@ -74,9 +74,9 @@ func TestSweepPhaseSplit(t *testing.T) {
 	d.Release()
 
 	total := genMs + signMs
-	t.Logf("SWEEP-PHASE SPLIT (keys=%d entries=%d peers=%d batches/peer=%d, stratified OFF):", keys, n, peers, batches)
-	t.Logf("  PHASE 1 generate (hoisted, ONCE/sweep)  = %10.2f ms  (%5.1f%%)", genMs, 100*genMs/total)
-	t.Logf("  PHASE 2 per-peer build+SIGN (NOT hoisted)= %10.2f ms  (%5.1f%%)  [%d signs]", signMs, 100*signMs/total, peers*batches)
-	t.Logf("  (PHASE 3 Publish/transport is NOT measurable here — no sockets; the silicon check measures it)")
-	t.Logf("  DECISION INPUT: build+sign share = %.1f%% of the measurable compute", 100*signMs/total)
+	t.Logf("Sweep-phase split (keys=%d entries=%d peers=%d batches/peer=%d, stratified OFF):", keys, n, peers, batches)
+	t.Logf("  First phase generate (hoisted, once/sweep)    = %10.2f ms  (%5.1f%%)", genMs, 100*genMs/total)
+	t.Logf("  Second phase per-peer build+sign (not hoisted)= %10.2f ms  (%5.1f%%)  [%d signs]", signMs, 100*signMs/total, peers*batches)
+	t.Logf("  (Third phase publish/transport not measurable here — no sockets; the silicon verification measures it)")
+	t.Logf("  Decision input: build+sign share = %.1f%% of the measurable compute", 100*signMs/total)
 }

@@ -28,11 +28,9 @@ import (
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// genKey generates a deterministic-distinct Ed25519 keypair. Tests use
-// crypto/rand (not a fixed seed) because the relay-chain semantics are
-// key-independent; the assertions are over the verify/drop verdicts, not
-// over specific key material. It accepts testing.TB so both tests and
-// benchmarks share the helper.
+// genKey generates a fresh Ed25519 keypair. Relay-chain behavior does not
+// depend on particular key material, so tests use crypto/rand and assert the
+// verification verdicts. It accepts testing.TB for use by tests and benchmarks.
 func genKey(t testing.TB) (ed25519.PublicKey, ed25519.PrivateKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -43,7 +41,7 @@ func genKey(t testing.TB) (ed25519.PublicKey, ed25519.PrivateKey) {
 }
 
 // pubArray copies a 32-byte Ed25519 public key into the canonical [32]byte
-// form the Hop record carries (mirrors the PeerBucketKey discipline).
+// form the Hop record carries (matching PeerBucketKey in pkg/admission).
 func pubArray(pub ed25519.PublicKey) [32]byte {
 	var a [32]byte
 	copy(a[:], pub)
@@ -52,9 +50,9 @@ func pubArray(pub ed25519.PublicKey) [32]byte {
 
 // fakeInnerWire returns a deterministic 120-byte stand-in for the inner
 // signed CRDTDeltaEvent capnp frame. The envelope carries the inner wire
-// verbatim and returns it byte-identical from Open; it never re-serializes
-// the inner frame, so a fixed 120-byte buffer (the CRDT delta frame size) is
-// a faithful stand-in that exercises the envelope without importing pkg/sync.
+// verbatim and returns it byte-identical from Open without re-serializing it,
+// so a fixed 120-byte buffer (the CRDT delta frame size) exercises the
+// envelope without importing pkg/sync.
 func fakeInnerWire() []byte {
 	w := make([]byte, 120)
 	for i := range w {
@@ -63,11 +61,10 @@ func fakeInnerWire() []byte {
 	return w
 }
 
-// buildRelayChain builds an N-hop relayed envelope: origin signs the inner
-// wire (the inner origin sig is NOT part of the envelope — it is verified
-// by the caller after Open returns the inner wire); then each relay in turn
-// signs the chain-of-custody material and appends its Hop. Returns the
-// envelope and the relay public keys (for the test to assert each verifies).
+// buildRelayChain builds an N-hop envelope. Each relay signs the inner wire
+// and the preceding signed material in order. Origin signing is separate:
+// the caller verifies that signature after Open returns the inner wire.
+// The relay public keys let tests independently verify each hop.
 func buildRelayChain(t *testing.T, innerWire []byte, nHops int) (*RelayEnvelope, []ed25519.PublicKey) {
 	t.Helper()
 	relayPubs := make([]ed25519.PublicKey, nHops)
@@ -88,20 +85,18 @@ func buildRelayChain(t *testing.T, innerWire []byte, nHops int) (*RelayEnvelope,
 }
 
 // ---------------------------------------------------------------------------
-// — relay-chain mock A->B->C->D (the roadmap acceptance)
+// Relay-chain mock A->B->C->D end-to-end verification
 // ---------------------------------------------------------------------------
 
 // TestEnvelope_RelayChainABCD builds a 3-hop relayed frame (B relays A's
 // origin sig; C relays B's; D relays C's), opens it, asserts all 3 outer
-// sigs verify + the inner origin sig verifies, and the inner wire equals
-// the original CRDTDeltaEvent bytes. This is the roadmap acceptance for
-// a relay chain A->B->C->D where the hop count is bounded by
-// the PROVEN per-Verify cost.
+// sigs verify plus the inner origin sig verifies, and checks that the inner
+// wire equals the original CRDTDeltaEvent bytes across the hop count bound.
 func TestEnvelope_RelayChainABCD(t *testing.T) {
 	inner := fakeInnerWire()
 
 	// Origin A signs the inner wire (the inner origin sig, verified by the
-	// caller AFTER Open returns the inner wire).
+	// caller after Open returns the inner wire).
 	originPub, originPriv := genKey(t)
 	originSig := ed25519.Sign(originPriv, inner)
 
@@ -123,20 +118,19 @@ func TestEnvelope_RelayChainABCD(t *testing.T) {
 	if hops != 3 {
 		t.Fatalf("Open returned hops=%d, want 3", hops)
 	}
-	// The inner wire MUST be returned byte-identical (the envelope never
-	// re-serializes the inner frame).
+	// The inner wire must be returned byte-identical (Open never re-serializes
+	// the inner frame).
 	if !bytes.Equal(gotInner, inner) {
 		t.Fatalf("Open returned inner wire that differs from the original (len got=%d want=%d)", len(gotInner), len(inner))
 	}
 
-	// The inner origin sig MUST verify on the returned inner wire (the
-	// caller's step). This proves the envelope preserves the inner
-	// frame's integrity end-to-end.
+	// The inner origin sig must verify on the returned inner wire. This proves
+	// the envelope preserves the inner frame's integrity end-to-end.
 	if !identity.VerifyCRDTFrame(originPub, gotInner, originSig) {
 		t.Fatalf("inner origin sig must verify on the returned inner wire")
 	}
 
-	// Each relay's outer sig MUST independently verify (defense-in-depth:
+	// Each relay's outer sig must independently verify (defense-in-depth:
 	// Open already verified them, but this re-asserts the chain-of-custody
 	// material is reconstructable from the envelope alone).
 	var preceding []byte
@@ -149,16 +143,10 @@ func TestEnvelope_RelayChainABCD(t *testing.T) {
 	}
 }
 
-// TestEnvelope_HopBoundExceeded drops a frame whose hop-count EXCEEDS the
-// bound, and asserts ZERO VerifyCRDTFrame calls were made (the O(1)
-// reject-before-Verify defense). It instruments a call counter via a
-// test-local verify wrapper that Open would call if it reached crypto.
-//
-// Because Open calls identity.VerifyCRDTFrame directly (the reuse seam), the
-// zero-Verify assertion is proven structurally: Open returns
-// ErrHopBoundExceeded from the depth check BEFORE the verify loop, so no
-// VerifyCRDTFrame call is issued. The test asserts the verdict is the
-// depth-exceed error (not a verify error) and that the inner wire is nil.
+// TestEnvelope_HopBoundExceeded checks the failure result when the hop count
+// exceeds the bound. Open returns ErrHopBoundExceeded, a nil inner wire, and a
+// zero hop count. TestEnvelope_VerifyCallCounter separately checks that this
+// branch makes no verification calls.
 func TestEnvelope_HopBoundExceeded(t *testing.T) {
 	inner := fakeInnerWire()
 	// Build a 5-hop chain and set the bound to 3 (exceeds).
@@ -179,18 +167,16 @@ func TestEnvelope_HopBoundExceeded(t *testing.T) {
 	}
 }
 
-// TestEnvelope_HopBoundExceededZeroVerify proves the O(1) reject-before-
-// Verify defense structurally: a forged MaxUint16-depth envelope is dropped
-// without any Ed25519 Verify. It builds an envelope with a hop count far
-// exceeding any sane bound and asserts Open returns ErrHopBoundExceeded
-// instantly. The zero-Verify property is proven by the fact that Open's
-// depth check returns before the verify loop is entered; a counter-based
-// proof is provided by TestEnvelope_VerifyCallCounter below.
+// TestEnvelope_HopBoundExceededZeroVerify checks early rejection of a
+// 1000-hop envelope with invalid hop records. Open returns ErrHopBoundExceeded
+// from the depth check, before it can attempt their signatures, and the test
+// requires that path to finish within one microsecond. The counting hook in
+// TestEnvelope_VerifyCallCounter separately checks the zero-call property.
 func TestEnvelope_HopBoundExceededZeroVerify(t *testing.T) {
 	inner := fakeInnerWire()
-	// A forged deep envelope: 1000 hops (the deep-chain attacker shape). The
+	// A forged deep envelope: 1000 hops (deep-relay exhaustion shape). The
 	// hop records are garbage (not real signatures) — Open must reject on
-	// depth BEFORE ever attempting to verify them.
+	// depth before ever attempting to verify them.
 	garbageHops := make([]Hop, 1000)
 	env := NewRelayEnvelope(inner, garbageHops)
 	// Bound sized for a 1ms budget = 15 hops; 1000 >> 15.
@@ -209,17 +195,9 @@ func TestEnvelope_HopBoundExceededZeroVerify(t *testing.T) {
 	}
 }
 
-// TestEnvelope_VerifyCallCounter instruments the verify path to prove the
-// hop-bound-exceeded branch issues ZERO VerifyCRDTFrame calls. It uses a
-// test-local RelayEnvelope whose hops are backed by a counting verify
-// wrapper: because Open calls identity.VerifyCRDTFrame on each hop's
-// RelayPub, the test substitutes a package-level verify hook that the
-// depth-exceed path must never reach. The hook is only consulted inside the
-// verify loop; the depth check returns before it.
-//
-// Implementation: the counter is incremented by a test-only verify function
-// that the test wires in via the verifyHook package var. Open's depth check
-// returns ErrHopBoundExceeded before the loop, so the hook is never called.
+// TestEnvelope_VerifyCallCounter installs a hook that counts calls to
+// identity.VerifyCRDTFrame. Opening a five-hop envelope with a three-hop bound
+// returns before the verification loop, so the observed count must be zero.
 func TestEnvelope_VerifyCallCounter(t *testing.T) {
 	inner := fakeInnerWire()
 	// 5-hop chain, bound 3 -> exceed.
@@ -243,20 +221,19 @@ func TestEnvelope_VerifyCallCounter(t *testing.T) {
 		t.Fatalf("want ErrHopBoundExceeded, got %v", err)
 	}
 	if got := atomic.LoadInt64(&calls); got != 0 {
-		t.Fatalf("hop-bound-exceeded path must issue ZERO Verify calls, got %d", got)
+		t.Fatalf("hop-bound-exceeded path must issue zero Verify calls, got %d", got)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// — the budget-bounded derivation (the load-bearing math)
+// Budget-bounded derivation
 // ---------------------------------------------------------------------------
 
-// TestMaxHopsForBudget_Derivation asserts MaxHopsForBudget(budget) ==
-// floor(budget / verifyCostPerHop32c) - 1, clamped to >= 0, with a
-// TEST-INJECTED budget. The test injects the budget; the SOURCE does not
-// bake it. This proves the derivation is not fabricated.
+// TestMaxHopsForBudget_Derivation checks the hop-bound formula against
+// caller-supplied budgets. The result is floor(budget/verifyCostPerHop32c)-1,
+// clamped to zero for budgets too small to cover an outer relay hop.
 func TestMaxHopsForBudget_Derivation(t *testing.T) {
-	// The ONE PROVEN constant the source commits.
+	// Use the measured verification cost to derive each expected bound.
 	const cost = int64(verifyCostPerHop32c) // 60211 ns
 
 	cases := []struct {
@@ -290,20 +267,15 @@ func TestMaxHopsForBudget_Derivation(t *testing.T) {
 		})
 	}
 
-	// The honest-math example from the specification: 1 ms -> 15 hops.
+	// 1 ms budget yields 15 hops.
 	if got, want := MaxHopsForBudget(1*time.Millisecond), 15; got != want {
-		t.Fatalf("honest-math example: MaxHopsForBudget(1ms) = %d, want %d", got, want)
+		t.Fatalf("MaxHopsForBudget(1ms) = %d, want %d", got, want)
 	}
 }
 
-// TestMaxHopsForBudget_BudgetInjectedNotBaked proves the budget is INJECTED
-// by the caller, not baked into source. It asserts MaxHopsForBudget is a
-// pure function of its argument (no hidden source constant): two different
-// budgets yield two different bounds, and the bound is derived from the
-// injected budget via the proven per-Verify cost (not a hardcoded pair).
-// The forbidden-budget guard () detector-bans a hardcoded budget from
-// source; this test proves the transform honors the injection by re-deriving
-// the expected bound from the injected budget and the ONE proven constant.
+// TestMaxHopsForBudget_BudgetInjectedNotBaked derives the expected bound from
+// each supplied budget and the measured verification cost. It also checks
+// that increasing the budget cannot reduce the number of permitted hops.
 func TestMaxHopsForBudget_BudgetInjectedNotBaked(t *testing.T) {
 	const cost = int64(verifyCostPerHop32c)
 	cases := []time.Duration{
@@ -324,7 +296,7 @@ func TestMaxHopsForBudget_BudgetInjectedNotBaked(t *testing.T) {
 				budget, got, want)
 		}
 	}
-	// The bound MUST scale with the injected budget: a larger budget admits
+	// The bound must scale with the injected budget: a larger budget admits
 	// strictly more hops (or equal, at the clamp). This proves no hidden
 	// source constant caps the bound independent of the injected budget.
 	prev := -1
@@ -344,7 +316,7 @@ func TestMaxHopsForBudget_BudgetInjectedNotBaked(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// — tamper resistance (property tests)
+// Tamper resistance property tests
 // ---------------------------------------------------------------------------
 
 // TestEnvelope_TamperedOuterSig proves a bit-flipped outer relay sig is
@@ -365,7 +337,7 @@ func TestEnvelope_TamperedOuterSig(t *testing.T) {
 }
 
 // TestEnvelope_TamperedOriginSig proves the inner origin sig, bit-flipped,
-// fails the caller's Verify AFTER all outer hops passed — the
+// fails the caller's Verify after all outer hops passed — the
 // ordering proves outer-before-inner. Open succeeds (outer hops intact);
 // the inner origin Verify on the returned wire fails.
 func TestEnvelope_TamperedOriginSig(t *testing.T) {
@@ -380,8 +352,8 @@ func TestEnvelope_TamperedOriginSig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outer hops are intact; Open must succeed (inner origin is the caller's job), got %v", err)
 	}
-	// The inner origin sig is verified by the CALLER after Open returns the
-	// inner wire. A tampered origin sig MUST fail here — proving the outer
+	// The inner origin sig is verified by the caller after Open returns the
+	// inner wire. A tampered origin sig must fail here — proving the outer
 	// hops passed first (outer-before-inner ordering).
 	if identity.VerifyCRDTFrame(originPub, gotInner, originSig) {
 		t.Fatalf("tampered inner origin sig must fail the caller's Verify (outer-before-inner ordering)")
@@ -394,7 +366,7 @@ func TestEnvelope_TamperedOriginSig(t *testing.T) {
 func TestEnvelope_TamperedInnerWire(t *testing.T) {
 	inner := fakeInnerWire()
 	env, _ := buildRelayChain(t, inner, 3)
-	// Flip a bit in the inner wire AFTER the chain was built. Every relay
+	// Flip a bit in the inner wire after the chain was built. Every relay
 	// signed the original inner wire, so the first outer Verify must fail.
 	env.innerWire[0] ^= 0x01
 	_, _, err := env.Open(MaxHopsForBudget(1 * time.Millisecond))
@@ -478,47 +450,32 @@ func TestEnvelope_MalformedFraming(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — STATIC GUARD: NO fabricated budget/hop-count magic number
-// ---------------------------------------------------------------------------
+// Source checks for deployment budgets and package boundaries.
 
-// forbiddenBudgetIdentifiers are identifier patterns that, if declared as a
-// const/var of integer or time.Duration type in non-test source, would be a
-// FABRICATED budget or hop-count magic number — the exact honesty constraint.
-// The ONE permitted PROVEN constant is verifyCostPerHop32c (which carries a
-// citation comment to the sweep). This guard detector-bans the rest.
+// forbiddenBudgetIdentifiers names declaration patterns associated with a
+// deployment budget or hop limit. The source-invariant test rejects numeric
+// literals assigned to these names; verifyCostPerHop32c is the documented
+// exception because it contains a measured verification cost.
 var forbiddenBudgetIdentifiers = []string{
 	"budget", "deadline", "admission", "latency", "hop", "hopcount", "maxhop",
 }
 
-// permittedBudgetConstants are the identifiers the guard ALLOWS as integer/
-// Duration consts: the ONE PROVEN verify-cost constant. Any other const
-// matching the forbidden regex must FAIL.
+// permittedBudgetConstants contains the measured verification-cost constant
+// excluded from the literal-budget check.
 var permittedBudgetConstants = map[string]bool{
 	"verifyCostPerHop32c": true,
 }
 
-// TestEnvelope_NoFabricatedBudgetMagicNumber greps pkg/attribution non-test
-// Go source for a fabricated budget/hop-count magic number. It parses each
-// .go file (excluding _test.go) and FAILS if a const/var declaration has an
-// identifier matching the forbidden regex AND a literal integer/Duration
-// VALUE (a bare magic number) OUTSIDE the ONE permitted PROVEN constant, OR
-// if a time.Millisecond / time.Microsecond literal appears as a hardcoded
-// value in a const/var declaration in non-test source. This makes the
-// fabricated-budget magic-number pattern detector-banned from pkg/attribution
-// source.
+// TestEnvelope_NoFabricatedBudgetMagicNumber parses non-test source and
+// rejects hard-coded deployment budgets or hop limits. A const or var whose
+// name matches forbiddenBudgetIdentifiers cannot have a bare numeric or
+// duration value, except for the documented verifyCostPerHop32c measurement.
+// It also rejects time duration selectors in const and var initializers.
 //
-// The literal-value check is load-bearing: it distinguishes a FABRICATED
-// magic number (const maxHops = 8 — a bare integer literal naming a bound)
-// from a DERIVED framing size (const HopSize = PubSize + SigSize + WallSize
-// — an expression, not a magic number) and an error sentinel
-// (var ErrHopBoundExceeded = errors.New(...) — a string value, not a
-// number). Only a bare literal naming a hop-count bound or admission budget
-// is the fabrication pattern the honesty constraint bans.
-//
-// Negative control: inject `const maxHops = 8` into envelope.go and this
-// test MUST FAIL; revert -> PASS. (See the commit message for the pasted
-// control result.)
+// Derived sizes such as HopSize = PubSize + SigSize + WallSize and error
+// values such as ErrHopBoundExceeded remain valid because they are not numeric
+// budget literals. Adding `const maxHops = 8` to envelope.go makes this test
+// fail.
 func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 	dir := "."
 	fset := token.NewFileSet()
@@ -529,10 +486,9 @@ func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse pkg/attribution: %v", err)
 	}
-	// isLiteralNumber reports whether an expression is a bare numeric or
-	// time-Duration literal (the shape of a magic number), as opposed to a
-	// derived expression (PubSize + SigSize + WallSize) or a function call
-	// (errors.New).
+	// isLiteralNumber distinguishes a bare numeric or duration value from a
+	// derived expression such as PubSize + SigSize + WallSize or a function
+	// call such as errors.New.
 	isLiteralNumber := func(expr ast.Expr) bool {
 		switch v := expr.(type) {
 		case *ast.BasicLit:
@@ -553,7 +509,7 @@ func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 				if !ok {
 					continue
 				}
-				// Only const/var declarations carry magic numbers.
+				// Only const and var declarations carry these values.
 				if gd.Tok != token.CONST && gd.Tok != token.VAR {
 					continue
 				}
@@ -574,21 +530,18 @@ func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 						if !matchesForbidden || permittedBudgetConstants[name.Name] {
 							continue
 						}
-						// A fabricated magic number is a bare literal VALUE
-						// naming a hop-count bound or admission budget. A
-						// derived expression (HopSize = a + b + c) or an error
-						// sentinel (errors.New) is NOT a magic number.
+						// Reject a bare numeric value assigned to a hop-limit or
+						// admission-budget name. Derived sizes and error sentinels
+						// are not deployment budgets.
 						if len(vs.Values) > ni && isLiteralNumber(vs.Values[ni]) {
-							t.Errorf("FORBIDDEN budget/hop-count magic-number %q = <literal> "+
-								"in %s (fabricated budget detector-banned from source; only "+
+							t.Errorf("forbidden budget/hop-count magic-number %q = <literal> "+
+								"in %s (only "+
 								"verifyCostPerHop32c is permitted, with its citation)",
 								name.Name, filepath.Base(fname))
 						}
 					}
-					// Ban time.Millisecond / time.Microsecond as a hardcoded
-					// literal VALUE in a const/var decl in non-test source.
-					// A deploy-time budget MUST be an injected ctor parameter,
-					// never a source literal.
+					// Deployment durations belong in constructor arguments rather
+					// than const or var initializers in production source.
 					for _, val := range vs.Values {
 						ast.Inspect(val, func(n ast.Node) bool {
 							sel, ok := n.(*ast.SelectorExpr)
@@ -596,8 +549,8 @@ func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 								return true
 							}
 							if id, ok := sel.X.(*ast.Ident); ok && id.Name == "time" && (sel.Sel.Name == "Millisecond" || sel.Sel.Name == "Microsecond" || sel.Sel.Name == "Second" || sel.Sel.Name == "Nanosecond") {
-								t.Errorf("FORBIDDEN hardcoded time literal time.%s in %s "+
-									"(a deploy-time budget MUST be an injected ctor parameter, "+
+								t.Errorf("forbidden hardcoded time literal time.%s in %s "+
+									"(a deploy-time budget must be an injected ctor parameter, "+
 									"never a source literal)", sel.Sel.Name, filepath.Base(fname))
 							}
 							return true
@@ -609,16 +562,11 @@ func TestEnvelope_NoFabricatedBudgetMagicNumber(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — STATIC GUARD: no-re-open guard (extended from the earlier guard)
-// ---------------------------------------------------------------------------
+// Production attribution code must not reference engine or clock symbols.
 
-// forbiddenEngineSymbols are identifiers that belong to the protected-core
-// crdt.go engine or the clock seam. This package is the attribution layer; it
-// MUST NOT call the engine (Join/ApplyCRDTDeltaEvent — that would import
-// pkg/sync) or touch the clock seam (AdvanceLamportTo). If any of these appear in
-// pkg/attribution Go source OUTSIDE comments, the silent-re-open pattern is
-// present and the test FAILS.
+// forbiddenEngineSymbols lists engine and clock identifiers that production
+// attribution code must not reference. Calling Join or ApplyCRDTDeltaEvent
+// would import pkg/sync; AdvanceLamportTo would cross the clock boundary.
 var forbiddenEngineSymbols = []string{
 	"lamportCounter",
 	"observedInboundRate",
@@ -628,15 +576,10 @@ var forbiddenEngineSymbols = []string{
 	"Join",
 }
 
-// TestEnvelope_ForbiddenSymbolsAbsent greps pkg/attribution Go source for
-// the forbidden engine identifiers. It parses each.go file (excluding
-// _test.go) and FAILS if any forbidden symbol appears in code (identifiers),
-// allowing it only in comments. This makes the silent-re-open of the
-// protected-core crdt.go and the clock seam detector-banned from pkg/attribution source.
-//
-// Negative control: inject a call to ApplyCRDTDeltaEvent into envelope.go and
-// this test MUST FAIL; revert -> PASS. (See the commit message for the
-// pasted control result.)
+// TestEnvelope_ForbiddenSymbolsAbsent parses non-test source and rejects
+// references to forbiddenEngineSymbols. Comments may name those symbols when
+// explaining the package boundary. Adding an ApplyCRDTDeltaEvent reference to
+// envelope.go makes this test fail.
 func TestEnvelope_ForbiddenSymbolsAbsent(t *testing.T) {
 	dir := "."
 	fset := token.NewFileSet()
@@ -669,8 +612,8 @@ func TestEnvelope_ForbiddenSymbolsAbsent(t *testing.T) {
 				}
 				for _, sym := range forbiddenEngineSymbols {
 					if ident.Name == sym {
-						t.Errorf("FORBIDDEN symbol %q appears in code in %s "+
-							"(silent-re-open of the protected-core crdt.go / the clock seam detector-banned)",
+						t.Errorf("forbidden symbol %q appears in code in %s "+
+							"(engine/clock boundary violation)",
 							sym, filepath.Base(fname))
 					}
 				}
@@ -681,14 +624,12 @@ func TestEnvelope_ForbiddenSymbolsAbsent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// — RACE gate (concurrent Open across 32 distinct relay chains)
+// Concurrent Open under -race (32 distinct relay chains)
 // ---------------------------------------------------------------------------
 
-// TestEnvelope_ConcurrentOpenNoRace runs 32 goroutines, each opening its
-// own distinct relay chain concurrently, under -race. 0 data race must be
-// reported. The RelayEnvelope is immutable post-construction (Open reads
-// the hop records and inner wire without mutating shared state), so
-// concurrent readers never contend.
+// TestEnvelope_ConcurrentOpenNoRace opens 32 independently constructed relay
+// chains in parallel. Run with -race to check Open's read-only use of each
+// envelope and the package-level verifyHook access.
 func TestEnvelope_ConcurrentOpenNoRace(t *testing.T) {
 	const goroutines = 32
 	// Pre-build 32 distinct relay chains (each with its own keys + inner

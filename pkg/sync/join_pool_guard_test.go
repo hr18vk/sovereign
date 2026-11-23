@@ -20,18 +20,13 @@ import (
 )
 
 // ================================================================================
-// DETERMINISM GUARD (C1): the pool MUST NOT change the merge result.
+// Join determinism (ADR-0015 §6): the pool must not change the merge result.
 // ================================================================================
 
-// TestJoinDeterminism_PooledVsUnpooledMerkleEqual drives Join with the SAME dot
-// set via (a) a warm-pool path (sustained Join load, pool recycles) and (b) a
-// cold-pool path (fresh engine, first Join grows). If the pool corrupts the
-// merge order or result, the Merkle roots diverge. This is the load-bearing
-// proof that the unfreeze preserves the determinism contract (C1).
-//
-// CRDT semantics: identical dot sets produce identical Merkle roots regardless
-// of pool state, because the merge is a pure function of the dot set. The pool
-// recycles BUFFERS; it does NOT change which dots land in the HAMT.
+// TestJoinDeterminism_PooledVsUnpooledMerkleEqual joins the same dot set through
+// a warm pool and a fresh engine. Moving fsync off persistMu's CAS callers must
+// not change merge behavior through buffer reuse: identical dot sets produce
+// identical Merkle roots regardless of how Join calls are grouped (ADR-0015 §6).
 func TestJoinDeterminism_PooledVsUnpooledMerkleEqual(t *testing.T) {
 	const arenaSize uintptr = 64 * 1024 * 1024 // 64 MiB
 	const numEntities = 50
@@ -104,41 +99,39 @@ func TestJoinDeterminism_PooledVsUnpooledMerkleEqual(t *testing.T) {
 
 	assert.Equal(t, merkleA, merkleB,
 		"join-determinism FAILED: MerkleRoot diverged — the pooled Join produced a different "+
-			"state than the cold-path Join for the SAME dot set. The pool corrupted "+
+			"state than the cold-path Join for the same dot set. The pool corrupted "+
 			"the merge result (likely a per-block merge scratch reuse bug).")
-	t.Logf("join-determinism PASS: pooled (engine A) MerkleRoot = %x == cold (engine B) MerkleRoot = %x "+
-		"for %d entities × %d entries — the pool does NOT corrupt the join-determinism contract",
+	t.Logf("join determinism: pooled root %x equals cold root %x "+
+		"for %d entities × %d entries",
 		merkleA[:8], merkleB[:8], numEntities, entriesPerEntity)
 }
 
 // ================================================================================
-// EBR POLLUTION GUARD (C2): pool buffers MUST NOT go through ebr.Retire
+// EBR reclamation (ADR-0015 §6): pool buffers must not go through ebr.Retire.
 // ================================================================================
-// TestJoinPool_DoesNotRetirePoolBuffers performs a static audit of the Join body
-// in crdt.go: it reads the source, extracts the Join function, and asserts that
-// EVERY ebr.Retire call is on a shard-pointer CAS target — NEVER on a pool
-// buffer. A pool buffer put through ebr.Retire would corrupt the arena freelist
-// (the retire list is for shard-pointer CAS targets ONLY; pool buffers recycle
-// via sync.Pool). This guard catches that.
+// TestJoinPool_DoesNotRetirePoolBuffers extracts Join from crdt.go and checks
+// each ebr.Retire call for references to pool buffers. Retiring a pool buffer
+// would corrupt the arena freelist: shard-pointer CAS targets use EBR, while
+// pool buffers return through sync.Pool.
 func TestJoinPool_DoesNotRetirePoolBuffers(t *testing.T) {
 	// Resolve crdt.go relative to this test file.
 	_, thisFile, _, _ := runtime.Caller(0)
 	srcPath := filepath.Join(filepath.Dir(thisFile), "crdt.go")
 	src, err := os.ReadFile(srcPath)
 	if err != nil {
-		t.Fatalf("ebr-pollution-guard: cannot read crdt.go source at %q: %v", srcPath, err)
+		t.Fatalf("ebr reclamation: cannot read crdt.go at %q: %v", srcPath, err)
 	}
 
 	// Find the Join function body via brace-counting.
 	joinIdx := strings.Index(string(src), "func (e *DeltaCRDTEngine) Join(delta CRDTDelta)")
 	if joinIdx < 0 {
-		t.Fatal("ebr-pollution-guard: Join function signature not found in crdt.go source")
+		t.Fatal("ebr reclamation: Join signature not found in crdt.go")
 	}
 
 	// Find opening brace of the Join function.
 	bodyStart := strings.Index(string(src[joinIdx:]), "{")
 	if bodyStart < 0 {
-		t.Fatal("ebr-pollution-guard: cannot find opening brace of Join function")
+		t.Fatal("ebr reclamation: cannot find Join's opening brace")
 	}
 	bodyStart += joinIdx
 
@@ -157,23 +150,23 @@ func TestJoinPool_DoesNotRetirePoolBuffers(t *testing.T) {
 		}
 	}
 	if bodyEnd < 0 {
-		t.Fatal("ebr-pollution-guard: cannot find closing brace of Join function (unbalanced braces)")
+		t.Fatal("ebr reclamation: cannot find Join's closing brace")
 	}
 
 	joinBody := string(src[bodyStart:bodyEnd])
 
-	// Find ALL ebr.Retire calls (match "Retire(" — NOT preceded by a letter,
+	// Find every ebr.Retire call (match "Retire(" — not preceded by a letter,
 	// so we don't match a hypothetical "xRetire").
 	retireRe := regexp.MustCompile(`\.Retire\(`)
 	retireIdxs := retireRe.FindAllStringIndex(joinBody, -1)
 
 	if len(retireIdxs) == 0 {
-		t.Fatal("ebr-pollution-guard: ZERO Retire calls found in Join body — the per-shard CAS " +
-			"retire path appears to have been removed. This is a C2 regression: " +
-			"EBR Reclamation must retire shard-pointer CAS targets.")
+		t.Fatal("ebr reclamation: Join contains no Retire calls; " +
+			"shard-pointer CAS targets must be retired; " +
+			"pool buffers must continue through sync.Pool")
 	}
 
-	// Prohibited pool-buffer identifiers that MUST NOT appear in a Retire call.
+	// Prohibited pool-buffer identifiers that must not appear in a Retire call.
 	prohibited := []string{
 		"buf.", "joinBuf", "incomingBlock", "blockScratch", "mergeScratch",
 	}
@@ -194,32 +187,30 @@ func TestJoinPool_DoesNotRetirePoolBuffers(t *testing.T) {
 
 		for _, p := range prohibited {
 			if strings.Contains(context, p) {
-				t.Fatalf("ebr-pollution-guard FAILED: ebr.Retire in Join body appears to reference a "+
-					"pool buffer (context contains %q):\n %s\n"+
-					"A pool buffer put through ebr.Retire would CORRUPT the arena freelist "+
-					"(the retire list is for shard-pointer CAS targets ONLY). "+
-					"Pool buffers MUST recycle via sync.Pool, NOT ebr.Retire.",
+				t.Fatalf("ebr reclamation: Retire in Join appears to reference a "+
+					"pool buffer (context contains %q):\n  %s\n"+
+					"Retiring a pool buffer would corrupt the arena freelist. "+
+					"Only shard-pointer CAS targets may use EBR; "+
+					"pool buffers must recycle via sync.Pool.",
 					p, strings.TrimSpace(context))
 			}
 		}
 	}
 
-	t.Logf("ebr-pollution-guard PASS: %d Retire call(s) in Join body — all on shard-pointer CAS "+
-		"targets (current/modified), ZERO on pool buffers. EBR contract is safe: "+
-		"the pool recycles via sync.Pool, NOT ebr.Retire.", len(retireIdxs))
+	t.Logf("ebr reclamation: checked %d Retire call(s) in Join; "+
+		"all referenced shard-pointer CAS targets; "+
+		"pool buffers continue through sync.Pool", len(retireIdxs))
 }
 
 // ================================================================================
-// ALIGNMENT / 57.6M CONTRACT GUARD (C3): the core is untouched
+// HAMT.Set zero-allocation coverage (ADR-0015 §6).
 // ================================================================================
 
-// TestHotPathZeroAllocDelegated confirms the HAMT.Set core (the 57.6M guard)
-// is untouched by. The existing TestHotPathZeroAllocations covers the
-// HAMT.Set path; edited Join ONLY. This guard documents the gate and
-// fails only if the delegational guard itself is removed.
+// TestHotPathZeroAllocDelegated points to the tests that cover the HAMT.Set
+// allocation and layout contracts independently of Join's buffer pool.
 func TestHotPathZeroAllocDelegated(t *testing.T) {
-	t.Logf("core-contract PASS: this guard is document — " +
-		"TestHotPathZeroAllocations + TestScalingGate + " +
-		"TestCRDTEntry_SizeAndAlignment are the C3 load-bearing guards. " +
-		" edited Join ONLY; the HAMT.Set core is untouched.")
+	t.Logf("HAMT.Set coverage: " +
+		"TestHotPathZeroAllocations, the scaling test, and " +
+		"TestCRDTEntry_SizeAndAlignment check allocation and layout behavior; " +
+		"Join's buffer-pool changes do not alter that path")
 }

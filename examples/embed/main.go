@@ -4,14 +4,14 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package main is a smoke example for the engine's exported lock-free core.
+// Package main is a smoke example demonstrating the exported lock-free core.
 //
-// It is evidence, not a benchmark: it imports ONLY the exported
+// It is evidence, not a benchmark: it imports only the exported
 // github.com/hr18vk/sovereign/pkg/sync package (no internal/ path), drives
 // a realistic concurrent push/pop workload on the lock-free core, and
 // asserts the conservation invariant a downstream would rely on:
 //
-//	total pushed − total popped == final stack size (drained to empty)
+//	total pushed  −  total popped  ==  final stack size (drained to empty)
 //
 // No marketing numbers. No synthetic headline. Just "the exported API
 // is usable and linearizable from an external Go module."
@@ -125,9 +125,9 @@ func main() {
 	conservedElim := int64(ePushed) - int64(ePopped) - int64(eDrained)
 	conserved := conservedSharded == 0 && conservedElim == 0
 	fmt.Printf("smoke: GOMAXPROCS=%d workers=%d\n", runtime.GOMAXPROCS(0), workers)
-	fmt.Printf("sharded: pushed=%d popped=%d drained=%d (pushed-popped=%d)\n",
+	fmt.Printf("sharded: pushed=%d popped=%d drained=%d  (pushed-popped=%d)\n",
 		pushed, popped, drained, int64(pushed)-int64(popped))
-	fmt.Printf("elim: pushed=%d popped=%d drained=%d (pushed-popped=%d)\n",
+	fmt.Printf("elim:    pushed=%d popped=%d drained=%d  (pushed-popped=%d)\n",
 		ePushed, ePopped, eDrained, int64(ePushed)-int64(ePopped))
 	fmt.Printf("conservation (pushed - popped == drained): %v\n", conserved)
 	if !conserved {

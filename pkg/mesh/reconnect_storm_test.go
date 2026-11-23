@@ -6,37 +6,20 @@
 
 package mesh
 
-// reconnect_storm_test.go — ADR-0045: the
-// ReconnectLoop colocated-stampede RED→GREEN guards.
+// These tests cover ReconnectLoop behavior when many colocated peers reconnect
+// (ADR-0045). Each configured peer has its own loop, so one host-wide event can
+// wake thousands of goroutines together.
 //
-// THE BUG (silicon, 100 nodes / 3 hosts / 34 nodes per host): every node
-// runs one ReconnectLoop goroutine per configured peer (main.go:1443), so a
-// 34-colocated host runs 34 × 99 = 3366 of them. Two defects made that a storm:
+// A configured listen address does not identify an inbound edge in byAddr:
+// RegisterInbound uses the ephemeral remote address. liveReconnectEdge therefore
+// also checks ps.peers, the map Publish uses, both before and after waiting on a
+// connection's done channel. A live peer returns to the wait instead of dialing
+// again. Repeated stale dials could otherwise make the peers replace each other's
+// connections and sustain a reconnection cycle.
 //
-//	— the post-wait liveness gap. The loop looked up ps.byAddr[addr] BEFORE
-//	     waiting on pc.done, but never re-checked AFTER the wait; it dialed
-//	     unconditionally. Worse, the only lookup it did was byAddr[configuredAddr],
-//	     which STRUCTURALLY CANNOT see a live inbound edge: RegisterInbound keys
-// byAddr under conn.RemoteAddr — the peer's EPHEMERAL port (peer.go:529) —
-//	     while ReconnectLoop holds the configured listen addr. So a node with a
-//	     perfectly good, publishable, registered inbound edge from a peer
-//	     re-dialed that peer anyway. The remote's RegisterInbound then stale-closed
-//	     the peer's own outbound peerConn (peer.go:542-563), waking THAT node's
-//	     ReconnectLoop, which re-dialed back: a self-sustaining ping-pong that
-//	     re-registered the same nodeID ~10× at different ephemeral ports (exactly
-// what's logs show) and starved the anti-entropy sweep to 1 round
-//	     in 91 seconds.
-//
-//	— zero jitter. The backoff ladder (1s→2s→4s→8s→10s) was perfectly
-//	     deterministic, so thousands of loops dropped by one host-wide event
-//	     re-dialed in LOCKSTEP, and doubling PRESERVES that phase alignment at
-//	     every rung. The herd never de-synchronized on its own.
-//
-// THE FIX: liveReconnectEdge (byAddr OR ps.peers — the map Publish consults) is
-// consulted both before the wait AND after it; a live edge means "return to the
-// wait", not "dial". Plus ±20% uniform jitter from a per-loop PCG source.
-//
-// RUN: go test -run 'TestReconnect' -race -count=1 ./pkg/mesh/
+// Independent per-loop PCG sources add uniform ±20% jitter to the exponential
+// backoff. This spreads dial and TLS work after a simultaneous disconnect rather
+// than preserving lockstep timing through every backoff rung.
 
 import (
 	"context"
@@ -49,11 +32,8 @@ import (
 	"time"
 )
 
-// stormDialer counts every Dial attempt and records when each one happened. It
-// ALWAYS fails: a failing dial is what drives the loop onto the backoff ladder,
-// which is precisely the path the jitter governs. Failing also keeps the guard
-// free of TLS/listener machinery, so what it measures is the loop's dial-decision
-// behavior and nothing else.
+// stormDialer records every dial attempt and always refuses it, keeping each
+// ReconnectLoop on its backoff ladder without requiring listeners or TLS.
 type stormDialer struct {
 	mu     sync.Mutex
 	count  int64 // atomic
@@ -79,30 +59,21 @@ func (d *stormDialer) snapshot() []time.Duration {
 	return out
 }
 
-// TestReconnectLivePeerNotRedialed is the guard: N ReconnectLoops
-// whose peers are ALL ALREADY LIVE via the INBOUND edge (registered in
-// ps.peers under the real nodeID, keyed in byAddr under an ephemeral port — the
-// exact colocated shape) must issue ZERO dials.
-//
-// This is the load-bearing storm assertion. On the pre-code every loop dials
-// immediately, because byAddr[configuredAddr] misses (the inbound edge is keyed
-// under the ephemeral port) so the pc.done wait is SKIPPED and Dial is called
-// unconditionally → N dials in the first tick. With, liveReconnectEdge finds the
-// peer in ps.peers and the loop blocks on that edge's done channel → 0 dials.
-//
-// RED→Positive control: verified by fault-injection (documented in the change log) —
-// reverting liveReconnectEdge to a byAddr-only lookup makes this FAIL with
-// dials >= N.
-func TestReconnectLivePeerNotRedialed(t *testing.T) {
+// TestReconnectStormLivePeerNotRedialed starts one ReconnectLoop per live peer.
+// Each peer is installed in ps.peers by node ID and in byAddr by an ephemeral
+// address different from its configured dial address. The loops must find the
+// peer through ps.peers and wait without dialing. A byAddr-only lookup misses
+// this topology and produces at least one dial per peer.
+func TestReconnectStormLivePeerNotRedialed(t *testing.T) {
 	const peers = 20
 	d := &stormDialer{t0: time.Now()}
 	ps := NewPeerSet(d, nopFrameSink{}, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Install `peers` LIVE inbound edges exactly the way RegisterInbound does:
+	// Install `peers` live inbound edges exactly the way RegisterInbound does:
 	// keyed in ps.peers under the real nodeID, and in byAddr under the peer's
-	// EPHEMERAL address — deliberately DIFFERENT from the configured dial addr the
+	// ephemeral address — deliberately different from the configured dial addr the
 	// ReconnectLoop holds. This is the colocated topology that defeated the
 	// byAddr-only lookup.
 	type peerFixture struct {
@@ -118,27 +89,26 @@ func TestReconnectLivePeerNotRedialed(t *testing.T) {
 		id[1] = byte(i + 1) // never the zero nodeID (that bucket is excluded by design)
 		f := peerFixture{
 			nodeID:     id,
-			configAddr: fmt.Sprintf("10.0.0.%d:7373", i+1), // the CONFIGURED listen addr
+			configAddr: fmt.Sprintf("10.0.0.%d:7373", i+1), // the configured listen addr
 			pc: &peerConn{
-				addr:   fmt.Sprintf("10.0.0.%d:%d", i+1, 40000+i), // the EPHEMERAL addr
+				addr:   fmt.Sprintf("10.0.0.%d:%d", i+1, 40000+i), // the ephemeral addr
 				peerID: id,
 				done:   make(chan struct{}),
 			},
 		}
-		ps.peers[f.nodeID] = f.pc   // what Publish consults — the live edge
-		ps.byAddr[f.pc.addr] = f.pc // keyed under the EPHEMERAL port, as RegisterInbound does
+		ps.peers[f.nodeID] = f.pc   // the live edge
+		ps.byAddr[f.pc.addr] = f.pc // keyed under the ephemeral port, as RegisterInbound does
 		fixtures[i] = f
 	}
 	ps.mu.Unlock()
 
-	// Sanity: the configured addr each loop will hold must NOT be in byAddr — the
-	// premise of the test. If it were, the guard would pass via the pre-fix lookup
-	// and prove nothing about.
+	// A configured address in byAddr would let the address-only lookup pass
+	// without exercising the node-ID lookup this test targets.
 	ps.mu.RLock()
 	for _, f := range fixtures {
 		if _, hit := ps.byAddr[f.configAddr]; hit {
 			ps.mu.RUnlock()
-			t.Fatalf("PREMISE BROKEN: byAddr contains the CONFIGURED addr %s — the test must model RegisterInbound's EPHEMERAL keying, else it cannot distinguish the storm guard from the pre-fix byAddr-only lookup", f.configAddr)
+			t.Fatalf("byAddr unexpectedly contains configured address %s; inbound edges must use ephemeral keys for this test", f.configAddr)
 		}
 	}
 	ps.mu.RUnlock()
@@ -156,18 +126,17 @@ func TestReconnectLivePeerNotRedialed(t *testing.T) {
 	}
 	close(start)
 
-	// Observe for a window that would contain MANY backoff ticks (20ms base → ~5
-	// rungs in 300ms). A storming loop cannot hide inside this window.
+	// Observe for a window that would contain many backoff ticks (20 ms base → ~5
+	// rungs in 300 ms). A storming loop cannot hide inside this window.
 	time.Sleep(300 * time.Millisecond)
 	got := d.dials()
 	if got != 0 {
-		t.Fatalf("STORM: %d dials fired in 300ms against %d peers that are ALL ALREADY LIVE via the accept-symmetry inbound edge (ps.peers keyed by real nodeID). Expected ZERO. A live, publishable peer must NEVER be re-dialed: the re-dial makes the remote's RegisterInbound stale-close that peer's own outbound peerConn (peer.go:542-563), waking its ReconnectLoop into a re-dial ping-pong — the run-#4 storm that starved the sweep to 1 round/91s. Check liveReconnectEdge consults ps.peers[peerID], not just byAddr[addr] (RegisterInbound keys byAddr under the EPHEMERAL port, so byAddr alone CANNOT see an inbound edge).", got, peers)
+		t.Fatalf("%d dials fired in 300 ms against %d live peers, want 0; liveReconnectEdge must check ps.peers[peerID] because byAddr contains only the ephemeral address", got, peers)
 	}
-	t.Logf("GREEN (storm guard) — %d ReconnectLoops, all peers live via the accept-symmetry INBOUND edge (ps.peers by real nodeID; byAddr under the ephemeral port): %d dials in 300ms. The loops are parked on their live edges' done channels, so the colocated re-dial ping-pong cannot start.", peers, got)
+	t.Logf("%d ReconnectLoops with live inbound edges made %d dials in 300 ms", peers, got)
 
-	// Now DROP every edge at once — the host-wide event. Each loop must wake and
-	// re-dial (liveness is real, not a permanent mute), proving did not simply
-	// disable reconnection.
+	// Closing every done channel must wake every loop. Suppressing duplicate
+	// dials for live peers must not disable reconnection after teardown.
 	for _, f := range fixtures {
 		f.pc.closeDone()
 	}
@@ -179,25 +148,19 @@ func TestReconnectLivePeerNotRedialed(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if woke := d.dials(); woke < peers {
-		t.Fatalf("OVER-SUPPRESSION: after closing ALL %d live edges, only %d dials fired within 2s. The storm guard must dedupe LIVE peers only — a dead peer MUST still be re-dialed, or the mesh never heals (the liveness discipline). Check that liveReconnectEdge returns nil once pc.done is closed.", peers, woke)
+		t.Fatalf("closing all %d live edges produced only %d dials within 2 s, want one per peer", peers, woke)
 	}
 	cancel()
 	wg.Wait()
-	t.Logf("GREEN (storm-guard liveness is REAL) — after all %d edges dropped, %d dials fired: the dedupe suppresses re-dials of LIVE peers only; dead peers still heal. The guard is a storm drain, not a reconnection kill-switch.", peers, d.dials())
+	t.Logf("closing all %d edges produced %d reconnection dials", peers, d.dials())
 }
 
-// TestReconnectJitterDecorrelates is the guard: N loops dialing
-// DEAD peers in lockstep must NOT re-dial in phase. It measures the spread of dial
-// timestamps within one backoff rung.
-//
-// The pre-ladder is perfectly deterministic, so with all loops released at the
-// same instant every one of them fires its k-th dial at the same offset (base ×
-// (2^k − 1)), and the timestamps cluster into tight spikes. With ±20% jitter drawn
-// from a per-loop PCG source seeded by (addr, peerID), the k-th dials spread across
-// a window. The assertion is on the SPREAD, not on any single dial time — that is
-// the property that converts O(all colocated) instantaneous dial load into
-// O(fanout).
-func TestReconnectJitterDecorrelates(t *testing.T) {
+// TestReconnectStormJitterDecorrelates releases N loops together with no live
+// peers and compares timestamps in their second dial wave. Deterministic backoff
+// would align that wave; ±20% jitter from per-loop PCG sources must spread it.
+// The test asserts timestamp variance rather than a scheduler-sensitive instant
+// for any individual dial.
+func TestReconnectStormJitterDecorrelates(t *testing.T) {
 	const peers = 24
 	const base = 40 * time.Millisecond
 	d := &stormDialer{t0: time.Now()}
@@ -205,8 +168,8 @@ func TestReconnectJitterDecorrelates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// No peers installed at all → every dial fails → every loop rides the backoff
-	// ladder. This isolates: there is no liveness to dedupe, only jitter.
+	// With no installed peers, every dial fails and every loop stays on the
+	// backoff ladder. This isolates jitter from liveness deduplication.
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < peers; i++ {
@@ -230,10 +193,10 @@ func TestReconnectJitterDecorrelates(t *testing.T) {
 
 	stamps := d.snapshot()
 	if len(stamps) < 2*peers {
-		t.Fatalf("C2 guard premise: expected >= %d dials (each of %d loops dialing at least twice), got %d — the loops are not riding the backoff ladder; the guard cannot measure jitter", 2*peers, peers, len(stamps))
+		t.Fatalf("got fewer than %d dials across %d loops (actual %d), so jitter cannot be measured", 2*peers, peers, len(stamps))
 	}
-	// The FIRST `peers` dials are the immediate ones (no backoff yet, so no jitter
-	// is expected there). The jitter governs the SECOND wave: dials [peers, 2*peers).
+	// The first wave is immediate. The second wave includes the first jittered
+	// backoff for every loop.
 	second := stamps[peers : 2*peers]
 	var mean float64
 	for _, s := range second {
@@ -247,28 +210,22 @@ func TestReconnectJitterDecorrelates(t *testing.T) {
 	}
 	stddev := time.Duration(math.Sqrt(variance / float64(len(second))))
 
-	// With ±20% jitter on a 40ms rung the offsets are uniform over a 16ms window;
-	// a uniform distribution's stddev is width/sqrt(12) ≈ 4.6ms. Require >= 1ms:
-	// comfortably above scheduler noise on a loaded box, and far above the
-	// sub-100µs clustering a ZERO-jitter ladder produces.
+	// A 40 ms rung with ±20% jitter spans 16 ms, whose uniform standard
+	// deviation is about 4.6 ms. One millisecond rejects lockstep dialing while
+	// leaving room for scheduler noise.
 	const minSpread = time.Millisecond
 	if stddev < minSpread {
-		t.Fatalf("C2 LOCKSTEP: the second-wave dials of %d loops have stddev %v (< %v) — they are re-dialing IN PHASE. A deterministic ladder re-synchronizes the herd at every rung (doubling preserves phase), so a host-wide drop at colocated density spikes O(all edges) of dial+TLS work per instant and starves the anti-entropy sweep goroutine. Check the +/-20 pct jitter is applied to the TIMER value (d), drawn from the per-loop rand.NewPCG source.", peers, stddev, minSpread)
+		t.Fatalf("second-wave dials across %d loops have stddev %v, want at least %v; check per-loop PCG jitter on the timer", peers, stddev, minSpread)
 	}
-	t.Logf("GREEN (C2) — second-wave dial timestamps across %d loops: mean %v, stddev %v (>= %v). The +/-20 pct per-loop PCG jitter de-correlates the ladder, so a host-wide drop spreads dial arrivals across a window instead of spiking in lockstep.",
+	t.Logf("second-wave dials across %d loops: mean %v, stddev %v (minimum %v)",
 		peers, time.Duration(mean), stddev, minSpread)
 }
 
-// TestReconnectNoSpinOnZeroBackoff pins the latent tight-spin this change
-// also closed: the pre-fix loop normalized backoff0<=0 into `b` but then reset with
-// `b = backoff0` (the RAW argument) after a successful dial, so a caller passing 0
-// got NewTimer(0) and `b *= 2 == 0` — a 100%-CPU re-dial spin. At colocated density
-// a zero-backoff loop IS a stampede, so it belongs to the backoff-bucket fix.
-//
-// The assertion is a dial-RATE ceiling: with backoff0=0 the loop must still back off
-// (normalized to 1s), so a 250ms window admits very few dials. A spinning loop would
-// fire thousands.
-func TestReconnectNoSpinOnZeroBackoff(t *testing.T) {
+// TestReconnectStormNoSpinOnZeroBackoff passes zero for both backoff limits.
+// ReconnectLoop must normalize them and retain the normalized base after a dial.
+// Resetting to the raw zero argument would make every timer immediate and cause
+// a tight dial loop. The 250 ms observation window permits at most five dials.
+func TestReconnectStormNoSpinOnZeroBackoff(t *testing.T) {
 	d := &stormDialer{t0: time.Now()}
 	ps := NewPeerSet(d, nopFrameSink{}, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -281,7 +238,7 @@ func TestReconnectNoSpinOnZeroBackoff(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// backoff0 = 0 AND backoffMax = 0 — both must normalize.
+		// backoff0 = 0 and backoffMax = 0 — both must normalize.
 		ps.ReconnectLoop(ctx, "10.2.0.1:7373", "localhost", id, 0, 0)
 	}()
 	time.Sleep(250 * time.Millisecond)
@@ -289,31 +246,27 @@ func TestReconnectNoSpinOnZeroBackoff(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	// Normalized base is 1s, so in 250ms: 1 immediate dial, then a wait. Allow a
-	// small margin for jitter/scheduling; a spin would be orders of magnitude above.
+	// The normalized base is one second: one immediate dial, then a wait. The
+	// ceiling leaves room for scheduling without admitting a tight loop.
 	const ceiling = 5
 	if got > ceiling {
-		t.Fatalf("TIGHT SPIN: %d dials in 250ms with backoff0=0 (ceiling %d). The loop is not backing off — a zero/negative backoff0 must normalize (base = 1s) AND the post-dial reset must restore the NORMALIZED base, not the raw argument. A 100 pct-CPU re-dial spin per dropped peer is a stampede by itself at 34 nodes/host.", got, ceiling)
+		t.Fatalf("%d dials in 250 ms with zero backoff limits, want at most %d; the loop did not retain a normalized backoff", got, ceiling)
 	}
-	t.Logf("GREEN (no spin) — backoff0=0/backoffMax=0 normalized: %d dials in 250ms (ceiling %d). The post-dial reset restores the NORMALIZED base, so a caller passing zero cannot arm a tight re-dial spin.", got, ceiling)
+	t.Logf("zero backoff limits produced %d dials in 250 ms (ceiling %d)", got, ceiling)
 }
 
-// TestReconnectZeroPeerIDNotDeduped guards the deliberate EXCLUSION in
-// liveReconnectEdge: the ZERO nodeID must NOT be honored as a liveness key.
-//
-// Dial keys an un-provisioned peer whose leaf-CN reconcile misses under the zero
-// peerID, so ps.peers[zero] is a COLLISION BUCKET shared by every un-provisioned
-// peer. Honoring it would let ONE peer's liveness suppress a DIFFERENT peer's
-// reconnect — a false dedupe that silently partitions the mesh. For the zero
-// peerID the predicate must degrade to exactly the pre-fix byAddr-only behavior.
-func TestReconnectZeroPeerIDNotDeduped(t *testing.T) {
+// TestReconnectStormZeroPeerIDNotDeduped verifies that the zero node ID is not
+// a liveness key. Unprovisioned peers share that map bucket, so one peer's live
+// connection must not suppress another peer's reconnect. With a zero peer ID,
+// liveReconnectEdge uses only the configured address lookup.
+func TestReconnectStormZeroPeerIDNotDeduped(t *testing.T) {
 	d := &stormDialer{t0: time.Now()}
 	ps := NewPeerSet(d, nopFrameSink{}, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// A LIVE peerConn parked in the zero-nodeID bucket (what an un-provisioned,
-	// reconcile-missed peer looks like), keyed in byAddr under a DIFFERENT addr
+	// A live peerConn parked in the zero-nodeID bucket (what an un-provisioned,
+	// reconcile-missed peer looks like), keyed in byAddr under a different addr
 	// than the loop's configured one.
 	live := &peerConn{addr: "10.3.0.9:55555", done: make(chan struct{})}
 	ps.mu.Lock()
@@ -325,7 +278,7 @@ func TestReconnectZeroPeerIDNotDeduped(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// The loop targets a DIFFERENT addr and carries the ZERO peerID.
+		// The loop targets a different addr and carries the zero peerID.
 		ps.ReconnectLoop(ctx, "10.3.0.1:7373", "localhost", [16]byte{}, 30*time.Millisecond, 120*time.Millisecond)
 	}()
 	time.Sleep(150 * time.Millisecond)
@@ -334,7 +287,7 @@ func TestReconnectZeroPeerIDNotDeduped(t *testing.T) {
 	wg.Wait()
 
 	if got == 0 {
-		t.Fatalf("FALSE DEDUPE: a ReconnectLoop carrying the ZERO peerID issued 0 dials while an UNRELATED live peerConn sat in ps.peers[zero]. The zero nodeID is a COLLISION BUCKET (every un-provisioned, reconcile-missed peer lands there), so honoring it lets one peer's liveness suppress another peer's reconnect — a silent mesh partition. liveReconnectEdge must SKIP the ps.peers half when peerID is zero.")
+		t.Fatalf("zero-peerID loop made no dials while an unrelated live connection occupied ps.peers[zero]; the shared bucket must not suppress reconnection")
 	}
-	t.Logf("GREEN (zero-peerID exclusion) — a zero-peerID loop still dialed %d times despite an unrelated live conn in ps.peers[zero]: the collision bucket is correctly EXCLUDED, so the predicate degrades to byAddr-only for un-provisioned peers (no false dedupe, no silent partition).", got)
+	t.Logf("zero-peerID loop made %d dials despite an unrelated connection in ps.peers[zero]", got)
 }

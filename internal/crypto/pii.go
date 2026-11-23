@@ -4,38 +4,36 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package crypto implements the Zero-GC PII masking hot path for the Sovereign
+// Package crypto implements the zero-GC PII masking hot path for the Sovereign
 // Engine ingestion pipeline.
 //
-// PHYSICS (see "Go High-Performance Architecture Research", §DOMAIN 1, and
-// SUPREMUM_STYLE §1):
+// Design constraints:
 //
-// - The hot path scans 1KB string payloads for a generic 12-digit PII
-// pattern and deterministically redacts it. Regex
-// engines are forbidden: they allocate heap state for capture groups and
-// a compiled state machine, which is a future GC bill per write.
+//   - The hot path scans 1KB string payloads for a generic 12-digit PII
+//     pattern and deterministically redacts it. Regex
+//     engines are forbidden: they allocate heap state for capture groups and
+//     a compiled state machine, which is a future GC bill per write.
 //
-// - The scan must be Zero-GC when no PII is present (the overwhelmingly
-// common case): MaskPII returns the input string *unchanged*, byte-for-byte
-// equal (same data pointer, same length) so its single caller —
-// internal/database/memtable.go — proves maskedStr == payloadStr and
-// reuses event.Payload directly with zero allocation.
+//   - The scan must be Zero-GC when no PII is present (the overwhelmingly
+//     common case): MaskPII returns the input string *unchanged*, byte-for-byte
+//     equal (same data pointer, same length) so its single caller —
+//     internal/database/memtable.go — proves maskedStr == payloadStr and
+//     reuses event.Payload directly with zero allocation.
 //
-// - When PII IS present (the rare path), MaskPII allocates exactly once to
-// build the redacted string. The dossier explicitly permits this rare-path
-// allocation ("we must allocate the new masked bytes"). The allocation is
-// one []byte -> one result string, sized to the result, never to the
-// payload.
+//   - When PII IS present (the rare path), MaskPII allocates exactly once to
+//     build the redacted string. The rare path allocates exactly once because
+//     the redacted output is a new buffer sized to the result, never to the
+//     payload.
 //
-// - Deterministic redaction uses xxhash (cespare/xxhash/v2, already an
-// indirect dependency) of the 12-digit run, formatted to fixed-length
-// hex, so the same token always redacts to the same marker — enabling
-// downstream join/analysis without retaining raw PII.
+//   - Deterministic redaction uses xxhash (cespare/xxhash/v2, already an
+//     indirect dependency) of the 12-digit run, formatted to fixed-length
+//     hex, so the same token always redacts to the same marker — enabling
+//     downstream join/analysis without retaining raw PII.
 //
-// - Bounds-check elimination (BCE): the scan loop is written so the
-// compiler proves every access is in-bounds by induction on the loop
-// counter; constant-length run checks are unrolled so no IsInBounds
-// resurfaces on the scan. Verified with `go build -gcflags="-m -m"`.
+//   - Bounds-check elimination (BCE): the scan loop is written so the
+//     compiler proves every access is in-bounds by induction on the loop
+//     counter; constant-length run checks are unrolled so no IsInBounds
+//     resurfaces on the scan. Verified with `go build -gcflags="-m -m"`.
 //
 // INVARIANT: MaskPII never mutates the input string's backing memory. It
 // treats the input as read-only; a source string in a read-only segment is
@@ -43,10 +41,10 @@
 // buffer).
 //
 // OUTPUT CONTRACT (pinned by internal/database/memtable_test.go):
-// - The raw 12-digit run MUST NOT be present in the result.
-// - The replacement MUST contain the literal marker "PII_REDACTED".
-// - When no 12-digit run is present, the result is byte-equal to the input
-// (data pointer and length both identical — the MemTable == reuse path).
+//   - The raw 12-digit run must not be present in the result.
+//   - The replacement must contain the literal marker "PII_REDACTED".
+//   - When no 12-digit run is present, the result is byte-equal to the input
+//     (data pointer and length both identical — the MemTable == reuse path).
 package crypto
 
 import (
@@ -123,10 +121,10 @@ func MaskPII(payload string) string {
 		}
 	}
 	// masks is provably >= 1 here: the `if !hasPII { return payload }`
-	// early return above guarantees firstStart kwos a real 12-digit run, and
+	// early return above guarantees firstStart knows a real 12-digit run, and
 	// Pass 2 counts non-overlapping runs starting at firstStart, so masks >= 1.
 	// The previous `if masks == 0 { masks = 1 }` defensive guard was unreachable
-	// dead code (the early return dominated it). Removed for honesty.
+	// dead code (the early return dominated it) and has been removed.
 
 	// Rare-path allocation: one []byte sized to the exact result length.
 	// outLen = n + masks * (replLen - piiLen).

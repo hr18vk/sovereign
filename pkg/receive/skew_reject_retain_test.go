@@ -6,12 +6,10 @@
 
 package receive
 
-// skew_reject_retain_test.go — POST-REVIEW guard for a code-review finding:
-// a batch that clears signature verification but
-// FAILS Apply (the per-element skew bound) must NOT be retained. The pre-fix
-// order fired onAcceptRelayBatch BEFORE ApplyCRDTDeltaBatch, so a skew-rejected
-// batch was pinned in the relayCache — retained forever, never Joined, never
-// re-pointed (the refcount only frees frames whose dots get re-pointed).
+// A batch that passes signature verification but fails the per-element skew
+// bound must not be retained. Retaining it before ApplyCRDTDeltaBatch would pin
+// a frame whose dots never enter state and therefore never release the relay
+// cache reference.
 
 import (
 	"testing"
@@ -52,8 +50,8 @@ func TestSkewRejectedBatchNotRetained(t *testing.T) {
 		retained++
 	})
 
-	// A batch whose DotCounters sit FAR beyond the skew bound (AbsoluteSlack
-	// = 1000; the engine's clock is fresh): signature-valid, Apply-rejected.
+	// The DotCounters exceed the fresh engine's skew bound, so signature
+	// verification succeeds but ApplyCRDTDeltaBatch holds every element.
 	const n = 4
 	batchWire := buildAllocBenchBatchWire(t, n, 1<<40)
 	sig, err := identity.SignCRDTFrame(originSeed, batchWire)
@@ -66,14 +64,13 @@ func TestSkewRejectedBatchNotRetained(t *testing.T) {
 
 	v := recv.HandleBatchFrame(frame)
 	if v.Verdict != DropVerify {
-		t.Fatalf("guard premise broken: the skew-violating batch got verdict=%s (want DropVerify) — it never reached the Apply skew gate (reason: %v)", v.Verdict, v.Reason)
+		t.Fatalf("skew-violating batch got verdict %s, want DropVerify: %v", v.Verdict, v.Reason)
 	}
 	if retained != 0 {
-		t.Fatalf("a skew-REJECTED batch was retained (%d retain calls) — pinned in the relayCache forever, never Joined, never re-pointed. The retain must fire only AFTER Apply succeeds.", retained)
+		t.Fatalf("skew-rejected batch caused %d retain calls; retention must follow a successful apply", retained)
 	}
 
-	// Control: the SAME-shaped batch inside the skew bound IS retained after a
-	// successful Apply (the hook is wired and live, not just never-called).
+	// A similar in-bound batch verifies that the recording hook is live.
 	recv2 := NewReceiver(admission.NewPeerBucket(), clock.NewIngressHLCScalarCap(sc, engine), sc, dir, engine, 50_000_000)
 	retained2 := 0
 	recv2.SetRelayRetainerBatch(func(originNodeID [16]byte, originSeq uint64, dotCounters []uint64, frameBytes []byte) {

@@ -7,10 +7,10 @@
 package sync
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -19,51 +19,68 @@ import (
 // the table's capacity threshold, causing unresolvable bucket collisions.
 var ErrIncompletePeel = errors.New("ErrIncompletePeel: difference exceeds IBLT capacity threshold")
 
-// Bucket represents a single cell in the Invertible Bloom Lookup Table.
-// By maintaining cryptographic XOR sums rather than simple bits, we ensure
-// exactly 0.00% false positives during state reconciliation.
-//
-// Fields:
-// - Count: Signed integer, incremented on Insert, decremented on Delete/Subtract.
-// - KeySum: XOR accumulator of all keys mapped to this bucket.
-// - HashSum: XOR accumulator of the hashes of all mapped keys (purity verification).
+// Bucket is one cell in an Invertible Bloom Lookup Table. Count tracks the
+// signed number of resident keys, KeySum accumulates their XOR, and HashSum
+// accumulates the XOR of their hashes. Peel uses HashSum to check whether a
+// bucket with count ±1 contains a single key.
 type Bucket struct {
 	Count   int32
 	KeySum  uint64
 	HashSum uint64
 }
 
-// IBLT guarantees mathematically exact set reconciliation for transaction mempools.
-// It replaces the probabilistic Bloom Filter (0.59% FPR) with a deterministic
-// structure that achieves 0.00% false positives via the Peeling Cascade algorithm.
-//
-// Communication complexity is O(d) where d is the size of the symmetric difference,
-// rather than O(n) for the entire set — a planetary-scale bandwidth reduction.
+// IBLT reconciles sets by subtracting two tables and peeling pure buckets.
+// Its communication cost depends on the symmetric difference rather than the
+// full set. If collisions prevent complete decoding, Peel returns
+// ErrIncompletePeel instead of presenting a partial difference as complete.
 type IBLT struct {
 	buckets []Bucket
 	k       int
 	seed    maphash.Seed
 
-	// arenaRef, arenaBucketsOffset, and arenaStructOffset are the
-	// arena-backed IBLT lifecycle fields. They are zero-valued for the existing
-	// heap-allocated constructors (NewIBLT / NewIBLTWithSeed — protected,
-	// byte-identical behavior), and populated only by NewArenaIBLT which
-	// provisions BOTH the IBLT struct and its buckets []Bucket from the mmap'd
-	// HamtArena. IBLT.Release() inspects arenaRef: nil → no-op (the heap IBLT
-	// shape the capnp roundtrip / chaos / strata estimator paths still use);
-	// non-nil → routes the bucket array AND the struct back through EBR
-	// RetireBlock so the slabs are recycled ABA-safely after the global epoch
-	// advances. This is byte-faithful to allocHAMTWrapper's arena-pointer +
-	// EBR-retire pattern (the IBLT's bucket array is one more variable-size
-	// slab class; the IBLT struct is one more ~48-byte slab class).
+	// Arena constructors allocate both the table and its bucket backing store
+	// from HamtArena and record their offsets here. Heap constructors leave
+	// these fields zero. Release returns arena slabs through EBR; it is a no-op
+	// for heap tables.
 	arenaRef           *HamtArena
 	arenaBucketsOffset uint64
 	arenaStructOffset  uint64
+
+	// schemeV2 captures placement at construction: zero selects arithmetic-
+	// progression indices and one selects decorrelated indices. Capturing the
+	// process setting here keeps a table's placement fixed for its lifetime,
+	// even if another table is later constructed under a different setting.
+	// MarshalIBLT records the captured scheme in the frame magic.
+	schemeV2 uint64
 }
 
-// NewIBLT initializes a table engineered to hold a specific capacity of differences.
-// numBuckets should be ~1.5x the expected maximum number of differences for
-// reliable peeling. k is the number of independent hash functions (typically 3-5).
+// ibltSchemeV2Enabled selects the scheme for newly constructed tables. The
+// node sets it from --iblt-v2 during initialization, before digest builders
+// start. Existing tables retain the scheme they captured at construction.
+var ibltSchemeV2Enabled atomic.Bool
+
+// SetIBLTSchemeV2 selects decorrelated placement for subsequently constructed
+// IBLTs. Call it during initialization, before any table exists. Existing
+// tables are not migrated; tests restore the default after constructing tables
+// under the opt-in scheme.
+func SetIBLTSchemeV2(v2 bool) { ibltSchemeV2Enabled.Store(v2) }
+
+// IBLTSchemeV2 reports the scheme selected for new tables. The wire decoder
+// uses it to choose the only frame magic it accepts.
+func IBLTSchemeV2() bool { return ibltSchemeV2Enabled.Load() }
+
+// ibltSchemeWord is the constructors' one-shot capture helper.
+func ibltSchemeWord() uint64 {
+	if ibltSchemeV2Enabled.Load() {
+		return 1
+	}
+	return 0
+}
+
+// NewIBLT constructs a heap-allocated table with numBuckets cells and k hash
+// indices per key. Bucket capacity determines how large a symmetric difference
+// can peel; approximately 1.5 buckets per expected difference is the default
+// sizing heuristic. It panics when k is outside [1, ibltMaxK].
 func NewIBLT(numBuckets int, k int) *IBLT {
 	if k <= 0 || k > ibltMaxK {
 		// Defensive: the engine never constructs an IBLT outside [1, ibltMaxK].
@@ -72,48 +89,40 @@ func NewIBLT(numBuckets int, k int) *IBLT {
 		panic(fmt.Sprintf("iblt: k=%d out of range [1, %d]", k, ibltMaxK))
 	}
 	return &IBLT{
-		buckets: make([]Bucket, numBuckets),
-		k:       k,
-		seed:    maphash.MakeSeed(),
+		buckets:  make([]Bucket, numBuckets),
+		k:        k,
+		seed:     maphash.MakeSeed(),
+		schemeV2: ibltSchemeWord(),
 	}
 }
 
 // NewIBLTWithSeed creates an IBLT with a specific seed for deterministic peer sync.
-// Both peers MUST use identical seeds for Subtract to produce correct results.
+// Both peers must use identical seeds for Subtract to produce correct results.
 func NewIBLTWithSeed(numBuckets int, k int, seed maphash.Seed) *IBLT {
 	if k <= 0 || k > ibltMaxK {
 		panic(fmt.Sprintf("iblt: k=%d out of range [1, %d]", k, ibltMaxK))
 	}
 	return &IBLT{
-		buckets: make([]Bucket, numBuckets),
-		k:       k,
-		seed:    seed,
+		buckets:  make([]Bucket, numBuckets),
+		k:        k,
+		seed:     seed,
+		schemeV2: ibltSchemeWord(),
 	}
 }
 
 // ---------------------------------------------------------------------------
-// — ARENA-BACKED IBLT (Zero-GC delta-generation hot path)
+// Arena-backed IBLT
 // ---------------------------------------------------------------------------
 //
-// NewArenaIBLT provisions an IBLT whose bucket array AND struct live in the
-// mmap'd HamtArena (off-heap, invisible to the Go GC), byte-faithful to the
-// allocVar/pushFreeVar pattern the HAMT wrapper already uses (allocHAMTWrapper
-// / freeHAMTWrapper). The buckets []Bucket backing memory is allocated via
-// arena.allocVar(numBuckets * sizeof(Bucket)) — one variable-size slab request
-// — and a Go slice header over that mmap region is reconstructed via
-// unsafe.Slice so the existing Insert/Peel/Subtract math (zero-alloc H2 FIX)
-// operates on off-heap bytes unchanged. The IBLT struct itself is allocated
-// from the arena too (a separate ~48-byte slab); the caller MUST invoke
-// IBLT.Release() when done so both slabs are routed back through EBR
-// RetireBlock for ABA-safe reclamation.
+// NewArenaIBLT allocates the table and its bucket backing store from arena.
+// unsafe.Slice exposes the off-heap bucket memory to the same Insert, Peel,
+// and Subtract operations used by heap tables. GenerateDelta uses this
+// constructor to keep digest generation off the Go heap; wire decoding and
+// strata estimation continue to use heap constructors.
 //
-// DO NOT use this constructor for the capnp roundtrip / chaos / strata
-// estimator paths: those keep the heap-allocating NewIBLT /
-// NewIBLTWithSeed signatures byte-identical. The Zero-GC migration is on the
-// GenerateDelta / GenerateDigestWithSeed HOT PATH ONLY.
-//
-// The constructor does NOT call Release on failure (panic on out-of-arena);
-// the caller MUST Release a successfully-returned IBLT.
+// A successful call transfers ownership to the caller, which must call Release
+// or ReleaseLocal before discarding the table. Exhaustion panics; the
+// constructor does not attempt to clean up a partially allocated table.
 func NewArenaIBLT(numBuckets int, k int, seed maphash.Seed, arena *HamtArena) *IBLT {
 	if k <= 0 || k > ibltMaxK {
 		panic(fmt.Sprintf("iblt: k=%d out of range [1, %d]", k, ibltMaxK))
@@ -121,22 +130,28 @@ func NewArenaIBLT(numBuckets int, k int, seed maphash.Seed, arena *HamtArena) *I
 	if arena == nil {
 		panic("iblt: NewArenaIBLT called with nil arena")
 	}
+	// The largest variable block provides 524,280 payload bytes after its
+	// header, exactly 21,845 Buckets. varSizeClassIndex clamps larger requests
+	// to that class, so allocVar would clear the requested length beyond the
+	// returned block and overwrite adjacent slabs. Callers handling remote
+	// sizes pass through ClampIBLTBuckets before reaching this constructor;
+	// this panic catches a caller that bypassed the clamp.
+	if numBuckets > MaxArenaIBLTBuckets {
+		panic(fmt.Sprintf("iblt: NewArenaIBLT numBuckets=%d exceeds the arena variable-block ceiling MaxArenaIBLTBuckets=%d (silent-overflow boundary, not OOM): internal misuse; remote-controlled sizes must be clamped via ClampIBLTBuckets first", numBuckets, MaxArenaIBLTBuckets))
+	}
 	if numBuckets <= 0 {
 		numBuckets = 0
 	}
 
-	// Allocate the IBLT struct itself from the arena (one slab class for the
-	// ~48-byte struct). allocVar pins the goroutine to the EBR epoch and falls
-	// back to the bump allocator if the slab freelist is empty.
+	// allocVar pins the goroutine to the EBR epoch and uses the bump allocator
+	// when no suitable freelist block is available.
 	structPayload := arena.allocVar(uintptr(unsafe.Sizeof(IBLT{})))
 	if structPayload == 0 {
 		panic("HamtArena: OOM — cannot allocate arena IBLT struct")
 	}
 	t := (*IBLT)(unsafe.Pointer(structPayload))
 
-	// Allocate the bucket array backing store from the arena. The 24 KB slab
-	// (1024 * 24B) lands in the existing power-of-2 freeHeads class computed by
-	// varSizeClassIndex; no new arena size class is introduced.
+	// The bucket array is one variable-sized arena allocation.
 	var bucketsPtr uintptr
 	var bucketsOffset uint64
 	if numBuckets > 0 {
@@ -148,23 +163,22 @@ func NewArenaIBLT(numBuckets int, k int, seed maphash.Seed, arena *HamtArena) *I
 		bucketsOffset = uint64(bucketsPtr - arena.base)
 	}
 
-	// Zero the struct + backing memory so no fieldnoise survives a slab
-	// recycle. The heap constructors got zeroed buckets from make(); the
-	// arena path MUST replicate that invariant (recycled slabs may carry
-	// stale bits).
+	// Heap allocation zeroes buckets; recycled arena memory needs the same
+	// initialization before use.
 	*t = IBLT{
 		k:                  k,
 		seed:               seed,
 		arenaRef:           arena,
 		arenaBucketsOffset: bucketsOffset,
 		arenaStructOffset:  uint64(structPayload - arena.base),
+		schemeV2:           ibltSchemeWord(),
 	}
 	if bucketsPtr != 0 {
 		// Build a Go slice header over the mmap'd bucket region. The slice
 		// points at the payload (past allocVar's 8-byte size-class header),
 		// which is the bucket array itself.
 		t.buckets = unsafe.Slice((*Bucket)(unsafe.Pointer(bucketsPtr)), numBuckets)
-		// Zero the recycled bucket memory (allocVar does NOT zero large
+		// Zero the recycled bucket memory (allocVar does not zero large
 		// variable payloads on the bump path for the heap constructors'
 		// `make([]Bucket, n)` zero semantics).
 		for i := range t.buckets {
@@ -174,13 +188,10 @@ func NewArenaIBLT(numBuckets int, k int, seed maphash.Seed, arena *HamtArena) *I
 	return t
 }
 
-// Release returns an arena-backed IBLT's struct + bucket slabs to the
-// HamtArena's EBR-deferred free-list. It is a no-op for heap-allocated IBLTs
-// (arenaRef == nil) so the capnp / chaos / strata paths that still use
-// NewIBLT/NewIBLTWithSeed are unaffected. The physical slab push happens only
-// after the global EBR epoch advances by 2 (RetireBlock), so a concurrent
-// reader pinned to an earlier epoch cannot observe a recycled bucket array
-// (ABA safety). After Release the caller MUST NOT touch the IBLT.
+// Release retires an arena-backed table's bucket and struct slabs through EBR.
+// Reuse waits for epoch advancement so readers pinned to an earlier epoch
+// cannot observe recycled memory. It is a no-op for heap tables. The caller
+// must not access the table after Release returns.
 func (t *IBLT) Release() {
 	if t == nil || t.arenaRef == nil {
 		return
@@ -199,29 +210,15 @@ func (t *IBLT) Release() {
 	t.buckets = nil
 }
 
-// ReleaseLocal returns an arena-backed IBLT's struct + bucket slabs DIRECTLY
-// to the HamtArena's variable-size freelist (pushFreeVar), WITHOUT routing
-// through EBR RetireBlock. It is the zero-RetiredNode-alloc sibling of Release
-// for slabs that NEVER cross goroutine boundaries — they are written by one
-// generator goroutine and read-only by that same goroutine's body before the
-// generator returns. EBR's epoch-deferred ABA protection exists for slabs that
-// a concurrent reader might still be walking; body-local slabs have no such
-// reader, so direct freelist reuse is ABA-safe AND zero-alloc (RetireBlock
-// otherwise pulls a RetiredNode from sync.Pool's retiredPool, which only
-// refills on AdvanceEpoch — the bench's GenerateDelta-only loop never advances
-// without the maybeAdvanceEpoch drain, so every RetireBlock would heap-alloc
-// a fresh RetiredNode, breaking the Zero-GC gate).
+// ReleaseLocal returns arena slabs directly to the variable-size freelist.
+// It is restricted to tables that remain within one goroutine for their whole
+// lifetime, where no concurrent reader can retain a pointer into the memory.
+// GenerateDelta uses it for its local digest and difference tables; slices
+// retained by a delta closure instead use Release and EBR.
 //
-// ReleaseLocal is used for the short-lived localDigest and diff IBLTs inside
-// GenerateDelta's body (mandate: these retire INSIDE the body). The
-// lifecycle slabs (sendKeys + shardRoots held by the lazy closure past the
-// body) still go through EBR RetireBlock via Release; they recycle through
-// the maybeAdvanceEpoch drain GenerateDelta adds at its tail.
-//
-// Like Release, ReleaseLocal is a no-op for heap-allocated IBLTs (arenaRef ==
-// nil) so the capnp / chaos / strata paths that still use NewIBLT /
-// NewIBLTWithSeed are byte-identical. After ReleaseLocal the caller
-// MUST NOT touch the IBLT.
+// Direct return avoids allocating a RetiredNode when epoch advancement is not
+// driving the retired-node pool. ReleaseLocal is a no-op for heap tables, and
+// the caller must not access the table after it returns.
 func (t *IBLT) ReleaseLocal() {
 	if t == nil || t.arenaRef == nil {
 		return
@@ -239,25 +236,57 @@ func (t *IBLT) ReleaseLocal() {
 	t.buckets = nil
 }
 
-// subtractArena produces an arena-backed diff of t minus other, mirroring
-// Subtract's math but provisioning the result IBLT (struct + bucket array)
-// from the supplied HamtArena instead of the Go heap. The returned *IBLT is
-// arena-backed and MUST be Release()'d by the caller (RetireBlock routes both
-// slabs back via the EBR epoch-deferred freelist).
+// MaxArenaIBLTBuckets is the number of Buckets that fit in the arena's largest
+// variable block after its 8-byte header: 524,280 / 24 = 21,845. Deriving the
+// bound with unsafe.Sizeof keeps it aligned with Bucket's in-memory layout.
+// NewArenaIBLT rejects larger requests because the allocator would otherwise
+// clear beyond the returned block.
+var MaxArenaIBLTBuckets = int((blockSizeForClass(numSizeClasses-1) - varAllocHeaderSize) / unsafe.Sizeof(Bucket{})) // == 21845
+
+// IBLTDigestDefaultBuckets is the bucket count used by the fixed-size digest
+// wrappers and the v1 wire path.
+const IBLTDigestDefaultBuckets = 1024
+
+// ClampIBLTBuckets bounds a digest size to [128, MaxArenaIBLTBuckets] before
+// arena allocation. Remote sizes reach it through GenerateDigestSizedWithSeed.
+// The lower bound preserves the full-keyset fallback for a one-bucket remote:
+// the locally clamped sizes differ, subtraction is rejected, and no partial
+// difference is returned.
 //
-// This is the arena-backed sibling of Subtract used by the GenerateDelta hot
-// path. Subtract's public signature and heap-allocating behavior are
-// preserved byte-identical for the capnp roundtrip / chaos / strata-estimator
-// consumers. Subtract's existing error-return shape is preserved here
-// (the Subtract contract never errors on byte-identical-size peers in
-// practice; the GenerateDelta hot path already ignores the error via
-// `diff, _:= localDigest.Subtract(remoteDigest)`).
+// At k=4, the 21,845-bucket ceiling corresponds to approximately 16,869
+// differences at the c4=1.295 transition, or 7,802 with the 2.8 sizing margin.
+// Larger differences require rateless, multi-frame continuation, which the
+// mesh transport does not currently provide.
+func ClampIBLTBuckets(n int) int {
+	if n < minDynamicBuckets {
+		return minDynamicBuckets
+	}
+	if n > MaxArenaIBLTBuckets {
+		return MaxArenaIBLTBuckets
+	}
+	return n
+}
+
+// digestSnapshotRestarts counts digest builds restarted after a shard root
+// changed between snapshot capture and verification. Sweep and responder
+// goroutines share the counter.
+var digestSnapshotRestarts atomic.Uint64
+
+// DigestSnapshotRestarts reports how many digest builds detected a concurrent
+// write and restarted from a new set of shard roots. A quiescent build does
+// not increment the counter.
+func DigestSnapshotRestarts() uint64 { return digestSnapshotRestarts.Load() }
+
+// subtractArena subtracts other from t and allocates the result from arena.
+// The caller owns the returned table and must release it. GenerateDelta uses
+// this path to avoid heap allocation; public Subtract retains its heap result.
 func (t *IBLT) subtractArena(other *IBLT, arena *HamtArena) *IBLT {
-	if len(t.buckets) != len(other.buckets) || t.k != other.k {
-		// Configuration mismatch — fall back to the heap Subtract shape so
-		// neither this hot path nor Subtract's contract diverges on the
-		// error branch. The GenerateDelta caller already tolerates a nil
-		// diff via its `if diff != nil` peel guard.
+	// Different sizes, k values, or placement schemes cannot be subtracted:
+	// common keys would not cancel, and peeling would produce invalid output.
+	// Delegate the mismatch to Subtract, whose nil result selects the
+	// full-keyset fallback in GenerateDelta.
+	if len(t.buckets) != len(other.buckets) || t.k != other.k || t.schemeV2 != other.schemeV2 {
+		// Keep the mismatch behavior identical to public Subtract.
 		diff, _ := t.Subtract(other)
 		return diff
 	}
@@ -286,29 +315,35 @@ func (t *IBLT) K() int {
 	return t.k
 }
 
-// ibltMaxK is the compile-time cap on the number of hash functions (k) used by
-// any IBLT instance. The peer-reconciliation workloads in this engine use k in
-// {3, 4} (see strataK=3 and the ADR-5 reconciliation k=4). Cap = 8 gives two
-// doublings of headroom at zero memory cost: callers pass a *stack* array of
-// exactly this size and H2 FIX makes Insert/Peel allocation-free.
-//
-// NewIBLT panics if k > ibltMaxK, gating misuse at construction (defensive —
-// the engine never constructs an IBLT above).
+// ibltMaxK bounds the stack array used for bucket indices. Reconciliation uses
+// k=3 or k=4; the cap of 8 leaves room for larger wire values without adding a
+// heap allocation to Insert or Peel. Constructors reject values outside it.
 const ibltMaxK = 8
 
-// hashKeyWithSeed computes the 64-bit primary double-hash seed for `key`
-// under this IBLT's seed, plus the h2 odd secondary hash. Pure value math,
-// zero heap allocation; the indices table is filled by the caller into its
-// own stack array via getHashesInto.
+// hashKeyWithSeed returns the primary hash and the two values used for v1
+// arithmetic-progression placement. It applies the splitmix64 finalizer to the
+// key and the seed's serialized backing word, with no heap allocation.
+//
+// A runtime maphash hasher is unsuitable here because it incorporates
+// per-process state: peers using the same wire seed would place a common key
+// in different buckets, preventing subtraction from cancelling it. Before the
+// deterministic hash, 20 sampled cross-process exchanges all returned the full
+// 10,000-key set to peers that already held those keys. Using SeedToUint64
+// makes placement a pure function of the transmitted key and seed word.
+//
+// The primary hash also feeds HashSum, and isPure recomputes this function.
+// The wire carries the seed and buckets, not a hash-function identifier.
 func (t *IBLT) hashKeyWithSeed(key uint64) (primaryHash, h1, h2, n uint64) {
-	var h maphash.Hash
-	h.SetSeed(t.seed)
-
-	var keyBytes [8]byte
-	binary.LittleEndian.PutUint64(keyBytes[:], key)
-	h.Write(keyBytes[:])
-
-	primaryHash = h.Sum64()
+	// Key the finalizer by the seed's wire word so two processes hashing the
+	// same (key, seedWord) agree byte-for-byte. The golden-ratio multiplier
+	// decorrelates distinct seeds; splitmix64 avalanches the sum.
+	x := key + SeedToUint64(t.seed)*0x9E3779B97F4A7C15
+	x ^= x >> 30
+	x *= 0xBF58476D1CE4E5B9
+	x ^= x >> 27
+	x *= 0x94D049BB133111EB
+	x ^= x >> 31
+	primaryHash = x
 	// Use upper and lower 32 bits as two independent hash functions.
 	h1 = primaryHash
 	// Ensure h2 is odd so it is relatively prime to power-of-2 table sizes.
@@ -317,24 +352,48 @@ func (t *IBLT) hashKeyWithSeed(key uint64) (primaryHash, h1, h2, n uint64) {
 	return primaryHash, h1, h2, n
 }
 
-// getHashesInto fills out[:t.k] with the k bucket indices for `key` and returns
-// the primary hash. H2 FIX (Zero-GC): the caller passes a STACK-allocated
-// *[ibltMaxK]int — the function never heap-allocates. This is the
-// allocation-free replacement for the old getHashes() that did
-// `make([]int, t.k)` per Insert and per Peel cascade step, which had put a
-// heap allocation on the CRDT digest/delta hot path that SUPREMUM_STYLE §1
-// forbids.
+// getHashesInto writes the key's k bucket indices to the caller's stack array
+// and returns the primary hash used in HashSum. Insert, Peel, and isPure share
+// this placement function.
 func (t *IBLT) getHashesInto(out *[ibltMaxK]int, key uint64) (hashSum uint64) {
 	primaryHash, h1, h2, n := t.hashKeyWithSeed(key)
+	if t.schemeV2 == 0 {
+		// v1 uses an arithmetic progression derived from h1 and odd h2.
+		for i := 0; i < t.k; i++ {
+			out[i] = int((h1 + uint64(i)*h2) % n)
+		}
+		return primaryHash
+	}
+	// A v1 index set is determined by (h1 mod n, h2 mod n), approximately
+	// n²/4 possibilities. Two difference keys therefore share all k cells
+	// with probability about 4/n², independent of k; at n=1024 that floor is
+	// 2^-18 and does not recede when n grows proportionally to the difference.
+	//
+	// v2 applies splitmix64 separately for each index. This models the pair-
+	// collision floor as n^-k (2^-40 at n=1024, k=4), leaving the 2-core
+	// threshold as the binding constraint: peeling succeeds with high
+	// probability when n > c_k*d, with c4=1.295 (Goodrich–Mitzenmacher,
+	// Theorem 1). These deterministic rounds are not proven k-wise
+	// independent, so the Monte Carlo tests measure the finite-size behavior
+	// rather than assuming the asymptotic model.
+	//
+	// Disjoint 16-bit fields would be cheaper but require a power-of-two table
+	// and collapse indices above k=4 to bucket zero. Wire decoding accepts k
+	// through 8, so those fields are not a suitable replacement.
 	for i := 0; i < t.k; i++ {
-		out[i] = int((h1 + uint64(i)*h2) % n)
+		x := primaryHash + (uint64(i)+1)*0x9E3779B97F4A7C15
+		x ^= x >> 30
+		x *= 0xBF58476D1CE4E5B9
+		x ^= x >> 27
+		x *= 0x94D049BB133111EB
+		x ^= x >> 31
+		out[i] = int(x % n)
 	}
 	return primaryHash
 }
 
-// getHashes is kept for external test consumers; the hot path uses
-// getHashesInto. It allocates once (make([]int, t.k)) and is therefore NOT on
-// the CRDT hot path.
+// getHashes returns an allocated index slice for tests and diagnostic callers.
+// Reconciliation uses getHashesInto with stack storage instead.
 func (t *IBLT) getHashes(key uint64) ([]int, uint64) {
 	var scratch [ibltMaxK]int
 	hashSum := t.getHashesInto(&scratch, key)
@@ -347,7 +406,7 @@ func (t *IBLT) getHashes(key uint64) ([]int, uint64) {
 // Each of the k hash functions increments Count, XORs the key into KeySum,
 // and XORs the key's hash into HashSum for the corresponding bucket.
 func (t *IBLT) Insert(key uint64) {
-	// H2 FIX (Zero-GC): stack-allocated indices — no make() per Insert.
+	// Stack-allocated indices — no make() per Insert.
 	var indices [ibltMaxK]int
 	hashSum := t.getHashesInto(&indices, key)
 	for i := 0; i < t.k; i++ {
@@ -360,7 +419,7 @@ func (t *IBLT) Insert(key uint64) {
 
 // Delete removes a key from the IBLT (inverse of Insert).
 func (t *IBLT) Delete(key uint64) {
-	// H2 FIX (Zero-GC): stack-allocated indices — no make() per Delete.
+	// Stack-allocated indices — no make() per Delete.
 	var indices [ibltMaxK]int
 	hashSum := t.getHashesInto(&indices, key)
 	for i := 0; i < t.k; i++ {
@@ -371,16 +430,19 @@ func (t *IBLT) Delete(key uint64) {
 	}
 }
 
-// Subtract mathematically diffs two IBLTs. The resulting IBLT contains ONLY
+// Subtract mathematically diffs two IBLTs. The resulting IBLT contains only
 // the transactions that differ between the local and remote nodes.
 //
 // For each bucket i:
-// - Diff.Count[i] = A.Count[i] - B.Count[i]
-// - Diff.KeySum[i] = A.KeySum[i] ^ B.KeySum[i]
-// - Diff.HashSum[i] = A.HashSum[i] ^ B.HashSum[i]
+//   - Diff.Count[i]   = A.Count[i]   - B.Count[i]
+//   - Diff.KeySum[i]  = A.KeySum[i]  ^ B.KeySum[i]
+//   - Diff.HashSum[i] = A.HashSum[i] ^ B.HashSum[i]
 func (t *IBLT) Subtract(other *IBLT) (*IBLT, error) {
-	if len(t.buckets) != len(other.buckets) || t.k != other.k {
-		return nil, errors.New("IBLT configurations must match perfectly")
+	// The scheme-mismatch reject (the subtractArena sibling — see its
+	// comment; never subtract a v1 table against a v2 table, in-process or
+	// cross-process).
+	if len(t.buckets) != len(other.buckets) || t.k != other.k || t.schemeV2 != other.schemeV2 {
+		return nil, errors.New("IBLT configurations must match perfectly (bucket count, k, and digest scheme: cannot subtract a v1 double-hash table against a v2 k-decorrelated table)")
 	}
 
 	diff := NewIBLTWithSeed(len(t.buckets), t.k, t.seed)
@@ -401,19 +463,17 @@ func isPureCount(count int32) bool {
 	return count == 1 || count == -1
 }
 
-// isPure verifies if a bucket contains exactly one uncollided key.
-// A bucket is pure when:
-// - Count is exactly +1 (local has, remote doesn't) or -1 (remote has, local doesn't)
-// - The hash of KeySum matches HashSum (cryptographic purity verification)
-//
-// The mathematical guarantee of 0.00% false positives hinges on this logic.
+// isPure reports whether idx is a usable singleton bucket. Count must be +1
+// (local-only) or -1 (remote-only), and hashing KeySum must reproduce HashSum.
+// The hash check rejects count collisions except when their hashes also
+// collide; Peel still verifies that every bucket is empty before succeeding.
 func (t *IBLT) isPure(idx int) bool {
 	b := t.buckets[idx]
 	if b.Count != 1 && b.Count != -1 {
 		return false
 	}
 
-	// H2 FIX (Zero-GC): stack-allocated indices; only the hash is consumed.
+	// Stack-allocated indices; only the hash is consumed.
 	var scratch [ibltMaxK]int
 	expectedHash := t.getHashesInto(&scratch, b.KeySum)
 	return b.HashSum == expectedHash
@@ -421,9 +481,9 @@ func (t *IBLT) isPure(idx int) bool {
 
 // Peel extracts the exact symmetric difference via cascading avalanche logic.
 // It returns:
-// - localHas: keys present locally but missing on the remote peer (Count == +1)
-// - remoteHas: keys present on the remote peer but missing locally (Count == -1)
-// - error: ErrIncompletePeel if the difference exceeds the table's capacity
+//   - localHas:  keys present locally but missing on the remote peer (Count == +1)
+//   - remoteHas: keys present on the remote peer but missing locally (Count == -1)
+//   - error:     ErrIncompletePeel if the difference exceeds the table's capacity
 //
 // The peeling process is deterministic: removing a pure bucket's key from all
 // k connected buckets un-collides adjacent buckets, triggering a cascade that
@@ -432,13 +492,9 @@ func (t *IBLT) Peel() ([]uint64, []uint64, error) {
 	var localHas []uint64
 	var remoteHas []uint64
 
-	// H3 FIX: the previous `pureQueue = pureQueue[1:]` was an O(n) memmove of
-	// the slice header per dequeue, making the peeling cascade O(n^2) in the
-	// worst case. Replace with an index-based drain over the slice: dequeue
-	// advances a head counter and we compact only when the head reaches the
-	// midpoint, so every element is moved at most once across the whole peel.
-	// The pureQueue itself is still heap-allocated (it escapes to the caller's
-	// result), but it is O(|d|), not O(buckets), and the per-step dequeue is O(1).
+	// A head index provides constant-time dequeue without reslicing away the
+	// consumed prefix. Periodic compaction reclaims that prefix once at least
+	// half the queue has been consumed.
 	pureQueue := make([]int, 0, len(t.buckets)/4)
 	head := 0 // index of the next pure bucket to peel
 
@@ -449,8 +505,8 @@ func (t *IBLT) Peel() ([]uint64, []uint64, error) {
 		}
 	}
 
-	// The Peeling Avalanche. Each cascade step uses a stack-allocated index
-	// array (H2 FIX) — no make([]int, t.k) per step.
+	// Each cascade step uses a stack-allocated index array — no
+	// make([]int, t.k) per step.
 	for head < len(pureQueue) {
 		idx := pureQueue[head]
 		head++
@@ -461,7 +517,7 @@ func (t *IBLT) Peel() ([]uint64, []uint64, error) {
 		if !isPureCount(b.Count) {
 			continue
 		}
-		// Re-verify the cryptographic purity check now (cheap hash only).
+		// Check HashSum as well as the count before decoding the key.
 		if !t.isPure(idx) {
 			continue
 		}
@@ -492,9 +548,8 @@ func (t *IBLT) Peel() ([]uint64, []uint64, error) {
 			}
 		}
 
-		// Compaction: avoid unbounded queue growth by reclaiming the head
-		// once it reaches half the queue. Each element is moved at most one
-		// extra time across the entire peel, so the total work stays O(|d|).
+		// Compaction reclaims the consumed prefix. Copying is amortized over
+		// queue entries, and ordinary dequeues remain constant-time.
 		if head >= 16 && head*2 >= len(pureQueue) {
 			n := copy(pureQueue, pureQueue[head:])
 			pureQueue = pureQueue[:n]
@@ -512,36 +567,23 @@ func (t *IBLT) Peel() ([]uint64, []uint64, error) {
 	return localHas, remoteHas, nil
 }
 
-// PeelArena is the arena-backed sibling of Peel: the result slices (localHas,
-// remoteHas) and the internal pureQueue are provisioned from the supplied
-// HamtArena instead of grown via make/append on the Go heap. The math is
-// byte-identical to Peel (it walks the same peeling cascade, uses the same
-// H2 stack-allocated index array, the same H3 compaction). Only the backing
-// store of the three escaped slices changes. The caller MUST retire the
-// returned slices via the owning arena (RetireBlock on their offsets) or
-// retain them for the lifetime of the consumer (GenerateDelta sorts localHas
-// in place into the send-key set and retires it on CRDTDelta.Release).
+// PeelArena performs Peel with arena backing for localHas, remoteHas, and the
+// pure-bucket queue. It returns arena offsets alongside the result slices so
+// the caller can retire their storage. GenerateDelta retains localHas in the
+// delta and releases it with CRDTDelta.Release; the other paths use heap Peel.
 //
-// Bounding: localHas and remoteHas are each upper-bounded by numBuckets (each
-// pure bucket yields one key); pureQueue is upper-bounded by numBuckets
-// (each bucket may enqueue once). The arena slabs are sized at those upper
-// bounds; the returned slices are sliced to their actual length./
-// mandate: the bench reads these as ZERO Go-heap allocs because the backing
-// memory is mmap'd (allocVar), invisible to -benchmem.
-//
-// DO NOT use PeelArena for the capnp/chaos/strata paths: those keep
-// the heap-allocating Peel signature byte-identical.
+// Arena exhaustion falls back to heap Peel and returns zero offsets. On arena
+// success the returned slices use the allocated capacity directly, keeping
+// result growth off the Go heap.
 func (t *IBLT) PeelArena(arena *HamtArena) (localHas, remoteHas []uint64, localHasOffset, remoteHasOffset, pureQueueOffset uint64, err error) {
 	n := len(t.buckets)
-	// Upper-bounded arena slabs; zero Go-heap allocs. Each slice is given the
-	// FULL arena-backed capacity (unsafe.Slice(ptr, n)[:0:n]) so append() uses
-	// the in-place mmap backing and never grows the slice on the Go heap.
+	// Preallocate n slots for each slice so ordinary result growth uses arena
+	// memory rather than the Go heap. Returned lengths reflect decoded keys.
 	localBacking := arena.allocVar(uintptr(n) * unsafe.Sizeof(uint64(0)))
 	remoteBacking := arena.allocVar(uintptr(n) * unsafe.Sizeof(uint64(0)))
 	queueBacking := arena.allocVar(uintptr(n) * unsafe.Sizeof(int(0)))
 	if localBacking == 0 || remoteBacking == 0 || queueBacking == 0 {
-		// OOM — fall back to the heap Peel so the (already-impossible-on-a-
-		// 2GiB-bench-arena) error path does not panic the engine.
+		// Arena exhaustion uses the heap implementation rather than panicking.
 		l, r, e := t.Peel()
 		return l, r, 0, 0, 0, e
 	}
@@ -612,21 +654,14 @@ func (t *IBLT) PeelArena(arena *HamtArena) (localHas, remoteHas []uint64, localH
 }
 
 // ---------------------------------------------------------------------------
-// ADR 5: Stratified Invertible Bloom Lookup Trees (S-IBLT)
+// Stratified Invertible Bloom Lookup Trees
 // ---------------------------------------------------------------------------
 //
-// Standard IBLTs fail catastrophically when |d| exceeds the bucket count.
-// The Strata Estimator solves this by partitioning elements into log2(U)
-// strata based on trailing zeros in their hash. Each stratum holds a small
-// fixed-size IBLT (strataIBLTBuckets=80, k=3).
-//
-// Estimation protocol:
-// 1. Both peers exchange StrataEstimators (~50KB each)
-// 2. Subtract stratum-by-stratum from highest to lowest
-// 3. First failing stratum s yields estimate: count × 2^(s+1)
-// 4. Dynamically size the reconciliation IBLT at 1.5 × d_est
-//
-// Communication complexity: O(d × log(d)) instead of O(n)
+// StrataEstimator partitions keys by trailing zeros in their hash. Each
+// stratum holds an 80-bucket, k=3 IBLT. Peers subtract strata from highest to
+// lowest; the first stratum that cannot peel supplies the scale for an
+// estimate of the symmetric difference. DynamicIBLTSize then applies a 1.5
+// sizing factor for reconciliation.
 
 const (
 	// strataCount is the number of strata. For a 64-bit hash space,
@@ -640,26 +675,24 @@ const (
 	// strataK is the number of hash functions per stratum IBLT.
 	strataK = 3
 
-	// ibltSafetyFactor is the multiplier applied to d_est for the final IBLT.
-	// 1.5× provides ample margin for reliable peeling (literature standard).
+	// ibltSafetyFactor is 3/2: DynamicIBLTSize allocates 1.5 buckets per
+	// estimated difference before applying the minimum bucket floor.
 	ibltSafetyFactor = 3 // numerator; divided by 2 → 1.5×
 
 	// minDynamicBuckets is the floor for dynamically-sized IBLTs.
 	minDynamicBuckets = 128
 )
 
-// StrataEstimator partitions the key space into strata by trailing zero count.
-// Each stratum contains a small, fixed-size IBLT.
-//
-// Memory layout: fixed array of 32 IBLTs, each 80 buckets × 20 bytes = 51.2KB total.
-// No heap growth — the array is sized at construction and never resized.
+// StrataEstimator partitions keys by trailing-zero count. It contains 32
+// independently allocated IBLTs of 80 in-memory Buckets each; construction
+// allocates the full structure and later inserts do not resize it.
 type StrataEstimator struct {
 	strata [strataCount]*IBLT
 	seed   maphash.Seed
 }
 
 // NewStrataEstimator creates a new estimator with the given hash seed.
-// Both peers MUST use the same seed for subtraction to work.
+// Both peers must use the same seed for subtraction to work.
 func NewStrataEstimator(seed maphash.Seed) *StrataEstimator {
 	se := &StrataEstimator{seed: seed}
 	for i := 0; i < strataCount; i++ {
@@ -705,17 +738,12 @@ func trailingZeros64(x uint64) int {
 	return table[((x&-x)*deBruijn)>>58]
 }
 
-// Estimate computes an unbiased estimate of the symmetric difference |d|
-// between the local and remote datasets by subtracting the remote estimator.
-//
-// Algorithm:
-// 1. Iterate from the highest stratum (most sparse) to the lowest
-// 2. Subtract each stratum's IBLT and attempt to peel
-// 3. Accumulate successfully decoded elements
-// 4. The first stratum that fails to peel → estimate = count × 2^(s+1)
-//
-// If all strata peel successfully, the estimate is the exact count.
-// Communication: O(strataCount × strataIBLTBuckets × 20) = ~50KB
+// Estimate estimates the symmetric-difference size by subtracting remote's
+// strata from highest to lowest. It accumulates decoded keys until a stratum
+// cannot peel, then scales the partial count by 2^(s+1) for that stratum's
+// sampling probability. If every stratum peels, it returns the exact count.
+// Exchanging an estimator costs strataCount × strataIBLTBuckets × 20 wire
+// bytes, excluding headers.
 func (se *StrataEstimator) Estimate(remote *StrataEstimator) int {
 	var count int
 
@@ -740,11 +768,10 @@ func (se *StrataEstimator) Estimate(remote *StrataEstimator) int {
 	return count
 }
 
-// DynamicIBLTSize computes the optimal IBLT bucket count from a strata estimate.
-// Uses 1.5× safety factor (3/2) with a minimum floor of minDynamicBuckets.
-// O(1) — pure integer arithmetic.
+// DynamicIBLTSize applies the 1.5 sizing factor to a strata estimate and
+// returns at least minDynamicBuckets.
 func DynamicIBLTSize(dEst int) int {
-	// buckets = max(minDynamicBuckets, ceil(d_est × 1.5))
+	// Integer arithmetic truncates dEst*3/2 before applying the lower bound.
 	size := (dEst * ibltSafetyFactor) / 2
 	if size < minDynamicBuckets {
 		return minDynamicBuckets

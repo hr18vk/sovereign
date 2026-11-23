@@ -7,45 +7,44 @@
 package chaos
 
 // ---------------------------------------------------------------------------
-// §2 — End-to-end SIGSEGV survival gate.
+// End-to-end SIGSEGV survival gate.
 // ---------------------------------------------------------------------------
 //
-// Ruthless Go Engine Verification Blueprint, §2, mandate:
-// "The supervisor identifies the dead connection [worker], recovers the
-// persistent database state via the write-ahead log, and spins up a
-// pristine worker engine. This entire recovery cycle must execute without
-// ever dropping the active HTTP connections."
+// The supervisor identifies the dead worker, recovers the persistent database
+// state via the write-ahead log, and spins up a pristine worker engine. This
+// entire recovery cycle must execute without ever dropping the active HTTP
+// connections.
 //
-// This test proves ALL THREE properties at once, end-to-end:
+// This test proves three properties at once, end-to-end:
 //
-// (1) REAL OFF-HEAP SIGSEGV: the worker child, on OpCrashProbe, runs
-// WorkerExecuteCrashProbe — which corrupts an off-heap child pointer in
-// its mmap'd arena and dereferences an unmapped address. The worker is
-// a SEPARATE PROCESS, so recover() in the supervisor cannot save it; the
-// child dies and its stdout pipe closes.
+//   (1) Off-heap SIGSEGV: the worker child, on OpCrashProbe, runs
+//       WorkerExecuteCrashProbe — which corrupts an off-heap child pointer in
+//       its mmap'd arena and dereferences an unmapped address. The worker is
+//       a separate process, so recover() in the supervisor cannot save it; the
+//       child dies and its stdout pipe closes.
 //
-// (2) WAL RECOVERY: the supervisor observes the stdout EOF, spawns a PRISTINE
-// worker that boots by replaying the WAL, and asserts the recovered
-// Merkle root equals the pre-crash root (crash-consistency, not just
-// liveness). This is the TestWALRecoveryDeterminism property
-// exercised through the real fork+exec path.
+//   (2) WAL recovery: the supervisor observes the stdout EOF, spawns a pristine
+//       worker that boots by replaying the WAL, and asserts the recovered
+//       Merkle root equals the pre-crash root (crash-consistency, not just
+//       liveness). This is the WAL recovery determinism property exercised
+//       through the real fork+exec path.
 //
-// (3) NO DROPPED CONNECTION: the test owns a real net.Listener BEFORE any
-// worker is spawned and accepts a TCP connection on it. That connection
-// is independent of the worker process: the supervisor never hands its
-// listener or sockets to the child. The test pings the connection, drives
-// the crash+recovery, then pings the SAME connection again — a dropped
-// connection would fail the second ping.
+//   (3) No dropped connection: the test owns a real net.Listener before any
+//       worker is spawned and accepts a TCP connection on it. That connection
+//       is independent of the worker process: the supervisor never hands its
+//       listener or sockets to the child. The test pings the connection, drives
+//       the crash and recovery, then pings the same connection again — a dropped
+//       connection would fail the second ping.
 //
-// HONESTY ON A SUBTLETY:
-// the design doc's invariant is structurally about the supervisor OWNING the
-// listener so a child death cannot take client sockets with it. This test
-// owns the listener in the test process (a faithful stand-in) and proves the
-// socket survives the child crash. It does NOT prove the supervisor code in
-// supervisor.go itself owns a listener — supervisor.go is listener-agnostic by
-// design so it is reusable behind any front-end. The two facts compose: the
-// supervisor keeps the worker recovered; whoever owns the listener (here the
-// test, in prod the daemon's front-end) keeps the sockets open.
+// On a subtlety:
+//   The invariant is structurally about the supervisor owning the listener so a
+//   child death cannot take client sockets with it. This test owns the listener
+//   in the test process (a faithful stand-in) and proves the socket survives
+//   the child crash. It does not prove the supervisor code in supervisor.go
+//   itself owns a listener — supervisor.go is listener-agnostic by design so it
+//   is reusable behind any front-end. The two facts compose: the supervisor
+//   keeps the worker recovered; whoever owns the listener (here the test, in
+//   prod the daemon's front-end) keeps the sockets open.
 // ---------------------------------------------------------------------------
 
 import (
@@ -57,12 +56,12 @@ import (
 	"time"
 )
 
-// TestSIGSEGVSurvival is the §2 gate. See the file doc above for
-// the three properties it proves simultaneously.
+// TestSIGSEGVSurvival is the end-to-end SIGSEGV survival gate. See the file
+// documentation above for the three properties it proves simultaneously.
 func TestSIGSEGVSurvival(t *testing.T) {
 	// This gate spawns and SIGSEGV-crashes an external `chaos-worker` binary
 	// and proves the supervisor recovers the connection via WAL replay. The
-	// `chaos-worker` binary is intentionally excluded from the open-source
+	// `chaos-worker` binary is intentionally excluded from the source-available
 	// core library release (it is a thin process-isolation harness around the
 	// C-space allocator, not a library concern). The gate is therefore
 	// *conditionally skipped* rather than disabled: a maintainer or CI job
@@ -70,21 +69,21 @@ func TestSIGSEGVSurvival(t *testing.T) {
 	// witness. This is the standard pattern for external-binary gates and
 	// preserves the gate as a runnable witness instead of silencing it.
 	if os.Getenv("CHAOS_WORKER_BIN") == "" {
-		t.Skip("set CHAOS_WORKER_BIN to the built chaos-worker binary to enable this gate; the binary is intentionally excluded from the open-source core library release")
+		t.Skip("set CHAOS_WORKER_BIN to the built chaos-worker binary to enable this gate; the binary is intentionally excluded from the source-available core library release")
 	}
 
 	if testing.Short() {
-		t.Skip("§2 survival test spawns a child process; skip in -short")
+		t.Skip("survival test spawns a child process; skip in -short")
 	}
 
 	// (a) Build the chaos-worker binary into a temp path so the supervisor
-	// spawns a real, freshly-compiled child. The build is done ONCE per test
-	// process via sync.Once through buildWorkerBinary.
+	// spawns a real, freshly-compiled child. buildWorkerBinary builds the binary
+	// into a temp dir and is called once in this test, with no sync-once mechanism.
 	workerBin := buildWorkerBinary(t)
 	t.Setenv("CHAOS_WORKER_BIN", workerBin)
 
 	// (b) A supervisor-owned listener stand-in: the test owns this listener
-	// BEFORE the worker exists, accepts a connection, and proves it survives
+	// before the worker exists, accepts a connection, and proves it survives
 	// the crash + recovery cycle. A dropped connection fails the post-recovery
 	// ping.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -156,7 +155,7 @@ func TestSIGSEGVSurvival(t *testing.T) {
 		t.Fatalf("fresh boot root non-zero: %x", root)
 	}
 
-	// (e) An active "connection liveness" probe that must succeed BOTH before
+	// (e) An active "connection liveness" probe that must succeed both before
 	// and after the crash+recovery cycle.
 	ping := func(label string) {
 		pingBuf := []byte("ALIVE")
@@ -205,12 +204,12 @@ func TestSIGSEGVSurvival(t *testing.T) {
 	}
 	t.Logf("recovered: root=%x lamport=%d", recRoot, recLamport)
 	if recRoot != preCrashRoot {
-		t.Fatalf("CRASH-CONSISTENCY BROKEN: recovered root %x != pre-crash %x\n"+
+		t.Fatalf("crash-consistency broken: recovered root %x != pre-crash %x\n"+
 			"The worker survived but the acknowledged state diverged — recovery is data-lossy.",
 			recRoot, preCrashRoot)
 	}
 
-	// (h) The connection-survival proof: the SAME active connection must still
+	// (h) The connection-survival proof: the same active connection must still
 	// answer. A dropped client socket fails here. Hold it across the whole
 	// crash+recovery window.
 	pong := make(chan struct{})
@@ -221,12 +220,12 @@ func TestSIGSEGVSurvival(t *testing.T) {
 	select {
 	case <-pong:
 	case <-time.After(10 * time.Second):
-		t.Fatal("post-crash ping timed out — active connection was NOT preserved across recovery")
+		t.Fatal("post-crash ping timed out — active connection was not preserved across recovery")
 	}
 }
 
-// lastAckNodeIDfallsBack returns the current ack root + lamport. Named to avoid
-// collision with the engsync-aliased sync import in this file.
+// lastAckNodeIDfallsBack returns the current ack root and counter under s.mu
+// with t.Helper().
 func (s *Supervisor) lastAckNodeIDfallsBack(t *testing.T) ([32]byte, uint64) {
 	t.Helper()
 	s.mu.Lock()
@@ -234,9 +233,8 @@ func (s *Supervisor) lastAckNodeIDfallsBack(t *testing.T) ([32]byte, uint64) {
 	return s.lastAckRoot, s.lastAckCounter
 }
 
-// buildWorkerBinaryOnce guards the single build of the chaos-worker binary.
-// Migrated to TestMain-level build via sync.Once wrapper so parallel subtests
-// don't each recompile; for the single survival test it's a one-shot compile.
+// buildWorkerBinary builds the chaos-worker binary into a temp directory.
+// It is called once in this test; there is no sync-once or TestMain build.
 func buildWorkerBinary(t *testing.T) string {
 	t.Helper()
 	binPath := filepath.Join(t.TempDir(), "chaos-worker-test")
@@ -260,7 +258,7 @@ func moduleRoot(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	// cwd is.../internal/chaos; module root is...
+	// cwd is .../internal/chaos; module root is ...
 	dir := cwd
 	for i := 0; i < 4; i++ {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {

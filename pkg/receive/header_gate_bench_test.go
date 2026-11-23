@@ -13,37 +13,34 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// — RE-MEASURED RATIO (the change's headline output)
-//
-// This file re-runs the 3.5b Shape B reject benches against the v3 receiver
-// and reports the new accept/reject ratio as a MEASURED number. The 3.5b
-// bench MEASURED ~300x (the reject-path floor was a ~1 us capnp decode in
+// This file re-runs the Shape B reject benchmarks against the v3 receiver
+// and reports the new accept/reject ratio. The Shape B benchmarks measured
+// approximately 300x (the reject-path floor was a ~1 µs capnp decode in
 // readGateFields); the v3 lift moves the gate fields to the header, so the
-// reject-path floor drops to two fixed-offset slice reads (tens of ns). The
-// track's job is to convert "~300x" into a new measured figure; whether it is
-// ~500x or hits ~1000x is a NUMBER this box PRODUCES, not one this doc
-// predicts. If the new ratio is, say, only 400x because UnmarshalRelayEnvelope's
-// parsing cost now dominates the reject path, that is the honest finding —
-// reported, not goalpost-tuned.
+// reject-path floor drops to two fixed-offset slice reads (tens of ns).
+// Whether the new ratio is ~500x or ~1000x is a number the benchmarks produce,
+// not one this comment predicts. If the ratio is only 400x because
+// UnmarshalRelayEnvelope's parsing cost now dominates the reject path, that
+// is the finding — reported, not goalpost-tuned.
 //
-// The benches drive the FULL HandleFrame composition over v3 frames (built via
-// benchBuildFrame, which now binds the v3 header mirrors). They do NOT bypass
-// HandleFrame (§0: a test that drives gates directly is BANNED). The cheap
-// rejects MUST run against the HEADER dotCounter (the v3 mirror), NOT a capnp
-// decode — asserted by the in-body VerifyHookCount==0 check ().
+// The benchmarks drive the full HandleFrame composition over v3 frames (built
+// via benchBuildFrame, which binds the v3 header mirrors). They do not bypass
+// HandleFrame; a test that drives gates directly is not representative. The
+// cheap rejects must run against the header dotCounter (the v3 mirror), not a
+// capnp decode — asserted by the in-body VerifyHookCount==0 check.
 //
-// GEAR TAG (HONEST): _4c. This box is GOMAXPROCS=4, CPU part 0xd40
-// (Graviton3-era). It is NOT c8g.8xlarge at 32c. The "_4c" suffix is the
-// HONEST gear tag; the 32c figures cited separately are PROVEN
-// publication numbers, NOT a 4c re-measurement.
+// Gear tag: _4c. This box runs GOMAXPROCS=4 on a CPU part 0xd40
+// (Graviton3-era). It is not a c8g.8xlarge at 32 cores. The "_4c" suffix is
+// the gear tag; the 32-core figures cited separately are the proven
+// publication numbers from the 32-core benchmark, not a 4-core re-measurement.
 // ---------------------------------------------------------------------------
 
-// BenchmarkDropDepth_4c re-measures the depth-exceed drop path against
-// the v3 receiver: a 3-hop frame under a 30us budget (MaxHopsForBudget=0) is
-// dropped at the 3.2 depth check with ZERO Verify calls. The v3 lift does NOT
-// change the depth path's cost (the depth check reads the hop count, not the
-// gate fields), so this bench is the control: it should match the 3.5b
-// DropDepth figure within noise. The headline is the rate/clock benches below
+// BenchmarkDropDepth_4c measures the depth-exceed drop path against the v3
+// receiver: a 3-hop frame under a 30 µs budget (MaxHopsForBudget=0) is dropped
+// at the depth check with zero Verify calls. The v3 lift does not change the
+// depth path's cost (the depth check reads the hop count, not the gate fields),
+// so this benchmark is the control: it should match the previous DropDepth
+// figure within noise. The headline is the rate and clock benchmarks below
 // (those are the paths the v3 header read accelerates).
 func BenchmarkDropDepth_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
@@ -67,20 +64,20 @@ func BenchmarkDropDepth_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf(": depth reject must issue ZERO Verify calls under bench load, got %d", got)
+		b.Fatalf("depth reject must issue zero Verify calls under bench load, got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
 	}
 }
 
-// BenchmarkDropRate_4c re-measures the rate-exceed drop path against
-// the v3 receiver: a MaxUint64 header dotCounter drains the peer bucket to 0,
-// so Accept returns Drop BEFORE Open (zero Verifies). The v3 lift accelerates
-// THIS path: the rate gate reads the HEADER dotCounter (O(1)), not a capnp
-// decode, so the reject-path floor drops from ~1 us to tens of ns. The
-// reported frames/sec is the v3 number; the ratio vs Shape A accept is the
-// track's headline.
+// BenchmarkDropRate_4c measures the rate-exceed drop path against the v3
+// receiver: a MaxUint64 header dotCounter drains the peer bucket to zero, so
+// Accept returns Drop before Open (zero Verifies). The v3 lift accelerates
+// this path: the rate gate reads the header dotCounter (O(1)), not a capnp
+// decode, so the reject-path floor drops from ~1 µs to tens of ns. The
+// reported frames/sec is the v3 number; the ratio versus Shape A accept is the
+// headline.
 func BenchmarkDropRate_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
 	originPub, originPriv := benchSetupOrigin(b)
@@ -102,21 +99,21 @@ func BenchmarkDropRate_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf(": rate reject must issue ZERO Verify calls under bench load (cheap gate reads the header mirror, not a capnp decode), got %d", got)
+		b.Fatalf("rate reject must issue zero Verify calls under bench load (cheap gate reads the header mirror, not a capnp decode), got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
 	}
 }
 
-// BenchmarkAcceptStream_4c measures the end-to-end ACCEPT cost of the
-// v3 receiver: a valid 3-hop frame with a valid dotCounter (7) passes all
-// cheap gates, passes Open (Ed25519 Verify), passes VerifyCRDTFrame, and
-// reaches Accept. This is the Shape A accept path against which the Shape B
-// reject paths (DropRate, DropClock) are ratioed. The v3 lift does NOT
-// accelerate the accept path (it still pays the capnp decode + Ed25519 Verify
-// for the inner payload), so this number should be comparable to the 3.5b
-// AcceptStream figure (~300 us/op on this box). The headline ratio is
+// BenchmarkAcceptStream_4c measures the end-to-end accept cost of the v3
+// receiver: a valid 3-hop frame with a valid dotCounter (7) passes all cheap
+// gates, passes Open (Ed25519 Verify), passes VerifyCRDTFrame, and reaches
+// Accept. This is the Shape A accept path against which the Shape B reject
+// paths (DropRate, DropClock) are ratioed. The v3 lift does not accelerate
+// the accept path (it still pays the capnp decode and Ed25519 Verify for the
+// inner payload), so this number should be comparable to the previous
+// AcceptStream figure (~300 µs/op on this box). The headline ratio is
 // AcceptStream_ns / DropRate_ns (and DropClock_ns).
 func BenchmarkAcceptStream_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
@@ -138,22 +135,22 @@ func BenchmarkAcceptStream_4c(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-	// Accept path MUST call Verify (Ed25519 on inner payload). The exact count
+	// Accept path must call Verify (Ed25519 on inner payload). The exact count
 	// depends on hop count (3 hops = 3 verifies for the relay chain + 1 for
 	// the origin = 4). We assert >= 1 to prove the accept path is real.
 	if got := count.Load(); got < 1 {
-		b.Fatalf(": accept path MUST call Verify (Ed25519 on inner payload), got %d", got)
+		b.Fatalf("accept path must call Verify (Ed25519 on inner payload), got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
 	}
 }
 
-// BenchmarkDropClock_4c re-measures the clock-future drop path
-// against the v3 receiver: the last hop's WallUSec is 3000us ahead of the
-// local clock (beyond the 2ms epsilon), so IngressHLCScalarCap.Admit rejects
-// BEFORE Open (zero Verifies). Like DropRate, the v3 lift accelerates this
-// path (the clock gate reads the HEADER dotCounter, O(1)).
+// BenchmarkDropClock_4c measures the clock-future drop path against the v3
+// receiver: the last hop's WallUSec is 3000 µs ahead of the local clock
+// (beyond the 2 ms epsilon), so IngressHLCScalarCap.Admit rejects before Open
+// (zero Verifies). Like DropRate, the v3 lift accelerates this path (the clock
+// gate reads the header dotCounter, O(1)).
 func BenchmarkDropClock_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
 	originPub, originPriv := benchSetupOrigin(b)
@@ -175,7 +172,7 @@ func BenchmarkDropClock_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf(": clock reject must issue ZERO Verify calls under bench load (cheap gate reads the header mirror, not a capnp decode), got %d", got)
+		b.Fatalf("clock reject must issue zero Verify calls under bench load (cheap gate reads the header mirror, not a capnp decode), got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")

@@ -4,95 +4,46 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — CAS-STORM CLOSURE (freeHeads[classIdx] var-alloc + EBR retired[idx] sharding).
+// These tests cover variable-size free-list sharding in hamt_arena.go and
+// retired-list sharding in reclamation.go.
 //
-// This file is the regression catcher: four guards over the
-// production edits to pkg/sync/hamt_arena.go and pkg/sync/reclamation.go.
-// The surgical edits close THE TWO remaining single-CAS
-// concentrates that the earlier freelist sharding did NOT touch, measured by
-// pprof at the pre-change production gear:
+// Variable-size allocation formerly concentrated allocVar/freeVar operations on
+// freeHeads[classIdx].head. Profiling the JoinParallel workload at 32 cores
+// attributed 57.91% of cumulative CPU to that path. Each variable class now has
+// 256 slabFreeHead shards, separate push and pop routes, and a bounded 128-shard
+// pop fallback.
 //
-// C1 — freeHeads[classIdx].head.CompareAndSwap (allocVar/freeVar). Profiling
-// measured this at 57.91% cum — the DOMINANT concentrate at 32c under
-// JoinParallel. The change shards this to a [256]slabFreeHead per variable
-// class with a bounded 128-shard sweep pop fallback (maintaining
-// steady-stateMatch against freeVar's separate push route counter
-// — the leak at 1.4 GB / 20K ops pre-sweep required the sweep to
-// preserve the M2 recycle gate).
-// C2 — m.retired[idx].PushBlock / PushHAMT CompareAndSwap (the EBR retire
-// path's per-epoch LIST HEAD). Profiling measured 11.20% cum (re-measured at
-// the production gear — the earlier record reported 16.49%). The change
-// shards each of the 3 epoch lists to [256]RetiredList (POINTERS, not
-// the freelist's Uint64 offsets — the head type mirrors RetiredList's
-// existing head atomic.Pointer[RetiredNode]). AdvanceEpoch drains all
-// 256 shards of the safe epoch via two-phase Swap-then-walk (the
-// load-bearing correctness fix for the premature-drain UAF that
-// surfaced at GOMAXPROCS=4 pre-fix).
+// EBR retirement formerly concentrated PushBlock/PushHAMT operations on one
+// head per epoch, measured at 11.20% cumulative CPU. Each of the three epochs
+// now has 256 RetiredList shards with atomic.Pointer[RetiredNode] heads.
+// AdvanceEpoch swaps all shard heads before walking any of them, so recursive
+// retirement during reclamation cannot add fresh entries to a shard that is
+// already being drained.
 //
-// UNVARNISHED MEASUREMENT (5-gear content curve, 3 runs/cell, 32c c7g.8xlarge):
+// A five-point JoinParallel comparison used three runs per point on a
+// 32-core c7g.8xlarge:
 //
-// gear HEAD(pre-change) sharded(this tree) Δ ns/op Δ B/op
-// 1c 6232 ns · 524 B · 9 al 6962 ns · 526 B · 9 al +12% worse +2 B
-// 8c 1733 ns · 538 B · 9 al 2636 ns · 527 B · 9 al +52% worse -11 B (~2% better)
-// 16c 1476 ns · 556 B · 9 al 2330 ns · 535 B · 9 al +58% worse -21 B (~4% better)
-// 24c 1674 ns · 577 B · 9 al 2350 ns · 541 B · 9 al +40% worse -36 B (~6% better)
-// 32c 2407 ns · 622 B · 9 al 1387 ns · 603 B · 9 al -42% FASTER -19 B (~3% better)
+//	cores   unsharded                 sharded                    change
+//	1       6232 ns, 524 B, 9 alloc   6962 ns, 526 B, 9 alloc   +12% ns, +2 B
+//	8       1733 ns, 538 B, 9 alloc   2636 ns, 527 B, 9 alloc   +52% ns, -11 B
+//	16      1476 ns, 556 B, 9 alloc   2330 ns, 535 B, 9 alloc   +58% ns, -21 B
+//	24      1674 ns, 577 B, 9 alloc   2350 ns, 541 B, 9 alloc   +40% ns, -36 B
+//	32      2407 ns, 622 B, 9 alloc   1387 ns, 603 B, 9 alloc   -42% ns, -19 B
 //
-// The graph is a SCISSORS. The change is SLOWER at 1c..24c (routing overhead), FASTER
-// only at 32c (CAS storm collapse dominates). The B/op signal — the CAS-retry
-// collapse proxy, since heap traffic scales with retry count — is STRICTLY
-// REDUCED at 32c (603 vs HEAD 622). The headline ns/op "1.5× speedup" the
-// prior revision advertised was a fabrication: the original gate divided its
-// live throughput by a HARDCODED headBaselineNsPerOp=2442 cherry-picked from a
-// single pprof snapshot. The design excised the constant
-// and re-framed the gate around the actual mechanical win — B/op at 32c — and
-// added the inversion proof the prior revision omitted.
+// Sharding adds routing overhead below 32 cores. At 32 cores, reduced CAS
+// contention outweighs that overhead. The runtime test therefore compares
+// bytes per operation at GOMAXPROCS=1 and GOMAXPROCS=32 rather than asserting a
+// throughput improvement at every core count. Every one of five runs must have
+// an inflation ratio no greater than casRetryInflationCeiling. Nanoseconds per
+// operation are logged separately.
 //
-// THE GUARDS:
-//
-// — TestCASStormShardedStatic (STATIC regex guard over
-// hamt_arena.go + reclamation.go asserting C1.1-C1.6 + C2.1-C2.5
-// invariants). No t.Skip under any condition; red-on-mute. The
-// C2.1 HARD-RED signal is an `atomic.Uint64` retire-head regex —
-// the type is Pointer (RetiredList.head), NOT Uint64 (the freelist).
-// — TestCASStormShardedRuntime (the CAS-retry collapse
-// gate). MEASURES B/op @ GOMAXPROCS=1 (the un-contended baseline —
-// CAS never fails, so B/op reflects heap traffic ONLY) AND B/op @
-// GOMAXPROCS=32 (where the CAS storm raged pre-change). Asserts the
-// inflation ratio (B/op@32c / B/op@1c) ≤ casRetryInflationCeiling.
-// The ceiling is calibrated from the honest 5-gear sweep: HEAD's
-// inflation is 1.187×; the sharded path's is 1.146×. The 1.18× ceiling grants
-// headroom and screams RED on M1/M3 (collapse the sharding → 32c B/op
-// inflates to HEAD's ~1.20×). ACROSS 5 RUNS — the publication bar.
-// ns/op is logged but NOT gated (the 1.5×
-// ns/op gate is dead; 1c..24c routing penalty is honest disclosure,
-// not a gate axis). SKIPS under -race (raceEnabled guard — race
-// instrumentation perturbs ns/op + B/op shadows 5-10×; static guard
-// still bites under every build mode).
-// — TestNoZeroGCRegression: GenerateDelta 0 B/op · 0 allocs/op
-// 5/5 at GOMAXPROCS=1 (the Zero-GC mandate — the sharded freelist
-// adds ZERO per-op allocs; the route counter increment is one atomic
-// add). Regression-negative.
-// — TestInversionProof (the 16→32c inversion gate).
-// MEASURES ns/op @ GOMAXPROCS=16 AND @ GOMAXPROCS=32 across 3 runs
-// per gear, asserts ns/op@32c ≤ ns/op@16c (RATIO ≤ 1.0). At the
-// pre-change HEAD the ratio was 1.63× (32c WORSE than 16c — the CAS storm
-// dominated 32c). At the sharded path the ratio is 0.595× (32c BETTER than 16c —
-// INVERTED). This is the publication proof that the CAS-storm closure
-// flipped the JoinParallel content curve. ACROSS 3 RUNS — the
-// minimum ratio is the published figure. RED on M1 collapse (CAS
-// storm returns → 32c worst gear again, ratio > 1.0).
-//
-// THE MUTATION GUARDS (M1, M2, M3) are NOT in this file — they are exercised
-// ad-hoc: each is a code-level revert /
-// refactor of the production source with md5-verified restore; the runtime +
-// static guards above MUST bite RED on each mutation.
-//
-// Scope: this file is NEW (the only added test source). It
-// contains NO production code. It does NOT modify hamt_arena.go /
-// reclamation.go / crdt.go (the byte-identical protected set) / any other
-// _test.go file. The production touches are in hamt_arena.go +
-// reclamation.go; this file is the regression catcher for those edits.
+// TestCASStormShardedStatic inspects both production files in every build
+// mode. TestCASStormShardedRuntime skips the byte-ratio comparison under the
+// race detector because instrumentation changes allocation behavior.
+// TestNoZeroGCRegression checks GenerateDelta's zero-allocation contract in
+// five runs at GOMAXPROCS=1. TestInversionProof requires 32-core JoinParallel
+// latency to be no worse than 16-core latency in each of three runs; the
+// measured unsharded and sharded ratios were 1.63 and 0.595 respectively.
 package sync
 
 import (
@@ -104,63 +55,35 @@ import (
 	"testing"
 )
 
-// casRetryInflationCeiling is the maximum tolerated ratio of
-// B/op @ GOMAXPROCS=32 divided by B/op @ GOMAXPROCS=1 the runtime guard
-// allows. B/op is the proxy for CAS amplification: every CAS retry on the
-// engine's hot freelist head re-enters allocVar's per-op heap traffic, so
-// B/op inflation under contention tracks the CAS-retry count directly. At
-// HEAD(pre-change) the inflation was 1.187× (622/524); at the sharded path it is 1.146×
-// (603/526) — the 0.04× reduction IS the CAS-storm collapse captured as a
-// heap-traffic delta. The 1.18× ceiling is calibrated from the HEAD figure
-// with a small honesty margin: the change passes with headroom, M1/M3 (collapse the
-// sharding back to a single per-class head CAS) regress the inflation to
-// ~1.20× and scream RED.
-//
-// CALIBRATION HONESTY: the constant was chosen AFTER measuring the 5-gear
-// content curve at the sharded path AND HEAD (see the table in the file header), not
-// before. The prior revision's gate (stormThroughputRatioGate=1.5 over a
-// hardcoded 2442 ns/op denominator) was a fabrication; this gate binds on
-// the actual mechanical signal: B/op at 32c as
-// CAS-retry-collapse proxy, ratioed against an in-process dynamically-
-// measured un-contended baseline (1c — the engine's CAS never retries when
-// uncontended, so B/op@1c is the floor heap traffic).
+// casRetryInflationCeiling limits B/op at GOMAXPROCS=32 relative to B/op at
+// GOMAXPROCS=1. Contended CAS retries can send allocVar down its bump-allocator
+// path, increasing bytes per operation. The measured ratio was 1.187 without
+// sharding and 1.146 with sharding. The 1.18 ceiling leaves a small margin over
+// the sharded measurement while rejecting the unsharded behavior.
 const casRetryInflationCeiling = 1.18
 
-// inversionRatioCeiling is the maximum tolerated ratio of ns/op @
-// GOMAXPROCS=32 divided by ns/op @ GOMAXPROCS=16 the inversion guard
-// allows. A ratio of 1.0 means 32c is no worse than 16c — the content curve
-// has flattened or inverted. At HEAD(pre-change) the ratio was 1.63× (32c WORSE
-// than 16c), at the sharded path it is 0.595× (32c BETTER than 16c — the SCISSORS inversion
-// this gate demands publication proof of). The ≤1.0
-// ceiling asserts the inversion has occurred under the sharded path; M1 collapse (CAS storm
-// returns) regresses the ratio past 1.0 and screams RED.
+// inversionRatioCeiling limits ns/op at 32 cores relative to ns/op at 16
+// cores. A value no greater than one means adding cores does not increase
+// latency. Returning to concentrated CAS heads reverses that relationship.
 const inversionRatioCeiling = 1.0
 
-// stormRuntimeRuns is the sample size for the runtime guard. 5 is the
-// binding precedent (the JoinParallel-32 ratio gate runs
-// 5× ACROSS ALL 5 MUST PASS — the publication gate enforces consistency).
+// stormRuntimeRuns requires five independent byte-ratio measurements.
 const stormRuntimeRuns = 5
 
-// stormInversionRuns is the sample size for the inversion guard. 3 runs
-// per gear (16c and 32c) = 6 bench drives per guard invocation. Lower than
-// the runtime guard's 5 because each guard-run = a 16c + a 32c bench = double the wall time.
+// stormInversionRuns uses three measurements at each of 16 and 32 cores.
 const stormInversionRuns = 3
 
-// TestCASStormShardedStatic is the STATIC regex guard over the
-// two production source files (hamt_arena.go + reclamation.go) asserting the
-// C1.1-C1.6 + C2.1-C2.5 invariants pinning the sharded SHAPE. The guard
-// bites RED the instant any invariant regresses. Regex-only; red-on-mute;
-// runs under every build mode including -short and -race (no t.Skip under any
-// condition).
+// TestCASStormShardedStatic inspects hamt_arena.go and reclamation.go for the
+// sharded data structures, routing order, and two-phase retirement drain. It
+// runs in every build mode, including -short and -race.
 func TestCASStormShardedStatic(t *testing.T) {
-	// Read the two-production source files. os.ReadFile (NOT go/embed) —
-	// the guard must sweep the current tree, not the embed-time snapshot.
+	// Read the current source rather than an embed-time snapshot.
 	hamtSrc, err := os.ReadFile(filepath.Join("hamt_arena.go"))
 	if err != nil {
 		alt := filepath.Join("pkg", "sync", "hamt_arena.go")
 		hamtSrc, err = os.ReadFile(alt)
 		if err != nil {
-			t.Fatalf("CAS-STORM R3a: cannot read hamt_arena.go: %v", err)
+			t.Fatalf("static check: cannot read hamt_arena.go: %v", err)
 		}
 	}
 	recSrc, err := os.ReadFile(filepath.Join("reclamation.go"))
@@ -168,313 +91,205 @@ func TestCASStormShardedStatic(t *testing.T) {
 		alt := filepath.Join("pkg", "sync", "reclamation.go")
 		recSrc, err = os.ReadFile(alt)
 		if err != nil {
-			t.Fatalf("CAS-STORM R3a: cannot read reclamation.go: %v", err)
+			t.Fatalf("static check: cannot read reclamation.go: %v", err)
 		}
 	}
 	hamtStr := string(hamtSrc)
 	recStr := string(recSrc)
 	missing := false
 
-	// ── C1 — var freelist sharding (hamt_arena.go) ──────────────────────────
-
-	// C1.1 — the varFreelist field on the HamtArena struct. The pre-change design
-	// delegated all variable-size classes to a single freeHeads[classIdx] per
-	// class; routes the hot path through a [numVarClasses][256]slabFreeHead
-	// shard array per class (the cartesian outer dimension is classIdx-1 — the
-	// 16 var classes 1..16 are indexed [0..15] in the var freelist).
+	// Variable-size classes use varFreelist[classIdx-1], with 256 shard heads
+	// per class instead of one freeHeads[classIdx] head.
 	if !regexp.MustCompile(`(?m)^\s*varFreelist\s+varFreelistShards\s*$`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.1: missing `varFreelist varFreelistShards` field declaration in hamt_arena.go — the sharded variable-size freelist has regressed (M1 signature)")
+		t.Errorf("static check: missing `varFreelist varFreelistShards` field in hamt_arena.go; variable-size classes are not using sharded free-lists")
 	}
-	// C1.2 — the var freelist shard-array type declaration with const shard
-	// count. arenaVarFreelistShardCount MUST be 256 (power-of-two; the
-	// (start+probe)&(N-1) bitmask sweep routing assumes it). The const pins
-	// cardinality so a mutation `arenaVarFreelistShardCount = 1` revert is
-	// caught here too.
+	// The power-of-two shard count permits masking with N-1 during the pop
+	// sweep. Checking the constant also catches a change to one shard.
 	if !regexp.MustCompile(`(?m)^\s*type\s+varFreelistShards\s+\[numVarClasses\]\[arenaVarFreelistShardCount\]slabFreeHead\s*$`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.1: missing `type varFreelistShards [numVarClasses][arenaVarFreelistShardCount]slabFreeHead` declaration in hamt_arena.go — the sharded variable-size freelist type has regressed (M1 signature)")
+		t.Errorf("static check: missing `varFreelistShards` array declaration in hamt_arena.go")
 	}
 	if !regexp.MustCompile(`(?m)^\s*const\s+arenaVarFreelistShardCount\s*=\s*256\s*$`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.2: missing `const arenaVarFreelistShardCount = 256` declaration in hamt_arena.go — the shard count regressed away from the N=256 power-of-two default (M3 signature)")
+		t.Errorf("static check: arenaVarFreelistShardCount must remain 256 in hamt_arena.go")
 	}
-	// C1.3 — varFreelistRoutePop + varFreelistRoutePush, BOTH CacheLinePad-
-	// isolated. The two counters MUST be SEPARATE — a mutation collapsing them
-	// into one (push/pop sharing the counter) is the M2 deterministic-static
-	// bite. Both the pop and push counters are wrapped in CacheLinePad fields
-	// on the HamtArena struct (mirroring the nodeFreelistRoutePop/Push
-	// discipline).
+	// Push and pop use separate cache-line-isolated routing counters, as do the
+	// class-0 node free-lists.
 	if !regexp.MustCompile(`varFreelistRoutePop\s+atomic\.Uint64`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.3: missing `varFreelistRoutePop atomic.Uint64` declaration in hamt_arena.go (the pop routing counter has regressed; M2 collapse signature)")
+		t.Errorf("static check: missing varFreelistRoutePop atomic counter in hamt_arena.go")
 	}
 	if !regexp.MustCompile(`varFreelistRoutePush\s+atomic\.Uint64`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.3: missing `varFreelistRoutePush atomic.Uint64` declaration in hamt_arena.go (the push routing counter has regressed; M2 collapse signature — push and pop MUST use separate counters, mirroring the nodeFreelist pattern)")
+		t.Errorf("static check: missing varFreelistRoutePush atomic counter in hamt_arena.go; push and pop require separate counters")
 	}
-	// C1.4 — the pop AND push routing helpers. routeVarFreelistShardPop()
-	// (allocVar-side) and routeVarFreelistShardPush() (freeVar-side), both
-	// byte-identical signature shape to routeNodeFreelistShard/Push.
+	// The routing helpers select a shard once per allocVar or freeVar call.
 	if !regexp.MustCompile(`(?m)^\s*func\s+\(a \*HamtArena\)\s+routeVarFreelistShardPop\(\)\s+int\s*\{`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.4: missing `func (a *HamtArena) routeVarFreelistShardPop() int` pop routing helper in hamt_arena.go — the allocVar→shard router has regressed")
+		t.Errorf("static check: missing routeVarFreelistShardPop in hamt_arena.go")
 	}
 	if !regexp.MustCompile(`(?m)^\s*func\s+\(a \*HamtArena\)\s+routeVarFreelistShardPush\(\)\s+int\s*\{`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.4: missing `func (a *HamtArena) routeVarFreelistShardPush() int` push routing helper in hamt_arena.go — the asymmetric push router has regressed (push/pop MUST use separate counters)")
+		t.Errorf("static check: missing routeVarFreelistShardPush in hamt_arena.go")
 	}
-	// C1.5 — allocVar CAS operates on `a.varFreelist[classIdx-1][shardIdx].head`
-	// (NOT on `a.freeHeads[classIdx].head` as the hot path). The M1 REVERT
-	// fingerprint on the POP side: a revert that removes the var-shard path
-	// restores `a.freeHeads[classIdx].head.CompareAndSwap` AS THE HOT PATH
-	// C1.5b. The presence of `a.varFreelist[classIdx-1]` indexing in allocVar's
-	// body is the load-bearing shape guard — the AllocNode pattern uses
-	// `shard.head.CompareAndSwap` but indexes shard via the nodeFreelist route;
-	// allocVar's `varFreelist[classIdx-1][shardIdx]` indexing IS the unique
-	// fingerprint (classIdx-1 because var classes are 1..16 mapped to freelist
-	// outer index 0..15).
+	// Variable classes 1 through 16 occupy outer indices 0 through 15. This
+	// class-minus-one indexing distinguishes allocVar from class-0 AllocNode.
 	if !strings.Contains(hamtStr, "a.varFreelist[classIdx-1]") {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.5: missing `a.varFreelist[classIdx-1]` shard-array indexing in allocVar/freeVar hamt_arena.go — the hot-path var-class shard CAS has regressed back to freeHeads[classIdx].head (M1 signature); the class-X pop CAS storm was NOT sharded")
+		t.Errorf("static check: missing varFreelist[classIdx-1] indexing in hamt_arena.go; variable-size allocation is not using its shard array")
 	}
-	// C1.5b — HARD-RED: the pre-change single per-class head CAS pattern MUST be
-	// GONE from allocVar/freeVar's hot path. A revert reinstating
-	// `a.freeHeads[classIdx].head.CompareAndSwap` AS THE HOT PATH C1.5b is the
-	// M1 collapse fingerprint. Strings.Contains not regex — represents the
-	// exact pre-change line's appearance as the hot pop CAS site.
+	// The old per-class CAS must not remain in the allocation or return path.
 	if strings.Contains(hamtStr, "a.freeHeads[classIdx].head.CompareAndSwap") {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.5b: HARD RED — found `a.freeHeads[classIdx].head.CompareAndSwap` in hamt_arena.go — the single per-class var freelist CAS has regressed back as the allocVar/freeVar hot path (M1 collapse signature); the sharded varFreelist path is dead")
+		t.Errorf("static check: found freeHeads[classIdx].head.CompareAndSwap in hamt_arena.go; variable-size operations must use varFreelist shards")
 	}
-	// C1.6 — freeHeads [numSizeClasses]slabFreeHead STILL PRESENT (fallback
-	// held). The two-tier pop/push contract preserves freeHeads as the
-	// cartesian-layout slot — removing it would break the layout analysis test
-	// (protected set) and the [numSizeClasses] cartesian layout. The field
-	// declaration is the byte-identical pre-change form.
+	// freeHeads retains its [numSizeClasses] layout for the remaining size
+	// classes and the layout checks.
 	if !regexp.MustCompile(`(?m)^\s*freeHeads\s+\[numSizeClasses\]slabFreeHead\s*$`).MatchString(hamtStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C1.6: missing `freeHeads [numSizeClasses]slabFreeHead` declaration in hamt_arena.go — the per-class cartesian freeHeads slot has regressed (the [numSizeClasses] layout shared with var classes was broken)")
+		t.Errorf("static check: missing freeHeads [numSizeClasses]slabFreeHead in hamt_arena.go")
 	}
 
-	// ── C2 — EBR retired[idx][shard] sharding (reclamation.go) ──────────────
-
-	// C2.1 — the retired [3][arenaRetiredFreelistShardCount]RetiredList field
-	// declaration. CRITICAL: the head TYPE is `atomic.Pointer[RetiredNode]`
-	// (mirroring RetiredList.head), NOT atomic.Uint64 (the freelist's offset
-	// type). A regex finding `atomic.Uint64` anywhere in the retire-head field
-	// declaration is a HARD-RED signal — it catches the original-draft bug.
-	// The shape selected: `[3][256]RetiredList` — preserves the existing
-	// PushHAMT/PushBlock method signatures byte-identical; the route dispatches
-	// to m.retired[idx][shard].PushBlock/PushHAMT, so the type is
-	// RetiredList (whose head is the atomic.Pointer[RetiredNode]).
+	// Each of the three EBR epochs has its own RetiredList shard array.
+	// RetiredList.head is atomic.Pointer[RetiredNode], unlike the Uint64 offsets
+	// used by arena free-lists. Keeping RetiredList also preserves the
+	// PushBlock/PushHAMT method contracts.
 	if !regexp.MustCompile(`retired\s+\[3\]\[arenaRetiredFreelistShardCount\]RetiredList`).MatchString(recStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C2.1: missing `retired [3][arenaRetiredFreelistShardCount]RetiredList` field declaration in reclamation.go — the sharded 3-epoch retired ring has regressed back to the single per-epoch head (M1 signature); the per-epoch LIST HEAD was not sharded")
+		t.Errorf("static check: missing retired [3][arenaRetiredFreelistShardCount]RetiredList in reclamation.go")
 	}
-	// HARD-RED signal: the retire-head TYPE is Pointer (RetiredList.head is
-	// atomic.Pointer[RetiredNode]), NOT Uint64. An atomic.Uint64 retire-head
-	// declaration anywhere in the retire sharding is the original-draft bug
-	// (which mirror'ed the freelist's offset type instead of the retire path's
-	// pointer type) — RED the instant it appears.
+	// A Uint64 array here would confuse free-list offsets with retired-node
+	// pointers.
 	if regexp.MustCompile(`retired\s+\[3\]\[.*\]atomic\.Uint64`).MatchString(recStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C2.1: HARD RED — found `retired [3][...]atomic.Uint64` in reclamation.go; the retire-head TYPE is atomic.Pointer[RetiredNode] (RetiredList.head), NOT atomic.Uint64 (the freelist's offset type). The original-draft bug has regressed — the sharded retire ring is the WRONG TYPE.")
+		t.Errorf("static check: retired lists use atomic.Uint64 in reclamation.go; RetiredList heads must be atomic.Pointer[RetiredNode]")
 	}
-	// C2.2 — arenaRetiredFreelistShardCount = 256 const. Power-of-two so the
-	// route is a clean bitmask. The const pins cardinality so a mutation
-	// `arenaRetiredFreelistShardCount = 1` revert is caught here too.
+	// The power-of-two retired-list shard count permits bitmask routing and
+	// must not be reduced to one effective shard.
 	if !regexp.MustCompile(`(?m)^\s*const\s+arenaRetiredFreelistShardCount\s*=\s*256\s*$`).MatchString(recStr) {
 		missing = true
-		t.Errorf("CAS-STORM R3a C2.2: missing `const arenaRetiredFreelistShardCount = 256` declaration in reclamation.go — the shard count regressed away from the N=256 power-of-two default (M3 signature)")
+		t.Errorf("static check: arenaRetiredFreelistShardCount must remain 256 in reclamation.go")
 	}
-	// C2.3 — the `idx:=... % 3` (the 3-epoch routing) STILL PRESENT in
-	// RetireBlock. The 3-epoch ring is a GRACE invariant — the retire path MUST
-	// stay modulo-3 routed on globalEpoch; collapsing the 3 epoch buckets into
-	// one breaks the EBR grace (FORBIDDEN PATH B3). The regex pins this exact
-	// arithmetic inside RetireBlock's body.
+	// RetireBlock must keep routing globalEpoch through the three-epoch ring.
+	// Combining the epochs would shorten the grace period before reclamation.
 	retireBlockBody := parkFuncBody(recStr, "RetireBlock")
 	if retireBlockBody == "" {
 		missing = true
-		t.Errorf("CAS-STORM R3a C2.3: cannot isolate RetireBlock function body in reclamation.go — the function has regressed or been renamed")
+		t.Errorf("static check: cannot isolate RetireBlock in reclamation.go")
 	} else {
 		stripped := parkStripGoComments(retireBlockBody)
-		// C2.3 — `idx:=... % 3` present (the 3-epoch routing — GRACE invariant).
-		// CRITICAL: the CompareAndSwap over the LIST HEAD lives INSIDE
-		// RetiredList.PushBlock (NOT inside RetireBlock's body). RetireBlock
-		// dispatches to `m.retired[idx][shard].PushBlock(...)`. The fingerprint
-		// for the var-shard CAS path therefore asserts `m.retired[idx][shard]`
-		// access pattern (the per-shard access is the SHAPE-unique fixture — the
-		// single-head pre-change used `m.retired[idx].PushBlock`).
+		// RetireBlock selects the epoch first, then the shard. The list-head
+		// CAS remains in RetiredList.PushBlock; this function only dispatches to
+		// m.retired[idx][shard].
 		modRe := regexp.MustCompile(`idx\s*:=\s*[a-zA-Z_]\w*\s*%\s*3`)
 		modLoc := modRe.FindStringIndex(stripped)
 		routeRe := regexp.MustCompile(`routeRetiredShard\(\)`)
 		routeLoc := routeRe.FindStringIndex(stripped)
 		shardAccessRe := regexp.MustCompile(`m\.retired\[idx\]\[shard\]`)
 		shardAccessLoc := shardAccessRe.FindStringIndex(stripped)
-		// C2.3 — `idx:=... % 3` present
 		if modLoc == nil {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.3: missing `idx:= <expr> %% 3` (the 3-epoch routing — the GRACE invariant) in RetireBlock; the 3-epoch bucketing has regressed (FORBIDDEN PATH B3 — collapsing the 3 epoch buckets breaks EBR grace)")
+			t.Errorf("static check: RetireBlock does not route with idx := <expr> %% 3; the three-epoch grace period is not preserved")
 		}
-		// C2.3b — the per-shard access pattern `m.retired[idx][shard]` MUST be
-		// present in RetireBlock (the M1 collapse fingerprint is
-		// `m.retired[idx].PushBlock` — single-head access).
 		if shardAccessLoc == nil {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.3b: missing `m.retired[idx][shard].PushBlock(...)` per-shard access in RetireBlock — the retire path has regressed back to single per-epoch head `m.retired[idx].PushBlock` (M1 collapse signature); the per-epoch LIST HEAD was NOT sharded")
+			t.Errorf("static check: RetireBlock must access m.retired[idx][shard].PushBlock instead of one list per epoch")
 		}
-		// C2.4 — route sits AFTER the `idx:=... % 3` AND before the per-shard
-		// access (route-then-access ordering).
+		// Shard routing follows epoch selection and precedes the list access.
 		if routeLoc == nil {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.4: missing `routeRetiredShard()` call in RetireBlock; the per-shard routing has regressed (M1 collapse signature)")
+			t.Errorf("static check: missing routeRetiredShard call in RetireBlock")
 		} else if modLoc != nil && routeLoc[0] < modLoc[0] {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.4: `routeRetiredShard()` at byte %d is BEFORE `idx:= <expr> %% 3` at byte %d in RetireBlock; the 3-epoch routing (the GRACE invariant) MUST be computed BEFORE the shard route (route-after-idx-of-3 ordering)", routeLoc[0], modLoc[0])
+			t.Errorf("static check: routeRetiredShard at byte %d precedes epoch selection at byte %d; select the epoch before the shard", routeLoc[0], modLoc[0])
 		} else if shardAccessLoc != nil && routeLoc[0] >= shardAccessLoc[0] {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.4: `routeRetiredShard()` at byte %d is NOT before the per-shard access `m.retired[idx][shard]` at byte %d in RetireBlock; the route MUST sit OUTSIDE the CAS retry loop (M3 signature — moving the route inside the CAS loop makes the routing counter a hot stripe)", routeLoc[0], shardAccessLoc[0])
+			t.Errorf("static check: routeRetiredShard at byte %d does not precede the shard access at byte %d; routing must occur outside the list CAS loop", routeLoc[0], shardAccessLoc[0])
 		}
-		// C2.4b — HARD-RED: a single-head pre-change fingerprint
-		// `m.retired[idx].PushBlock` (the 2-D indexing regressed to 1-D) is the
-		// M1 collapse fingerprint. The PushBlock method itself uses `l.head`
-		// internally and is byte-identical to pre-change; the indexing collapse here
-		// is what deterministically bites the M1 mutation.
+		// PushBlock still operates on l.head internally. Only the caller's
+		// indexing changes, so one-dimensional indexing indicates lost sharding.
 		if regexp.MustCompile(`m\.retired\[idx\]\.PushBlock`).MatchString(stripped) {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.4b: HARD RED — found `m.retired[idx].PushBlock` (single-head indexing) in RetireBlock — the per-epoch LIST HEAD sharding has collapsed back to the pre-change single-head shape (M1 collapse signature)")
+			t.Errorf("static check: found m.retired[idx].PushBlock in RetireBlock; use the two-dimensional shard index")
 		}
-		// C2.4c — M3 fingerprint: the GREEN RetireBlock body has NO `for {`-loop
-		// — the CAS retry loop is encapsulated inside RetiredList.PushBlock (a
-		// callee method owned by the `RetiredList` type, byte-identical to the pre-change form
-		//). An M3 collapse that inlines the CAS retry loop into RetireBlock's
-		// own body AND routes per-CAS-retry via `routeRetiredShard()` puts the
-		// routing counter increment in the hot CAS frame — the deterministic
-		// signal is `for {` in the stripped RetireBlock body. Bites RED the
-		// instant the route moves into the CAS frame (the GREEN body calls
-		// PushBlock callee; no inlined for-loop).
+		// The CAS retry loop belongs to RetiredList.PushBlock. An infinite loop
+		// here would put routing in the retry path and add counter contention.
 		if regexp.MustCompile(`\bfor\s*\{`).MatchString(stripped) {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.4c: HARD RED — found `for {` infinite-loop in RetireBlock body — the CAS retry loop has been inlined out of RetiredList.PushBlock (M3 signature); the routing counter increment — `routeRetiredShard()` — now lands in the hot CAS frame (hot-stripe regression). The GREEN shape calls `m.retired[idx][shard].PushBlock(...)` (CALLEE-inlined CAS), NO for-loop in RetireBlock's own body")
+			t.Errorf("static check: found an infinite loop in RetireBlock; keep the CAS retry loop in RetiredList.PushBlock so routing stays outside it")
 		}
 	}
-	// C2.5 — AdvanceEpoch drains via a loop over 256 shards on
-	// m.retired[safeIdx]. The two-phase Swap-then-walk is the load-bearing
-	// correctness fix — single-swaps across shards would corrupt grace (the
-	// pre-fix premature-drain UAF surfaced at GOMAXPROCS=4). The regex pins
-	// the `for shard:=... range` loop over m.retired[safeIdx] + the
-	// Swap-then-walk order (Swap happens BEFORE the freeRetiredList walk inside
-	// the loop, OR the loop captures all Swaps before any walk — the latter is
-	// the two-phase shape; asserted via the heads[] local-array regex).
+	// AdvanceEpoch must swap all 256 heads in m.retired[safeIdx] before any
+	// freeRetiredList walk. Otherwise recursive RetireBlock calls can add fresh
+	// retirees to an unswapped shard and have them reclaimed without a complete
+	// grace period.
 	advanceBody := parkFuncBody(recStr, "AdvanceEpoch")
 	if advanceBody == "" {
 		missing = true
-		t.Errorf("CAS-STORM R3a C2.5: cannot isolate AdvanceEpoch function body in reclamation.go — the function has regressed or been renamed")
+		t.Errorf("static check: cannot isolate AdvanceEpoch in reclamation.go")
 	} else {
 		stripped := parkStripGoComments(advanceBody)
-		// Drain loop pattern: a `for shard:=... range arenaRetiredFreelistShardCount` or a
-		// `for shard:= 0; shard < arenaRetiredFreelistShardCount; shard++` loop with
-		// `m.retired[safeIdx][shard].head.Swap(nil)` inside it.
 		loopRe := regexp.MustCompile(`for\s+shard\s*:?=\s*[^;]*;[^;]*shard\s*<\s*arenaRetiredFreelistShardCount`)
 		if !loopRe.MatchString(stripped) {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.5: missing `for shard:= 0; shard < arenaRetiredFreelistShardCount; shard++` loop in AdvanceEpoch — the 256-shard drain has regressed back to the single-head swap (M1 signature); the per-epoch LIST HEAD was not sharded")
+			t.Errorf("static check: AdvanceEpoch does not iterate over arenaRetiredFreelistShardCount shards")
 		} else if !strings.Contains(stripped, "m.retired[safeIdx][shard].head.Swap(nil)") {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.5: missing `m.retired[safeIdx][shard].head.Swap(nil)` in AdvanceEpoch — the per-shard drain has regressed (the Swap is the load-bearing atomic-fanout)")
+			t.Errorf("static check: AdvanceEpoch does not swap each m.retired[safeIdx][shard] head")
 		}
-		// The two-phase Swap-then-walk: a HEADS[shard] snapshot variable is
-		// populated in the first for-loop, then freeRetiredList is called in a
-		// second for-loop over the snapshots. This is the load-bearing
-		// correctness fix — single-loop Swap-during-walk would corrupt grace
-		// when globalEpoch advances mid-walk (recursive RetireBlock calls from
-		// freeRetiredList would land in un-swapped shards and steal fresh
-		// retirees into the current drain with 0-epoch grace → UAF).
+		// The heads array holds the first phase's snapshots. freeRetiredList
+		// runs only after every shard has been swapped.
 		if !strings.Contains(stripped, "heads[shard]") {
 			missing = true
-			t.Errorf("CAS-STORM R3a C2.5: missing `heads[shard]` (the two-phase Swap-then-walk snapshot array) in AdvanceEpoch — the load-bearing correctness fix has regressed to single-loop Swap-during-walk (a UAF was measured at GOMAXPROCS=4 pre-fix; recursive RetireBlock calls would steal fresh retirees with 0-epoch grace)")
+			t.Errorf("static check: AdvanceEpoch lacks heads[shard] snapshots; swap all retired-list heads before walking any of them")
 		}
 	}
 
 	if missing {
-		t.Fatalf("CAS-STORM R3a: one or more static CAS-storm sharding invariants FAILED — see errors above")
+		t.Fatalf("static check: one or more sharding invariants failed")
 	}
-	t.Logf("CAS-STORM R3a: sharded CAS-storm SHAPE present — varFreelist[numVarClasses][256]slabFreeHead + arenaVarFreelistShardCount=256 + varFreelistRoutePop/Push + routeVarFreelistShardPop/Push + varFreelist[classIdx-1][shardIdx] (freeHeads[classIdx] CAS gone); retired[3][256]RetiredList (Pointer not Uint64) + arenaRetiredFreelistShardCount=256 + routeRetiredShard + 3-epoch idx%%3 routing + RetireBlock route-after-idx + AdvanceEpoch 256-shard two-phase Swap-then-walk")
+	t.Logf("static check: found varFreelist[numVarClasses][256]slabFreeHead with separate push/pop routes; retired[3][256]RetiredList with pointer heads, epoch-then-shard routing, and two-phase AdvanceEpoch draining")
 }
 
-// TestCASStormShardedRuntime is the CAS-retry collapse gate
-// reframed around B/op (the CAS-retry heap-traffic proxy). The original
-// throughput-ratio gate fabricated a
-// 1.5× speedup by dividing live throughput by a hardcoded
-// headBaselineNsPerOp=2442 cherry-picked from a pprof snapshot; that
-// constant is excised. The new gate MEASURES the engine at GOMAXPROCS=1 (the
-// in-process un-contended baseline — CAS never retries when there is no
-// contention, so B/op@1c reflects heap traffic ONLY) and at GOMAXPROCS=32
-// (where the CAS storm raged pre-change), and asserts the inflation ratio
-// (B/op@32c / B/op@1c) ≤ casRetryInflationCeiling across 5 runs.
+// TestCASStormShardedRuntime compares JoinParallel B/op at GOMAXPROCS=1 and
+// GOMAXPROCS=32. The single-threaded run has no CAS contention and supplies the
+// baseline. Each of five contended-to-baseline ratios must remain at or below
+// casRetryInflationCeiling.
 //
-// MECHANICAL TRACE — why B/op is the CAS-retry-collapse proxy:
+// A Join allocates a CRDTDelta, a seqEntry slice, and a HAMT wrapper through
+// allocVar. Retrying a shared free-list head can lead to bump allocation, so
+// increased B/op under contention tracks that amplification. Sharding the
+// variable classes and retired lists reduces contention on both paths.
 //
-// - The engine's per-Join hot path allocates a CRDTDelta literal + a
-// seqEntry slice + a HAMT wrapper via allocVar. Each CAS-retry on the
-// shared var freelist head re-enters the allocVar body and either
-// consumes a recycled slab (no fresh heap) OR escalates to the bump
-// allocator (fresh heap). Under contention the bump escalation rate
-// scales with the retry count, so B/op @ 32c directly tracks the CAS
-// amplification. 256-way sharding drops per-shard CAS share ~256×
-// for class-1..16 (class-0 was already handled by the earlier sharding), so retries
-// rarefy and B/op @ 32c drops toward B/op @ 1c.
-// - The same proxy traces the EBR retire ring (C2): the retire-path
-// PushBlock CAS on the per-epoch LIST HEAD, when contended, drops the
-// retired node into the bump arena (escalation) and the engine pays a
-// freeRetiredList drain cost later. Sharding m.retired[idx] to 256
-// makes the PushBlock CAS rarefy, so the B/op inflation the EBR ring
-// contributed is also captured in the aggregate B/op @ 32c figure.
-//
-// Under -race, the guard SKIPS honestly via the raceEnabled gate (race
-// instrumentation shadow-allocates per-atomic access — perturbing B/op 5-10×;
-// race coverage of the sharded freelist is carried by the package -race
-// sweep). The static guard still bites under every build mode.
-//
-// HONESTY DISCLOSURE: the gate does NOT pass on ns/op. The 5-gear sweep
-// shows the change is ns/op-slower than
-// HEAD at 1c..24c (the routing-counter increment + 256-shard sweep pop
-// fallback pay a tax when CASes do not contend). The change wins ONLY at 32c. This
-// is an honest trade-off: CAS-retry collapse via B/op, ns/op
-// routing penalty disclosed not gated.
+// Race instrumentation changes allocation behavior, so this comparison is
+// skipped under -race; the static test and package race tests still run. This
+// test does not assert a latency improvement: routing makes the sharded path
+// slower below 32 cores in the recorded comparison, and only the 32-core case
+// is faster.
 func TestCASStormShardedRuntime(t *testing.T) {
 	if testing.Short() {
-		t.Skip("CAS-STORM R3b: runtime drive runs JoinParallel twice per run (1c + 32c); skip in -short")
+		t.Skip("CAS byte-ratio check: runs JoinParallel at one and maximum GOMAXPROCS; skip in -short")
 	}
 	if raceEnabled {
-		t.Skip("CAS-STORM R3b: race detector shadow-allocates per-atomic access (perturbing B/op 5-10×), preventing an honest CAS-retry-collapse ratio; race coverage of the sharded freelist is carried by the package -race sweep. Mirrors the race-SKIP precedent.")
+		t.Skip("CAS byte-ratio check: race instrumentation changes allocation behavior; package race tests provide concurrency coverage")
 	}
-	// (ADR-0045): this gate is a 32-CORE
-	// calibration — the 1.180x CAS-retry-inflation ceiling binds the ratio
-	// B/op@(<=32c) / B/op@1c for a CAS storm that only physically exists at 32
-	// hardware threads. On fewer cores the denominator's serialization dominates
-	// and the ratio measures scheduler noise, not the sharding: measured
-	// a DETERMINISTIC FAIL in isolation on 4 cores (21.08s, 20.74s; worst row
-	// 1.4316x > 1.180x) — not a load flake. Skip below 32 cores, with the reason
-	// named (NOT the scaling crucible's NumCPU<4 threshold — that gate's floor
-	// is a different calibration).
+	// The ceiling was calibrated at 32 hardware threads. Fewer cores do not
+	// produce the contention this ratio measures.
 	if n := runtime.NumCPU(); n < 32 {
-		t.Skipf("CAS-STORM R3b: the %.3fx CAS-retry-inflation ceiling is calibrated at 32 cores; on %d cores the ratio measures scheduler noise, not the sharding (deterministic 4c FAIL: worst row 1.4316x).", casRetryInflationCeiling, n)
+		t.Skipf("CAS byte-ratio check: the %.3fx ceiling requires 32 cores; host has %d", casRetryInflationCeiling, n)
 	}
 	maxP := joinMaxParallelGOMAXPROCS()
 	numCPU := runtime.NumCPU()
-	t.Logf("CAS-STORM R3b: sandbox runtime.NumCPU()=%d; max GOMAXPROCS=%d; CAS-retry-inflation gate=%.3fx across %d runs (B/op@max / B/op@1)",
+	t.Logf("CAS byte-ratio check: runtime.NumCPU()=%d; max GOMAXPROCS=%d; ceiling=%.3fx across %d runs (B/op@max / B/op@1)",
 		numCPU, maxP, casRetryInflationCeiling, stormRuntimeRuns)
 	if maxP < 2 {
-		t.Logf("CAS-STORM R3b: GOMAXPROCS=max=%d < 2; the sharded CAS serializes no parallel pop — skip the runtime drive (gate is load-bearing only when max>1).", maxP)
+		t.Logf("CAS byte-ratio check: GOMAXPROCS=max=%d < 2; no parallel pop contention is available", maxP)
 		return
 	}
 
-	// Baseline: the UN-CONTENDED single-goroutine drive. At GOMAXPROCS=1 the
-	// engine's hot-path CASes never contend — never retry — so B/op@1c is
-	// the floor heap traffic the Join costs with zero CAS amplification. The
-	// 32c run is the contended drive; the inflation ratio is the gate axis.
+	// With no parallel contention, the one-thread run supplies the baseline
+	// allocation cost. The maximum-GOMAXPROCS run adds CAS contention.
 	ratios := make([]float64, stormRuntimeRuns)
 	minRatio := 1e9
 	for run := 0; run < stormRuntimeRuns; run++ {
@@ -485,29 +300,26 @@ func TestCASStormShardedRuntime(t *testing.T) {
 		if ratio < minRatio {
 			minRatio = ratio
 		}
-		t.Logf("CAS-STORM R3b row %d/%d: B/op@1c=%d B/op@%d=%d inflation=%.4fx (gate=%.3fx)",
+		t.Logf("CAS byte-ratio run %d/%d: B/op@1c=%d B/op@%d=%d ratio=%.4fx (ceiling=%.3fx)",
 			run+1, stormRuntimeRuns, bopAt1c, maxP, bopAtMax, ratio, casRetryInflationCeiling)
 	}
-	// The gate binds ACROSS ALL 5 RUNS — the publication bar.
 	gateOK := true
 	for i, r := range ratios {
 		if r > casRetryInflationCeiling {
 			gateOK = false
-			t.Errorf("CAS-STORM R3b run %d FAILED: inflation=%.4fx > ceiling=%.3fx (the sharded path's B/op@32c inflated above the CAS-retry-collapse tolerance — the 256-way sharding did NOT collapse the storm; M1/M3 signature)", i+1, r, casRetryInflationCeiling)
+			t.Errorf("CAS byte-ratio run %d: ratio=%.4fx exceeds ceiling %.3fx; sharding did not contain allocation growth under contention", i+1, r, casRetryInflationCeiling)
 		}
 	}
-	t.Logf("CAS-STORM R3b (runtime): inflation ratios across %d runs: %.4fx %.4fx %.4fx %.4fx %.4fx (ceiling=%.3fx, min=%.4fx)",
+	t.Logf("CAS byte ratios across %d runs: %.4fx %.4fx %.4fx %.4fx %.4fx (ceiling=%.3fx, min=%.4fx)",
 		stormRuntimeRuns, ratios[0], ratios[1], ratios[2], ratios[3], ratios[4], casRetryInflationCeiling, minRatio)
 	if !gateOK {
-		t.Fatalf("CAS-STORM R3b gate FAILED — at least one run's B/op inflation is above the %.3fx ceiling; the 32c CAS storm was not collapsed by the 256-way sharding (M1/M3 signature)", casRetryInflationCeiling)
+		t.Fatalf("CAS byte-ratio check failed: at least one run exceeded the %.3fx ceiling", casRetryInflationCeiling)
 	}
-	t.Logf("CAS-STORM R3b gate PASS — all %d runs show B/op@32c / B/op@1c <= %.3fx (min=%.4fx); 256-way sharding collapsed the 32c CAS storm (the B/op reduction IS the heap-traffic delta of the retry collapse)", stormRuntimeRuns, casRetryInflationCeiling, minRatio)
+	t.Logf("CAS byte-ratio check passed: all %d runs are at or below %.3fx (min=%.4fx)", stormRuntimeRuns, casRetryInflationCeiling, minRatio)
 }
 
-// driveJoinBytesPerOp runs BenchmarkCRDTEngine_JoinParallel at the
-// given GOMAXPROCS and returns the per-op heap bytes (B/op). Mirrors the
-// production bench harness shape — the same drive the 5-gear content curve
-// logged in the file-header table uses.
+// driveJoinBytesPerOp runs BenchmarkCRDTEngine_JoinParallel at gomaxprocs and
+// returns allocated bytes per operation.
 func driveJoinBytesPerOp(t *testing.T, gomaxprocs int) int64 {
 	t.Helper()
 	prior := runtime.GOMAXPROCS(gomaxprocs)
@@ -518,38 +330,30 @@ func driveJoinBytesPerOp(t *testing.T, gomaxprocs int) int64 {
 	}
 	res := testing.Benchmark(benchFn)
 	if res.N == 0 {
-		t.Fatalf("CAS-STORM R3b: bench ran 0 ops at GOMAXPROCS=%d", gomaxprocs)
+		t.Fatalf("JoinParallel byte measurement ran 0 operations at GOMAXPROCS=%d", gomaxprocs)
 	}
 	return res.AllocedBytesPerOp()
 }
 
-// TestInversionProof is the publication proof. The prior revision
-// omitted it; this
-// guard measures JoinParallel ns/op at GOMAXPROCS=16 and at GOMAXPROCS=32
-// (3 runs per gear), computes the ratio ns/op@32c / ns/op@16c, and asserts
-// the ratio is STRICTLY ≤ inversionRatioCeiling (=1.0) across all 3
-// runs. At HEAD(pre-change) the ratio was 1.63× (32c WORSE than 16c — the CAS
-// storm dominated the 32c gear); at the sharded path the ratio is 0.595× (32c BETTER
-// than 16c — the SCISSORS inversion the closure delivers).
-//
-// RED on M1/M3 collapse: the CAS storm returns → 32c becomes the worst gear
-// again → ratio exceeds 1.0 → FAIL.
-//
-// SKIPS under -race (same raceEnabled rationale as the runtime guard — race shadow
-// perturbs ns/op 5-10×; the static guard carries shape coverage under -race).
+// TestInversionProof measures JoinParallel ns/op at 16 and 32 cores three
+// times. Each 32-core to 16-core ratio must be no greater than
+// inversionRatioCeiling. Concentrating CAS operations on shared heads makes the
+// 32-core run slower again. The measured ratio was 1.63 before sharding and
+// 0.595 after sharding. Race instrumentation changes timing, so this comparison
+// runs only without -race.
 func TestInversionProof(t *testing.T) {
 	if testing.Short() {
-		t.Skipf("CAS-STORM R3d: inversion proof drives JoinParallel at 16c AND 32c × %d runs; skip in -short", stormInversionRuns)
+		t.Skipf("JoinParallel latency ratio: runs at 16 and 32 cores %d times; skip in -short", stormInversionRuns)
 	}
 	if raceEnabled {
-		t.Skip("CAS-STORM R3d: race detector perturbs ns/op 5-10× (shadow-memory instrumentation); the inversion ratio gate is meaningful only without -race. Static guard carries shape coverage under -race.")
+		t.Skip("JoinParallel latency ratio: race instrumentation changes timing; run without -race")
 	}
 	numCPU := runtime.NumCPU()
 	maxP := joinMaxParallelGOMAXPROCS()
-	t.Logf("CAS-STORM R3d: sandbox runtime.NumCPU()=%d; max GOMAXPROCS=%d; inversion gate=%.3fx across %d runs (ns/op@32 / ns/op@16)",
+	t.Logf("JoinParallel latency ratio: runtime.NumCPU()=%d; max GOMAXPROCS=%d; ceiling=%.3fx across %d runs (ns/op@32 / ns/op@16)",
 		numCPU, maxP, inversionRatioCeiling, stormInversionRuns)
 	if maxP < 32 {
-		t.Logf("CAS-STORM R3d: GOMAXPROCS=max=%d < 32; the 32c reference gear is unavailable on this sandbox — the inversion gate requires exactly the 16c→32c crossing. Skip the runtime drive (gate is load-bearing only when max>=32).", maxP)
+		t.Logf("JoinParallel latency ratio: GOMAXPROCS=max=%d < 32; the 16-core to 32-core comparison is unavailable", maxP)
 		return
 	}
 
@@ -563,7 +367,7 @@ func TestInversionProof(t *testing.T) {
 		if ratio > worstRatio {
 			worstRatio = ratio
 		}
-		t.Logf("CAS-STORM R3d row %d/%d: ns/op@16c=%d ns/op@32c=%d ratio=%.4fx (gate=%.3fx)",
+		t.Logf("JoinParallel latency run %d/%d: ns/op@16c=%d ns/op@32c=%d ratio=%.4fx (ceiling=%.3fx)",
 			run+1, stormInversionRuns, nsAt16, nsAt32, ratio, inversionRatioCeiling)
 	}
 	gateOK := true
@@ -571,20 +375,19 @@ func TestInversionProof(t *testing.T) {
 		if r > inversionRatioCeiling {
 			gateOK = false
 			r := r
-			t.Errorf("CAS-STORM R3d run %d FAILED: ratio=%.4fx > gate=%.3fx (the sharded path's ns/op@32c WORSE than ns/op@16c — the 16→32c INVERSION has regressed; the CAS storm has NOT been collapsed, 32c is again the worst gear — M1/M3 signature)", i+1, r, inversionRatioCeiling)
+			t.Errorf("JoinParallel latency run %d: ratio=%.4fx exceeds ceiling %.3fx; 32-core latency is worse than 16-core latency", i+1, r, inversionRatioCeiling)
 		}
 	}
-	t.Logf("CAS-STORM R3d (inversion): ratios across %d runs: %.4fx %.4fx %.4fx (gate=%.3fx, worst=%.4fx)",
+	t.Logf("JoinParallel latency ratios across %d runs: %.4fx %.4fx %.4fx (ceiling=%.3fx, worst=%.4fx)",
 		stormInversionRuns, ratios[0], ratios[1], ratios[2], inversionRatioCeiling, worstRatio)
 	if !gateOK {
-		t.Fatalf("CAS-STORM R3d gate FAILED — at least one run's ns/op@32c / ns/op@16c exceeds %.3fx; the SCISSORS inversion regressed (32c is no longer better-than-16c under the sharded path — the CAS storm re-concentrated)", inversionRatioCeiling)
+		t.Fatalf("JoinParallel latency ratio failed: at least one run exceeded %.3fx", inversionRatioCeiling)
 	}
-	t.Logf("CAS-STORM R3d gate PASS — all %d runs show ns/op@32c / ns/op@16c <= %.3fx (worst=%.4fx); the sharded path has INVERTED the 16→32c content curve (32c is now BETTER than 16c, whereas the pre-change HEAD measured 1.63× WORSE)", stormInversionRuns, inversionRatioCeiling, worstRatio)
+	t.Logf("JoinParallel latency ratio passed: all %d runs are at or below %.3fx (worst=%.4fx)", stormInversionRuns, inversionRatioCeiling, worstRatio)
 }
 
-// driveJoinNsPerOp runs BenchmarkCRDTEngine_JoinParallel at the given
-// GOMAXPROCS and returns the per-op nanoseconds (ns/op). Used by the
-// inversion guard.
+// driveJoinNsPerOp runs BenchmarkCRDTEngine_JoinParallel at gomaxprocs and
+// returns nanoseconds per operation.
 func driveJoinNsPerOp(t *testing.T, gomaxprocs int) int64 {
 	t.Helper()
 	prior := runtime.GOMAXPROCS(gomaxprocs)
@@ -595,57 +398,46 @@ func driveJoinNsPerOp(t *testing.T, gomaxprocs int) int64 {
 	}
 	res := testing.Benchmark(benchFn)
 	if res.N == 0 {
-		t.Fatalf("CAS-STORM R3d: bench ran 0 ops at GOMAXPROCS=%d", gomaxprocs)
+		t.Fatalf("JoinParallel latency measurement ran 0 operations at GOMAXPROCS=%d", gomaxprocs)
 	}
 	return res.NsPerOp()
 }
 
-// TestNoZeroGCRegression is the Zero-GC regression-negative
-// gate. GenerateDelta 0 allocs/op with B/op ≤ 48 (the Zero-GC mandate —
-// the sharded freelist adds ZERO per-op ALLOCATIONS; the route counter
-// increment is one atomic add). The sharded var freelist + EBR retire ring
-// replace heads with mutex-free atomic CASes; neither path heap-allocates.
+// TestNoZeroGCRegression checks GenerateDelta's zero-allocation contract in
+// five runs at GOMAXPROCS=1. The sharded free-list and retired-list paths use
+// atomic operations and do not allocate per operation.
 //
-// The gate's hard signal is `allocs/op == 0` (engine's verifiable contract per
-// authoritative testing.AllocsPerRun). B/op carries `testing.Benchmark`
-// framework noise (`runtime.mallocgc` + `acquireSudog` + `poolChain` book-
-// keeping the engine did NOT allocate — empirically 0-36 B/op steady-state
-// dust floor at small N). The 48 B/op ceiling is the calibrated precedent
-// borrowed verbatim from TestDeltaGenZeroGC (deltaGenBytesCeiling):
-// it accepts the framework noise floor and screams RED on any mutation that
-// leaves a real per-op allocation (M1 reads 54123 B/op; M3 reads 80-97 B/op
-// per the mutation drive).
+// AllocsPerOp is the primary signal. testing.Benchmark also reports a small
+// framework allocation background, measured here at 0-36 B/op, so bytes are
+// allowed up to the same 48 B/op ceiling used by TestDeltaGenZeroGC. That margin
+// accommodates the background while still detecting a per-operation engine
+// allocation.
 func TestNoZeroGCRegression(t *testing.T) {
 	if raceEnabled {
-		t.Skip("CAS-STORM R3c: -race instrumentation shadow-allocates per-atomic access; the Zero-GC gate is meaningless under -race. The Zero-GC mandate is asserted here at GOMAXPROCS=1 without -race; race coverage of the sharded freelist is carried by the package -race sweep.")
+		t.Skip("GenerateDelta allocation check: race instrumentation adds allocations; run at GOMAXPROCS=1 without -race")
 	}
 	prior := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(prior)
 
-	// Use the same harness as TestDeltaGenZeroGC:
-	// drive GenerateDelta + Release 5× and assert 0 allocs/op · B/op ≤ 48 per
-	// run. The hard gate is on ALLOCS (the engine's verifiable contract).
 	const stormBytesCeiling = 48
 	const runs = 5
 	for r := 0; r < runs; r++ {
 		allocs, bytes := measureGenerateDeltaAllocs(t)
 		if allocs != 0 {
-			t.Errorf("CAS-STORM R3c run %d/%d FAILED: GenerateDelta residual heap escape allocs/op=%d (the 0-alloc gate is non-negotiable; a residual signals a leaked sendMap / seqPtr / CRDTDelta literal / participant-pool dry / per-call closure rebuild — the sharded freelist added a per-op heap alloc)", r+1, runs, allocs)
+			t.Errorf("GenerateDelta allocation run %d/%d: got %d allocs/op, want 0", r+1, runs, allocs)
 		}
 		if bytes > stormBytesCeiling {
-			t.Errorf("CAS-STORM R3c run %d/%d FAILED: GenerateDelta residual heap bytes above the steady-state framework-noise ceiling: B/op=%d (ceiling=%d; M1 undone reads 54123 B/op, M3 per-call closure reads 80-97 B/op — both scream RED here; the steady-state band is 0-36 B/op of `runtime.mallocgc`+`acquireSudog` dust the engine did NOT allocate)", r+1, runs, bytes, stormBytesCeiling)
+			t.Errorf("GenerateDelta allocation run %d/%d: got %d B/op, maximum %d including benchmark background", r+1, runs, bytes, stormBytesCeiling)
 		}
 	}
 	if t.Failed() {
-		t.Fatalf("CAS-STORM R3c: Zero-GC regression gate FAILED — GenerateDelta residual heap escape (regression against the Zero-GC mandate)")
+		t.Fatalf("GenerateDelta allocation check failed")
 	}
-	t.Logf("CAS-STORM R3c: Zero-GC mandate held — %d/%d runs of GenerateDelta read 0 allocs/op · B/op ≤ %d (the sharded freelist/retire ring adds ZERO per-op heap allocations; route counters are one atomic add)", runs, runs, stormBytesCeiling)
+	t.Logf("GenerateDelta allocation check passed: %d/%d runs report 0 allocs/op and at most %d B/op", runs, runs, stormBytesCeiling)
 }
 
-// measureGenerateDeltaAllocs drives GenerateDelta + Release once and returns
-// the per-op allocs/bytes. Mirrors TestDeltaGenZeroGC's harness shape:
-// fresh engine + warmup + single GenerateDelta + Release, allocs measured via
-// testing.Benchmark's ReportAllocs.
+// measureGenerateDeltaAllocs measures GenerateDelta and Release with
+// testing.Benchmark after loading 1,000 entries and warming the free-lists.
 func measureGenerateDeltaAllocs(t *testing.T) (allocs int64, bytes int64) {
 	t.Helper()
 	benchFn := func(b *testing.B) {
@@ -655,15 +447,14 @@ func measureGenerateDeltaAllocs(t *testing.T) (allocs int64, bytes int64) {
 
 		engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, 64*1024*1024)
 		if err != nil {
-			b.Fatalf("CAS-STORM R3c: NewDeltaCRDTEngine: %v", err)
+			b.Fatalf("NewDeltaCRDTEngine: %v", err)
 		}
 		b.Cleanup(func() { _ = engine.Close() })
-		// Seed the engine — mirrors benchCRDTEngine's warmup.
 		for i := 0; i < 1000; i++ {
-			engine.InsertLocal("e"+itoaP25D(i), CRDTEntry{SystemTime: int64(i)})
+			engine.InsertLocal("e"+itoaLocal(i), CRDTEntry{SystemTime: int64(i)})
 		}
 		emptyDigest := NewIBLT(1024, 4)
-		// Warm the freelist pools — mirrors TestDeltaGenZeroGC's harness.
+		// Populate the free-lists before measuring allocations.
 		for w := 0; w < 64; w++ {
 			dW := engine.GenerateDelta(emptyDigest)
 			dW.Release()
@@ -679,9 +470,8 @@ func measureGenerateDeltaAllocs(t *testing.T) (allocs int64, bytes int64) {
 	return res.AllocsPerOp(), res.AllocedBytesPerOp()
 }
 
-// itoaP25D stringifies an int (test-local helper to avoid pulling in strconv
-// twice — mirrors the upstream minimal helpers).
-func itoaP25D(i int) string {
+// itoaLocal formats an integer without importing strconv in this test file.
+func itoaLocal(i int) string {
 	if i == 0 {
 		return "0"
 	}

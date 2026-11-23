@@ -6,20 +6,12 @@
 
 //go:build linux
 
-// Package transport implements the EPOLLET-based Cap'n Proto RPC listener
-// for the Sovereign Engine ingestion pipeline. This is the network entry
-// point that replaces Kafka with zero-copy, zero-GC message ingestion.
+// Package transport implements a Cap'n Proto ingestion listener on Linux.
+// One epoll event loop serves all connections to a server, with edge-triggered
+// reads and a jemalloc-backed reassembly buffer for each connection.
 //
-// ARCHITECTURAL JUSTIFICATION:
-// Go's standard net.Listener spawns a goroutine per connection and allocates
-// bufio.Reader buffers on the Go heap. At 100K RPS, this creates 100K+
-// heap allocations/sec, inducing GC pauses that violate our <200μs P99 target.
-//
-// This implementation uses raw epoll(7) with EPOLLET (edge-triggered) mode:
-//   - No goroutines per connection (single event loop thread).
-//   - All read buffers are jemalloc-backed (invisible to GC).
-//   - Cap'n Proto messages are overlaid directly on the read buffer via
-//     unsafe.Slice + SingleSegment — zero deserialization overhead.
+// A SingleSegment arena decodes each TriTemporalEvent in place. The event is
+// dispatched synchronously, before its portion of the buffer can be reused.
 package transport
 
 import (
@@ -41,13 +33,12 @@ import (
 )
 
 const (
-	// MaxMessageSize is the hard limit for a single Cap'n Proto message.
-	// Messages exceeding this are from malformed or adversarial clients.
-	MaxMessageSize = 64 * 1024 * 1024 // 64MB
+	// MaxMessageSize is the largest segment payload the server will parse.
+	// A larger message closes the connection.
+	MaxMessageSize = 64 * 1024 * 1024 // 64 MiB
 
 	// ReadBufSize is the initial per-connection reassembly buffer size.
-	// Sized for typical ingestion messages (1-10KB).
-	ReadBufSize = 64 * 1024 // 64KB
+	ReadBufSize = 64 * 1024 // 64 KiB
 
 	// MaxConnections is the maximum concurrent connections the server accepts.
 	MaxConnections = 4096
@@ -56,21 +47,18 @@ const (
 	EpollMaxEvents = 256
 )
 
-// connState tracks per-connection state for the reassembly state machine.
-// Each connection has its own jemalloc-backed buffer to handle TCP
-// fragmentation without heap allocations.
+// connState tracks TCP reassembly for one connection. Its buffer storage is
+// allocated by jemalloc rather than on the Go heap.
 type connState struct {
 	fd     int
 	buf    []byte // jemalloc-backed reassembly buffer
 	bufLen int    // number of valid bytes in buf
-	bufCap int    // capacity of buf (for jemalloc realloc)
+	bufCap int    // usable length of buf for reads and reallocation
 }
 
-// EventHandler is the callback invoked for each successfully deserialized
-// TriTemporalEvent. The handler receives the raw Cap'n Proto message and
-// the parsed event struct. The handler MUST NOT retain references to the
-// message or event after returning — the underlying jemalloc memory may
-// be reused for the next message on this connection.
+// EventHandler handles one decoded TriTemporalEvent. The event is valid only
+// for the duration of the call; retain copies of any fields needed later.
+// Returned errors are logged and do not stop the event loop.
 type EventHandler func(event capnp_schema.TriTemporalEvent) error
 
 // EpollServer is the EPOLLET-based Cap'n Proto ingestion server.
@@ -85,8 +73,9 @@ type EpollServer struct {
 	bytesRecv  atomic.Uint64
 }
 
-// NewEpollServer creates a new EPOLLET Cap'n Proto server.
-// addr is a TCP address (e.g., ":9100") or a Unix socket path (prefixed with "unix:").
+// NewEpollServer creates an edge-triggered Cap'n Proto server. The allocator
+// supplies connection buffers, and the handler runs on the event-loop
+// goroutine.
 func NewEpollServer(allocator *database.JemallocAllocator, handler EventHandler) *EpollServer {
 	return &EpollServer{
 		allocator: allocator,
@@ -97,12 +86,12 @@ func NewEpollServer(allocator *database.JemallocAllocator, handler EventHandler)
 	}
 }
 
-// ListenAndServe binds to the given address and starts the epoll event loop.
-// This function blocks until Shutdown() is called.
+// ListenAndServe binds addr and runs the epoll event loop. A normal shutdown
+// closes all connections and descriptors before ListenAndServe returns.
 //
-// addr format:
-//   - "tcp::9100" or ":9100" — TCP listener
-//   - "unix:/var/run/supremum.sock" — Unix domain socket
+// Accepted address forms are:
+//   - "tcp::9100" or ":9100" for TCP
+//   - "unix:/var/run/sovereign.sock" for a Unix domain socket
 func (s *EpollServer) ListenAndServe(addr string) error {
 	var socketFd int
 	var err error
@@ -156,7 +145,7 @@ func (s *EpollServer) listenTCP(addr string) (int, error) {
 		return -1, err
 	}
 
-	// SO_REUSEADDR + SO_REUSEPORT for zero-downtime restarts.
+	// Allow address reuse and multiple listeners on the same port.
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		_ = unix.Close(fd)
 		return -1, fmt.Errorf("setsockopt SO_REUSEADDR: %w", err)
@@ -166,7 +155,7 @@ func (s *EpollServer) listenTCP(addr string) (int, error) {
 		return -1, fmt.Errorf("setsockopt SO_REUSEPORT: %w", err)
 	}
 
-	// TCP_NODELAY disables Nagle's algorithm — critical for low-latency RPC.
+	// Disable Nagle's algorithm on sockets created from this listener.
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
 		_ = unix.Close(fd)
 		return -1, fmt.Errorf("setsockopt TCP_NODELAY: %w", err)
@@ -174,11 +163,8 @@ func (s *EpollServer) listenTCP(addr string) (int, error) {
 
 	// Bind.
 	sa := &unix.SockaddrInet4{Port: tcpAddr.Port}
-	// E2 FIX: Defensive nil check for IPv4 binding.
-	// net.ResolveTCPAddr("tcp", ":9100") returns IP=nil for INADDR_ANY.
-	// tcpAddr.IP.To4() on nil IP returns nil. copy() with nil src is a no-op,
-	// which correctly zero-fills sa.Addr (0.0.0.0 = INADDR_ANY).
-	// IPv6 requires AF_INET6 + SockaddrInet6 — not supported in this sprint.
+	// A nil IP means INADDR_ANY. To4 returns nil in that case, leaving
+	// sa.Addr zeroed. This listener supports IPv4 only.
 	if ip4 := tcpAddr.IP.To4(); ip4 != nil {
 		copy(sa.Addr[:], ip4)
 	}
@@ -198,7 +184,7 @@ func (s *EpollServer) listenTCP(addr string) (int, error) {
 
 // listenUnix creates a non-blocking Unix domain socket listener.
 func (s *EpollServer) listenUnix(path string) (int, error) {
-	// Remove stale socket file. Ignore ENOENT (file doesn't exist).
+	// Unlink path before binding; any unlink error is ignored.
 	_ = syscall.Unlink(path)
 
 	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
@@ -220,7 +206,7 @@ func (s *EpollServer) listenUnix(path string) (int, error) {
 	return fd, nil
 }
 
-// eventLoop is the core EPOLLET event processing loop.
+// eventLoop waits for socket events until Shutdown clears running.
 func (s *EpollServer) eventLoop() error {
 	events := make([]unix.EpollEvent, EpollMaxEvents)
 
@@ -228,7 +214,7 @@ func (s *EpollServer) eventLoop() error {
 		n, err := unix.EpollWait(s.epollFd, events, 100) // 100ms timeout for shutdown check
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
-				continue // Signal interrupted — retry.
+				continue // Retry after an interrupted wait.
 			}
 			return fmt.Errorf("transport: epoll_wait: %w", err)
 		}
@@ -253,7 +239,7 @@ func (s *EpollServer) eventLoop() error {
 	return nil
 }
 
-// acceptConnections accepts all pending connections (edge-triggered: must drain).
+// acceptConnections accepts pending connections until Accept4 would block.
 func (s *EpollServer) acceptConnections() {
 	for {
 		connFd, _, err := unix.Accept4(s.listenFd, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
@@ -277,10 +263,8 @@ func (s *EpollServer) acceptConnections() {
 		// Allocate per-connection reassembly buffer from jemalloc (off-heap).
 		buf := s.allocator.Allocate(ReadBufSize)
 
-		// M1 FIX: Allocate returns a slice whose len == the jemalloc usable size
-		// (>= ReadBufSize, size-class-rounded). Track THAT as bufCap so the read
-		// window conn.buf[bufLen:bufCap] stays in bounds and Free gets the exact
-		// size jemalloc recorded for the block. ReadBufSize is the floor.
+		// Allocate returns the full jemalloc size class, which can be larger
+		// than ReadBufSize. bufCap records the usable length for reads and Free.
 		usable := len(buf)
 		if usable < ReadBufSize {
 			usable = ReadBufSize
@@ -292,7 +276,7 @@ func (s *EpollServer) acceptConnections() {
 			bufCap: usable,
 		}
 
-		// Register with EPOLLIN | EPOLLET | EPOLLRDHUP (edge-triggered).
+		// Register for edge-triggered reads and half-close notifications.
 		if err := s.epollAdd(connFd, unix.EPOLLIN|unix.EPOLLET|unix.EPOLLRDHUP); err != nil {
 			log.Printf("[TRANSPORT] epoll_ctl add failed for fd=%d: %v", connFd, err)
 			s.closeConn(connFd)
@@ -300,8 +284,7 @@ func (s *EpollServer) acceptConnections() {
 	}
 }
 
-// handleRead processes incoming data on a connection.
-// EPOLLET requires draining ALL available data in a single notification.
+// handleRead drains the socket because its read notifications are edge-triggered.
 func (s *EpollServer) handleRead(fd int) {
 	conn, ok := s.conns[fd]
 	if !ok {
@@ -318,37 +301,34 @@ func (s *EpollServer) handleRead(fd int) {
 				return
 			}
 			conn.buf = s.allocator.Reallocate(newCap, conn.buf[:conn.bufCap])
-			// M1 FIX: Reallocate returns a slice whose len == the jemalloc usable
-			// size (>= newCap, size-class-rounded). Track len(conn.buf) as bufCap so
-			// the read window and Free see the size jemalloc recorded for the block,
-			// eliminating the size-class mismatch that risked sdallocx corruption.
+			// Reallocate also returns the full usable size class, which can
+			// exceed newCap. Keep bufCap equal to the returned slice length.
 			conn.bufCap = len(conn.buf)
 		}
 
-		// Read directly into jemalloc buffer. Zero heap allocation.
-		// Use raw syscall.Read to bypass Go's net.Conn GC-tracked buffers.
+		// Read available bytes directly into the reassembly buffer.
 		n, err := syscall.Read(fd, conn.buf[conn.bufLen:conn.bufCap])
 		if n > 0 {
 			conn.bufLen += n
 			s.bytesRecv.Add(uint64(n))
 
-			// Attempt to parse complete messages from the reassembly buffer.
+			// Parse every complete message now available.
 			s.parseMessages(conn)
 		}
 
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				return // No more data available — edge drained.
+				return // The socket has no more data to read.
 			}
 			if !errors.Is(err, syscall.EINTR) {
 				s.closeConn(fd)
 				return
 			}
-			// EINTR: retry read.
+			// Retry after an interrupted read.
 		}
 
 		if n == 0 {
-			// EOF — client closed connection.
+			// The client closed the connection.
 			s.closeConn(fd)
 			return
 		}
@@ -365,7 +345,7 @@ func (s *EpollServer) handleRead(fd int) {
 //	[Padding to 8-byte boundary if segmentCount is even]
 //	Segment data (segmentSize × 8 bytes each)
 //
-// For our single-segment schema, this simplifies to:
+// The ingestion protocol accepts only single-segment messages:
 //
 //	Bytes 0-3:  0x00000000  (segment count = 1, encoded as 0)
 //	Bytes 4-7:  uint32 segmentWords (data section size in 8-byte words)
@@ -381,8 +361,7 @@ func (s *EpollServer) parseMessages(conn *connState) {
 		// Parse segment count (always 0 for single-segment messages).
 		segCountMinusOne := binary.LittleEndian.Uint32(buf[0:4])
 		if segCountMinusOne != 0 {
-			// Multi-segment messages are not supported in the ingestion schema.
-			// This is either corruption or a protocol violation.
+			// The ingestion server accepts only single-segment messages.
 			log.Printf("[TRANSPORT] rejecting multi-segment message (segments=%d) on fd=%d",
 				segCountMinusOne+1, conn.fd)
 			s.closeConn(conn.fd)
@@ -403,14 +382,13 @@ func (s *EpollServer) parseMessages(conn *connState) {
 		// Total message size = 8 (header) + segBytes (data).
 		totalMsgSize := 8 + segBytes
 		if conn.bufLen < totalMsgSize {
-			return // Incomplete message — wait for more data.
+			return // Wait for the rest of the message.
 		}
 
 		// Extract the segment data (past the 8-byte framing header).
 		msgData := conn.buf[8:totalMsgSize]
 
-		// Create zero-copy Cap'n Proto arena over the jemalloc buffer.
-		// NewIngestionArena wraps SingleSegment(b) with bp=nil, fromPool=false.
+		// Decode from the jemalloc buffer without copying the segment.
 		arena := network.NewIngestionArena(msgData)
 		msg := &capnp.Message{Arena: arena}
 
@@ -424,10 +402,8 @@ func (s *EpollServer) parseMessages(conn *connState) {
 			continue
 		}
 
-		// PIN-IN-DISPATCH: pin the backing []byte of the zero-copy TriTemporalEvent
-		// for the duration of the handler. While pinned, the GC cannot relocate the
-		// slice out from under the event's Text pointer fields. See pinner.go for
-		// the physics (runtime.Pinner, Go 1.21+; dossier §DOMAIN 3).
+		// Dispatch synchronously while msgData is valid. The handler must copy
+		// any fields it needs before advanceBuffer reuses this storage below.
 		var handlerErr error
 		pinIngestionMessage(msgData, func() {
 			handlerErr = s.handler(event)
@@ -446,9 +422,8 @@ func (s *EpollServer) parseMessages(conn *connState) {
 	}
 }
 
-// advanceBuffer shifts unconsumed data to the front of the reassembly buffer.
-// Uses copy() which is a single memmove — O(remaining) but amortized O(1)
-// when messages arrive in quick succession.
+// advanceBuffer discards consumed bytes and moves any remaining bytes to the
+// front. The overlapping copy preserves an incomplete following message.
 func (s *EpollServer) advanceBuffer(conn *connState, consumed int) {
 	remaining := conn.bufLen - consumed
 	if remaining > 0 {
@@ -492,16 +467,16 @@ func (s *EpollServer) epollAdd(fd int, events uint32) error {
 	return unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, fd, &ev)
 }
 
-// Shutdown signals the server to stop accepting new connections and exit
-// the event loop. Existing connections are drained and closed.
+// Shutdown signals the event loop to exit. It does not wait for cleanup;
+// ListenAndServe closes all remaining connections and descriptors before returning.
 func (s *EpollServer) Shutdown() {
 	s.running.Store(false)
 }
 
-// cleanup releases all resources: close all connections, epoll fd, listen fd.
+// cleanup closes every connection, the epoll descriptor, and the listener.
 func (s *EpollServer) cleanup() {
-	// E3 FIX: Collect keys first, then iterate. Prevents potential
-	// undefined behavior if closeConn ever has side effects on the map.
+	// closeConn deletes from s.conns, so iterate over a separate descriptor
+	// slice.
 	fds := make([]int, 0, len(s.conns))
 	for fd := range s.conns {
 		fds = append(fds, fd)

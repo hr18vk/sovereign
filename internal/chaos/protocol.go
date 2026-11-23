@@ -4,19 +4,19 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package chaos implements the Chaos Layer for the Sovereign Engine
-// engine. See wal.go for the recovery substrate and supervisor.go for the
-// decoupled Supervisor-Worker process architecture.
+// Package chaos implements the chaos layer for the Sovereign Engine. See
+// wal.go for the recovery substrate and supervisor.go for the decoupled
+// Supervisor-Worker process architecture.
 //
-// PHYSICS (Blueprint §2):
+// Physical constraint:
 //
 //	Native Go recovers panics with recover(), but a SIGSEGV occurring in
 //	off-heap C-space (mmap'd memory the GC does not scan) cannot be caught by
-//	recover() — it violently terminates the ENTIRE parent process. The civic
-//	engine therefore CANNOT execute in the same failure domain as the HTTP
-//	API layer. This package puts the engine in a child process and the
-//	listening socket in the supervisor; a worker SIGSEGV is recovered from
-//	the WAL without dropping a single active connection.
+//	recover() — it terminates the parent process. The engine therefore cannot
+//	execute in the same failure domain as the HTTP API layer. This package
+//	puts the engine in a child process and the listening socket in the
+//	supervisor; a worker SIGSEGV is recovered from the WAL without dropping
+//	an active connection.
 package chaos
 
 import (
@@ -37,10 +37,10 @@ import (
 //
 // Frame wire layout (big-endian, total header = 9 bytes):
 //
-//	[0] op (1 byte)
-//	[1:5] payloadLen (4 bytes, uint32; cap 4 GiB)
-//	[5:9] frameSeq (4 bytes, uint32)
-//	[9..] payload (payloadLen bytes)
+//	[0]       op            (1 byte)
+//	[1:5]     payloadLen    (4 bytes, uint32; cap 4 GiB)
+//	[5:9]     frameSeq      (4 bytes, uint32)
+//	[9..]     payload       (payloadLen bytes)
 
 // frameHeaderLen is the fixed size of each frame's header, in bytes.
 const frameHeaderLen = 9

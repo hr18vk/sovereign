@@ -12,9 +12,8 @@ import (
 	"testing"
 )
 
-// recordingAdvancer is a fake LogicalAdvancer that records every
-// AdvanceLamportTo invocation (count + last arg) under an atomic so it
-// is safe for the -race gate's concurrent Admit callers.
+// recordingAdvancer records the number of AdvanceLamportTo calls and the most
+// recent argument. Atomic storage permits concurrent use in the race test.
 type recordingAdvancer struct {
 	calls atomic.Int64
 	last  atomic.Uint64
@@ -28,47 +27,52 @@ func (r *recordingAdvancer) AdvanceLamportTo(remoteCounter uint64) {
 func (r *recordingAdvancer) callCount() int64 { return r.calls.Load() }
 func (r *recordingAdvancer) lastArg() uint64  { return r.last.Load() }
 
-// — 1500 us-future frame ACCEPTED.
+// A frame 1500 microseconds in the future is within the drift bound. Admit
+// leaves the logical clock unchanged; Advance forwards a counter separately.
 func TestAdmit_1500usFutureAccepted(t *testing.T) {
-	const t0 int64 = 1_700_000_000_000_000 // pinned local physical, us
+	const t0 int64 = 1_700_000_000_000_000 // local physical time, microseconds
 	clock := NewSyntheticClock(t0)
 	adv := &recordingAdvancer{}
 	cap := NewIngressHLCScalarCap(clock, adv)
 
 	const incomingLogical uint64 = 42
-	accepted := cap.Admit(t0+1500, incomingLogical)
+	accepted := cap.Admit(t0 + 1500)
 
 	if !accepted {
-		t.Fatalf("1500 us-future frame must be ACCEPTED (1500 > 2000 is false), got rejected")
+		t.Fatalf("frame 1500 microseconds ahead was rejected; want acceptance within the 2000-microsecond bound")
 	}
+	if got := adv.callCount(); got != 0 {
+		t.Fatalf("Admit made %d logical-clock advances; want 0", got)
+	}
+	cap.Advance(incomingLogical)
 	if got := adv.callCount(); got != 1 {
-		t.Fatalf("AdvanceLamportTo must be called exactly once on accept, got %d", got)
+		t.Fatalf("Advance must feed the engine exactly once, got %d", got)
 	}
 	if got := adv.lastArg(); got != incomingLogical {
-		t.Fatalf("AdvanceLamportTo must be called with incomingLogical=%d, got %d", incomingLogical, got)
+		t.Fatalf("Advance must feed incomingLogical=%d, got %d", incomingLogical, got)
 	}
 }
 
-// — 3000 us-future frame REJECTED, AdvanceLamportTo NOT called.
+// A frame 3000 microseconds in the future exceeds the drift bound and is
+// rejected without a logical-clock advance.
 func TestAdmit_3000usFutureRejected(t *testing.T) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
 	adv := &recordingAdvancer{}
 	cap := NewIngressHLCScalarCap(clock, adv)
 
-	accepted := cap.Admit(t0+3000, 42)
+	accepted := cap.Admit(t0 + 3000)
 
 	if accepted {
-		t.Fatalf("3000 us-future frame must be REJECTED (3000 > 2000 is true), got accepted")
+		t.Fatalf("frame 3000 microseconds ahead was accepted; want rejection beyond the 2000-microsecond bound")
 	}
 	if got := adv.callCount(); got != 0 {
-		t.Fatalf("AdvanceLamportTo must NOT be called on reject, got %d calls", got)
+		t.Fatalf("rejection made %d logical-clock advances; want 0", got)
 	}
 }
 
-// — physical-in-the-past frame ACCEPTED (normal late frame, not
-// Byzantine). incomingPhysical = T0 - 5000 us -> Admit true,
-// AdvanceLamportTo called.
+// A frame 5000 microseconds behind the local clock is accepted as late.
+// Physical-time admission does not advance the logical clock.
 func TestAdmit_PastPhysicalAccepted(t *testing.T) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
@@ -76,107 +80,86 @@ func TestAdmit_PastPhysicalAccepted(t *testing.T) {
 	cap := NewIngressHLCScalarCap(clock, adv)
 
 	const incomingLogical uint64 = 7
-	accepted := cap.Admit(t0-5000, incomingLogical)
+	accepted := cap.Admit(t0 - 5000)
 
 	if !accepted {
-		t.Fatalf("past-physical frame (T0-5000 us) must be ACCEPTED as a normal late frame, got rejected")
+		t.Fatalf("frame 5000 microseconds behind was rejected; want acceptance as a late frame")
 	}
-	if got := adv.callCount(); got != 1 {
-		t.Fatalf("AdvanceLamportTo must be called on accept of a late frame, got %d", got)
+	if got := adv.callCount(); got != 0 {
+		t.Fatalf("late-frame admission made %d logical-clock advances; want 0", got)
 	}
+	cap.Advance(incomingLogical)
 	if got := adv.lastArg(); got != incomingLogical {
-		t.Fatalf("AdvanceLamportTo must be called with incomingLogical=%d, got %d", incomingLogical, got)
+		t.Fatalf("Advance must feed incomingLogical=%d, got %d", incomingLogical, got)
 	}
 }
 
-// — max(local, remote) monotone. The controller feeds
-// incomingLogical to AdvanceLamportTo unconditionally on accept; the
-// ENGINE enforces monotonicity (current >= remoteCounter breaks at
-// crdt.go:1642). Prove with a recording fake: advance engine to
-// logical=100, admit a frame with incomingLogical=50 -> Admit true,
-// fake recorded AdvanceLamportTo(50) was invoked (the engine's
-// internal guard then no-ops it). This is BY DESIGN.
+// Advance forwards stale logical counters without consulting engine state.
+// The real engine ignores them; the recording fake retains them so the test
+// can observe the controller's behavior.
 func TestAdmit_MonotoneAdvanceByEngine(t *testing.T) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
 	adv := &recordingAdvancer{}
 	cap := NewIngressHLCScalarCap(clock, adv)
 
-	// Simulate the engine already advanced to logical=100 by recording
-	// it through the same fake (the real engine would hold it in
-	// lamportCounter). The controller does NOT read local logical.
+	// Start with 100 as the fake's previously recorded counter. The controller
+	// has no access to an engine's local logical clock.
 	adv.last.Store(100)
 
 	const incomingLogical uint64 = 50 // stale relative to engine's 100
-	accepted := cap.Admit(t0+100, incomingLogical)
+	accepted := cap.Admit(t0 + 100)
 
 	if !accepted {
-		t.Fatalf("frame within epsilon must be ACCEPTED regardless of logical ordering, got rejected")
+		t.Fatalf("frame within the drift bound was rejected based on logical ordering")
 	}
-	// The controller fed the stale logical to the engine unconditionally.
+	if got := adv.callCount(); got != 0 {
+		t.Fatalf("Admit made %d logical-clock advances; want 0", got)
+	}
+	cap.Advance(incomingLogical)
 	if got := adv.lastArg(); got != incomingLogical {
-		t.Fatalf("controller must feed incomingLogical=%d to engine (engine no-ops stale), got %d", incomingLogical, got)
+		t.Fatalf("Advance should forward incomingLogical=%d without pre-filtering; recorded %d", incomingLogical, got)
 	}
-	// BY DESIGN: the real engine's crdt.go:1642 guard (current >=
-	// remoteCounter -> break) no-ops this stale advance. The recording
-	// fake has no such guard, so it records the call — proving the
-	// controller does NOT pre-filter on local logical (which would
-	// require reading the private lamportCounter and re-open frozen
-	// crdt.go).
+	// Unlike the recording fake, the real engine's compare-and-swap loop
+	// discards a counter that does not exceed its current value.
 }
 
-// — STATIC GUARD (the fabrication-detector-ban, load-bearing).
-// Asserts:
-// 1. maxDriftEpsilon == 2000 (the numeric value, in us).
-// 2. maxDriftEpsilonUnit == "microsecond" (the unit sentinel; BANNED:
-// empty, "millisecond"-only, "2000 ms").
-// 3. t.Errorf fires if maxDriftEpsilon == 2_000_000 (2000 ms = 2 s =
-// the fabrication) OR if maxDriftEpsilon == 2 with a microsecond
-// clock (2 us = too tight).
-//
-// This guard makes the 2000-ms fabrication detector-banned from source
-// forever.
+// TestMaxDriftEpsilon_UnitInvariant pins the bound to 2000 microseconds
+// (2 milliseconds) and requires an explicit microsecond unit label.
 func TestMaxDriftEpsilon_UnitInvariant(t *testing.T) {
-	// (1) numeric value is exactly 2000 (us == 2 ms, CONSTRAINT Z).
 	if maxDriftEpsilon != 2000 {
-		t.Fatalf("maxDriftEpsilon must be 2000 (us == 2 ms, CONSTRAINT Z), got %d", maxDriftEpsilon)
+		t.Fatalf("maxDriftEpsilon = %d; want 2000 microseconds (2 milliseconds)", maxDriftEpsilon)
 	}
-	// (3a) the 2000-ms fabrication: 2_000_000 us == 2 s.
+	// 2_000_000 microseconds would widen the bound to 2 seconds.
 	if maxDriftEpsilon == 2_000_000 {
-		t.Fatalf("maxDriftEpsilon == 2_000_000 is the 2000-ms FABRICATION (2 s), detector-banned")
+		t.Fatalf("maxDriftEpsilon must not be 2_000_000 microseconds (2 seconds)")
 	}
-	// (3b) the 2-us-too-tight fabrication: value 2 in a microsecond
-	// clock admits a 2-us bound (1000x too tight) and fails the
-	// acceptance deltas.
+	// A value of 2 would enforce 2 microseconds rather than 2 milliseconds.
 	if maxDriftEpsilon == 2 {
-		t.Fatalf("maxDriftEpsilon == 2 in a microsecond clock is 2 us (1000x too tight), detector-banned")
+		t.Fatalf("maxDriftEpsilon must not be 2 microseconds")
 	}
-	// (2) unit sentinel is "microsecond". BANNED: empty,
-	// "millisecond"-only (would imply the 2000 is in ms = 2 s),
-	// "2000 ms".
 	switch maxDriftEpsilonUnit {
 	case "microsecond":
-		// the ONLY permitted unit label.
+		// Required unit label.
 	case "":
-		t.Fatalf("maxDriftEpsilonUnit is empty — unit is undeclared, detector-banned")
+		t.Fatalf("maxDriftEpsilonUnit is empty; want \"microsecond\"")
 	case "millisecond":
-		t.Fatalf("maxDriftEpsilonUnit == \"millisecond\" implies 2000 ms = 2 s, the FABRICATION, detector-banned")
+		t.Fatalf("maxDriftEpsilonUnit = \"millisecond\" would describe 2000 milliseconds (2 seconds)")
 	case "2000 ms":
-		t.Fatalf("maxDriftEpsilonUnit == \"2000 ms\" is the FABRICATION label, detector-banned")
+		t.Fatalf("maxDriftEpsilonUnit = \"2000 ms\" would describe 2 seconds instead of 2 milliseconds")
 	default:
-		t.Fatalf("maxDriftEpsilonUnit == %q is not the permitted \"microsecond\" label, detector-banned", maxDriftEpsilonUnit)
+		t.Fatalf("maxDriftEpsilonUnit = %q; want \"microsecond\"", maxDriftEpsilonUnit)
 	}
 
-	// Compile-time-checked assertion that the constant is exactly 2000.
-	// [0]byte would fail to compile if maxDriftEpsilon != 2000; the
-	// non-zero array size is the guard.
+	// Both arrays have length zero when maxDriftEpsilon is 2000. Any other
+	// constant value makes one array length negative and fails compilation.
 	var _ [maxDriftEpsilon - 2000]byte
 	var _ [2000 - maxDriftEpsilon]byte
 }
 
-// — concurrent Admit callers on a shared controller + synthetic
-// clock: 0 DATA RACE. The controller read path is read-only on the
-// clock; AdvanceLamportTo is atomic. Run under `go test -race`.
+// Concurrent Admit and Advance calls share one controller, clock, and
+// advancer. Admit contributes no advances, so every expected call comes from
+// an explicit Advance call. Run this test with -race to check atomic access.
 func TestAdmit_ConcurrentNoRace(t *testing.T) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
@@ -193,14 +176,15 @@ func TestAdmit_ConcurrentNoRace(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				// Mix accept and reject paths across goroutines.
-				offset := int64((seed + i) % 5000) // 0..4999 us future
-				cap.Admit(t0+offset, uint64(seed*iters+i))
+				offset := int64((seed + i) % 5000) // 0 to 4999 microseconds ahead
+				cap.Admit(t0 + offset)
+				cap.Advance(uint64(seed*iters + i))
 			}
 		}(g)
 	}
 	wg.Wait()
 
-	if got := adv.callCount(); got == 0 {
-		t.Fatalf("expected some accepted admits to call AdvanceLamportTo, got 0")
+	if got := adv.callCount(); got != goroutines*iters {
+		t.Fatalf("want exactly %d advance calls from explicit Advance calls, with none from Admit; got %d", goroutines*iters, got)
 	}
 }

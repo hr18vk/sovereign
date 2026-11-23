@@ -7,43 +7,42 @@
 package sync
 
 // ---------------------------------------------------------------------------
-// — Sharded Stack Verification Suite
+// Sharded Stack Verification Suite
 // ---------------------------------------------------------------------------
 //
-// This file is the verification battery for the ShardedStack (sharded.go).
+// This file is the verification suite for the ShardedStack (sharded.go).
 // It mirrors the structure of flatcomb_test.go and elimination_test.go:
 //
-// 1. STRUCTURAL SIZE ASSERTION
-// TestShardedShardSize — secShard is exactly 128 bytes (two cache
-// lines), and adjacent shards in the array have stride 128.
+//   1. Structural Size Assertion
+//      TestShardedShardSize — secShard is exactly 128 bytes (two cache
+//      lines), and adjacent shards in the array have stride 128.
 //
-// 2. ZERO-GC MICROSCOPE
-// TestShardedHotPathZeroAllocations — the unyielding CI gate proving
-// the push/pop hot path allocates zero heap objects.
+//   2. Zero-GC Microscope
+//      TestShardedHotPathZeroAllocations — the CI gate proving
+//      the push/pop hot path allocates zero heap objects.
 //
-// 3. SEQUENTIAL CORRECTNESS
-// TestShardedSequentialCorrectness — single-goroutine push/pop LIFO
-// on one shard. Catches basic stack-logic bugs.
+//   3. Sequential Correctness
+//      TestShardedSequentialCorrectness — single-goroutine push/pop LIFO
+//      on one shard. Catches basic stack-logic bugs.
 //
-// 4. LINEARIZABILITY / CORRECTNESS
-// TestShardedLinearizability — concurrent stress: N goroutines push
-// and pop for a fixed duration, then drainAll across ALL shards must
-// equal netSurplus (pushed - popped). Catches cross-shard data loss.
+//   4. Linearizability / Correctness
+//      TestShardedLinearizability — concurrent stress: N goroutines push
+//      and pop for a fixed duration, then drainAll across all shards must
+//      equal netSurplus (pushed - popped). Catches cross-shard data loss.
 //
-// 5. CYCLE DETECTION
-// TestShardedCycleDetection — walks every shard's stackTop chain
-// without popping, detects cycles and cross-shard node duplication.
+//   5. Cycle Detection
+//      TestShardedCycleDetection — walks every shard's stackTop chain
+//      without popping, detects cycles and cross-shard node duplication.
 //
-// ADAPTER: secStackAdapter adapts ShardedStack to the gateStack
-// interface and registers it with the gate's makeGateStack factory +
-// sets gateCandidateNameOverride in init(). This wiring means
-// TestScalingGate (the rewritten asymmetric gate) automatically
+// Adapter: secStackAdapter adapts ShardedStack to the gate's stack
+// interface and registers it with the gate's factory in init(). This wiring means
+// the asymmetric gate automatically
 // exercises the SEC candidate once this test file is compiled into the
 // package.
 //
-// INIT ORDERING: Go runs init functions in source file name lexicographic
+// Init ordering: Go runs init functions in source file name lexicographic
 // order within a package. flatcomb_test.go < sharded_test.go, so this
-// init() runs AFTER flatcomb_test.go's init(), overriding the factory.
+// init() runs after flatcomb_test.go's init(), overriding the factory.
 // The gate therefore drives the SEC candidate. FC-specific tests in
 // flatcomb_test.go are unaffected — they construct flatCombStack directly.
 // ---------------------------------------------------------------------------
@@ -59,11 +58,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// ADAPTER — wire ShardedStack into the scaling gate (anti-self-deception)
+// Adapter — wire ShardedStack into the asymmetric burst gate
 // ---------------------------------------------------------------------------
 
-// secStackAdapter exposes ShardedStack via the gateStack interface
-// so the SAME asymmetric burst workload (scaling_gate_test.go) drives
+// secStackAdapter exposes ShardedStack via the gate's stack interface
+// so the same asymmetric burst workload drives
 // the SEC candidate as drove the elimination and FC candidates.
 type secStackAdapter struct {
 	inner *ShardedStack
@@ -77,14 +76,14 @@ func (a *secStackAdapter) pop(pool *ElimNodePool, prng *ElimPRNG) (uint64, bool)
 	return a.inner.pop(pool, prng)
 }
 
-// headLoad returns shard 0's head for single-head consumers.
-// Multi-shard drain uses drainAll.
+// headLoad returns shard 0's head for backward compatibility with the
+// diag_test.go walker. Multi-shard drain uses drainAll.
 func (a *secStackAdapter) headLoad() uint64 {
 	return a.inner.shards[0].stackTop.Load()
 }
 
-// drainAll walks EVERY shard's stackTop, follows.next chains, dedups
-// every visited node index (an index CANNOT survive on two shards under
+// drainAll walks every shard's stackTop, follows .next chains, dedups
+// every visited node index (an index cannot survive on two shards under
 // the per-P routing invariant, but dedup catches corruption), and returns
 // the total surviving node count. A cycle, out-of-pool index, or
 // unbounded walk returns ok=false.
@@ -112,9 +111,9 @@ func (a *secStackAdapter) drainAll(pool *ElimNodePool, poolCap int) (int64, bool
 	return drained, true
 }
 
-// init wires the SEC candidate into the gate's makeGateStack factory
+// init wires the SEC candidate into the gate's factory
 // and sets the candidate name. By lexicographic init order
-// (flatcomb_test.go < sharded_test.go), this runs AFTER FC's init(),
+// (flatcomb_test.go < sharded_test.go), this runs after FC's init(),
 // overriding the factory. The gate therefore drives the SEC candidate.
 func init() {
 	makeGateStack = func() gateStack {
@@ -124,10 +123,10 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// 1. STRUCTURAL SIZE ASSERTION
+// 1. Structural Size Assertion
 // ---------------------------------------------------------------------------
 
-// TestShardedShardSize verifies secShard is EXACTLY 128 bytes (two
+// TestShardedShardSize verifies secShard is exactly 128 bytes (two
 // Neoverse-V1 cache lines) and that adjacent shards in the array have
 // stride 128. This is the structural precondition for L2 spatial
 // prefetcher defeat: adjacent shards must never share a 128-byte
@@ -161,19 +160,19 @@ func TestShardedShardSize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. ZERO-GC MICROSCOPE
+// 2. Zero-GC Microscope
 // ---------------------------------------------------------------------------
 
-// TestShardedHotPathZeroAllocations is the unyielding CI gate for the
+// TestShardedHotPathZeroAllocations is the CI gate for the
 // Zero-GC mandate on the sharded stack hot path. Uses
-// testing.AllocsPerRun to measure heap allocations performed ONLY
+// testing.AllocsPerRun to measure heap allocations performed only
 // inside the closure, averaged across N invocations.
 //
 // The hot path is: cache-hit alloc (zero heap) → set value → procPin
 // → one CAS → procUnpin → cache recycle (zero heap). The ElimNodePool
 // is pre-allocated. No allocation source exists on the hot path.
 //
-// 1 allocation = critical architectural failure (closure boxed, pool
+// 1 allocation = architectural failure (closure boxed, pool
 // grew, interface boxed, etc.).
 func TestShardedHotPathZeroAllocations(t *testing.T) {
 	stack := NewShardedStack()
@@ -202,7 +201,7 @@ func TestShardedHotPathZeroAllocations(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. SEQUENTIAL CORRECTNESS
+// 3. Sequential Correctness
 // ---------------------------------------------------------------------------
 
 // TestShardedSequentialCorrectness is a simple, deterministic sanity
@@ -210,13 +209,13 @@ func TestShardedHotPathZeroAllocations(t *testing.T) {
 // Catches basic stack-logic bugs before concurrent stress.
 //
 // Edge cases:
-// - pop on empty shard returns (0, false)
-// - push then pop returns the SAME value (single round-trip)
-// - 1000 pushes then 1000 pops return LIFO order
-// - lawful zero payload (value 0 vs. NullOffset64 sentinel)
-// - after full drain, shard is empty again
+//   - pop on empty shard returns (0, false)
+//   - push then pop returns the same value (single round-trip)
+//   - 1000 pushes then 1000 pops return LIFO order
+//   - lawful zero payload (value 0 vs. NullOffset64 sentinel)
+//   - after full drain, shard is empty again
 //
-// This test runs on a SINGLE goroutine, so procPin always returns the
+// This test runs on a single goroutine, so procPin always returns the
 // same P-ID, and all operations hit the same shard. LIFO is verifiable.
 func TestShardedSequentialCorrectness(t *testing.T) {
 	stack := NewShardedStack()
@@ -284,11 +283,11 @@ func TestShardedSequentialCorrectness(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. LINEARIZABILITY — concurrent stress
+// 4. Linearizability — concurrent stress
 // ---------------------------------------------------------------------------
 
 // TestShardedLinearizability stresses the sharded stack with concurrent
-// pushers and poppers. After quiescence, drainAll across ALL shards
+// pushers and poppers. After quiescence, drainAll across all shards
 // must equal totalPushed - totalPopped (netSurplus). If any value is
 // lost, duplicated, or fabricated by the per-shard CAS logic, this
 // fails. Cross-shard accounting is verified by the union walk in
@@ -348,7 +347,7 @@ func TestShardedLinearizability(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Drain ALL shards via the adapter's drainAll.
+	// Drain all shards via the adapter's drainAll.
 	adapter := &secStackAdapter{inner: stack}
 	poolCap := elimTestPoolSize
 	drained, drainOK := adapter.drainAll(pool, poolCap)
@@ -362,14 +361,14 @@ func TestShardedLinearizability(t *testing.T) {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ SEC-SHARDED LINEARIZABILITY STRESS TEST ║")
+	fmt.Println("║  SEC-SHARDED LINEARIZABILITY STRESS TEST                        ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" Goroutines: %16d\n", numGoroutines)
-	fmt.Printf(" Total popped: %16d\n", totalPopped)
-	fmt.Printf(" Drained from shards: %16d\n", drained)
-	fmt.Printf(" Net surplus: %16d\n", totalNetSurplus)
-	fmt.Printf(" Drain OK: %16v\n", drainOK)
-	fmt.Printf(" GOMAXPROCS: %16d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  Goroutines:          %16d\n", numGoroutines)
+	fmt.Printf("  Total popped:        %16d\n", totalPopped)
+	fmt.Printf("  Drained from shards: %16d\n", drained)
+	fmt.Printf("  Net surplus:         %16d\n", totalNetSurplus)
+	fmt.Printf("  Drain OK:            %16v\n", drainOK)
+	fmt.Printf("  GOMAXPROCS:          %16d\n", runtime.GOMAXPROCS(0))
 	fmt.Println()
 
 	if !drainOK {
@@ -391,17 +390,17 @@ func TestShardedLinearizability(t *testing.T) {
 	}
 
 	t.Logf(
-		"✓ SEC-SHARDED LINEARIZABILITY VERIFIED: %d drained == %d surplus "+
+		"PASS: SEC-sharded linearizability verified: %d drained == %d surplus "+
 			"(popped=%d, GOMAXPROCS=%d, shards=%d)",
 		drained, totalNetSurplus, totalPopped, runtime.GOMAXPROCS(0), secShardCount,
 	)
 }
 
 // ---------------------------------------------------------------------------
-// 5. CYCLE DETECTION
+// 5. Cycle Detection
 // ---------------------------------------------------------------------------
 
-// TestShardedCycleDetection walks every shard's stackTop chain WITHOUT
+// TestShardedCycleDetection walks every shard's stackTop chain without
 // popping (direct head + next traversal via packed-index encoding) to
 // detect cycles, out-of-pool indices, or cross-shard node duplication.
 // Under per-P routing, each node is pushed onto exactly one shard and
@@ -443,7 +442,7 @@ func TestShardedCycleDetection(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Walk every shard's chain. Dedup across ALL shards — a node index
+	// Walk every shard's chain. Dedup across all shards — a node index
 	// appearing on two shards is fatal corruption.
 	globalVisited := make(map[uint64]bool)
 	totalNodes := 0

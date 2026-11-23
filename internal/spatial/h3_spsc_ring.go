@@ -23,7 +23,7 @@
 // - Isolation: C++ thread runs outside Go scheduler jurisdiction.
 // - Memory: mmap'd shared region — no syscalls, no futexes, no mutexes.
 //
-// CROSS-PROCESS SHARED MEMORY TOPOLOGY:
+// Cross-process shared memory topology:
 // The shared memory region is backed by memfd_create(2), which creates an
 // anonymous in-memory file descriptor. Unlike MAP_ANONYMOUS (which produces
 // memory invisible across execve boundaries), memfd creates a real fd that
@@ -33,7 +33,7 @@
 //
 // VULNERABILITY REMEDIATION (Post-Audit):
 // The original implementation used syscall.Mmap(-1, MAP_ANON|MAP_SHARED),
-// which creates anonymous memory with NO backing file descriptor. When the
+// which creates anonymous memory with no backing file descriptor. When the
 // C++ worker is a standalone binary spawned via execve (required after the
 // cmd/ relocation override), anonymous mmap regions are irrevocably severed
 // at the execve boundary. The C++ worker would receive fd=-1, lseek would
@@ -65,9 +65,10 @@ import (
 func procyield(cycles uint32)
 
 // PhasedWaitStrategy combines bounded hardware spinning with OS-level futex
-// parking. : procyield(30) x maxSpins keeps L1 cache hot. :
-// sync.Cond.Wait() parks the goroutine via futex, yielding the M and P
-// completely to prevent Epoll starvation.
+// parking. The first phase uses procyield(30) repeated up to maxSpins to
+// keep the L1 cache hot. The second phase parks the goroutine via
+// sync.Cond.Wait(), yielding the M and P completely to prevent Epoll
+// starvation.
 type PhasedWaitStrategy struct {
 	cond     *sync.Cond
 	maxSpins int
@@ -82,17 +83,17 @@ func NewPhasedWaitStrategy(maxSpins int) *PhasedWaitStrategy {
 }
 
 // Wait blocks the caller deterministically using phased back-off.
-// : Hardware PAUSE spinning (bounded). : Futex park.
+// The first phase spins with hardware PAUSE (bounded). The second phase
+// parks via futex.
 func (ws *PhasedWaitStrategy) Wait(isFull func() bool) {
 	spins := 0
 	for isFull() {
 		if spins < ws.maxSpins {
-			// : Hardware PAUSE. Keeps L1 cache hot, avoids Epoll starvation.
+			// Hardware PAUSE keeps L1 cache hot and avoids Epoll starvation.
 			procyield(30)
 			spins++
 		} else {
-			// : OS-Level Futex Park.
-			// Yields the M (Machine) and P (Processor) completely.
+			// Futex park yields the M (Machine) and P (Processor) completely.
 			ws.cond.L.Lock()
 			for isFull() {
 				ws.cond.Wait()
@@ -105,10 +106,10 @@ func (ws *PhasedWaitStrategy) Wait(isFull func() bool) {
 
 // Signal wakes one parked goroutine from the futex.
 //
-// FLAW 6 FIX: The mutex MUST be held around Signal() to serialize with
-// the Wait() call in the Wait() method. Without the lock, a signal fired
-// between the isFull() predicate check and the cond.Wait() call evaporates
-// into the void, permanently deadlocking the producer goroutine.
+// The mutex must be held around Signal() to serialize with the Wait()
+// call. Without the lock, a signal fired between the isFull() predicate
+// check and cond.Wait() is lost, permanently deadlocking the producer
+// goroutine.
 func (ws *PhasedWaitStrategy) Signal() {
 	ws.cond.L.Lock()
 	ws.cond.Signal()
@@ -124,12 +125,12 @@ const (
 	DefaultRingCapacity = 8192
 
 	// Slot state machine values. Monotonic progression per slot:
-	// Go: EMPTY → READY (producer writes coords, flips to READY)
-	// C++: READY → PROCESSING → DONE (consumer computes H3, flips to DONE)
-	// Go: DONE → EMPTY (producer reads result, reclaims slot)
+	// Go:  empty → ready  (producer writes coords, flips to ready)
+	// C++: ready → processing → done  (consumer computes H3, flips to done)
+	// Go:  done → empty   (producer reads result, reclaims slot)
 	//
-	// ABA Prevention: Each actor owns exclusive state transitions.
-	// Go never sees PROCESSING. C++ never sees EMPTY or DONE→EMPTY.
+	// ABA prevention: Each actor owns exclusive state transitions.
+	// Go never sees processing. C++ never sees empty or done→empty.
 	SlotEmpty      uint32 = 0
 	SlotReady      uint32 = 1
 	SlotProcessing uint32 = 2
@@ -141,14 +142,14 @@ const (
 //
 // MEMORY LAYOUT (must be identical in C++ h3_worker main.cpp):
 //
-//	Offset Size Field
-//	0x00 4B State (atomic uint32: EMPTY/READY/PROCESSING/DONE)
-//	0x04 4B Resolution (H3 resolution level, 0-15)
-//	0x08 8B Latitude (IEEE-754 Float64, little-endian)
-//	0x10 8B Longitude (IEEE-754 Float64, little-endian)
-//	0x18 8B H3Index (uint64 result, written by C++)
-//	0x20 8B RequestID (uint64, monotonic sequence for correlation)
-//	0x28 24B _padding (zeroed, forces total slot size to 64B)
+//	Offset  Size  Field
+//	0x00    4B    State        (atomic uint32: empty/ready/processing/done)
+//	0x04    4B    Resolution   (H3 resolution level, 0-15)
+//	0x08    8B    Latitude     (IEEE-754 Float64, little-endian)
+//	0x10    8B    Longitude    (IEEE-754 Float64, little-endian)
+//	0x18    8B    H3Index      (uint64 result, written by C++)
+//	0x20    8B    RequestID    (uint64, monotonic sequence for correlation)
+//	0x28    24B   _padding     (zeroed, forces total slot size to 64B)
 //
 // TOTAL: 64 bytes = 1 L1 cache line. Zero implicit Go padding.
 type RingSlot struct {
@@ -171,16 +172,16 @@ var _ [CacheLineSize]byte = [unsafe.Sizeof(RingSlot{})]byte{}
 //
 // MEMORY LAYOUT:
 //
-//	Offset Size Field
-//	0x000 8B WriterCursor (Go increments, C++ reads — dedicated cache line)
-//	0x008 56B _padW (padding to 64B boundary)
-//	0x040 8B ReaderCursor (C++ increments, Go reads — dedicated cache line)
-//	0x048 56B _padR (padding to 64B boundary)
-//	0x080 4B Shutdown (Go writes 1 to signal termination)
-//	0x084 4B Resolution (Default H3 resolution for this ring)
-//	0x088 4B Capacity (Number of slots)
-//	0x08C 52B _padS (padding to 64B boundary)
-//	0x0C0... Slots[0] (first RingSlot begins here)
+//	Offset    Size   Field
+//	0x000     8B     WriterCursor  (Go increments, C++ reads — dedicated cache line)
+//	0x008     56B    _padW         (padding to 64B boundary)
+//	0x040     8B     ReaderCursor  (C++ increments, Go reads — dedicated cache line)
+//	0x048     56B    _padR         (padding to 64B boundary)
+//	0x080     4B     Shutdown      (Go writes 1 to signal termination)
+//	0x084     4B     Resolution    (Default H3 resolution for this ring)
+//	0x088     4B     Capacity      (Number of slots)
+//	0x08C     52B    _padS         (padding to 64B boundary)
+//	0x0C0     ...    Slots[0]      (first RingSlot begins here)
 type RingHeader struct {
 	WriterCursor uint64   // Atomic: next slot Go will write to
 	_padW        [56]byte // Pad to dedicated 64B cache line
@@ -246,12 +247,12 @@ type SPSCRing struct {
 // The original implementation used syscall.Mmap(-1, MAP_ANON), which
 // creates anonymous memory invisible across execve. Since the C++ worker
 // is a standalone binary (an operator-supplied consumer of this ring, not
-// shipped in the open-source core library release), it could never attach
+// shipped in the source-available core library release), it could never attach
 // to a MAP_ANON shared region — the inherited fd would be -1, lseek would
 // fail with EBADF, and Go's Collect() would deadlock forever. memfd_create
 // provides a real fd backed by tmpfs that survives process inheritance.
 //
-// capacity MUST be a power of 2 for efficient modulo via bitmask.
+// capacity must be a power of 2 for efficient modulo via bitmask.
 func NewSPSCRing(capacity uint32, resolution uint32) (*SPSCRing, error) {
 	if capacity == 0 || (capacity&(capacity-1)) != 0 {
 		return nil, fmt.Errorf("spsc: capacity must be a power of 2, got %d", capacity)
@@ -306,11 +307,11 @@ func NewSPSCRing(capacity uint32, resolution uint32) (*SPSCRing, error) {
 		capacity:          capacity,
 		defaultResolution: resolution,
 		submitWait:        NewPhasedWaitStrategy(100),
-		// FLAW 6 FIX: collectWait MUST use pure-spin mode (never enter
-		// futex park). The C++ worker transitions slots to SlotDone via shared
-		// memory atomic writes — it cannot call Go's sync.Cond.Signal(). If
+		// collectWait must use pure-spin mode (never enter futex park).
+		// The C++ worker transitions slots to SlotDone via shared memory
+		// atomic writes — it cannot call Go's sync.Cond.Signal(). If
 		// collectWait enters sync.Cond.Wait(), no signal will ever arrive and
-		// the goroutine deadlocks. math.MaxInt prevents entry entirely.
+		// the goroutine deadlocks. math.MaxInt prevents futex park entry entirely.
 		// Production code uses EpochBatcher.collectWithTimeout (bounded procyield)
 		// and never reaches this path.
 		collectWait: NewPhasedWaitStrategy(math.MaxInt),
@@ -328,14 +329,17 @@ func (r *SPSCRing) SharedMemoryFd() (int, int) {
 // passing the shared memory fd via ExtraFiles inheritance.
 //
 // The C++ worker receives the fd at position 3 (first ExtraFiles entry)
-// and the total shared memory size as argv[2]. It mmaps the fd and
+// and the total shared memory size as argv[3]. It mmaps the fd and
 // begins consuming ring buffer slots.
+//
+// argv[1] is the inherited fd number, argv[2] is the CPU core to pin to,
+// argv[3] is the total shared memory size in bytes.
 //
 // workerPath: absolute path to the compiled h3_worker binary.
 // pinCore: CPU core to pin the worker thread to (-1 for no pinning).
 func (r *SPSCRing) StartWorker(workerPath string, pinCore int) error {
 	// Wrap the memfd integer in an *os.File for ExtraFiles.
-	// os.NewFile does NOT take ownership — we still manage the fd lifecycle.
+	// os.NewFile does not take ownership — we still manage the fd lifecycle.
 	memFile := os.NewFile(uintptr(r.memfd), "h3_spsc_ring_memfd")
 
 	// The fd will be inherited as fd 3 in the child process (0=stdin, 1=stdout, 2=stderr).
@@ -367,17 +371,18 @@ func (r *SPSCRing) StartWorker(workerPath string, pinCore int) error {
 // This prevents the Epoll priority-inversion livelock caused by Gosched().
 //
 // MEMORY ORDERING:
-// - All data writes (lat, lng, resolution) use normal stores.
-// - The State transition to READY uses atomic.StoreUint32 with release
-// semantics, guaranteeing all preceding data writes are visible to
-// the C++ consumer before it observes READY.
+//   - All data writes (lat, lng, resolution) use normal stores.
+//   - The State transition to READY uses atomic.StoreUint32 with release
+//     semantics, guaranteeing all preceding data writes are visible to
+//     the C++ consumer before it observes READY.
 func (r *SPSCRing) Submit(lat, lng float64) (uint64, error) {
 	idx := r.nextSeqID % uint64(r.capacity)
 	slot := &r.slots[idx]
 
 	// GOSCHED ERADICATION: Phased back-off replaces runtime.Gosched().
-	// : procyield(30) x 100 — hardware PAUSE, keeps L1 hot.
-	// : sync.Cond.Wait() — futex park, yields M+P completely.
+	// The first phase spins with procyield(30) x 100 — hardware PAUSE,
+	// keeping L1 hot. The second phase parks via sync.Cond.Wait() — futex
+	// park, yielding M+P completely.
 	r.submitWait.Wait(func() bool {
 		return atomic.LoadUint32(&slot.State) != SlotEmpty
 	})
@@ -452,7 +457,7 @@ func (r *SPSCRing) Shutdown() {
 }
 
 // Close unmaps the shared memory region and closes the memfd.
-// MUST be called after Shutdown() and after the C++ worker has exited.
+// Call this after Shutdown() and after the C++ worker has exited.
 func (r *SPSCRing) Close() error {
 	var firstErr error
 

@@ -4,28 +4,16 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// (ADR-0019) guards (the REAL *LocalFS guards) — the L0→L1 per-entity
-// compaction fork, driven against a REAL *LocalFS (the guard-principle
-// "drive the route, not the seam").
+// Per-entity L0-to-L1 compaction tests over real LocalFS storage (ADR-0019).
 //
-// These guards CLOSE the MaxL0Files silent-data-loss cap. AsOf lists ONLY the
-// newest MaxL0Files per-entity L0 files per query; every older per-entity file
-// is invisible → a query for an OLD valid-time returns ErrEntityNotFound for
-// data IS durable on disk. The L0→L1 per-entity compaction eliminates the cap:
-// a background compaction merges the N per-entity L0 files into ONE sorted L1
-// file; AsOf scans the L1 (always, the full merged history) + the uncompacted
-// L0 tail and skips superseded L0 keys via the compaction manifest.
+// AsOf lists at most MaxL0Files of an entity's newest L0 files. Without
+// compaction, older durable rows can therefore be invisible to a query.
+// Compaction merges those files into one sorted L1; AsOf reads that history plus
+// the uncompacted L0 tail and uses the manifest to skip superseded L0 keys.
 //
-// T1 — THE HEADLINE RED→GREEN over a REAL *LocalFS: write N>MaxL0Files per-
-// entity checkpoints; RED the OLDEST query → ErrEntityNotFound (silent loss);
-// run the compaction (merges the L0s → ONE L1); GREEN the SAME OLDEST query
-// → 200 (the right dominant). T3 — idempotent (merge-twice-same-L1-bytes). T4
-// — L1+tail (AsOf scans BOTH, not L1 alone).
-//
-// These guards live in pkg/durability (the home of LocalFS) because an
-// internal/database test cannot import pkg/durability (import cycle: snapshot.go
-// imports internal/database). The byte-identity/scope-hygiene/frozen guards
-// (T2/T5/T6) live in internal/database/l1_compaction_test.go.
+// The tests cover recovery of the oldest row beyond the cap, deterministic
+// repeated merges, and a query whose dominant row is in the uncompacted tail.
+// They live beside LocalFS to avoid an import cycle with internal/database.
 package durability
 
 import (
@@ -43,30 +31,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newLocalFS builds a REAL *LocalFS in a temp dir. LocalFS satisfies all
-// three database S3 interfaces (S3Uploader/S3Lister/S3Downloader) by signature
-// (compile-check at the bottom of localfs.go). This is the production-on-disk
-// path the guard-principle demands T1 drive.
+// newLocalFS builds a LocalFS in a temporary directory. LocalFS implements the
+// uploader, lister, and downloader interfaces used by the storage tests.
 func newLocalFS(t *testing.T) *LocalFS {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "localfs-tmp")
+	root := filepath.Join(t.TempDir(), "l0-bucket")
 	lfs, err := NewLocalFS(root)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	return lfs
 }
 
-// insertRow inserts one tri-temporal row into a fresh SkipListArena with
-// the open-ended ValidTimeEnd sentry (9e18, int64-safe). The row uses
-// the production MemTable.Write packing via the database package's exported
-// helpers (the SkipList.Put + the 4.1 binary layout).
+// insertRow writes one tri-temporal row through a fresh SkipListArena and
+// flushes it to L0. Its open-ended valid interval uses the largest int64-safe
+// endpoint shared by these fixtures.
 func insertRow(t *testing.T, alloc *database.JemallocAllocator, lfs *LocalFS, flusher *database.L0Flusher, entityID string, sysNs int64, payload []byte) {
 	t.Helper()
 	const openEnd int64 = 9_000_000_000_000_000_000
 	sl := database.NewSkipListArena(alloc, 2*1024*1024)
 	// Build the composite key + packed value via the test-helper-style layout
-	// (mirrors the l0_split_test.go insertEntityRow, but lives here in
-	// pkg/durability so it can use the REAL *LocalFS).
+	// (mirrors the ADR-0018 insertEntityRow helper, but lives here in
+	// pkg/durability so it can use a real *LocalFS).
 	fullHash := sha256.Sum256([]byte(entityID))
 	key := make([]byte, 40)
 	copy(key[0:16], fullHash[:16])
@@ -89,7 +74,7 @@ func insertRow(t *testing.T, alloc *database.JemallocAllocator, lfs *LocalFS, fl
 	sl.Free()
 }
 
-// putBE64 writes a BigEndian uint64 into b (the composite key's field order).
+// putBE64 writes a uint64 in the composite key's big-endian field order.
 func putBE64(b []byte, v uint64) {
 	_ = b[7]
 	b[0] = byte(v >> 56)
@@ -102,10 +87,9 @@ func putBE64(b []byte, v uint64) {
 	b[7] = byte(v)
 }
 
-// makePackedValue is the pkg/durability-side copy of the 4.1 binary
-// layout (the test_helpers_test.go makePackedValue, reproduced because the
-// test helper is package database, not exported). Layout:
-// [2B entityIDLen][entityID][8B H3Index][8B ValidTimeEnd][32B PayloadDigest][4B payloadLen][payload].
+// makePackedValue uses the MemTable value layout so these tests can construct
+// rows outside package database: entity length and ID, H3 index, ValidTimeEnd,
+// payload digest, payload length, and payload.
 func makePackedValue(entityID string, h3Index uint64, validTimeEnd int64, pd [32]byte, payload []byte) []byte {
 	id := []byte(entityID)
 	v := make([]byte, 2+len(id)+8+8+32+4+len(payload))
@@ -144,10 +128,9 @@ func makePackedValue(entityID string, h3Index uint64, validTimeEnd int64, pd [32
 	return v
 }
 
-// writeNCheckpoints writes `n` per-entity checkpoints for ONE entity, one event per
-// checkpoint, with a DISTINCT strictly-increasing SystemTime so the OLDEST
-// checkpoint is retrievable ONLY if the read path can see the OLDEST file.
-// Returns (oldestSysNs, oldestPayload).
+// writeNCheckpoints writes n single-event L0 files with strictly increasing
+// system times. It returns the oldest time and payload for the capped-read and
+// post-compaction queries.
 func writeNCheckpoints(t *testing.T, alloc *database.JemallocAllocator, lfs *LocalFS, entity string, n int) (oldestSysNs int64, oldestPayload []byte) {
 	t.Helper()
 	flusher := database.NewL0Flusher(alloc, lfs, "l0-bucket")
@@ -166,15 +149,10 @@ func writeNCheckpoints(t *testing.T, alloc *database.JemallocAllocator, lfs *Loc
 	return oldestSysNs, oldestPayload
 }
 
-// --- T1 — THE HEADLINE: the OLDEST query survives the MaxL0Files cap via the
-// L1 (RED-then-GREEN over a REAL *LocalFS). ---
-//
-// RED at HEAD pre-compaction: write > MaxL0Files (N=20, MaxL0Files=10) per-
-// entity checkpoints; the OLDEST query → ErrEntityNotFound (the oldest 10 files
-// are silently dropped by the capped list). GREEN post-compaction: run the
-// compaction (merges the 20 L0 files → ONE L1); the SAME OLDEST query → 200,
-// the right dominant (SystemTime == the oldest checkpoint's sysTime, the
-// verbatim PayloadDigest). Both byte-captured here.
+// TestOldestQuerySurvivesMaxL0CapRedThenGreen first queries beyond the L0 cap
+// and requires ErrEntityNotFound. It then compacts the same files and requires
+// the identical query to return the oldest row with its original system time,
+// payload, and digest.
 func TestOldestQuerySurvivesMaxL0CapRedThenGreen(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
@@ -184,57 +162,54 @@ func TestOldestQuerySurvivesMaxL0CapRedThenGreen(t *testing.T) {
 	const maxL0 = 10 // resolver MaxL0Files = 10 → the oldest 10 are silently dropped without compaction
 	oldestSysNs, oldestPayload := writeNCheckpoints(t, alloc, lfs, entity, N)
 
-	// --- RED stage: NO compaction. Resolver with MaxL0Files=10 only lists the
-	// newest 10 L0 files; the OLDEST 10 (incl. checkpoint 0) are invisible → a
-	// query for the oldest valid-time returns ErrEntityNotFound (silent loss of
-	// durable data on disk). ---
+	// Without compaction, the capped resolver lists only the newest ten L0 files.
+	// The oldest durable row is outside that window and must be reported missing.
 	redResolver := database.NewResolver(lfs, lfs, alloc, "l0-bucket", database.ResolverConfig{MaxL0Files: maxL0})
 	OldestValid := time.Unix(0, oldestSysNs)
 	OldestTx := time.Unix(0, oldestSysNs+1)
 	redGot, redErr := redResolver.AsOf(ctx, entity, OldestValid, OldestTx)
-	// The cap form reproduces: the oldest durable row is INVISIBLE under the cap
+	// The cap form reproduces: the oldest durable row is invisible under the cap
 	// (the 11th-20th-oldest files are dropped by the capped list; the reverse
-	// sort keeps the newest 10). The OLDEST checkpoint's validStart==sysTime is
-	// BEFORE the 11th-oldest, so NO scanned row covers validTime=oldestSysNs.
-	assert.ErrorIsf(t, redErr, database.ErrEntityNotFound, "RED: the oldest query (sysTime=%d) must be ErrEntityNotFound with MaxL0Files=%d and no L1 — the silent-loss cap form", oldestSysNs, maxL0)
-	assert.Nilf(t, redGot, "RED: nil expected, the oldest durable row is invisible under the cap")
+	// sort keeps the newest 10). The oldest checkpoint's validStart==sysTime is
+	// before the 11th-oldest, so no scanned row covers validTime=oldestSysNs.
+	assert.ErrorIsf(t, redErr, database.ErrEntityNotFound, "oldest query (sysTime=%d) must fail with MaxL0Files=%d and no L1", oldestSysNs, maxL0)
+	assert.Nilf(t, redGot, "oldest durable row unexpectedly resolved outside the L0 cap")
 
-	// --- GREEN stage: run the compaction. The 20 L0 files merge → ONE L1;
-	// AsOf scans the L1 (always, full history) → the oldest query 200s. ---
+	// Compaction merges all 20 L0 files into one L1, making the oldest row
+	// available independently of the L0 listing cap.
 	compactor := database.NewL1Compactor(lfs, lfs, lfs, alloc, "l0-bucket", database.DefaultCompactionConfig())
 	h8 := database.EntityHash8(entity)
 	res, err := compactor.Compaction(ctx, entity, h8)
 	require.NoError(t, err)
 	require.Falsef(t, res.AlreadyMoved, "compaction must produce an L1 (20 L0 files exist)")
-	require.Equalf(t, N, res.Rows, "the L1 must preserve ALL %d rows (the bitemporal invariant — no pruning)", N)
+	require.Equalf(t, N, res.Rows, "L1 must preserve all %d input rows", N)
 	require.NotEmptyf(t, res.L1Key, "an L1 must be written")
 	require.NotEmptyf(t, res.L0Files, "the manifest must list the merged L0 keys")
 	require.Lenf(t, res.L0Files, N, "all %d L0 keys must be in the manifest", N)
 
 	l1s, _ := lfs.ListObjects(ctx, "local", "l1/"+fmt.Sprintf("%x", h8[:])+"/", 0)
-	require.Lenf(t, l1s, 1, "exactly ONE L1 file per entity (the shape); got %v", l1s)
+	require.Lenf(t, l1s, 1, "one entity must have exactly one L1 file; got %v", l1s)
 	mans, _ := lfs.ListObjects(ctx, "local", "compaction/"+fmt.Sprintf("%x", h8[:])+"/", 0)
-	require.Lenf(t, mans, 1, "exactly ONE manifest per compaction job; got %v", mans)
+	require.Lenf(t, mans, 1, "one compaction must produce exactly one manifest; got %v", mans)
 
-	// GREEN: the SAME resolver configuration (MaxL0Files=10) now returns the
-	// oldest dominant via the L1 — the cap no longer silently loses data.
+	// The same capped resolver must now return the oldest dominant through the
+	// merged L1.
 	greenResolver := database.NewResolver(lfs, lfs, alloc, "l0-bucket", database.ResolverConfig{MaxL0Files: maxL0})
 	got, gerr := greenResolver.AsOf(ctx, entity, OldestValid, OldestTx)
-	require.NoErrorf(t, gerr, "GREEN: the oldest query must 200 via the L1 (the cap is eliminated)")
-	require.NotNilf(t, got, "GREEN: non-nil result expected")
-	assert.Equalf(t, entity, got.EntityID, "GREEN: returned a different entity (keying collision)")
-	assert.Equalf(t, oldestSysNs, got.SystemTime, "GREEN: SystemTime must be the oldest checkpoint's sysTime (the dominant for the oldest valid-time)")
+	require.NoErrorf(t, gerr, "oldest query failed through the merged L1")
+	require.NotNilf(t, got, "oldest query returned no result through the merged L1")
+	assert.Equalf(t, entity, got.EntityID, "compacted query returned a different entity")
+	assert.Equalf(t, oldestSysNs, got.SystemTime, "compacted query did not return the oldest SystemTime")
 	wantDigest := sha256.Sum256(oldestPayload)
-	assert.Equalf(t, wantDigest, got.PayloadDigest, "GREEN: PayloadDigest must be sha256(oldest payload) (Law V — verbatim digest, not fabricated)")
-	assert.Equalf(t, oldestPayload, got.Payload, "GREEN: Payload must be the oldest checkpoint's payload")
+	assert.Equalf(t, wantDigest, got.PayloadDigest, "compacted query did not preserve the oldest payload digest")
+	assert.Equalf(t, oldestPayload, got.Payload, "compacted query did not preserve the oldest payload")
 
-	// Byte-capture the RED→GREEN chronology (the commit-message precedent).
-	t.Logf("T1 RED: oldest query (sysTime=%d) with MaxL0Files=%d → ErrEntityNotFound (silent loss of the OLDEST %d durable files)", oldestSysNs, maxL0, N-maxL0)
-	t.Logf("T1 GREEN: compaction merged %d L0 files → L1 %s (%d rows preserved); oldest query now 200 (dominant sysTime=%d, digest=%x)", len(res.L0Files), res.L1Key, res.Rows, got.SystemTime, got.PayloadDigest)
+	t.Logf("before compaction, oldest query (sysTime=%d) with MaxL0Files=%d missed %d durable files", oldestSysNs, maxL0, N-maxL0)
+	t.Logf("compaction merged %d L0 files into %s (%d rows); oldest query returned sysTime=%d and digest=%x", len(res.L0Files), res.L1Key, res.Rows, got.SystemTime, got.PayloadDigest)
 }
 
-// --- T3 — idempotent: the SAME L0 set merged twice → byte-identical L1 bytes
-// (deterministic merge: sorted inputs + sorted rows + schema-identical). ---
+// TestIdempotentMergeTwiceSameL1Bytes compacts an unchanged L0 set twice and
+// requires the same key and byte-identical sorted L1 contents.
 func TestIdempotentMergeTwiceSameL1Bytes(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
@@ -249,7 +224,7 @@ func TestIdempotentMergeTwiceSameL1Bytes(t *testing.T) {
 	require.NoError(t, err)
 	l1Bytes1 := readObject(t, lfs, res1.L1Key)
 
-	// Re-run Compaction on the SAME L0 set (the L0 files were NOT deleted —
+	// Re-run Compaction on the same L0 set (the L0 files were not deleted —
 	// delete-after-read-safety). firstSysT is the oldest row's sysTime, unchanged;
 	// the L1 key is the same; Upload O_TRUNCs (LocalFS) so the file is replaced
 	// byte-identically with the same sorted content.
@@ -258,7 +233,7 @@ func TestIdempotentMergeTwiceSameL1Bytes(t *testing.T) {
 	require.Equalf(t, res1.L1Key, res2.L1Key, "idempotency: the L1 key must be the same (firstSysT is deterministic)")
 
 	l1Bytes2 := readObject(t, lfs, res2.L1Key)
-	assert.Equalf(t, l1Bytes1, l1Bytes2, "T3 idempotency: L1 byte-content must be identical across merges (len1=%d len2=%d)", len(l1Bytes1), len(l1Bytes2))
+	assert.Equalf(t, l1Bytes1, l1Bytes2, "L1 bytes differ across identical merges (len1=%d len2=%d)", len(l1Bytes1), len(l1Bytes2))
 }
 
 // readObject downloads a single key as raw bytes.
@@ -281,10 +256,9 @@ func readObject(t *testing.T, lfs *LocalFS, key string) []byte {
 	return data
 }
 
-// --- T4 — AsOf scans L1 + uncompacted tail, NOT L1 alone. After a compaction
-// merges the bulk into an L1, write MORE checkpoints (the uncompacted tail) so
-// a query's dominant is a tail row with sysTime NEWER than the L1's newest —
-// proving AsOf reads BOTH tiers. ---
+// TestAsOfScansL1PlusUncompactedTail writes newer L0 rows after compaction. The
+// query's dominant is one of those tail rows, so reading only the L1 would
+// return an older value.
 func TestAsOfScansL1PlusUncompactedTail(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
@@ -295,14 +269,14 @@ func TestAsOfScansL1PlusUncompactedTail(t *testing.T) {
 	const extraTail = 5
 
 	oldestSysNs, _ := writeNCheckpoints(t, alloc, lfs, entity, bulk)
-	// Run compaction → ONE L1 (the 20-row merged history).
+	// Run compaction → one L1 (the 20-row merged history).
 	compactor := database.NewL1Compactor(lfs, lfs, lfs, alloc, "l0-bucket", database.DefaultCompactionConfig())
 	h8 := database.EntityHash8(entity)
 	_, err := compactor.Compaction(ctx, entity, h8)
 	require.NoError(t, err)
 
-	// Write extraTail MORE checkpoints with sysTime NEWER than the L1's newest.
-	// These form the uncompacted tail (L0 files), NOT in the L1.
+	// Write extraTail more checkpoints with sysTime newer than the L1's newest.
+	// These form the uncompacted tail (L0 files), not in the L1.
 	flusher := database.NewL0Flusher(alloc, lfs, "l0-bucket")
 	tailLatestSysNs := oldestSysNs + int64(bulk-1) // the L1's newest (last of the bulk)
 	var tailDominantSys int64
@@ -317,18 +291,18 @@ func TestAsOfScansL1PlusUncompactedTail(t *testing.T) {
 		insertRow(t, alloc, lfs, flusher, entity, sys, payload)
 	}
 
-	// Query at a validTime covered by BOTH the oldest L1 row [oldestSysNs, openEnd)
-	// AND the tail dominant [tailDominantSys, openEnd) (openEnd so all rows cover
-	// every time >= their validStart). The tail dominant has a NEWER sysTime than
-	// every L1 row → it must win. The L1 alone would return its newest row (WRONG);
-	// scanning the tail picks the newer tail dominant. This proves AsOf scans BOTH.
+	// Query at a validTime covered by both the oldest L1 row [oldestSysNs, openEnd)
+	// and the tail dominant [tailDominantSys, openEnd) (openEnd so all rows cover
+	// every time >= their validStart). The tail dominant has a newer sysTime than
+	// every L1 row → it must win. The L1 alone would return its newest row (wrong);
+	// scanning the tail picks the newer tail dominant. This proves AsOf scans both.
 	resolver := database.NewResolver(lfs, lfs, alloc, "l0-bucket", database.ResolverConfig{MaxL0Files: maxL0})
 	qValid := time.Unix(0, tailDominantSys)
 	qTx := time.Unix(0, tailDominantSys+1)
 	got, gerr := resolver.AsOf(ctx, entity, qValid, qTx)
-	require.NoErrorf(t, gerr, "T4: query must resolve (L1+tail scan)")
+	require.NoErrorf(t, gerr, "query failed while reading L1 and the uncompacted tail")
 	require.NotNil(t, got)
-	assert.Equalf(t, tailDominantSys, got.SystemTime, "T4: dominant must be the TAIL row (newer sysTime than ANY L1 row) — proves AsOf scans L1 AND tail, not L1 alone")
+	assert.Equalf(t, tailDominantSys, got.SystemTime, "query did not select the newer uncompacted tail row")
 	wantDigest := sha256.Sum256(tailDominantPayload)
-	assert.Equalf(t, wantDigest, got.PayloadDigest, "T4: the tail dominant's digest (Law V)")
+	assert.Equalf(t, wantDigest, got.PayloadDigest, "query did not preserve the tail row's payload digest")
 }

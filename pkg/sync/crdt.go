@@ -20,257 +20,143 @@ import (
 	"unsafe"
 )
 
-// DataDir is the legacy package-level default data directory. The
-// constructor NewDeltaCRDTEngine (crdt.go:279) copies this global INTO a fresh
-// engine's e.dataDir field at crdt.go:290, and recoverLamport() (crdt.go:376)
-// reads e.dataDir MID-CONSTRUCTION to look for <dataDir>/lamport_<nodeID>.dat —
-// a persisted Lamport override that, if present, can lift initialCounter above
-// the caller's seed. Recovery (pkg/durability newEngineAt) therefore still
-// WRITES this global to a fresh scratch dir BEFORE the ctor so recoverLamport
-// reads no stale file and the WAL-derived determinism seed is honored EXACTLY
+// DataDir is the legacy package-level default data directory.
+// NewDeltaCRDTEngine copies it into the engine before recoverLamport reads
+// <dataDir>/lamport_<nodeID>.dat. A persisted value above initialCounter becomes
+// the starting clock value. Durability recovery sets this global to a scratch
+// directory before construction so an unrelated file cannot override its seed
 // (ADR-0013 §4).
 //
-// (ADR-0021 §2.2): for an ENGINE INSTANCE whose lifetime outlives the
-// ctor, the safe override path is engine.SetDataDir(dir) (crdt.go:484) — it
-// acquires persistMu so a concurrent apply/persistLamport sees the same
-// ordering edge. DIRECTLY mutating this global from a caller that has an live
-// engine is NOT recommended (it races concurrent applies on OTHER engines
-// sharing the global). The global residual is documented-load-bearing: it
-// closes fully ONLY when the constructor takes an explicit dataDir argument
-// instead of reading the global — disclosed in ADR-0021 §6, NOT done here.
+// Use SetDataDir to change the directory of an existing engine. It holds
+// persistMu, ordering the change against persistence. Writing DataDir while
+// engines are running can race with other constructors and is not supported
+// (ADR-0021 §2.2).
 var DataDir = "/data/crdt"
 
-// LamportSkewAbsoluteSlackUnbounded is the AbsoluteSlack policy value that
-// turns the skew bound off (it saturates MaxAcceptableDotCounter to
-// math.MaxUint64, which admits any inbound DotCounter below MaxUint64). It is
-// the documented config-override knob a caller may opt into when it wants to
-// DISABLE the skew check on a specific engine WITHOUT touching the production
-// default that closes the far-future-stamp Lamport-poisoning attack — e.g. the
-// happy-path tests deliberately mint unrealistically-large eyecatch sentinels
-// (0x7f7f7f7f7f7f7f7f, 0x2f2f2f2f2f2f2f2f) chosen for zero-fill detection,
-// NOT as plausible DotCounters, and they RaiseAbsoluteSlack here to admit them.
-// The resolution keeps the production default (AbsoluteSlack=1000) unchanged
-// and lets opt-in callers disable. A real wire-bound engine MUST NEVER set
-// this — doing so re-opens the very attack the production default closes.
+// LamportSkewAbsoluteSlackUnbounded disables the Lamport skew bound for one
+// engine by saturating MaxAcceptableDotCounter. Tests use it to admit large dot
+// counters chosen to detect zero-filled fields without changing the production
+// default of 1000. Wire-facing engines must not use this value: it removes the
+// guard against a far-future counter advancing the local clock.
 const LamportSkewAbsoluteSlackUnbounded uint64 = math.MaxUint64
 
-// defaultShardCount is the default number of per-entityID shards the
-// sharded root CAS opens the single root into. N=256 is a power
-// of two (routing = maphash(entityID, routeSeed) & (N-1)) and comfortably >= any
-// realistic GOMAXPROCS (the storm peak is 32 cores; 256 shards gives 8× the cache
-// lines workers can spread across), and each per-shard pointer + its two cache-
-// line pads fits the L1 cache × cache-line-pad the padding discipline
-// established. SetShardCount re-roots the engine into a different cardinality at
-// runtime (matching the existing SetDataDir persistMu-guarded override pattern).
+// defaultShardCount is the initial number of per-entity HAMT roots. A power of
+// two lets routeShard use a bitmask, and 256 spreads writers across many cache
+// lines. SetShardCount can replace the roots with a different cardinality.
 const defaultShardCount = 256
 
-// shardRoot is one per-entityID shard of the sharded root CAS. Each
-// shard owns its own atomic.Pointer[HAMT] and is wrapped in CacheLinePad so two
-// hot shards mutated by different cores do not share an L1 line (the
-// CACHE COHERENCE / false-sharing discipline, now per-shard instead of per-root).
-//
-// Per-shard linearizability: each shard.ptr is its own atomic pointer,
-// so the per-shard CAS loop is linearizable INDEPENDENTLY. The cross-shard model
-// is "last-writer-per-shard" = the CRDT Join contract (for each entityID, merge
-// the delta's entries into the existing set), which is per-entityID and therefore
-// per-shard. Sharding by entityID preserves the contract verbatim.
+// shardRoot holds one independently updated HAMT root. Padding keeps hot roots
+// on separate cache lines. Each atomic pointer has its own linearizable CAS
+// history; routing by entity ID keeps every merge for an entity in one shard.
 type shardRoot struct {
 	_padHead CacheLinePad
 	ptr      atomic.Pointer[HAMT]
 	_padTail CacheLinePad
 }
 
-// incomingEntry is a transient buffer element produced while iterating the
-// CRDTDelta Seq inside Join. It was moved from a Join-local type to package
-// level so the sync.Pool-backed joinBuffers can reference it.
-// Unexported — the struct is internal to the Join hot path.
+// incomingEntry is one transient element collected from a CRDTDelta Seq during
+// Join. It is package-level so the pooled joinBuffers can retain its slice.
 type incomingEntry struct {
 	entityID string
 	entry    CRDTEntry
 }
 
-// joinBuffers pools the transient Join throughput buffers that escape to heap
-// (sort.Slice captures the incoming slice as a closure) but whose backing arrays
-// are recycled across Join calls via sync.Pool.
-//
-// (ADR-0015): the incoming []incomingEntry buffer (the 26% Join-
-// direct alloc source) + the per-block merge scratch slices (the 33.6%
-// func3 perShardMerge alloc source). The pool recycles the GROWTH reallocs; the
-// slice-header escape from the sort survives (removing the sort via a
-// PreSorted Seq contract is out of scope here).
+// joinBuffers retains Join's incoming slice and per-entity merge scratch space.
+// Reusing their backing arrays avoids repeating growth allocations. The incoming
+// slice header can still escape through the delta iterator's callback; pooling
+// does not remove that allocation (ADR-0015).
 type joinBuffers struct {
 	incoming     []incomingEntry
 	blockScratch []CRDTEntry // reused for incomingBlock in perShardMerge
 	mergeScratch []CRDTEntry // reused for merged in perShardMerge
 }
 
-// joinBufPool recycles joinBuffers across Join calls. The New func returns a
-// zero-valued struct — slices grow on first use and the pool captures the grown
-// backing arrays for the next Join. GC pressure: under GOGC the pool is cleared
-// on GC (sync.Pool is GC-weak); the first Join after a GC grows fresh. This is
-// the documented cold-start cost (ADR-0015 §4).
+// joinBufPool recycles joinBuffers across Join calls. New returns zero slices,
+// whose grown backing arrays are retained for later calls. sync.Pool may drop
+// entries during GC, so subsequent Join calls can allocate again (ADR-0015 §4).
 var joinBufPool = sync.Pool{
 	New: func() any {
 		return &joinBuffers{}
 	},
 }
 
-// DeltaCRDTEngine manages the local CRDT state and generates/applies deltas
-// for peer-to-peer synchronization, utilizing an off-heap HAMT arena and EBR.
+// DeltaCRDTEngine manages local CRDT state and generates and applies deltas for
+// peer synchronization. It stores HAMT nodes in an off-heap arena and uses
+// epoch-based reclamation.
 //
-// CACHE COHERENCE & FALSE SHARING ELIMINATION:
-//
-// The previous layout packed multiple independently-mutated atomic variables
-// onto the same 64-byte L1 cache line. When Core A executes a CAS on `state`
-// while Core B increments `lamportCounter`, the MESI coherence protocol
-// invalidates the entire cache line on both cores, forcing a 100-300 cycle
-// main-memory fetch. This "HITM storm" silently destroys multi-core scaling.
-//
-// The fix: every hot atomic field is now isolated onto its own 64-byte cache
-// line via CacheLinePad padding. This ensures that independent cores can
-// mutate independent atomics without triggering cross-core cache invalidation.
-//
-// Layout (post-padding):
-//
-//	Cache Line 0: state (CAS'd on every InsertLocal/Join)
-//	Cache Line 1: lamportCounter + lastSavedCounter (Add'd on every NextDot)
-//	Cache Line 2: participantPool + arena + ebr (read-only after init)
-//	Cache Line 3: epochCounter (Add'd on every operation)
-//	Cache Line 4: metrics counters (Add'd on every InsertLocal/Join)
+// CacheLinePad separates groups of frequently written atomics. Without that
+// separation, writes to unrelated fields on one cache line would force coherence
+// traffic between cores. Each shard root is padded separately for the same
+// reason.
 type DeltaCRDTEngine struct {
-	// ── SHARDED ROOT CAS (replaces the single root) ──
-	// shards is the per-entityID shard array. Each shard owns an
-	// atomic.Pointer[HAMT] that is CAS'd ONLY by goroutines writing to
-	// entityIDs that route to that shard. At GOMAXPROCS=P the single-root
-	// design had P workers contending on ONE cache line (the 87% CAS-storm
-	// frame); sharding spreads that contention across N cache lines so each
-	// shard sees ~1/N of the traffic and CAS retries collapse.
+	// shards routes each entity ID to one independently CAS-updated HAMT root.
+	// Writes to different shards do not contend on the same root pointer. Join
+	// merges dots per entity, so keeping an entity in one shard preserves its
+	// merge semantics while each shard remains independently linearizable.
 	//
-	// Per-shard linearizability: each shard is its own atomic pointer, so it
-	// is linearizable INDEPENDENTLY. The cross-shard consistency model is
-	// "last-writer-per-shard" — exactly the CRDT semantics Join implements
-	// (for each entityID, merge the delta's entries into the existing set;
-	// the merge is per-entityID). Sharding by entityID preserves the
-	// contract; the integrity guards (dot attribution, skew bound, version
-	// mismatch) all operate per-entity anyway. The LamportClock is a
-	// SINGLE atomic.Uint64 SHARED across shards (just as it was shared across
-	// workers on the single root before); sharding the HAMT root does NOT
-	// shard the LamportClock.
-	//
-	// shards is a slice (not a fixed array) so SetShardCount can re-root the
-	// engine into a different cardinality at runtime. The default N is the
-	// const defaultShardCount (256): >= GOMAXPROCS, a power
-	// of two (routing = hash & (N-1)), and sized so a per-shard pointer + its
-	// two cache-line pads fit in L1 × cache-line-pad.
+	// The Lamport clock, integrity checks, EBR manager, and persistence path
+	// remain shared. The slice representation lets SetShardCount rebuild the
+	// roots at a different power-of-two cardinality.
 	shards    []shardRoot
 	routeSeed maphash.Seed // stable across the engine lifetime; routes entityID -> shard
 
-	// mergedView is the lazily-materialized merged *HAMT returned by State().
-	// Because the engine root is sharded, State() must still return a
-	// single *HAMT (the production API surface — internal/chaos/probe.go and
-	// internal/chaos/partition.go call eng.State().RootPtr()/.MerkleRoot()).
-	// State() builds a fresh merged *HAMT from all shards, retires the
-	// PREVIOUS merged view via EBR (3-epoch grace, mirroring the single-root
-	// reclamation profile), and returns the new one. This bounds the merged-
-	// view arena hold to ONE live wrapper per engine at a time. Off the Join
-	// hot path (Join never calls State()); the bench's ns/op is unaffected.
-	// stateViewMu guards the mergedView swap (no cross-hot-path contention;
-	// the only callers are tests, the gossip Merkle-root sweep, and the
-	// off-hot-path probe). Deliberately NOT persistMu: that is the
-	// disk-mutex contract, which the sharding change does not touch.
+	// State materializes mergedView by copying every shard into one HAMT.
+	// stateViewMu serializes that construction; the previous merged view is
+	// retired through EBR. Join does not call State, so this work stays off the
+	// delta-apply path. A separate mutex avoids coupling view construction to
+	// Lamport persistence.
 	stateViewMu sync.Mutex
 	mergedView  atomic.Pointer[HAMT]
 
-	// ── Cache Line 1: Lamport clock ──
-	// lamportCounter is Add(1)'d on every NextDot call.
-	// lastSavedCounter is Load'd on every NextDot and Store'd every 1000 ops.
-	// Both are mutated by the same goroutine in NextDot, so they can share
-	// a cache line safely (no cross-core false sharing between them).
+	// NextDot increments lamportCounter. NextDot and AdvanceLamportTo advance
+	// lastSavedCounter in 1000-counter reservation steps; both fields are atomic
+	// because multiple goroutines can perform these operations concurrently.
 	localNodeID      [16]byte
 	_lamportPad0     CacheLinePad
 	lamportCounter   atomic.Uint64
 	lastSavedCounter atomic.Uint64
 	_lamportPad1     CacheLinePad
 
-	// ── Cache Line 2: infrastructure (read-only after init) ──
+	// Infrastructure and Lamport persistence.
 	persistMu       sync.Mutex
 	dataDir         string
 	participantPool sync.Pool
 	arena           *HamtArena
 	ebr             *EBRManager
 	_persistPad0    CacheLinePad
-	// The CAS callers (NextDot / AdvanceLamportTo) NO LONGER block on the
-	// fsync inside persistMu. They hand a "value to persist" to persistCh (an
-	// UNBUFFERED chan uint64 — exactly one in-flight persist job; the CAS
-	// caller drops the send if the worker is busy) and return immediately; a
-	// single dedicated goroutine (persistWorkerLoop) drains the channel and
-	// owns the f.Sync()+os.Rename UNDER persistMu (the mutex's job is still
-	// to serialize the tmp file + rename against concurrent
-	// SetDataDir/SetShardCount). The in-memory counter and
-	// lastSavedCounter advance synchronously in the CAS caller; the durable
-	// bump lags by at most one in-flight persist job (+1000 before the
-	// decouple -> +2000 worst-case durability window after). persistStopOnce
-	// guards Close()'s idempotent stop/close path (a second close(persistCh)
-	// would panic); persistWorkerWg lets Close drain the worker BEFORE
-	// arena.Free (no in-flight fsync dangles after Close).
+	// NextDot and AdvanceLamportTo hand persistence work to persistCh with a
+	// nonblocking send instead of waiting for fsync while holding persistMu.
+	// persistWorkerLoop serializes temporary-file writes and renames under that
+	// mutex. The in-memory durability watermark advances before the handoff; a
+	// busy worker can therefore leave the file one reservation step behind.
+	// Close uses persistStopOnce and persistWorkerWg to drain the worker once,
+	// before freeing the arena.
 	persistCh          chan uint64
 	persistWorkerWg    sync.WaitGroup
 	persistStopOnce    sync.Once
 	persistWorkerReady chan struct{}
-	// The close-handshake above only proved the worker goroutine was
-	// SCHEDULED (it reached close(persistWorkerReady)), NOT that it had
-	// PARKED on the `for val:= range e.persistCh` receive (the cold-start
-	// drop). Under bench-sweep scheduler contention the FIRST NextDot's
-	// select-default send dropped the only persist job; Close() drained an
-	// empty channel; the worker saw closed and exited without ever calling
-	// persistLamport; and recoverLamport read 0 instead of 1001. The fix is
-	// a SECOND cap-1 buffered ack channel: persistWorkerLoop sends struct{}{}
-	// on it IMMEDIATELY BEFORE the for-range (the worker has ALREADY
-	// evaluated the receive expression of persistCh); the constructor blocks
-	// on the receive. A buffered-send synchronizes-with that receive, so
-	// unblocking PROVES the worker is parked on the persistCh receive before
-	// NewDeltaCRDTEngine returns — the first select-send ALWAYS rendezvouses.
-	// The cap-1 buffer is load-bearing: an unbuffered park channel deadlocks
-	// the worker (no receiver yet spawned). persistCh stays UNBUFFERED (the
-	// exactly-one-in-flight invariant is preserved — buffering persistCh is
-	// forbidden). Both channels coexist (stage 1 = scheduled, stage 2 = parked).
+	// persistWorkerReady reports that the worker started. persistWorkerParked
+	// acknowledges the statement immediately before its receive loop; capacity
+	// one lets that acknowledgement complete before the constructor receives it.
+	// persistCh itself remains unbuffered, so it holds at most one handoff.
 	persistWorkerParked chan struct{}
 
-	// ── Zero-GC delta-generation pools ──
-	// deltaPool recycles the *CRDTDelta the bench/chaos callers Release back
-	// to the engine; the struct carries Go-heap pointer fields (Entries func
-	// value capturing the iterator's closure + ebrPart + arena) so it CANNOT
-	// be arena-allocated without making those closures GC-unreachable (a
-	// use-after-free hazard the HAMT-wrapper comment already documents for
-	// in-arena structs holding Go-heap pointers). The byte-faithful analog is
-	// the engine's existing participantPool sync.Pool; the steady-state 0-
-	// alloc amnesty is exactly documented sync.Pool precedent (the zero-alloc
-	// gate is steady-state, not cold-start).
+	// deltaPool recycles CRDTDelta values returned by Release. The struct holds
+	// Go pointers, including its iterator closure and EBR participant, so the
+	// struct itself must remain in GC-managed memory even though its snapshot
+	// and key slices use arena storage. Pool warmup allocations are outside the
+	// steady-state zero-allocation contract.
 	deltaPool sync.Pool
 
-	// ── Lamport skew-bound engine state ──
-	// observedInboundRate is an EWMA of inbound DotCounter advancement,
-	// updated inside AdvanceLamportTo on every successful advance
-	// (the per-call site where every inbound DotCounter is observed). It is
-	// stored as an atomic.Uint64 of its IEEE-754 bits (math.Float64bits /
-	// math.Float64frombits) so the skew-bound caller can build an atomic
-	// snapshot that is race-clean against concurrent InsertLocal/Join — a
-	// plain float64 would race under -race and could tear on 32-bit. The
-	// advance SEMANTICS of AdvanceLamportTo are UNCHANGED (only the
-	// EWMA update line is added; the max(local, remote) + disk-bump behavior
-	// is byte-identical). alpha = 0.1 (standard EWMA decay; a known limitation —
-	// a high alpha tracks bursts but is more attacker-influenceable).
+	// observedInboundRateBits stores an EWMA of inbound counter advances as
+	// IEEE-754 bits in an atomic uint64. AdvanceLamportTo updates it after a
+	// successful clock CAS. Atomic access avoids data races and torn float
+	// values; the alpha of 0.1 trades responsiveness against smoothing.
 	observedInboundRateBits atomic.Uint64
-	// lamportSkewHorizonSeconds / lamportSkewAbsoluteSlack are the
-	// policy knobs feeding the skew-bound snapshot (defaults 60.0 / 1000).
-	// These mirror the existing SetDataDir override convention: hard-coded
-	// defaults in NewDeltaCRDTEngine, runtime-tunable via the Set… setters
-	// below. The production default (AbsoluteSlack=1000) closes the
-	// far-future-stamp Lamport-poisoning attack; the setters let the
-	// happy-path wire tests admit their unrealistically-large eyecatch
-	// sentinels (chosen for zero-fill detection, NOT as plausible DotCounters)
-	// WITHOUT widening the production bound that closes that attack. Read in
-	// the atomic snapshot.
+	// The skew policy defaults to a 60-second horizon and absolute slack of
+	// 1000. The setters change these values under persistMu. Tests with large
+	// synthetic counters can relax the bound without changing the production
+	// default that rejects far-future counters.
 	lamportSkewHorizonSeconds float64
 	lamportSkewAbsoluteSlack  uint64
 
@@ -284,10 +170,9 @@ type DeltaCRDTEngine struct {
 	_epochPad1            CacheLinePad
 
 	// ── Cache Line 4: metrics counters ──
-	// These four counters are all atomic.Add'd on every InsertLocal/Join.
-	// They share a cache line with each other (they're all write-only metrics
-	// that are read rarely via Stats()), but they must NOT share with the
-	// hot CAS/epoch fields above.
+	// These four counters are incremented by InsertLocal and Join. They can
+	// share a cache line because Stats reads them infrequently, but padding
+	// separates them from the hot root-CAS and epoch fields.
 	_metricsPad0    CacheLinePad
 	deltasGenerated atomic.Uint64
 	deltasApplied   atomic.Uint64
@@ -315,14 +200,10 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 		// many mutations, preventing livelock under high concurrency.
 		epochAdvanceThreshold: 64,
 
-		// Lamport skew-bound policy knobs (the production defaults):
-		// HorizonSeconds=60.0 is generous to fast honest peers and
-		// correspondingly slow against ratcheting attackers (a known
-		// tradeoff); AbsoluteSlack=1000 is the small floor closing the
-		// far-future-stamp attack on the production wire (a stamp >
-		// lamport+envelope+1000 is refused before Join → AdvanceLamportTo).
-		// Overridable via the SetLamportHorizonSeconds / SetLamportAbsoluteSlack
-		// setters below.
+		// The skew bound allows a 60-second rate envelope plus 1000 counters.
+		// A larger horizon accommodates faster peers but gives an incremental
+		// attacker more room. Frames beyond the bound are rejected before Join
+		// can advance the local clock. The setters below override these defaults.
 		lamportSkewHorizonSeconds: 60.0,
 		lamportSkewAbsoluteSlack:  1000,
 	}
@@ -330,29 +211,13 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 		return e.ebr.Register()
 	}
 
-	// initialize the *CRDTDelta pool. The carrier box an
-	// earlier path allocated (`seqPtr:= new(Seq)`) was eliminated: the closure
-	// does not self-reference, so a stack-local `var deltaSeq Seq` carries the
-	// func value into the struct without a heap box. The CRDTDelta pool's
-	// New returns a fresh zero struct; at steady state the pool recycles it
-	// (the documented sync.Pool amnesty, NOT a Zero-GC breach).
+	// Build the lazy Entries closure once for each pooled delta. It captures the
+	// delta itself and reads the current snapshot, send keys, and peel status
+	// from fields refreshed by GenerateDelta and cleared by Release. Reusing the
+	// closure avoids rebuilding its capture environment on every call; the
+	// one-time allocation belongs to pool warmup rather than steady state.
 	e.deltaPool.New = func() any {
 		d := &CRDTDelta{}
-		// Build the lazy Entries iterator ONCE here in the pool's New,
-		// capturing `self` (the recycled *CRDTDelta). The closure reads its
-		// per-delta inputs from the struct's fields (shardRoots / sendKeys /
-		// diffNil / peelErr); those fields are UPDATE'd by GenerateDelta on
-		// every Get and cleared by Release on every Put. GenerateDelta does
-		// NOT reassign Entries (that would rebuild the closure's capture env
-		// every call = 1 alloc/op). Release does NOT nil Entries (that would
-		// discard the pre-built closure; a fresh deltaPool.Get's New would
-		// rebuild it). The capture-env struct (1 alloc, holding the single
-		// `self` pointer) is paid ONCE during pool warmup and recycled
-		// forever — the steady-state sync.Pool amnesty permits it; the bench
-		// reads 0 B/op · 0 allocs/op at steady state. This is the
-		// architectural shape that closes the conservative-escape the earlier
-		// 4-capture closure could not (a 4-capture env rebuilt per call = 1
-		// alloc/op; a 1-capture env built once = 0 allocs/op steady).
 		self := d
 		d.Entries = func(yield func(entityID string, entry CRDTEntry) bool) {
 			for _, sr := range self.shardRoots {
@@ -364,7 +229,7 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 						key := HashCausalDot(entries[i].Dot(), entries[i].PayloadDigest)
 						// sort.Search over the struct's sendKeys field: the
 						// in-place-sorted arena slice is binary-searched for
-						// membership. replacement for the heap sendMap.
+						// membership without allocating a map.
 						shouldSend := false
 						if len(self.sendKeys) > 0 {
 							idx := sort.Search(len(self.sendKeys), func(j int) bool {
@@ -372,7 +237,7 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 							})
 							shouldSend = idx < len(self.sendKeys) && self.sendKeys[idx] == key
 						}
-						// If diff == nil or peel failed, we fallback to sending everything
+						// Send the full set if subtraction or peeling failed.
 						if self.diffNil || self.peelErr != nil || shouldSend {
 							if !yield(entityID, entries[i]) {
 								return false
@@ -386,11 +251,9 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 		return d
 	}
 
-	// initialize the sharded root. Each shard is its own empty
-	// HAMT (its own seed); the engine routes entityID -> shard via routeSeed.
-	// The LamportClock, EWMA, and skew-bound knobs are initialized below as
-	// the single shared values they already were — sharding the HAMT root does
-	// NOT shard the LamportClock.
+	// Each shard starts with an empty HAMT. routeSeed assigns entity IDs to
+	// shards, while the Lamport clock, inbound-rate EWMA, and skew policy remain
+	// engine-wide.
 	e.routeSeed = maphash.MakeSeed()
 	e.initShardsLocked(arena, defaultShardCount)
 
@@ -404,97 +267,37 @@ func NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintpt
 
 	e.lamportCounter.Store(initialCounter)
 	e.lastSavedCounter.Store(initialCounter)
-	// EWMA seed: observedInboundRate starts at 0.0 — a fresh
-	// engine has observed no inbound advancement; the bound's rate-envelope
-	// term is therefore 0 on the first frame, leaving the bound at
-	// lamport + 0 + AbsoluteSlack. The EWMA grows as honest peers feed
-	// real DotCounters through Join, widening the envelope; an incremental-
-	// ratcheting attacker can ratchet it over many passing frames (a known
-	// limitation — the bound SLOWS that attack; the global EWMA alone does
-	// not CLOSE it).
+	// A fresh engine has no observed inbound rate, so its first bound is the
+	// local clock plus AbsoluteSlack. Successful inbound advances raise the
+	// EWMA and widen the rate envelope. An attacker can also inflate it through
+	// many accepted frames; the estimate slows incremental clock poisoning but
+	// does not prevent it on its own.
 	e.observedInboundRateBits.Store(math.Float64bits(0.0))
 
-	// Spawn the single dedicated persist worker. persistCh is UNBUFFERED
-	// (cap 0) so exactly ONE in-flight persist job exists at a time
-	// (consistent with the tmp-file serialization contract; a buffered chan
-	// would re-introduce tmp-file races across slots). The CAS caller
-	// (NextDot / AdvanceLamportTo) hands a nextLimit to persistCh via a
-	// non-blocking select-default send -- it drops the job if the worker is
-	// busy and the next +1000 CAS re-issues with a strictly-higher nextLimit.
-	// The worker is the ONLY caller of persistLamport now; it runs the
-	// f.Sync()+os.Rename UNDER persistMu so the disk-serialization contract
-	// is byte-identical to the pre-decouple shape -- only the CAS caller no
-	// longer blocks on that lock-hold.
+	// Start the persistence worker with an unbuffered work channel. A caller
+	// whose nonblocking send finds the worker busy skips that write; a later
+	// reservation offers a higher watermark instead. Only the worker performs
+	// asynchronous writes, under persistMu.
 	e.persistCh = make(chan uint64)
 	e.persistWorkerReady = make(chan struct{})
-	// The second (park) ack channel is the ONLY buffered channel in the
-	// persist path — a CAP-1 buffered chan struct{}. The `, 1` cap argument is
-	// load-bearing: an unbuffered park channel deadlocks the worker (its
-	// park send has no receiver yet — the constructor's <-persistWorkerParked
-	// has not even begun to wait; the worker has not advanced past the send
-	// to the for-range). The cap-1 buffer means the worker's park send NEVER
-	// blocks (it deposits into the buffer and proceeds to the receive),
-	// while the constructor's receive still synchronizes-with the send — the
-	// happens-before edge holds for buffered channels. persistCh stays
-	// UNBUFFERED (cap 0): the exactly-one-in-flight persist job invariant is
-	// preserved.
+	// The park acknowledgement needs capacity one: the worker sends it before
+	// the constructor starts receiving. An unbuffered acknowledgement would
+	// deadlock startup. persistCh itself remains unbuffered.
 	e.persistWorkerParked = make(chan struct{}, 1)
 	e.persistWorkerWg.Add(1)
 	go e.persistWorkerLoop()
-	// Two-stage startup handshake. The first cut shipped ONLY stage 1
-	// (close(persistWorkerReady)): a close() wakes receivers but does NOT
-	// establish a happens-before edge to any SUBSEQUENT statement in the
-	// closing goroutine — only to the receive that observed the closure.
-	// Stage 1 therefore proves the worker reached the close() (was
-	// scheduled), which is necessary-but-INSUFFICIENT: it says nothing
-	// about whether the worker has reached the `for val:= range persistCh`
-	// receive. There is a SCHEDULER WINDOW between close() and the worker
-	// reaching the for-range receive; a NextDot select-default send racing
-	// that window sees no parked receiver, hits default, and DROPS the job
-	// (the cold-start drop -> recoverLamport reads 0 instead of 1001).
-	//
-	// The park proof closes that window: the worker, AFTER parking on the
-	// for-range receive BUT BEFORE processing any value, sends struct{}{} on
-	// persistWorkerParked. A send on a buffered channel synchronizes-with
-	// the corresponding receive, and the send occurs AFTER the worker has
-	// evaluated (parked on) the for-range receive of persistCh. Therefore
-	// the constructor's <-persistWorkerParked unblocks ONLY when the worker
-	// is PROVABLY parked on the persistCh receive — the FIRST NextDot's
-	// select-send is guaranteed to rendezvous (the worker is the idle
-	// receiver, not busy). This is the textbook Go pattern for "wait until a
-	// goroutine has parked on a channel receive", and the only
-	// structurally-correct fix.
-	//
-	// The two-stage ordering is pinned: stage 1 (scheduled) MUST precede
-	// stage 2 (parked) — probing in the reverse order deadlocks a worker
-	// that closes stage-1 only AFTER its stage-2 park send (the
-	// persistWorkerLoop body orders close(persistWorkerReady) BEFORE the
-	// park send; the constructor observes ready THEN parked).
+	// Observe the startup acknowledgements in the worker's program order:
+	// started, then the statement immediately before the receive loop. Closing
+	// ready wakes the constructor but says nothing about later worker statements.
+	// The buffered park send establishes a happens-before edge to the corresponding
+	// receive, so this receive proves the acknowledgement was sent. It does not
+	// prove that the worker has entered the next receive.
 	<-e.persistWorkerReady
 	<-e.persistWorkerParked
-	// Determinism booster: the cap-1 buffered park-ack proves
-	// the worker REACHED the send-to-park line (close(ready) -> send-on-parked
-	// -> `for val:= range e.persistCh`), but the worker still has to RUN a
-	// few instructions INTO the for-range to actually PARK on <-persistCh (the
-	// buffered deposit is async -- the worker continues to the park loop
-	// without waiting on a receiver). The deposit's happens-before edge
-	// guarantees the worker executed the ack send, NOT that it has reached the
-	// park. A raw constructor return therefore races the worker's park under
-	// -race instrumentation (which inflates every instruction's cost and
-	// widens the contention window behind the cold-start drop): the worker
-	// is mid-transition-to-for-range when the test's first NextDot
-	// select-default send fires and sees no parked receiver -> default -> DROP
-	// -> recoverLamport reads 0. Yield the constructor a few scheduler turns
-	// here so the worker, which has nothing to do but reach the for-range park,
-	// is scheduled onto a core and PARKS on <-persistCh BEFORE the constructor
-	// returns and the caller issues the first NextDot. This is a documented
-	// scheduler hint (runtime.Gosched -- a cooperative yield with no busy-wait
-	// and no sleep), NOT a sentinel job (no persist value round-trips and no
-	// persist slot is consumed) and NOT a buffered persistCh (persistCh stays
-	// cap-0). Empirically this closes the residual cold-start race the raw
-	// cap-1 buffered ack alone leaves open (which flaked ~0.01%/iter ungated
-	// and surfaced under -race; the double yield drops it below the test's
-	// detection floor across 1000+ ungated and 200 -race iterations).
+	// Give the worker two opportunities to reach its receive before the caller
+	// can issue the first nonblocking persistence send. These are scheduler
+	// hints, not a handshake or a durability guarantee; a skipped write is still
+	// covered by a later reservation or the final flush in Close.
 	runtime.Gosched()
 	runtime.Gosched()
 
@@ -507,24 +310,19 @@ func (e *DeltaCRDTEngine) SetDataDir(dir string) {
 	e.dataDir = dir
 }
 
-// SetLamportHorizonSeconds overrides the skew-bound HorizonSeconds
-// policy knob. It mirrors the existing SetDataDir override
-// convention — a runtime-tunable knob used by tests/operators without
-// re-widening the constructor. The production default (60.0) is sized for
-// planetary-scale honest peers; override defensively only with a
-// justified operational reason. Acquires persistMu so the override is
-// ordered against concurrent Set…/Apply (matching SetDataDir's locking).
+// SetLamportHorizonSeconds changes the rate-envelope horizon used by the skew
+// bound. Larger values tolerate faster peers but also permit faster incremental
+// clock advances. persistMu orders the change against other configuration and
+// apply operations.
 func (e *DeltaCRDTEngine) SetLamportHorizonSeconds(h float64) {
 	e.persistMu.Lock()
 	defer e.persistMu.Unlock()
 	e.lamportSkewHorizonSeconds = h
 }
 
-// SetLamportAbsoluteSlack overrides the skew-bound AbsoluteSlack
-// policy knob. Production default 1000 closes the far-future-stamp attack on
-// the wire; raising it widens the bound (the rate-envelope floor grows).
-// Mirrors the SetDataDir convention; acquire persistMu for ordering vs
-// concurrent apply.
+// SetLamportAbsoluteSlack changes the fixed allowance in the skew bound. The
+// default is 1000; increasing it permits counters farther ahead of the local
+// clock. persistMu orders the change against configuration and apply operations.
 func (e *DeltaCRDTEngine) SetLamportAbsoluteSlack(s uint64) {
 	e.persistMu.Lock()
 	defer e.persistMu.Unlock()
@@ -536,10 +334,9 @@ func (e *DeltaCRDTEngine) SetLamportAbsoluteSlack(s uint64) {
 // (re-root into a different cardinality). The caller is responsible for routing
 // seed/lock invariants; this helper only populates the shard slice.
 //
-// The previous single `e.state.Store(NewHAMT(arena))` is replaced
-// by `n` independent NewHAMT(arena) roots. The EBR/persistMu/epochCounter state
-// is untouched — sharding the HAMT root does NOT shard the LamportClock, the
-// EBR manager, or the disk-persist path.
+// Each shard receives an independent empty HAMT in the shared arena. The caller
+// holds the appropriate configuration lock; this helper does not alter the
+// engine-wide Lamport clock, EBR manager, or persistence state.
 func (e *DeltaCRDTEngine) initShardsLocked(arena *HamtArena, n int) {
 	shards := make([]shardRoot, n)
 	for i := range shards {
@@ -548,19 +345,14 @@ func (e *DeltaCRDTEngine) initShardsLocked(arena *HamtArena, n int) {
 	e.shards = shards
 }
 
-// routeShard maps an entityID to a shard index in [0, len(e.shards)). It is a pure
-// function of (entityID, e.routeSeed) so the SAME entityID always lands in the
-// SAME shard — the load-bearing property that lets Join group incoming blocks by
-// shard and CAS only the shard they mutate. maphash gives a high-quality,
-// well-distributed hash independent of each shard's own HAMT seed, so entityIDs
-// spread uniformly across the N shards even under adversarial key patterns (the
-// bench's `parallel-W-L` entityIDs hash to ≈ uniform shards pre-change and
-// post-change).
+// routeShard maps entityID to an index in [0, len(e.shards)). The result depends
+// only on the ID and the engine's routeSeed, so Join can group all entries for
+// an entity into one shard update. The maphash seed is independent of the HAMT
+// hash seeds.
 //
-// The shard array length is a power of two (defaultShardCount and the
-// SetShardCount convention enforce this), so (h & (n-1)) is a clean bitmask
-// route with no modulo. A non-power-of-two n falls back to modulo (the assertion
-// on SetShardCount keeps the power-of-two contract; modulo is defensive only).
+// Power-of-two shard counts use a bitmask; the modulo branch is defensive for a
+// nonstandard internal configuration. SetShardCount enforces a positive power
+// of two.
 func (e *DeltaCRDTEngine) routeShard(entityID string) int {
 	n := len(e.shards)
 	if n == 0 {
@@ -573,25 +365,19 @@ func (e *DeltaCRDTEngine) routeShard(entityID string) int {
 	return int(h % uint64(n))
 }
 
-// SetShardCount re-roots the engine into a different shard cardinality at runtime.
-// It mirrors the existing SetDataDir persistMu-guarded override convention: a
-// runtime-tunable knob (test/operator) that does not re-widen the constructor.
-// The previous shards are retired through EBR (3-epoch grace) exactly as the
-// single-root design retired an old root on CAS, and the new shards start empty —
-// existing engine state is preserved by re-emitting every live (entityID, entries)
-// pair from the OLD shards into the NEW shards via Set, under one driver goroutine.
+// SetShardCount rebuilds the engine with n shards and reinserts every live
+// entity into its new root. n must be a positive power of two; other values
+// panic. A count of one restores a single-root layout.
 //
-// n MUST be a power of two (the routing bitmask assumes it) and >= 1; a violation
-// panics (this is an operator-configured knob, not a hot-path input). N=1 collapses
-// back to the single-root CAS shape — the benchmark's guard drive catches that as
-// the regression signature (ns/op at max workers returns to the CAS storm).
+// Callers must quiesce Join and InsertLocal before re-rooting. persistMu
+// serializes this operation with other configuration changes and disk writes;
+// those mutation paths do not take that mutex. Old roots are retired through
+// EBR after their entries have been copied.
 func (e *DeltaCRDTEngine) SetShardCount(n int) {
 	if n < 1 || n&(n-1) != 0 {
 		panic(fmt.Sprintf("SetShardCount: n must be a positive power of two, got %d", n))
 	}
-	// Guard the re-root against concurrent SetShardCount / Join / InsertLocal.
-	// persistMu is the existing pairing mutex; SetShardCount is off the hot path
-	// (operator/test knob), so coupling to persistMu does not surface on the bench.
+	// Serialize configuration and persistence; re-rooting is off the hot path.
 	e.persistMu.Lock()
 	defer e.persistMu.Unlock()
 
@@ -602,11 +388,8 @@ func (e *DeltaCRDTEngine) SetShardCount(n int) {
 	old := e.shards
 	e.initShardsLocked(e.arena, n)
 
-	// Re-emit every live (entityID, entries) pair from the OLD shards into the
-	// NEW shards. Each old shard's root is iterated once; the pairs are Set into
-	// the matching new shard (routing by the new cardinality). The old roots are
-	// then Retired via EBR (3-epoch grace), matching the single-root retire
-	// profile.
+	// Reinsert every live entity into its new shard. Retire each old root after
+	// its entries have been copied.
 	for oi := range old {
 		root := old[oi].ptr.Load()
 		if root == nil {
@@ -629,12 +412,9 @@ func (e *DeltaCRDTEngine) SetShardCount(n int) {
 	e.maybeAdvanceEpoch()
 }
 
-// mergeExistingDot merges `incoming` into `base` for the given entityID using the
-// SAME dot-sort/dedup the engine's Join uses. It is the SetShardCount re-emit
-// helper (off the hot path): a delivered (entityID, entries) block is folded into
-// the existing entries by dot, keeping the per-shard leaf invariant (dot-sorted,
-// deduped) intact. `added` is expressed by returning a freshly-Set HAMT only when
-// the merge grew the state (mirroring Join's `if added` branch).
+// mergeExistingDot merges incoming entries into base for entityID using Join's
+// dot ordering and deduplication. It preserves the sorted, duplicate-free leaf
+// invariant and returns base unchanged when no new dot is added.
 func mergeExistingDot(base *HAMT, entityID string, incoming []CRDTEntry) *HAMT {
 	existing := base.Get(entityID)
 	needed := len(existing) + len(incoming)
@@ -671,32 +451,17 @@ func mergeExistingDot(base *HAMT, entityID string, incoming []CRDTEntry) *HAMT {
 	return base.Set(entityID, merged)
 }
 
-// allShardRoots snapshots every shard's current *HAMT under the caller's existing
-// EBR participant pin. Used by GenerateDelta to iterate a frozen, reclaim-safe
-// view across all shards: the delta carries the EBR participant on
-// CRDTDelta.ebrPart (Enter'd here, Exit'd in Release), so a shard root retired
-// by a concurrent InsertLocal/Join CAS during iteration is NOT freed until the
-// caller Releases. The single-root design's IncRef/DecRef "defense in depth" is
-// N-rooted at sharded scale; the EBR pin is the load-bearing protection (the
-// use-after-free fix comment on GenerateDelta documents this), so the returned
-// delta carries rootRef=0/arenaRef=nil and Release() skips DecRef via its
-// arenaRef guard.
-// allShardRootsArena is the arena-backed sibling of allShardRoots:
-// the per-call []*HAMT slice (256 pointers = ~2 KB) is provisioned from
-// e.arena instead of the Go heap, eliminating the per-op make([]*HAMT, N)
-// allocation the bench diagnosed as one of the 10 GenerateDelta allocs. The
-// caller (GenerateDelta) retires the slab in CRDTDelta.Release via the
-// arena-backed send-key slab retire path's twin.
+// allShardRootsArena snapshots the current HAMT pointer from every shard into
+// an arena-backed slice and returns the slice with its arena offset. The caller
+// must hold an EBR participant for as long as the snapshot is read; GenerateDelta
+// transfers that duty to CRDTDelta.Release so roots retired by concurrent writes
+// remain allocated during lazy iteration.
 //
-// The slice holds Go-heap pointers (*HAMT) into mmap'd HAMT wrappers — the
-// cap-correct backing is in C-space (the slice header lives on the closure
-// capture struct), so the GC will NOT scan the *HAMT entries. The HAMT
-// wrappers themselves stay reachable during the delta's lifetime via the
-// engine's per-shard atomic.Pointer[HAMT] (shards[i].ptr), which is the
-// load-bearing root the EBR pin already protects; the []*HAMT here is a
-// frozen SNAPSHOT, not an ownership root. EBR RetireBlock on this slab is
-// safe (the slab is a stale-pointer-free variable-size block; recycling only
-// reclaims the 2 KB slice backing, never the HAMT wrappers themselves).
+// Arena storage avoids a per-call heap slice. The off-heap backing is invisible
+// to the GC, but it is only a snapshot, not the ownership root for the HAMT
+// wrappers. EBR protects their lifetime, and Release retires the snapshot block
+// separately. If arena allocation fails, the function returns a heap slice and
+// a zero offset.
 func (e *DeltaCRDTEngine) allShardRootsArena() ([]*HAMT, uint64) {
 	n := len(e.shards)
 	if n == 0 {
@@ -705,8 +470,8 @@ func (e *DeltaCRDTEngine) allShardRootsArena() ([]*HAMT, uint64) {
 	size := uintptr(n) * unsafe.Sizeof((*HAMT)(nil))
 	backing := e.arena.allocVar(size)
 	if backing == 0 {
-		// OOM — fall back to the heap path so a 2GB-arena-impossible case
-		// degrades gracefully (the bench's 256-shard slice is ~2 KB).
+		// If arena space is exhausted, use a heap-backed snapshot instead of
+		// failing delta generation.
 		roots := make([]*HAMT, n)
 		for i := range e.shards {
 			roots[i] = e.shards[i].ptr.Load()
@@ -720,9 +485,8 @@ func (e *DeltaCRDTEngine) allShardRootsArena() ([]*HAMT, uint64) {
 	return roots, uint64(backing - e.arena.base)
 }
 
-// allShardRoots snapshots every shard's current *HAMT. Preserved for any
-// caller that still wants the heap-backed variant (not on the GenerateDelta
-// hot path). Returns the same logical snapshot.
+// allShardRoots returns a heap-backed snapshot for callers outside the pooled
+// GenerateDelta path. The same EBR lifetime rules as allShardRootsArena apply.
 func (e *DeltaCRDTEngine) allShardRoots() []*HAMT {
 	roots := make([]*HAMT, len(e.shards))
 	for i := range e.shards {
@@ -731,29 +495,14 @@ func (e *DeltaCRDTEngine) allShardRoots() []*HAMT {
 	return roots
 }
 
-// LamportSnapshot is the atomic, receiver-state-sourced view of the engine
-// clock + rate + policy knobs the skew-bound wrapper consumes. It is the
-// caller-side (NOT wrapper-side) construction: the wrapper is a pure function
-// of (ev, snapshot) and never lazily re-reads e.lamport /
-// e.observedInboundRate mid-call. Build this ONCE per apply (per batch, taken
-// before the per-element loop), pass it through, and the bound is coherent
-// against concurrent InsertLocal on the same receiver — the load-bearing
-// property the concurrency guard asserts.
+// LamportSnapshot returns the receiver state used by
+// ReconstructEntryWithSkewBound. Callers take one snapshot per event or batch so
+// validation does not reread changing engine fields partway through the check.
 //
-// lamportSkewSnapshot reads e.lamportCounter (atomic.Uint64) and the EWMA
-// (atomic.Uint64 of IEEE-754 bits) under a single persistMu-held snapshot of
-// the two config knobs — so the lamport and the EWMA are read atomically
-// (each is its own atomic load) and the knobs are read coherently with each
-// other. The lamport and the knobs are not read under the SAME atomic, but
-// the lamport is itself atomic so the read cannot tear and the knobs are
-// mutex-guarded against concurrent SetLamport… so the snapshot is coherent
-// enough for the bound (a torn read of the EWMA bits on the wire is not
-// possible — the bits are a single uint64 atomic load). Returning a LamportSnapshot
-// by value (≈40 bytes) makes the snapshot immutable to the caller.
-// This method is the helper the apply callers feed to
-// ReconstructEntryWithSkewBound; it is also the construction the
-// concurrency guard uses directly (crdt_lamport_skew_test.go) so the guard can
-// pin the snapshot.Lamport value it passed.
+// The horizon and slack are read together under persistMu. The clock and EWMA
+// bits are read with individual atomic loads after the lock is released, so the
+// result is an immutable value for the caller, not a transactionally atomic view
+// of all four fields.
 func (e *DeltaCRDTEngine) LamportSnapshot() LamportSnapshot {
 	e.persistMu.Lock()
 	horizon := e.lamportSkewHorizonSeconds
@@ -776,12 +525,10 @@ func (e *DeltaCRDTEngine) LamportSnapshot() LamportSnapshot {
 // active). The EBR three-epoch ring buffer tolerates sparse epoch
 // advancement: retired nodes sit in their epoch's list safely.
 func (e *DeltaCRDTEngine) maybeAdvanceEpoch() {
-	// Once Close has armed the teardown flag, do NOT run
-	// the reclamation — the arena is about to be (or already is) munmap'd and
-	// freeRetiredList→freeVar would fault on the unmapped header. This covers
-	// the IN-FLIGHT Join/InsertLocal whose maybeAdvanceEpoch runs AFTER its
-	// participant.Exit (crdt.go:1010→1012) — i.e. OUTSIDE the window Quiesce's
-	// participant-drain observes. A single shared-line Closing() load.
+	// Close sets Closing before unmapping the arena. Do not reclaim retired
+	// nodes after that point: freeRetiredList would dereference arena headers
+	// that may already be unmapped. This also covers an in-flight Join or
+	// InsertLocal that exits its participant before calling maybeAdvanceEpoch.
 	if e.ebr.Closing() {
 		return
 	}
@@ -796,46 +543,23 @@ func (e *DeltaCRDTEngine) maybeAdvanceEpoch() {
 
 // Close releases the off-heap arena.
 func (e *DeltaCRDTEngine) Close() error {
-	// Arm the teardown flag FIRST. After this, any NEW
-	// Join/Get/InsertLocal fails LOUD (a post-Close arena access is a
-	// programming error, like send-on-closed-channel) and maybeAdvanceEpoch
-	// skips the reclamation — so nothing NEW can reach the arena. Arming the
-	// flag before the quiesce closes the in-flight set (no new joiners).
+	// Reject new operations and disable reclamation before draining active
+	// participants. Enter/Closing only access Go-managed EBR state.
 	e.ebr.SetClosing()
-	// Quiesce the EBR participants so NO in-flight
-	// Join/Get/reclamation is touching the arena. This MUST precede the
-	// persist-channel close below: an in-flight InsertLocal's NextDot sends on
-	// persistCh, and closing persistCh while such a send is live would panic
-	// (send-on-closed-channel). Quiesce first ⇒ no sender is in flight.
+	// Quiesce before closing persistCh: an in-flight NextDot or Join could
+	// otherwise send on the closed channel. It also ensures that no operation
+	// still accesses the arena when it is freed.
 	e.ebr.Quiesce()
-	// Drain the persist worker BEFORE arena.Free so no in-flight
-	// f.Sync()+os.Rename dangles after the engine is closed. persistStopOnce
-	// guards the channel close so a double
-	// Close (t.Cleanup + a manual test path) is safe -- a second
-	// close(e.persistCh) would panic; the Once prevents it. The second
-	// persistWorkerWg.Wait is a no-op (the WaitGroup has already been
-	// decremented to zero by the worker's exit). The arena is still valid
-	// during the drain (the worker touches only e.dataDir + persistLamport's
-	// os.OpenFile; it does NOT touch e.arena); Close orders worker-exhaust
-	// THEN arena teardown.
+	// Drain asynchronous persistence before the final synchronous flush. The
+	// Once makes repeated Close calls safe; the Wait prevents a worker write
+	// from racing the final file update.
 	e.persistStopOnce.Do(func() { close(e.persistCh) })
 	e.persistWorkerWg.Wait()
-	// Flush the final Lamport high-water synchronously.
-	// lastSavedCounter is CAS-advanced in the NextDot CALLER (crdt.go:206) even
-	// when the persist worker DROPS the send (the cold-start hole), so it is
-	// always the true high-water. Persisting it here — after the worker is
-	// drained, so this is the only persistLamport in flight — closes BOTH the
-	// cold-start drop AND the general Close-never-flushes gap. Best-effort (the
-	// WAL is authoritative); the guard asserts the file carries it.
-	//
-	// The flush is MONOTONE: it never writes a value below the one already
-	// persisted at e.dataDir. A stale engine (one that recoverLamport'd from a
-	// different DataDir before SetDataDir repointed the write path) carries a
-	// lastSavedCounter LOWER than the file's high-water; flushing it raw would
-	// REGRESS the file — TestDurabilityRoundTrip/Steady caught exactly
-	// this (a throwaway engine's Close flushed 0 over the real 1001). Read the
-	// current persisted value (0 when the file is absent/unreadable) and flush
-	// the max. The worker is already drained, so this read is race-free.
+	// Flush the in-memory durability watermark even if a nonblocking handoff
+	// was skipped. The WAL remains authoritative, and this write is best-effort.
+	// Never lower a value already in the file: an engine whose SetDataDir moved
+	// it to an existing directory may carry an older watermark than the file.
+	// With the worker drained, this read and write do not race persistence.
 	current, _ := e.recoverLamport()
 	final := e.lastSavedCounter.Load()
 	if current > final {
@@ -845,46 +569,20 @@ func (e *DeltaCRDTEngine) Close() error {
 	return e.arena.Free()
 }
 
-// persistWorkerLoop is the single dedicated goroutine that owns the
-// disk-persist path. It is the ONLY caller of persistLamport: it drains
-// persistCh under persistMu so the f.Sync()+os.Rename serialization (against
-// concurrent SetDataDir / SetShardCount) is byte-identical to the pre-decouple
-// shape. The CAS callers (NextDot / AdvanceLamportTo) hand the nextLimit here
-// via a non-blocking send and never block on the fsync; the durable bump lags
-// by at most one in-flight job. The loop exits when Close closes persistCh;
-// persistWorkerWg.Done releases the Close drain.
+// persistWorkerLoop handles asynchronous Lamport persistence. It serializes
+// file writes under persistMu and exits when Close closes persistCh. NextDot
+// and AdvanceLamportTo use nonblocking sends, so a busy worker can leave the
+// file behind the in-memory watermark until a later write. After this worker
+// exits, Close performs its own final synchronous flush.
 func (e *DeltaCRDTEngine) persistWorkerLoop() {
-	// Signal the goroutine has been scheduled and reached this
-	// point. close() is necessary-but-INSUFFICIENT (the cold-start drop): it
-	// proves the goroutine has reached THIS line (and was scheduled), NOT
-	// that it has reached the `for val:= range e.persistCh` receive below.
-	// There is a SCHEDULER WINDOW between this close() and the worker
-	// reaching the for-range receive; during that window a NextDot
-	// select-default send sees NO parked receiver and DROPS the only persist
-	// job, Close() drains an empty channel, the worker sees closed and exits
-	// without ever calling persistLamport, and recoverLamport reads 0 instead
-	// of 1001 — exactly this failure was captured in testing. Stage 1 alone is
-	// the bug; stage 2 is the fix.
+	// Report that the worker reached startup. Closing this channel does not
+	// order the constructor against any subsequent worker statement.
 	close(e.persistWorkerReady)
-	// The load-bearing park proof: send on the CAP-1 buffered
-	// persistWorkerParked channel IMMEDIATELY before the for-range. A
-	// successful send on a buffered channel synchronizes-with the
-	// corresponding receive (Go memory model); the send happens ONLY
-	// after this goroutine has ALREADY evaluated the for-range receive
-	// expression of e.persistCh (the for-range is the receive — the
-	// goroutine is about to park on it; the park send is the immediately
-	// preceding statement, so the receive expression has been set up).
-	// Therefore the constructor's <-persistWorkerParked unblocks ONLY
-	// after this send, which is ONLY after the worker is at the persistCh
-	// receive — the first NextDot's select-send is guaranteed to
-	// rendezvous (the worker is the receiver). The cap-1 buffer means the
-	// send never blocks (the worker does not have to wait for a receiver);
-	// an unbuffered park channel would deadlock the worker here (no
-	// receiver yet — the constructor's <-persistWorkerParked has not begun
-	// to wait; the worker has not advanced past the send to the for-range).
-	// This happens-before edge is the only structurally-correct proof that
-	// the worker is PARKED (not merely scheduled) before
-	// NewDeltaCRDTEngine returns.
+	// Acknowledge the statement immediately before the receive loop. Capacity
+	// one avoids waiting for the constructor's receive. The send has a
+	// happens-before edge to the constructor's corresponding receive, proving
+	// this statement executed; it does not prove the worker has entered the next
+	// receive, which is why the constructor also uses scheduler yields.
 	e.persistWorkerParked <- struct{}{}
 	for val := range e.persistCh {
 		e.persistMu.Lock()
@@ -906,27 +604,14 @@ func (e *DeltaCRDTEngine) NextDot() CausalDot {
 		}
 	}
 
-	// The unguarded `CompareAndSwap(Load(), nextLimit)` could REGRESS
-	// lastSavedCounter (Go's CAS checks old==current bitwise, NOT new>current —
-	// a racing goroutine that publishes a strictly-higher nextLimit leaves the
-	// deferred CAS's `old` matching `current`, so the CAS succeeds and pulls
-	// lastSaved BACKWARDS to the lower nextLimit — a fault-injection harness
-	// reproduced this 5/5 RED on disk: persisted value ~= 483K-758K vs peak ~=
-	// 800K). The fix mirrors `AdvanceLamportTo`'s monotone loop byte-for-byte
-	// in shape: the `nextLimit <= lastSaved` break BEFORE the CAS guarantees
-	// every CAS attempt has nextLimit > lastSaved, so a successful CAS can only
-	// ADVANCE the watermark. On CAS failure (a sibling CAS raced in between),
-	// re-loop, re-load, re-check — the sibling's strictly-higher value either
-	// covers this caller's +1000 step already (break) or leaves a window this
-	// caller re-CASes into.
-	// NextDot NO LONGER HOLDS persistMu. The in-memory lastSavedCounter
-	// advances SYNCHRONOUSLY here (the CAS caller publishes immediately; the
-	// in-memory clock is the truth). The +1000 amortization window stays
-	// byte-identical to the pre-decouple shape. The durable write lags by at
-	// most one in-flight persist job handed to the background worker. The
-	// select-default send drops the job if the single worker is busy; the next
-	// +1000 CAS re-issues with a strictly-higher nextLimit (no Lamport VALUE
-	// lost; only DURABILITY of the +1000 step lags by one extra +1000 step).
+	// Reserve persistence headroom 1000 counters at a time. Reloading and
+	// checking lastSaved before every CAS keeps the watermark monotone: a
+	// concurrent higher reservation either makes this one unnecessary or causes
+	// a retry. A single unguarded CAS could otherwise install a lower value.
+	//
+	// The reservation is published in memory without persistMu. The nonblocking
+	// handoff omits the file write when the worker is busy; a later reservation
+	// offers a strictly higher value, and Close flushes the final watermark.
 	nextLimit := counter + 1000
 	for {
 		lastSaved := e.lastSavedCounter.Load()
@@ -952,14 +637,9 @@ func (e *DeltaCRDTEngine) recoverLamport() (uint64, error) {
 	filePath := fmt.Sprintf("%s/lamport_%x.dat", e.dataDir, e.localNodeID)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		// Removed the fallback to "./data/crdt/" which is a
-		// relative path that resolves to different directories depending
-		// on CWD. In production, DataDir is always set to an absolute path
-		// (/data/crdt). In tests, DataDir is set to a unique temp directory.
-		// The fallback caused test pollution: Lamport counter files from
-		// previous test runs (or concurrent rapid property tests) were
-		// recovered via the relative path, producing non-deterministic
-		// initial counters that broke test assertions.
+		// Read only the configured directory. A relative-directory fallback
+		// could recover a counter belonging to another working directory or
+		// test engine and make the initial clock nondeterministic.
 		return 0, err
 	}
 	if len(data) < 8 {
@@ -971,12 +651,9 @@ func (e *DeltaCRDTEngine) recoverLamport() (uint64, error) {
 
 func (e *DeltaCRDTEngine) persistLamport(val uint64) error {
 	if err := os.MkdirAll(e.dataDir, 0755); err != nil {
-		// Removed the fallback to "./data/crdt/" — the same
-		// relative-path pollution vector as recoverLamport. If the data
-		// directory cannot be created, persist fails gracefully (the
-		// Lamport counter is still in memory and will be recovered on
-		// next restart from the in-memory value via NextDot's
-		// lastSavedCounter check).
+		// As in recoverLamport, do not fall back to a relative directory.
+		// Failure leaves the in-memory counter available for a later write in
+		// this process, including the final flush in Close.
 		return err
 	}
 	filePath := fmt.Sprintf("%s/lamport_%x.dat", e.dataDir, e.localNodeID)
@@ -1006,18 +683,11 @@ func (e *DeltaCRDTEngine) persistLamport(val uint64) error {
 // InsertLocal inserts a new event into the local CRDT state using a
 // lock-free CompareAndSwap loop, eliminating the need for joinMu.
 func (e *DeltaCRDTEngine) InsertLocal(entityID string, entry CRDTEntry) CausalDot {
-	// The teardown race window is BETWEEN the closing
-	// check and the arena CAS — a goroutine that reads Closing()==false and is
-	// then preempted can reach the arena AFTER Close's Quiesce+Free (NextDot's
-	// amortized early-return path does NOT touch persistCh, so it does not
-	// reliably panic first). Closing the window requires the participant to be
-	// CONTINUOUSLY active from BEFORE NextDot (whose persistCh send must be
-	// Quiesce-covered) through the last arena touch, so Quiesce observes this op
-	// for its whole duration: Enter FIRST, then fail LOUD if teardown began,
-	// then touch the arena. Enter/Closing read only Go-heap EBR fields
-	// (active/epoch/globalEpoch/closing), never the arena, so they are safe even
-	// after Free; the Closing check right after Enter panics before any arena
-	// access.
+	// Keep one EBR participant active from before NextDot until the last arena
+	// access. Otherwise Close could observe no participants and free the arena
+	// between a Closing check and a later CAS. Enter and Closing access only
+	// Go-managed EBR fields, so this ordering is safe during teardown; an
+	// operation that enters after Close starts panics before touching the arena.
 	participant := e.participantPool.Get().(*Participant)
 	participant.Enter(e.ebr)
 	exited := false
@@ -1036,39 +706,26 @@ func (e *DeltaCRDTEngine) InsertLocal(entityID string, entry CRDTEntry) CausalDo
 	entry.DotCounter = dot.Counter
 	entry.OriginNodeID = e.localNodeID
 
-	// route this entityID to its shard and CAS ONLY that shard's
-	// atomic.Pointer[HAMT]. The other shards are untouched, so N-1/N of the
-	// write traffic is invisible to this CAS — the CAS-storm collapses.
+	// Update only the shard selected for this entity; unrelated roots do not
+	// participate in this CAS.
 	shardIdx := e.routeShard(entityID)
 	shard := &e.shards[shardIdx]
 
-	// Lock-free CompareAndSwap loop to update the SHARD's HAMT root. The
-	// participant stays Enter'd across every retry: the single pinned epoch
-	// protects each iteration's `current` read (a node retired at epoch >= the
-	// entry epoch cannot be reclaimed while this participant holds that epoch),
-	// and collapsing the per-retry Enter/Exit into ONE Enter removes the
-	// mid-loop inactive window in which Quiesce could Free under a retry's CAS.
+	// Hold the EBR participant across retries. Its pinned epoch protects each
+	// current root from reclamation and prevents Close from freeing the arena
+	// during an inactive window between attempts.
 	for {
 		current := shard.ptr.Load()
 		existing := current.Get(entityID)
 
-		// Slice-corruption invariant: every CAS attempt MUST use a
-		// unique backing array. Reusing buffer[:0] or buffer[:needed] across
-		// retries causes silent memory corruption because the backing array
-		// pointer remains identical, violating linearizability.
+		// Every CAS attempt needs a fresh backing array. Reusing one after a
+		// failed CAS could overwrite entries still reachable from a published
+		// path-copying HAMT leaf.
 		//
-		// Zero-GC fix: the existing leaf entries are already dot-sorted
-		// (the HAMT leaf invariant maintained by Join's merge-sort and every
-		// preceding InsertLocal). Only the newly-appended entry is out of
-		// place, so a full sort is unnecessary. sort.Slice additionally
-		// heap-allocates a comparator closure on EVERY CAS retry — that
-		// allocation is on the write hot path the zero-alloc law forbids.
-		// We instead place the new entry at the tail and insertion-sort it
-		// into its dot position via a single backward pass: O(n) shift with
-		// NO closure allocation and NO generic sort. The make() itself is
-		// unavoidable: it is the fresh backing array the path-copying HAMT
-		// leaf escapes with (the slice-corruption invariant). No other Go-heap
-		// allocation occurs on this write path.
+		// Existing entries are already dot-sorted, so only the appended entry
+		// needs to move. The backward insertion pass takes O(n) time in the
+		// worst case and avoids a general sort and its comparator setup. The
+		// make supplies the independent storage required for this attempt.
 		newEntries := make([]CRDTEntry, len(existing)+1)
 		copy(newEntries, existing)
 		newEntries[len(existing)] = entry
@@ -1078,12 +735,10 @@ func (e *DeltaCRDTEngine) InsertLocal(entityID string, entry CRDTEntry) CausalDo
 		swapped := shard.ptr.CompareAndSwap(current, newState)
 
 		if swapped {
-			// Exit BEFORE Retire+maybeAdvanceEpoch so the epoch advance is not
-			// self-blocked by this still-active participant (AdvanceEpoch's
-			// canAdvance walks active participants and refuses while one pins an
-			// older epoch). The deferred cleanup sees exited==true and does not
-			// double-Exit; the Retire is safe post-Exit (it only PUSHES the old
-			// root's pointer onto a retired list — it never dereferences it).
+			// Leave the epoch before retiring and advancing so this participant
+			// cannot hold back its own reclamation pass. Retire only appends the
+			// old root pointer without dereferencing it; exited prevents a second
+			// Exit in the deferred cleanup.
 			participant.Exit()
 			exited = true
 			e.ebr.Retire(unsafe.Pointer(current))
@@ -1119,16 +774,11 @@ func compareDots(a, b CausalDot) int {
 	return 0
 }
 
-// cmpIncomingEntries is the (ADR-0022) slices.SortFunc comparator for
-// the Join incoming buffer. It is the byte-identical ordering of the prior
-// sort.Slice at crdt.go's step 2: lexicographic entityID ASC, then dot ASC via
-// compareDots. It receives incomingEntry elements BY VALUE — it captures NO
-// `incoming` slice reference — so slices.SortFunc does not spill the slice
-// header through interface boxing the way sort.Slice (reflect-path) did. The
-// Merkle-determinism contract does NOT depend on this sort (hamt.go:282
-// MerkleRoot re-sorts the dot pairs itself); the sort exists only to make the
-// adjacent-equal dedup (step 3) and the contiguous-equal run grouping of the
-// shard-partition (step 4) correct, which any equivalent sort preserves.
+// cmpIncomingEntries orders Join input by entity ID and then causal dot. The
+// comparator receives elements by value and captures no input slice. Sorting
+// places duplicate dots and equal entity IDs next to each other for deduplication
+// and shard batching; MerkleRoot independently sorts its own dot pairs
+// (ADR-0022).
 func cmpIncomingEntries(a, b incomingEntry) int {
 	if a.entityID != b.entityID {
 		if a.entityID < b.entityID {
@@ -1139,14 +789,10 @@ func cmpIncomingEntries(a, b incomingEntry) int {
 	return compareDots(a.entry.Dot(), b.entry.Dot())
 }
 
-// insertionSortLastEntry sorts ONLY the last element of dst into place,
-// assuming dst[:len(dst)-1] is already dot-ordered. It is the zero-allocation
-// residue of InsertLocal's old sort.Slice: a single backward-shift pass with a
-// loop-hoisted dot, no closure, no escape.
-//
-// The HAMT leaf invariant guarantees dst[:len-1] is dot-sorted on entry, so
-// this is provably O(n) in the worst case (the new dot is smaller than all
-// existing) and O(1) in the common case (the new dot is the largest).
+// insertionSortLastEntry moves the final element into dot order, assuming the
+// preceding elements are already sorted. It uses one backward-shift pass with
+// no comparator closure. The worst case is O(n); a largest new dot needs no
+// moves.
 func insertionSortLastEntry(dst []CRDTEntry) {
 	n := len(dst)
 	if n < 2 {
@@ -1162,17 +808,12 @@ func insertionSortLastEntry(dst []CRDTEntry) {
 	dst[j+1] = last
 }
 
-// Join merges an incoming delta state into the local engine state
-// in a completely lock-free manner using CAS loop.
+// Join merges an incoming delta with per-shard compare-and-swap loops.
 func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
-	// The SAME teardown-window fix as InsertLocal. The
-	// participant is Enter'd FIRST and held CONTINUOUSLY across delta.Entries
-	// (whose per-entry AdvanceLamportTo persistCh send must be Quiesce-covered),
-	// the sort/dedup, AND the per-shard CAS loop, so Quiesce observes this Join
-	// for its whole duration; a post-Close Join fails LOUD before touching the
-	// arena. Enter/Closing read only Go-heap EBR fields, never the arena, so
-	// they are safe even after Free; the Closing check right after Enter panics
-	// before any arena/persist access.
+	// As in InsertLocal, keep the participant active across iteration, Lamport
+	// persistence sends, sorting, and every CAS retry. Close cannot drain the
+	// participant set or free the arena while this operation is in flight. A
+	// Join that enters after Close starts panics before reading the delta.
 	participant := e.participantPool.Get().(*Participant)
 	participant.Enter(e.ebr)
 	exited := false
@@ -1189,11 +830,10 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 		return
 	}
 
-	// Per ADR-0015 §3: pool the incoming buffer via sync.Pool.
-	// The slice header escapes to heap (sort.Slice captures it as a closure),
-	// but the GROWTH reallocs (the append doubling) recycle across Join calls.
-	// Deferred Put after sort+dedup+shard-partition; the pool is GC-weak
-	// (sync.Pool is cleared on GC — the first Join after a GC grows fresh).
+	// Reuse the incoming buffer and merge scratch across calls (ADR-0015 §3).
+	// Appends can grow the backing arrays retained in the pool. The iterator
+	// callback may still let a slice header escape; sync.Pool may also discard
+	// retained buffers at GC, so later calls can allocate again.
 	buf := joinBufPool.Get().(*joinBuffers)
 	defer func() {
 		buf.incoming = buf.incoming[:0]
@@ -1211,42 +851,14 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 		return
 	}
 
-	// 2. Group incoming entries by EntityID and Dot using in-place sort.
+	// Sort in place before deduplicating and grouping entity runs. The generic
+	// comparator avoids the interface boxing of the old reflective sort, though
+	// the delta callback can still let incoming escape (ADR-0022).
 	//
-	// (ADR-0022): the ADR-0015 §7(a) escape here was NOT the
-	// comparator closure (escape analysis proves `sort.Slice`'s comparator
-	// is inlined and does-not-escape) — it was `incoming` itself spilling as
-	// a sort.Slice CALL PARAMETER because reflect-based sort takes any slice
-	// through interface boxing. slices.SortFunc is generic: the comparator
-	// `cmpIncomingEntries` receives incomingEntry ELEMENTS BY VALUE, so it
-	// captures no `incoming` reference and the call needs no interface boxing
-	// of the slice header → the `incoming (spill)` flow at this line that the
-	// -m=2 log attributed to sort.Slice is gone. The sort order is byte-
-	// identical to the prior sort.Slice (lex entityID, then compareDots ASC),
-	// so the dedup (step 3) and shard-partition (step 4) are unchanged.
-	//
-	// The compression honesty note: This does NOT privatize the
-	// `func2` escape at crdt.go:1085 (the `delta.Entries` yield callback —
-	// which captures `incoming` at line 1087 and escapes because it is
-	// passed into the Seq call). That escape SURVIVES this change and stays
-	// the irreducible residual ADR-0015 §5 names. This edit removes ONLY the
-	// sort-induced spill; any allocation reduction the bench shows is the
-	// spill's, reported honestly in ADR-0022 §5.
-	//
-	// NOT shipped: a stabilizeNearlySorted insertion sort. Its
-	// premise — that the sender's Seq yields entries already in (entityID
-	// ASC, DotCounter ASC) order — is FALSE: the production Entries Seq
-	// (crdt.go:353) walks shardRoots in HAMT-HASH order (entityID hash order,
-	// NOT lexical), so multi-entity batches arrive in hash order, not in
-	// entityID-sorted runs. stabilizeNearlySorted would leave cross-entity
-	// disorder in place → dedup (step 3 compares adjacent equal-entityID) and
-	// shard-partition (step 4 groups contiguous equal-entityID runs) would
-	// silently corrupt state on real traffic. It is also O(N²) worst-case on
-	// a reverse-injected dot sequence (a receiver CPU-amplification DoS the
-	// O(N log N) sort avoids). Merkle determinism does NOT depend on the
-	// sort (hamt.go:282 MerkleRoot re-sorts the dot pairs itself), so keeping
-	// a real sort costs no determinism. slices.SortFunc keeps the whole
-	// contract intact at O(N log N).
+	// Generated deltas walk HAMTs in hash order, not lexical entity order, so an
+	// insertion sort cannot assume nearly sorted input. slices.SortFunc provides
+	// O(n log n) worst-case sorting and avoids quadratic work on reversed or
+	// adversarial sequences. MerkleRoot does not rely on this order.
 	slices.SortFunc(incoming, cmpIncomingEntries)
 
 	// 3. Deduplicate the incoming payload in-place
@@ -1261,29 +873,14 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 	}
 	incoming = incoming[:k]
 
-	// 4. SHARD-LOCAL lock-free HAMT update.
+	// Group contiguous entity runs by their routed shard. Merge all runs for a
+	// shard into one candidate root, then CAS that root independently. Shards
+	// with no input remain untouched.
 	//
-	// incoming is already sorted by entityID; we partition it into per-shard
-	// runs grouped by the routing helper routeShard, because blocks with the
-	// SAME entityID always land in the SAME shard (routeShard is a pure
-	// function of entityID). Each shard that receives ≥1 block is then CAS'd
-	// INDEPENDENTLY: load the shard root, merge ALL of that shard's blocks
-	// into one modified HAMT (preserving the original batched-merge benefit
-	// at the shard granularity), CAS just that shard's pointer, and on
-	// success Retire the previous shard root. Shards with no incoming blocks
-	// are not touched — zero contention on them.
-	//
-	// This is per-shard linearizable and keeps maybeAdvanceEpoch
-	// once-per-Join: the EBR retire fires per successful per-shard
-	// CAS, but epoch advancement is amortized ONCE after the whole Join
-	// completes, preserving the reclamation contract the static guard pins.
-	//
-	// The participant is Get'd + Enter'd ONCE at the top
-	// of Join (before delta.Entries) and held across this whole shard-partition
-	// AND the per-shard CAS loop below — see the Join entry comment. The per-
-	// iteration Enter/Exit the single-root design used here is collapsed away:
-	// a per-iteration Exit would reopen the teardown window (Quiesce could see
-	// the participant inactive between retries and Free under the next CAS).
+	// Retire each replaced root after its successful CAS, but advance the epoch
+	// only once after the whole Join. The participant acquired above stays
+	// active through partitioning and every retry, including reads of roots
+	// that another operation may retire.
 	type blockRange struct {
 		start int
 		end   int
@@ -1303,30 +900,25 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 		shardBatches[idx] = append(shardBatches[idx], blockRange{start, i})
 	}
 
-	// Deterministic shard order so the per-shard driver below is reproducible
-	// across runs (the MerkleRoot determinism contract — the WAL round-trip
-	// test — depends on the engine state being a pure function of the applied
-	// dot set, NOT the order shards were CAS'd; sorting the shard indices keeps
-	// the EBR-retire bookkeeping deterministic too).
+	// Sort shard indices so map iteration cannot change the order of CAS and
+	// retirement operations. The resulting CRDT state depends on the applied dot
+	// set, while deterministic bookkeeping makes runs reproducible.
 	shardOrder := make([]int, 0, len(shardBatches))
 	for idx := range shardBatches {
 		shardOrder = append(shardOrder, idx)
 	}
 	sort.Ints(shardOrder)
 
-	// perShardMerge runs the original per-entityID dot-merge for every block
-	// routed to this shard against the given shard root `base`. It returns the
-	// modified HAMT (== base if nothing added), the inserted/skipped counters,
-	// and whether any block actually grew the state. This is the SAME merge
-	// code the single-root Join ran — now scoped to one shard's blocks.
+	// perShardMerge merges each entity block routed to this shard into base.
+	// It returns the modified HAMT, inserted and skipped counts, and whether any
+	// new dot was added. With no new dots, modified remains base.
 	perShardMerge := func(base *HAMT, batches []blockRange) (modified *HAMT, inserted, skipped uint64, addedAny bool) {
 		modified = base
 		for _, br := range batches {
 			entityID := incoming[br.start].entityID
-			// Per ADR-0015 §3: pool the per-block merge scratch
-			// slices via buf.blockScratch / buf.mergeScratch. The pool recycles
-			// the backing arrays across blocks within one Join; HAMT Set copies
-			// into the arena so the scratch is free to reuse after the Set.
+			// Reuse blockScratch and mergeScratch across entity blocks and CAS
+			// retries. HAMT.Set copies the merged entries into arena storage, so
+			// these scratch arrays remain reusable after the call.
 			needed := br.end - br.start
 			if cap(buf.blockScratch) < needed {
 				buf.blockScratch = make([]CRDTEntry, needed)
@@ -1378,9 +970,7 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 				modified = modified.Set(entityID, merged)
 				addedAny = true
 			}
-			// Per ADR-0015 §3: update the pool scratch
-			// to capture any capacity growth from append above, so the
-			// next block iteration reuses the grown backing array.
+			// Retain any capacity growth from append for the next block.
 			buf.mergeScratch = merged[:0]
 		}
 		return modified, inserted, skipped, addedAny
@@ -1393,11 +983,10 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 		batches := shardBatches[idx]
 
 		for {
-			// The participant stays Enter'd across every retry (see the Join
-			// entry comment): the single pinned epoch protects each iteration's
-			// `current` read, and there is NO mid-loop inactive window for
-			// Quiesce to Free under. Retire below is a push-only op (it never
-			// dereferences the retired pointer), so it is safe while active.
+			// The participant remains active across retries, protecting current
+			// and preventing a teardown between attempts. Retire only appends
+			// the replaced root to the retirement list; it does not dereference
+			// that root.
 			current := shard.ptr.Load()
 			modified, inserted, skipped, added := perShardMerge(current, batches)
 
@@ -1420,17 +1009,13 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 		}
 	}
 
-	// Exit BEFORE maybeAdvanceEpoch so the epoch advance
-	// is not self-blocked by this still-active participant (AdvanceEpoch's
-	// canAdvance refuses while any active participant pins an older epoch). The
-	// deferred cleanup sees exited==true and does not double-Exit.
+	// Leave the epoch before advancing it so this participant cannot hold back
+	// its own reclamation pass. The deferred cleanup checks exited to avoid a
+	// second Exit.
 	participant.Exit()
 	exited = true
-	// maybeAdvanceEpoch is called ONCE per Join (outside the
-	// per-shard driver loop) — preserving the reclamation contract: EBR Retire
-	// fires per successful per-shard CAS, AdvanceEpoch is amortized once per
-	// operation so the three-epoch ring recycles the per-shard retired roots
-	// in lockstep with the single-root design.
+	// Replaced roots were retired per successful shard CAS. Amortize epoch
+	// advancement once per Join rather than once per changed shard.
 	e.maybeAdvanceEpoch()
 
 	e.entriesSkipped.Add(totalSkipped)
@@ -1438,21 +1023,12 @@ func (e *DeltaCRDTEngine) Join(delta CRDTDelta) {
 	e.deltasApplied.Add(1)
 }
 
-// State returns a merged view of the current sharded HAMT state as a single
-// *HAMT. Because the engine root is sharded (e.shards), State() builds
-// a fresh *HAMT that stitches every shard's entries via Set. The previous
-// merged view is Retired through EBR (3-epoch grace — the same reclamation
-// profile the single-root design already had: a published root is retired by
-// the next publish, freed after 3 epoch advances). This bounds the live
-// merged-view arena hold to ONE wrapper per engine at a time.
+// State builds a single HAMT containing every entry from the current shards.
+// It preserves the engine's read API for callers that need Get, Len, ForEach,
+// MerkleRoot, or RootPtr. Construction costs O(total entries) and is not part of
+// Join.
 //
-// State() is OFF the Join hot path (Join never calls it); test fixtures, the
-// gossip Merkle-root sweep (internal/chaos/partition.go MerkleRoots), the WAL
-// checkpoint test, and the off-hot-path crash probe (internal/chaos/probe.go)
-// are the callers. Build cost is O(total entries) — negligible for the small
-// live sets those callers observe and irrelevant to BenchmarkCRDTEngine_JoinParallel.
-// The production API surface (*HAMT with Get/Len/ForEach/MerkleRoot/RootPtr)
-// is preserved so those byte-identical production callers compile unchanged.
+// The previous merged view is retired through EBR when a new view is built.
 func (e *DeltaCRDTEngine) State() *HAMT {
 	e.stateViewMu.Lock()
 	prev := e.mergedView.Swap(nil)
@@ -1467,11 +1043,8 @@ func (e *DeltaCRDTEngine) State() *HAMT {
 			return true
 		})
 	}
-	// Retire the previously-built merged view via EBR so the arena reclaims
-	// it after the 3-epoch grace window — mirroring the single-root publish
-	// profile. We Retire AWAY from the freshly-built `merged` so a concurrent
-	// reader of `prev` (racing State() callers, off the hot path) still
-	// survives its iteration within the EBR grace window.
+	// Retire the previous merged view through EBR. The newly built view is
+	// published below and is not part of this retirement.
 	if prev != nil {
 		e.ebr.Retire(unsafe.Pointer(prev))
 		e.maybeAdvanceEpoch()
@@ -1481,139 +1054,70 @@ func (e *DeltaCRDTEngine) State() *HAMT {
 	return merged
 }
 
-// Arena returns the engine's off-heap HamtArena.
-//
-// Chaos-probe seam: exposed read-only so the decoupled Worker crash
-// probe (internal/chaos) can construct a guaranteed off-heap SIGSEGV without
-// reaching into arena free-list internals. Off the hot path; Zero-GC invariants
-// are not affected.
+// Arena returns the engine's off-heap arena. Internal crash tests use it to
+// exercise faults in mapped storage without depending on free-list internals.
 func (e *DeltaCRDTEngine) Arena() *HamtArena { return e.arena }
 
-// EBR returns the engine's EBR manager. Exposed so the chaos crash probe can
-// pin an EBR epoch BEFORE reading state: the probe previously
-// snapshotted state:= eng.State() with no epoch pin, then dereferenced an
-// off-heap child pointer that a concurrent InsertLocal CAS could have DecRef'd
-// to 0, retired, and freed via a racing AdvanceEpoch — a use-after-free that
-// surfaced as a non-deterministic SIGSEGV instead of the deterministic one the
-// probe intends. Pinning holds freeRetiredList back for the duration of the
-// probe, so the corrupted pointer the probe dereferences is guaranteed to be
-// mapped. Off the hot path; Zero-GC invariants are not affected.
+// EBR returns the engine's epoch manager. A caller traversing off-heap state
+// can pin an epoch first to defer reclamation until the traversal is complete.
 func (e *DeltaCRDTEngine) EBR() *EBRManager { return e.ebr }
 
-// -----------------------------------------------------------------------------
-// GenerateDelta Logic (ZERO-GC: EBR Lifecycle via Release())
-// -----------------------------------------------------------------------------
+// GenerateDelta and the CRDTDelta lifecycle.
 
 // Seq is a push-based iterator (analogous to Go 1.23 iter.Seq).
 type Seq func(yield func(entityID string, entry CRDTEntry) bool)
 
-// CRDTDelta represents the minimal state delta for network transmission.
-// Zero-GC proof: the caller MUST call Release() after consuming
-// the iterator. This replaces runtime.SetFinalizer with deterministic EBR
-// lifecycle management, preventing the finalizer queue OOM collapse proven
-// by Little's Law under ≥100k RPS.
+// CRDTDelta is a lazily iterated state delta for network transmission. After
+// consuming Entries, the caller must call Release to drop the EBR pin and return
+// pooled resources. Deterministic release keeps retired roots and arena slabs
+// alive for exactly as long as the iterator needs them.
 type CRDTDelta struct {
 	Entries      Seq
 	OriginNodeID [16]byte
 	MerkleRoot   [32]byte
-	// EBR lifecycle fields — callers use Release() to drop the EBR epoch
-	// pin and decrement the root ref.
-	//
-	// Use-after-free fix: the delta's Entries iterator is lazy and is consumed
-	// AFTER the generator returns. The HAMT root it iterates can be DecRef'd
-	// to 0 and retired by a concurrent InsertLocal/DeleteLocal CAS while the
-	// consumer is still iterating — a use-after-free. We close that hazard by
-	// carrying an EBR participant on the delta: it is Enter()'d before
-	// state.Load() in the generator and Exit()'d in Release(). The epoch
-	// pin holds back freeRetiredList for the entire lifetime of the delta,
-	// matching the protection GenerateDigestWithSeed gets from its own
-	// participant.Enter/Exit. The IncRef remains as defense-in-depth: keeping
-	// the root past refcount-zero is unnecessary once the epoch pin is held,
-	// but IncRef/DecRef still honors the documented invariant.
+	// GenerateDelta enters ebrPart before capturing the shard roots. Entries
+	// runs after the generator returns, so a concurrent write can retire those
+	// roots during iteration. The participant prevents their reclamation until
+	// Release exits it. rootRef and arenaRef retain the reference-counted path
+	// used by other delta constructions; sharded generation leaves rootRef zero.
 	rootRef  NodePtr
 	arenaRef *HamtArena
 	ebrPart  *Participant
 
-	// sendKeysOffset is the mmap offset of the
-	// arena-backed sorted send-key slice the Entries iterator binary-searches
-	// (the sort.Search replacement for the earlier heap sendMap). The slab is
-	// provisioned by PeelArena (the localHas backing) and sorted in place; it
-	// is the ONLY slab held past GenerateDelta's body (the iterator reads it
-	// lazily after the generator returns). Release() retires it via the EBR
-	// epoch-deferred freelist so the slab recycles ABA-safely. Zero for the
-	// heap-allocated CRDTDelta shapes (the empty-delta path — backwards
-	// compatible, those keep a heap sendMap).
+	// sendKeysOffset locates the sorted send-key slab provisioned by PeelArena.
+	// Entries binary-searches sendKeys lazily, and Release retires the slab
+	// through EBR. The offset is zero when the keys have heap backing.
 	sendKeysOffset uint64
-	// shardRootsOffset is the mmap offset of the arena-backed []*HAMT snapshot
-	// (the earlier allShardRoots heap slice, now arena-backed). Retired in
-	// Release. Zero for the heap-CRDTDelta shapes.
+	// shardRootsOffset locates the arena-backed root snapshot retired by
+	// Release. It is zero for a heap-backed snapshot.
 	shardRootsOffset uint64
-	// sendKeys is the sorted slice over the arena backing; carried so the
-	// iterator's closure (which also captures it directly) and Release can
-	// both reach it. The slice header itself lives in the closure capture
-	// struct; this field is the Release-side handle.
+	// sendKeys is the sorted view of the arena slab used by the iterator.
 	sendKeys []uint64
-	// arenaBacked marks this CRDTDelta as the arena-pooled shape
-	// (GenerateDelta's hot path). The empty-delta branch keeps the earlier heap
-	// allocation and skips the sendKeys retire.
+	// arenaBacked distinguishes GenerateDelta's pooled, arena-backed shape from
+	// deltas whose Entries closure and auxiliary slices have heap lifetimes.
 	arenaBacked bool
-	// deltaPool carries the owning engine's *CRDTDelta sync.Pool back to
-	// Release (Release cannot reach the engine by any other path). Populated
-	// ONLY for the arena-pooled shape; the heap CRDTDelta shapes leave it nil
-	// so Release skips the pool put (and the sendKeys retire below) — byte-
-	// identical behavior for the heap shapes is preserved (Release of a heap
-	// delta ran only the ebrPart/arenaRef branches before the arena-pooling
-	// change).
-	// The arenaRef field (above) doubles as the arena handle for the sendKeys
-	// slab retire; rootRef stays 0 for the sharded delta path so the existing
-	// `d.arenaRef.DecRef(d.rootRef)` line is a no-op (DecRef(0) returns early).
-	deltaPool *sync.Pool
-	// participantPoolPtr carries the owning engine's *sync.Pool for
-	// Participants back to Release (the participant was Get'd from
-	// e.participantPool in GenerateDelta; before the arena-pooling change
-	// Release leaked it — it Exit()'d the participant but never Put it back,
-	// drying the pool and forcing e.participantPool.Get's New (ebr.Register →
-	// new(Participant)) to heap-alloc 1/op once the pool ran dry). Populated
-	// ONLY on the arena-pooled shape; Release returns the participant there.
-	// Heap shapes (the empty-delta path) use scoped defer Put and leave this nil.
+	// deltaPool and participantPoolPtr identify the pools that receive the
+	// delta and its EBR participant on Release. They are nil for shapes without
+	// pooled lifetimes. arenaRef also supplies the arena used to retire slabs;
+	// sharded generation leaves rootRef zero, making DecRef a no-op.
+	deltaPool          *sync.Pool
 	participantPoolPtr *sync.Pool
-	// Pool-prebuilt iterator state. The
-	// Entries closure is built ONCE in deltaPool.New (capturing the recycled
-	// `self` pointer, NOT the live locals) and reads its per-delta inputs
-	// from the struct's fields each invocation. GenerateDelta UPDATES these
-	// fields per call (it does NOT reassign Entries); Release clears them
-	// (it does NOT nil Entries, preserving the pre-built closure across
-	// pool recycles). The closure's capture-env struct (1 alloc) is paid
-	// ONCE during pool warmup and recycled forever — the steady-state
-	// sync.Pool amnesty permits it; allocs/op reads 0 at
-	// steady state. This shaves the earlier 4-capture env alloc off the hot path.
+	// Entries is built once in deltaPool.New and captures the delta itself.
+	// GenerateDelta refreshes these fields for each checkout, and Release
+	// clears them without discarding the reusable closure.
 	shardRoots []*HAMT
 	diffNil    bool
 	peelErr    error
 }
 
-// Release decrements the reference count on the pinned HAMT root.
-// This MUST be called after the delta's Entries iterator has been fully
-// consumed. Failure to call Release() will pin the HAMT root until
-// arena.Free(), causing a memory leak.
+// Release drops the delta's EBR pin, retires its arena slabs, and returns
+// pooled resources. Call it after Entries has been fully consumed. Delaying it
+// keeps the iterated roots and slabs from being reclaimed.
 func (d *CRDTDelta) Release() {
-	// Drop the EBR epoch pin first. As long as the participant is
-	// active, freeRetiredList cannot reclaim the HAMT tree the Entries
-	// iterator walked. We exit before DecRef so that a concurrent AdvanceEpoch
-	// cannot free the root we are about to DecRef-recurse into.
+	// The iterator is finished, so leave the EBR epoch and recycle the
+	// participant. Exit clears its hazards and marks it inactive; a later Enter
+	// reads the current global epoch before reusing it.
 	if d.ebrPart != nil {
-		// Exit the EBR pin AND return the Participant to its owning pool (the
-		// participant-pool-leak fix). The pre-pooling Release Exit()'d but
-		// never Put — the pool dried and every GenerateDelta's
-		// e.participantPool.Get hit its New (ebr.Register → new(Participant))
-		// = 1 heap alloc/op. The pool's New registers a fresh Participant into
-		// the EBR head list, so even after a dry-and-refill the participant
-		// stays EBR-visible; putting a quiescent Exit()'d participant back for
-		// the next Enter() is ABA-safe (Exit clears hazards + sets
-		// epoch=Inactive/active=false; Enter re-reads globalEpoch). This is
-		// the same Put-back shape InsertLocal's / GenerateDigestWithSeed's
-		// scoped-defer participants already use — Release just deferred the
-		// Put by the delta's (lazy) lifetime.
 		pp := d.participantPoolPtr
 		d.ebrPart.Exit()
 		if pp != nil {
@@ -1621,14 +1125,8 @@ func (d *CRDTDelta) Release() {
 			d.participantPoolPtr = nil
 		}
 	}
-	// The arena-pooled CRDTDelta shape (GenerateDelta hot path)
-	// carries arenaRef = owning arena + arenaBacked = true. Retire the
-	// arena-backed send-key slab the Entries iterator walked BEFORE the
-	// DecRef branch nil's arenaRef, then return the struct to the engine's
-	// *CRDTDelta pool (steady-state 0-alloc amnesty — byte-faithful to the
-	// engine's existing participantPool sync.Pool). The heap CRDTDelta
-	// shapes (the empty-delta path) leave arenaBacked false and skip
-	// both the slab retire and the pool put, preserving their earlier behavior.
+	// Retire the send-key and root-snapshot slabs before clearing arenaRef.
+	// Non-arena-backed deltas skip slab retirement and pool return.
 	pool := (*sync.Pool)(nil)
 	if d.arenaBacked {
 		if d.arenaRef != nil {
@@ -1645,33 +1143,22 @@ func (d *CRDTDelta) Release() {
 		d.shardRoots = nil
 		d.diffNil = false
 		d.peelErr = nil
-		// NOTE: Entries is intentionally NOT cleared. The pool-prebuilt
-		// closure (built once in deltaPool.New, capturing `self`) must survive
-		// the pool round-trip so the next Get returns a delta whose Entries
-		// iterator is already wired to read the (about-to-be-refreshed)
-		// struct fields. Clearing Entries would force the next Get's pool miss
-		// to rebuild the capture env = 1 alloc/op. The GC reachability is
-		// handled by the struct being returned to the Go-heap sync.Pool (a
-		// recycled *CRDTDelta is GC-visible so the closure env stays
-		// reachable); the arena slabs it referenced are retired ABOVE.
+		// Keep Entries intact across the pool round trip. Its closure reads
+		// fields refreshed by the next GenerateDelta; discarding it would
+		// allocate a new closure. The delta remains GC-managed in sync.Pool,
+		// while the arena slabs referenced by its previous use are retired.
 		pool = d.deltaPool
 		d.deltaPool = nil
 	}
-	// rootRef stays 0 for the sharded delta path (the allShardRoots
-	// snapshot owns the per-shard roots; the single-root IncRef/DecRef does
-	// not apply). DecRef(0) is a no-op (DecRef's `if current == 0 continue`);
-	// the guard stays so the heap shapes (the empty-delta path) keep their
-	// DecRef.
+	// Sharded deltas use EBR rather than a single root reference, so rootRef is
+	// zero and DecRef returns immediately. Other delta shapes retain their
+	// reference-counted release here.
 	if d.arenaRef != nil {
 		d.arenaRef.DecRef(d.rootRef)
 		d.arenaRef = nil
 	}
-	// Entries is intentionally NOT cleared for the arena-backed
-	// shape (see the arenaBacked block above — the pool-prebuilt closure is
-	// recycled intact). For the heap shapes (the empty-delta path), the
-	// earlier behavior niled Entries; preserve that byte-identically (those
-	// deltas carry a per-call closure built fresh in their generator, and
-	// nil'ing lets that closure env be GC'd promptly).
+	// Heap-backed shapes own a per-call closure, so clearing Entries releases
+	// that closure for GC. The pooled shape preserves its reusable closure.
 	if !d.arenaBacked {
 		d.Entries = nil
 	}
@@ -1707,78 +1194,49 @@ func HashCausalDot(dot CausalDot, digest [32]byte) uint64 {
 	return key
 }
 
-// GenerateDelta generates a delta containing entries that the remote peer
-// is missing, as determined by the exact IBLT reconciliation process.
-// Livelock proof: it accepts *IBLT instead of a BloomFilter.
+// GenerateDelta returns the entries missing from remoteDigest as determined by
+// IBLT subtraction and peeling. The caller must call Release after consuming
+// Entries. If subtraction or peeling fails, the delta falls back to the full
+// local set.
 func (e *DeltaCRDTEngine) GenerateDelta(remoteDigest *IBLT) *CRDTDelta {
-	// localDigest is arena-backed (NewArenaIBLT via
-	// GenerateDigestWithSeed) — the IBLT struct + its 24 KB bucket array are
-	// provisioned from e.arena (allocVar slabs, GC-invisible, recycled via EBR
-	// RetireBlock). The Subtract diff is arena-backed too (subtractArena); the
-	// peel's result slices are arena-backed (PeelArena). The send-set is the
-	// sorted (in place) PeelArena localHas slice carried on the returned delta.
-	localDigest := e.GenerateDigestWithSeed(remoteDigest.Seed())
+	// Build the local table with the remote seed and bucket count so subtraction
+	// sees compatible configurations. The count is clamped by the digest builder
+	// and travels with this call rather than shared engine state, allowing
+	// concurrent sweeps to use different sizes. A legacy 1024-bucket digest is
+	// unchanged. An incompatible fallback table makes subtraction return nil,
+	// which selects full-set transmission.
+	localDigest := e.GenerateDigestSizedWithSeed(remoteDigest.Seed(), remoteDigest.NumBuckets())
 
-	// Arena-backed symmetric difference (struct + 24 KB bucket array from
-	// e.arena). Subtract's heap signature is preserved byte-identical (the
-	// capnp / chaos / strata paths keep heap-allocating via Subtract).
+	// Subtract and peel in arena storage. localHas becomes the send-key set;
+	// remoteHas and the pure queue are needed only within this call. Other
+	// callers retain IBLT.Subtract's heap-allocating interface.
 	diff := localDigest.subtractArena(remoteDigest, e.arena)
-
-	// Peel into arena-backed result slices (PeelArena provisions localHas,
-	// remoteHas, and the internal pureQueue from e.arena — zero Go-heap
-	// allocs; the stack-array + compaction math is byte-identical to Peel).
-	// pureQueueOffset is retained so the body retires the queue slab
-	// after the peel completes (the queue is body-local; only localHas is
-	// carried past the body as the send-key set).
 	var sendKeys []uint64
 	var peelErr error
 	var pureQueueOffset uint64
 	var remoteHasOffset uint64
 	sendKeysOffset := uint64(0)
-	// Entries-filter regression fix: capture diffNil BEFORE
-	// the `if diff != nil` block nil's diff for its body-local retire. The pre-
-	// fix code read `diffNil:= diff == nil` AFTER `diff = nil`, so diffNil was
-	// ALWAYS true and the Entries closure always fell back to sending every
-	// entry (the bench never invoked Entries so the bench stayed 0/0; the
-	// PartialSync / FullSync integrity guards caught it — the bench is a
-	// throughput/allocs gate, NOT a correctness gate; the guards carry the
-	// correctness contract). diffNil now reflects the original `subtractArena
-	// → nil` outcome (a configuration mismatch fallback), not the body's
-	// post-retire housekeeping nil.
+	// Save the subtraction result before releasing diff. The lazy iterator uses
+	// this flag to distinguish a configuration mismatch from a successful peel;
+	// reading diff after its cleanup would incorrectly force full-set sending.
 	diffNil := diff == nil
 	if diff != nil {
 		var remoteHas []uint64
 		var localHasOffset uint64
 		sendKeys, remoteHas, localHasOffset, remoteHasOffset, pureQueueOffset, peelErr = diff.PeelArena(e.arena)
 		_ = remoteHas // remoteHas slab is body-local; retired below via remoteHasOffset.
-		// Sort the arena slice in place. slices.Sort is the generic (non-
-		// reflective) sort — it does NOT box sendKeys into an interface{} the
-		// way sort.Slice does, so the slice header does not escape the mmap
-		// backing here (sort.Slice's reflect path forced the header to heap).
-		// This IS the send-key set: the binary-search replacement for the
-		// earlier heap sendMap. No map, no hash buckets.
+		// Sort localHas in place for binary-search membership tests. The
+		// generic sort avoids the interface boxing of a reflective sort and
+		// leaves the send keys in their arena backing.
 		slices.Sort(sendKeys)
 		sendKeysOffset = localHasOffset // the slab backing sendKeys == PeelArena's localHas slab
-		// Diff IBLT + its buckets are fully consumed by PeelArena; retire
-		// inside the body (the diff is short-lived, body-only).
-		// The send-set slab (sendKeys) lives past the body — it is retired in
-		// CRDTDelta.Release.
+		// PeelArena has consumed diff, so release it now. Only sendKeys remains
+		// needed by the lazy iterator and therefore lives until CRDTDelta.Release.
 		diff.ReleaseLocal()
 		diff = nil
-		// Retire the body-local pureQueue + remoteHas slabs DIRECTLY to the
-		// freelist (pushFreeVar, NOT EBR RetireBlock). These slabs never cross
-		// goroutine boundaries — they are written by PeelArena and read ONLY
-		// inside GenerateDelta's body before the slab is returned. EBR's
-		// epoch-deferred protection is unnecessary for goroutine-local blocks
-		// with no concurrent reader; direct freelist reuse is ABA-safe here
-		// AND zero-RetiredNode-alloc (RetireBlock otherwise pulls a
-		// RetiredNode from sync.Pool's retiredPool, which only refills on
-		// AdvanceEpoch — the bench's GenerateDelta-only loop never advances,
-		// so every RetireBlock would heap-alloc a fresh RetiredNode, breaking
-		// the Zero-GC gate). The lifecycle slabs (sendKeys + shardRoots, held
-		// past the body by the lazy closure) still go through EBR RetireBlock
-		// (ABA-defensive; their RetiredNodes recycle via the
-		// maybeAdvanceEpoch drain below).
+		// The pure queue and remoteHas never leave this goroutine. Return them
+		// directly to the free list instead of allocating EBR retirement nodes.
+		// Blocks used later by Entries still require epoch-deferred retirement.
 		if pureQueueOffset != 0 {
 			e.arena.pushFreeVar(pureQueueOffset)
 		}
@@ -1786,62 +1244,34 @@ func (e *DeltaCRDTEngine) GenerateDelta(remoteDigest *IBLT) *CRDTDelta {
 			e.arena.pushFreeVar(remoteHasOffset)
 		}
 	}
-	// If diff == nil or peel failed, sendKeys is empty/nil — the iterator
-	// falls back to sending everything (the `diff == nil || peelErr != nil`
-	// short-circuit). sendKeysOffset stays 0 in that case. (diffNil was
-	// captured above, BEFORE this block nil'd diff for the body-local retire.)
+	// A nil diff or a peel error leaves sendKeys empty, which makes Entries
+	// yield the full local set. diffNil records subtraction failure before the
+	// local diff variable was cleared.
 	peelErrVal := peelErr
 
-	// Local digest IBLT is fully consumed by subtractArena; retire its slabs
-	// directly to the freelist inside the body (the localDigest's
-	// lifecycle is shorter than the delta's; it is goroutine-local — written by
-	// GenerateDigestWithSeed and read ONLY by subtractArena in this body — so
-	// direct pushFreeVar (zero-RetiredNode) is ABA-safe; EBR's deferred retire
-	// is unnecessary here and would heap-alloc a RetiredNode per slab).
+	// localDigest is also local to this call and fully consumed by subtraction,
+	// so release it directly rather than through EBR.
 	localDigest.ReleaseLocal()
 
-	// Use-after-free fix: the Entries iterator is consumed lazily AFTER this
-	// function returns. Enter an EBR participant now and carry it on the
-	// returned delta so freeRetiredList is held back for the delta's
-	// entire lifetime — not just for the body of this generator. The
-	// participant is Exit()'d in CRDTDelta.Release(). IncRef remains
-	// as documented defense-in-depth.
+	// Entries runs after this function returns, so hold an EBR participant on
+	// the delta until Release. It prevents reclamation of any snapshot root
+	// retired by a concurrent InsertLocal or Join during lazy iteration.
 	participant := e.participantPool.Get().(*Participant)
 	participant.Enter(e.ebr)
-	// The engine root is sharded. Snapshot every shard root
-	// under the EBR pin so the lazy Entries iterator (consumed after this
-	// generator returns) walks a frozen, reclaim-safe view. EBR holds
-	// freeRetiredList back for the delta's whole lifetime (the participant
-	// is Exit()'d in CRDTDelta.Release()), so a per-shard root retired by a
-	// concurrent InsertLocal/Join CAS during iteration is NOT freed until the
-	// caller Releases. The IncRef/DecRef pair (single-root "defense in
-	// depth") is N-rooted here; the EBR pin is the load-bearing protection
-	// (the use-after-free fix comment above documents this), so the delta
-	// carries rootRef=0 / arenaRef=e.arena (arenaRef carries the arena-backed
-	// send-key + shard-roots slabs' owning handle, used by Release to retire
-	// the slabs; rootRef stays 0 so DecRef(0) is a no-op).
-	// The shard-roots snapshot is arena-backed (allShardRootsArena) — the
-	// earlier make([]*HAMT, 256) heap alloc is gone; the slab retires in
-	// Release.
+	// Capture every shard under that pin. The snapshot and send-key slabs use
+	// arenaRef for their own retirement; rootRef remains zero because the EBR
+	// participant, rather than a single root reference, protects the roots.
 	shardRoots, shardRootsOffset := e.allShardRootsArena()
 
-	// Pool-prebuilt iterator: the earlier
-	// `seqPtr:= new(Seq)` carrier was a needless 1 alloc/op, AND the earlier
-	// per-call closure literal rebuilt its 4-capture (shardRoots / sendKeys /
-	// diffNil / peelErrVal) capture-env struct every GenerateDelta = 1 alloc/op.
-	// The closure is now built ONCE in deltaPool.New (capturing only `self`,
-	// the recycled *CRDTDelta) and reads its per-delta inputs from the struct's
-	// fields. GenerateDelta below only UPDATES those fields (it does NOT
-	// reassign delta.Entries); the capture-env struct is paid ONCE during pool
-	// warmup and recycled forever (the steady-state sync.Pool amnesty permits
-	// it). The bench reads 0 B/op · 0 allocs/op at steady state.
+	// Reuse the pool-prebuilt Entries closure. Updating its input fields avoids
+	// allocating a new capture environment for shardRoots, sendKeys, diffNil,
+	// and peelErr on every call.
 	delta := e.deltaPool.Get().(*CRDTDelta)
-	// NOTE: delta.Entries is intentionally NOT reassigned here — the closure
-	// was wired in deltaPool.New and is preserved across pool recycles.
+	// delta.Entries is already wired to this struct by deltaPool.New.
 	delta.OriginNodeID = e.localNodeID
-	delta.MerkleRoot = [32]byte{} // unused under sharding
-	delta.rootRef = 0             // sharded root: EBR pin owns the roots, not a single IncRef/DecRef
-	delta.arenaRef = e.arena      // owning arena for the send-key slab retire
+	delta.MerkleRoot = [32]byte{} // unused by the sharded delta path
+	delta.rootRef = 0             // EBR protects the roots instead of a single reference
+	delta.arenaRef = e.arena      // owning arena for slab retirement
 	delta.ebrPart = participant
 	delta.participantPoolPtr = &e.participantPool
 	delta.sendKeysOffset = sendKeysOffset
@@ -1852,18 +1282,10 @@ func (e *DeltaCRDTEngine) GenerateDelta(remoteDigest *IBLT) *CRDTDelta {
 	delta.peelErr = peelErrVal
 	delta.arenaBacked = true
 	delta.deltaPool = &e.deltaPool
-	// drain the EBR retired list periodically. The lifecycle slabs
-	// (sendKeys + shardRoots held by the lazy closure) retire through EBR
-	// RetireBlock, each pulling a RetiredNode from retiredPool. GenerateDelta
-	// does NOT flow through InsertLocal's maybeAdvanceEpoch, so without this
-	// drain the retiredPool would dry and every RetireBlock would heap-alloc a
-	// fresh RetiredNode (the bench's pure GenerateDelta loop would read 2
-	// allocs/op just for the RetiredNodes). The drain returns the RetiredNodes
-	// to retiredPool so the next GenerateDelta's RetireBlocks recycle at steady
-	// state. maybeAdvanceEpoch is the engine's existing helper (InsertLocal /
-	// Join already call it); it advances the epoch every 64 calls (the
-	// epochAdvanceThreshold) so the O(participants × hazardSlots) AdvanceEpoch
-	// cost is amortized to ~negligible per GenerateDelta.
+	// GenerateDelta-only workloads do not pass through InsertLocal or Join.
+	// Advance epochs here as well so retired send-key and snapshot slabs can be
+	// reclaimed and their RetiredNode values returned to the pool. The usual
+	// threshold amortizes the participant scan across calls.
 	e.maybeAdvanceEpoch()
 	return delta
 }
@@ -1876,13 +1298,9 @@ func (e *DeltaCRDTEngine) AdvanceLamportTo(remoteCounter uint64) {
 			break
 		}
 		if e.lamportCounter.CompareAndSwap(current, remoteCounter) {
-			// Advance disk limit to cover the newly advanced clock value.
-			// AdvanceLamportTo NO LONGER HOLDS persistMu -- mirrors NextDot
-			// exactly. The in-memory lastSavedCounter advances via CAS (NOT
-			// under persistMu); the durable write is handed to the background
-			// persist worker via a non-blocking select-default send (drop if the
-			// worker is busy; next +1000 CAS re-issues with a strictly-higher
-			// nextLimit). The +1000 amortization window stays byte-identical.
+			// Advance the durability reservation without waiting for persistMu.
+			// As in NextDot, the worker receives a nonblocking handoff; a busy
+			// worker defers the file write to a later reservation or Close.
 			for {
 				lastSaved := e.lastSavedCounter.Load()
 				if remoteCounter <= lastSaved {
@@ -1897,17 +1315,11 @@ func (e *DeltaCRDTEngine) AdvanceLamportTo(remoteCounter uint64) {
 					break
 				}
 			}
-			// EWMA update — the ONE line added to AdvanceLamportTo; the
-			// advance SEMANTICS above — max(local, remote) via CAS + the
-			// disk-bump loop — are byte-identical to the pre-EWMA shape.
-			// Observe the inbound advancement of this frame: advance =
-			// remoteCounter - current (the CAS only succeeded with remoteCounter
-			// > current, so advance > 0 here). The EWMA tracks recent inbound
-			// DotCounter pace; alpha=0.1 is a standard EWMA decay (a known
-			// limitation — a high alpha tracks bursts but is more
-			// attacker-influenceable; a low alpha is stable but slow). Single
-			// atomic store of the float's IEEE-754 bits — race-clean, matching
-			// the lamportCounter pattern.
+			// Record this successful inbound advance in the EWMA. The positive
+			// difference is remoteCounter-current. Alpha 0.1 weights recent
+			// bursts more heavily than a smaller value would, which also makes
+			// the estimate easier for a peer to influence. Store the float bits
+			// atomically to avoid races with snapshots.
 			const lamportSkewEWMAAlpha = 0.1
 			delta := remoteCounter - current
 			prev := math.Float64frombits(e.observedInboundRateBits.Load())
@@ -1923,28 +1335,37 @@ func (e *DeltaCRDTEngine) LamportCounter() uint64 {
 	return e.lamportCounter.Load()
 }
 
-// GenerateDigest generates an Invertible Bloom Lookup Table representing the local
-// causal state for exact anti-entropy synchronization.
-// Returns *IBLT instead of a *BloomFilter.
+// GenerateDigest returns an IBLT representing local causal state for
+// anti-entropy synchronization. It uses a fresh hash seed.
 func (e *DeltaCRDTEngine) GenerateDigest() *IBLT {
-	// Initialize IBLT with 1024 buckets and k=4 hashes (tunable)
 	return e.GenerateDigestWithSeed(maphash.MakeSeed())
 }
 
-// GenerateDigestWithSeed generates an IBLT using a specific seed, required for Subtract.
+// GenerateDigestWithSeed builds an arena-backed IBLT with the supplied seed
+// and the legacy default bucket count. Use a common seed for tables that will
+// be subtracted. Call Release when the digest is no longer needed; engine arena
+// teardown reclaims any remaining storage.
 //
-// The bucket array + IBLT struct are now
-// provisioned from e.arena via NewArenaIBLT, mirroring the allocVar/pushFreeVar
-// pattern HamtArena's allocHAMTWrapper already uses. NewIBLTWithSeed's public
-// signature is preserved byte-identical for the capnp roundtrip, chaos, and
-// strata-estimator paths; only the GenerateDelta hot path's
-// local digest migrates here. The returned *IBLT MUST be Release()'d (the
-// GenerateDelta body retires the localDigest via IBLT.Release after the
-// arena-backed subtract consumes it; the chaos path that retains the heap
-// digest passes the arena-backed digest through without Release, exactly as
-// it leaked the prior heap digest — the arena teardown reclaims everything).
+// GenerateDigestSizedWithSeed contains the shared implementation. Heap-backed
+// construction remains available through NewIBLTWithSeed.
 func (e *DeltaCRDTEngine) GenerateDigestWithSeed(seed maphash.Seed) *IBLT {
-	iblt := NewArenaIBLT(1024, 4, seed, e.arena)
+	return e.GenerateDigestSizedWithSeed(seed, IBLTDigestDefaultBuckets)
+}
+
+// GenerateDigestSizedWithSeed builds an arena-backed IBLT with numBuckets and
+// the supplied seed. ClampIBLTBuckets bounds remote-influenced sizes before
+// allocation. GenerateDelta passes the remote table's size directly through
+// this call, avoiding shared mutable sizing state between concurrent sweeps.
+//
+// To avoid a cross-shard torn snapshot, the builder captures all roots before
+// insertion and compares them with the live roots afterward. A mismatch restarts
+// the entire digest: IBLT insertion is XOR accumulation, so retrying only one
+// shard would cancel its earlier keys. At most three attempts reuse the same
+// zeroed buckets and root slice. After the final mismatch, the possibly skewed
+// digest is returned; reconciliation treats it as a hint and falls back to the
+// full set if peeling cannot recover a difference.
+func (e *DeltaCRDTEngine) GenerateDigestSizedWithSeed(seed maphash.Seed, numBuckets int) *IBLT {
+	iblt := NewArenaIBLT(ClampIBLTBuckets(numBuckets), 4, seed, e.arena)
 
 	participant := e.participantPool.Get().(*Participant)
 	participant.Enter(e.ebr)
@@ -1953,25 +1374,50 @@ func (e *DeltaCRDTEngine) GenerateDigestWithSeed(seed maphash.Seed) *IBLT {
 		e.participantPool.Put(participant)
 	}()
 
-	// The engine root is sharded. Iterate every shard's root
-	// under the EBR pin so all live entries contribute to the digest; a
-	// single e.state.Load() no longer exists. The per-shard snapshot is not
-	// atomic across shards, but the digest is an anti-entropy hint — the
-	// reconcile/peel contract tolerates a slightly-shifted view, exactly as
-	// the single-root design tolerated a root shifted between Load() and the
-	// second GenerateDelta sub call.
-	for si := range e.shards {
-		shardRoot := e.shards[si].ptr.Load()
-		if shardRoot == nil {
-			continue
+	n := len(e.shards)
+	roots, rootsOffset := e.allShardRootsArena()
+	// Build the insertion callback once and reuse it if the snapshot restarts.
+	insertOne := func(_ string, entries []CRDTEntry) bool {
+		for i := range entries {
+			key := HashCausalDot(entries[i].Dot(), entries[i].PayloadDigest)
+			iblt.Insert(key)
 		}
-		shardRoot.ForEach(func(_ string, entries []CRDTEntry) bool {
-			for i := range entries {
-				key := HashCausalDot(entries[i].Dot(), entries[i].PayloadDigest)
-				iblt.Insert(key)
+		return true
+	}
+	const digestSnapshotMaxAttempts = 3
+	for attempt := 1; ; attempt++ {
+		for si := 0; si < n; si++ {
+			shardRoot := roots[si]
+			if shardRoot == nil {
+				continue
 			}
-			return true
-		})
+			shardRoot.ForEach(insertOne)
+		}
+		stable := true
+		for si := 0; si < n; si++ {
+			if e.shards[si].ptr.Load() != roots[si] {
+				stable = false
+				break
+			}
+		}
+		if stable || attempt >= digestSnapshotMaxAttempts {
+			break
+		}
+		// A concurrent write changed a root. Count the restart, clear the reused
+		// buckets, refresh the root snapshot in place, and rebuild without
+		// allocating new slabs.
+		digestSnapshotRestarts.Add(1)
+		for i := range iblt.buckets {
+			iblt.buckets[i] = Bucket{}
+		}
+		for si := 0; si < n; si++ {
+			roots[si] = e.shards[si].ptr.Load()
+		}
+	}
+	if rootsOffset != 0 {
+		// The root snapshot does not escape this call, so return its slab
+		// directly to the free list without an EBR retirement node.
+		e.arena.pushFreeVar(rootsOffset)
 	}
 
 	return iblt
@@ -1987,9 +1433,7 @@ func (e *DeltaCRDTEngine) Stats() map[string]uint64 {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Strata Estimator Integration (ADR-0005)
-// ---------------------------------------------------------------------------
+// Strata estimator integration (ADR-0005).
 
 // GenerateStrataEstimator creates a StrataEstimator from all local CRDT entries.
 // This estimator is exchanged with a remote peer to estimate |d| before
@@ -2007,9 +1451,8 @@ func (e *DeltaCRDTEngine) GenerateStrataEstimator(seed maphash.Seed) *StrataEsti
 		e.participantPool.Put(participant)
 	}()
 
-	// Iterate every shard's root under the EBR pin (mirrors
-	// GenerateDigestWithSeed). The estimator is a |d| hint; per-shard
-	// snapshot skew is tolerated identically to the single-root design.
+	// Insert every shard's entries under the EBR pin. The estimator is a
+	// difference-size hint, so snapshot skew between shards is tolerable.
 	for si := range e.shards {
 		shardRoot := e.shards[si].ptr.Load()
 		if shardRoot == nil {
@@ -2027,35 +1470,13 @@ func (e *DeltaCRDTEngine) GenerateStrataEstimator(seed maphash.Seed) *StrataEsti
 	return se
 }
 
-// GenerateDeltaStratified was the S-IBLT-estimation delta primitive. It is
-// DELETED (ADR-0034) — reading its body refuted its premise.
+// GenerateDeltaStratified was removed because a StrataEstimator cannot supply
+// the remote key set required for reconciliation (ADR-0034). Its XOR summaries
+// estimate difference size but are not invertible into a populated remote IBLT.
+// The old implementation created an empty remote table and subtracted it, which
+// resent every local entry even when the peer already had some of them.
 //
-// The premise ("the diff is a strict subset → byte-identity + bandwidth cut")
-// was refuted by the primitive's body: it created `remoteIBLT :=
-// NewDynamicIBLT(dEst, 4, seed)` then NEVER populated it — the shard-root loop
-// filled only the LOCAL IBLT. The `localIBLT.Subtract(remoteIBLT)` subtracted
-// an EMPTY IBLT → the diff was the FULL local IBLT → the peel yielded ALL
-// local keys → the iterator shipped EVERY entry. The stratified delta was
-// byte-identical to oversend for ANY non-empty remote overlap (NO bandwidth
-// cut). The dormant unit test only covered the EMPTY-remote case (where
-// oversend==stratified by coincidence), so the defect never fired.
-//
-// The fundamental obstacle: the StrataEstimator is a LOSSY digest (XOR-based
-// KeySum, not invertible to the key set); the remote's FULL IBLT MUST come
-// from the wire, NOT be reconstructed from the estimator. The primitive's
-// signature `GenerateDeltaStratified(remoteEstimator *StrataEstimator)` could
-// not supply the remote IBLT — it had only the lossy estimator.
-//
-// The fix: the mesh's digest exchange (pkg/mesh/digest.go) now sends the
-// remote's FULL IBLT digest on the wire (alongside the estimator used only for
-// the dEst sizing hint), and the sweep calls `GenerateDelta(remoteIBLT)` — the
-// correct set-reconciliation primitive that subtracts the POPULATED remote
-// IBLT + peels the real diff. `GenerateDelta` has always set
-// `participantPoolPtr`, so the EBR-pool leak (the stratified sibling's only
-// real artifact) does not exist on this path — the leak was an artifact of the
-// now-deleted primitive, not the wiring.
-//
-// (The body is deleted; callers — pkg/mesh/gossip.go's generateSweepDelta —
-// now call GenerateDelta(remoteIBLT) directly.)
+// The mesh now sends the remote's full IBLT and calls GenerateDelta directly.
+// The estimator remains useful only as a sizing hint.
 
 // -------------------------------------------------------------------

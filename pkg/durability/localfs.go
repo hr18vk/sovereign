@@ -6,24 +6,16 @@
 
 package durability
 
-// — M2: LocalFS, the local-filesystem S3 shim.
+// LocalFS implements the storage interfaces used by internal/database and the
+// recovery path over a local directory. The flusher writes Arrow IPC objects
+// under "l0/<...>", and snapshots use "ckpt/<LamportHigh>".
 //
-// internal/database speaks to S3 through three narrow interfaces — S3Uploader
-// (l0_flusher.go), S3Lister + S3Downloader (query.go). M8 (ADR-0016 §5) wires
-// the LSM tier into the production path for the FIRST time; to prove the seam
-// on named WITHOUT an S3 account, this file implements all three interfaces
-// over a plain OS directory. The flusher uploads Arrow IPC under "l0/<...>";
-// the recovery snapshot (snapshot.go) writes the dot-bearing image under
-// "ckpt/<LamportHigh>". LocalFS treats both as files under `root`.
+// LocalFS is intended for tests and local development. It does not reproduce
+// S3 listing consistency, multipart uploads, or cross-region requests.
+// Production deployments supply an S3 client with the same interfaces.
 //
-// HONEST SCOPE: this is a CI/local substitute for S3. It is correct (the byte
-// stream round-trips) but it is not S3 — no eventual-consistency listing
-// lag, no multipart, no cross-region GET. Production deployments inject a
-// real S3 client that satisfies the same three interfaces.
-//
-// Key hygiene: keys are S3-style (forward-slash). A key is rejected if it is
-// absolute, empty, or escapes `root` via ".." — a snapshot path that left the
-// root would be a silent durability lie.
+// Keys use forward slashes. Empty and absolute keys, and keys that escape the
+// root through "..", are rejected.
 
 import (
 	"context"
@@ -40,64 +32,45 @@ import (
 
 // LocalFS is a local-filesystem implementation of the three S3 interfaces
 // consumed by internal/database (S3Uploader, S3Lister, S3Downloader) and by
-// the recovery path (the dot-bearing snapshot read/write).
+// the recovery path that reads and writes the dot-bearing snapshot.
 //
-// The `bucket` argument carried by S3Lister/S3Downloader is IGNORED — the
-// flusher's S3Uploader.Upload already omits bucket (the bucket lives in the
-// S3 client config out-of-band, not in the interface), so for LocalFS a single
-// `root` directory IS the bucket. Callers that pass a bucket get the same
-// root; this keeps the flusher ("l0/...") and the resolver ("l0/...") on the
-// same keyspace, and the recovery snapshot ("ckpt/...") alongside them.
+// The bucket argument to S3Lister and S3Downloader is ignored. S3 clients
+// carry their bucket in configuration, and Upload has no bucket parameter, so
+// the LocalFS root represents one bucket shared by uploads and reads.
 type LocalFS struct {
 	root string
-	// uploadHook is a TEST-ONLY park/spy point on Upload (T-A1 — the
-	// SetSyncHookForTest precedent, internal/chaos/wal.go:325). It is nil in
-	// production (NewLocalFS leaves it nil; only SetUploadHookForTest sets it).
-	// It fires at the TOP of Upload, BEFORE any write/fsync, so a test can park
-	// the checkpoint's image/index upload and prove the committing PutLocals
-	// does NOT wait for it (the decouple). Set it BEFORE triggering any
-	// checkpoint; the goroutine spawn establishes the happens-before edge, so no
-	// concurrent write races the read.
+	// uploadHook pauses tests before an upload writes or syncs data. Production
+	// leaves it nil. Tests install it before starting the checkpoint goroutine,
+	// which orders the write before Upload reads it.
 	uploadHook func()
 }
 
-// uploadTmpPrefix is the CreateTemp pattern for the atomic publish. The files
-// are UNCOMMITTED by definition — only the rename(2) publishes — so any
-// `.upload-*` a listing can see is an orphan from an interrupted process.
+// uploadTmpPrefix identifies temporary uploads. Rename publishes an object;
+// any matching file left behind belongs to an interrupted upload.
 const uploadTmpPrefix = ".upload-"
 
-// uploadDirSyncs counts the parent-directory fsyncs Upload has issued (
-// ). It exists so the guard can PROVE the fsync is in the publish path
-// (a counter incremented only after a successful fsync); the physical
-// durability itself is POSIX-delegated and disclosed as such in the fork
-// report. Off the hot path (one per checkpoint/flush), so one atomic add is
-// noise against the fsync itself.
+// uploadDirSyncs counts successful parent-directory syncs so tests can verify
+// that Upload includes that step. The filesystem provides the actual durability.
 var uploadDirSyncs atomic.Int64
 
-// uploadL0Uploads counts the query-tier (l0/) per-entity Arrow uploads (
-// T-B1). It is the O(N)-vs-O(Δ) WORK metric the delta-flush cuts: each l0/ upload
-// is one file carrying BOTH fsyncs (tmp.Sync:150 + fsyncParentDir:172). A full
-// re-flush OVERWRITES the same per-entity keys, so the distinct-file COUNT cannot
-// distinguish full from delta — but the upload WORK can (O(N) vs O(Δ) per
-// checkpoint). The ckpt/ recovery image is excluded (always 1 per checkpoint).
-// Off the hot path (one increment per upload).
+// uploadL0Uploads counts per-entity Arrow uploads. Unlike distinct filenames,
+// this distinguishes full flushes from delta flushes even when both overwrite
+// the same keys. Each upload includes a file sync and a parent-directory sync;
+// checkpoint images under ckpt/ are excluded.
 var uploadL0Uploads atomic.Int64
 
-// uploadL0UploadsCount is the test accessor for uploadL0Uploads (T-B1).
+// uploadL0UploadsCount returns the upload counter to tests.
 func uploadL0UploadsCount() int64 { return uploadL0Uploads.Load() }
 
 // NewLocalFS constructs a LocalFS rooted at root, creating the directory if
 // missing. It is safe to construct even when the snapshot feature is unused;
-// the cost is one MkdirAll + one orphan sweep.
+// the cost is one MkdirAll plus one orphan sweep.
 //
-// construction REAPS interrupted-upload orphans (`.upload-*`).
-// LocalFS is a single-process root (the local S3 shim; production S3 has no
-// local files), so at construction no upload of ours can be in flight and every
-// `.upload-*` present is by definition an orphan from a previous, dead life.
-// Reaping at boot is what bounds the l0/<hash8>/.upload-* wedge
-// (l1_compactor.go CompactionByHash8 hard-errors on the orphan sorting first)
-// to ONE process lifetime. A reap failure is logged, never fatal: the
-// ListObjects filter is the independent second layer.
+// Construction removes temporary files left by an earlier process. A LocalFS
+// root belongs to one process, so no upload can be active at this point.
+// Reaping prevents CompactionByHash8 from encountering a temporary filename
+// before the Arrow files. Failure to reap is logged; ListObjects independently
+// excludes these files.
 func NewLocalFS(root string) (*LocalFS, error) {
 	if root == "" {
 		return nil, errors.New("durability/localfs: empty root")
@@ -112,15 +85,13 @@ func NewLocalFS(root string) (*LocalFS, error) {
 	return l, nil
 }
 
-// Root returns the on-disk root (exposed for snapshot.go + tests).
+// Root returns the filesystem directory used for all objects.
 func (l *LocalFS) Root() string { return l.root }
 
-// SetUploadHookForTest installs a TEST-ONLY hook that fires at the top of every
-// Upload, before any write/fsync. It is the T-A1 park point: a test
-// parks the checkpoint's image/index upload here to prove the committing
-// PutLocals returns without waiting for it (the decouple), with the inline
-// (reverted) shape as the blocking negative control. Production NEVER sets it
-// (NewLocalFS leaves it nil). Set before any upload; not safe to swap mid-flight.
+// SetUploadHookForTest installs a hook at the start of Upload, before any
+// write or sync. Tests use it to pause a checkpoint image or index upload and
+// verify that PutLocals does not wait for that upload (ADR-0050). Install the
+// hook before starting an upload; changing it concurrently is not supported.
 func (l *LocalFS) SetUploadHookForTest(hook func()) { l.uploadHook = hook }
 
 // resolve joins key under root and verifies the result stays inside root.
@@ -150,23 +121,16 @@ func (l *LocalFS) resolve(key string) (string, error) {
 // ContentLength); LocalFS copies until EOF and ignores size, matching the
 // io.Reader contract the flusher relies on.
 //
-// ATOMIC PUBLISH (ADR-0045): the write goes to a
-// temp file in the SAME directory, is fsync'd, and is then rename(2)'d over the
-// target. The pre-form opened the target O_CREATE|O_WRONLY|O_TRUNC —
-// an in-place truncating overwrite — so a crash or a failed write (ENOSPC/EIO,
-// or kill -9 in the window after the WAL anchor fsynced) left a TORN file at a
-// key a durable checkpoint anchor points at. With the ckpt/<watermark> key
-// collision (the watermark repeats across back-to-back checkpoints), that made
-// a survivable disk-full indistinguishable from corruption. rename(2) is
-// atomic: a reader sees the OLD bytes or the NEW bytes, never a torn mix, and a
-// failed write leaves the old file intact. (S3's PUT is likewise atomic per
-// object, so this is the honest local substitute, not a divergence.)
+// Upload writes and syncs a temporary file in the destination directory before
+// renaming it over the target. Readers therefore see either the old object or
+// the complete new object, never a truncated mixture. A failed write leaves the
+// old object intact, matching S3's atomic PUT semantics (ADR-0045).
 func (l *LocalFS) Upload(ctx context.Context, key string, data io.Reader, size int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if l.uploadHook != nil {
-		l.uploadHook() // TEST-ONLY (T-A1): park/spy before any fsync.
+		l.uploadHook() // pause tests before any write or sync
 	}
 	abs, err := l.resolve(key)
 	if err != nil {
@@ -185,7 +149,7 @@ func (l *LocalFS) Upload(ctx context.Context, key string, data io.Reader, size i
 		_ = tmp.Close()
 		return fmt.Errorf("durability/localfs: write %s: %w", key, err)
 	}
-	if err := tmp.Sync(); err != nil { // fsync BEFORE the rename (the local substitute for S3's durability guarantee)
+	if err := tmp.Sync(); err != nil { // sync file contents before publishing the name
 		_ = tmp.Close()
 		return fmt.Errorf("durability/localfs: sync %s: %w", key, err)
 	}
@@ -199,27 +163,21 @@ func (l *LocalFS) Upload(ctx context.Context, key string, data io.Reader, size i
 	if err := os.Rename(tmpName, abs); err != nil {
 		return fmt.Errorf("durability/localfs: rename %s: %w", key, err)
 	}
-	//rename(2) is ATOMIC but not DURABLE — the directory entry
-	// lives in the parent dir's page cache until that DIRECTORY is fsync'd. On a
-	// power loss the rename can revert to the OLD bytes while the WAL's 0x05
-	// anchor (already fsync'd, bridge.go:399 before:446) describes the NEW
-	// ones — exactly the stale-image input the binding check exists to catch.
-	// fsync the parent directory after every publish. The cost is one extra
-	// fsync per upload (measured in the fork report); an error here means the
-	// object exists but is not durable — surfaced, never swallowed.
+	// Rename is atomic but the new directory entry is durable only after the
+	// parent directory is synced. Without this sync, power loss could restore the
+	// old image while the synced WAL anchor describes the new one. An error here
+	// means the object exists but its publication is not durable.
 	if err := fsyncParentDir(filepath.Dir(abs)); err != nil {
 		return fmt.Errorf("durability/localfs: dir fsync for %s: %w", key, err)
 	}
 	if strings.HasPrefix(key, "l0/") {
-		uploadL0Uploads.Add(1) // T-B1: the query-tier per-entity upload count
+		uploadL0Uploads.Add(1) // query-tier per-entity upload count
 	}
 	return nil
 }
 
-// fsyncParentDir fsyncs a directory so a rename(2) into it is durable, not
-// merely atomic. The observability counter increments ONLY after a
-// successful fsync — the guard asserts the count, so a regression that drops
-// the fsync (or the whole call) is caught by injection.
+// fsyncParentDir makes a rename in dir durable. The counter advances only
+// after a successful sync, allowing tests to detect a removed call.
 func fsyncParentDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -233,18 +191,13 @@ func fsyncParentDir(dir string) error {
 	return nil
 }
 
-// ReapUploadOrphans deletes every `.upload-*` file under root — the temp files
-// an interrupted Upload leaves behind (the defer os.Remove only runs in a LIVE
-// process; kill -9 between CreateTemp and Rename orphans them). Without a
-// reaper an orphan under l0/<hash8>/ sorts BEFORE the real Arrow files
-// ('.'=0x2E < '0'=0x30) and CompactionByHash8 hard-errors on it EVERY sweep,
-// permanently (register availability wedge); orphans under ckpt/, l1/,
-// and compaction/ had no deleter at all. Returns the count; every removal is
-// LOGGED (a delete is never silent here).
+// ReapUploadOrphans removes temporary files left when a process stops between
+// CreateTemp and Rename. Such a file under l0/<hash8>/ sorts before Arrow files
+// and causes CompactionByHash8 to fail. It returns the removal count and logs
+// each deleted path.
 //
-// SAFETY: only call when no upload can be in flight (boot, or an operator
-// sweep with the writer stopped). NewLocalFS calls it at construction, which
-// is exactly that condition for this single-process root.
+// Call it only while no upload is active, such as during construction or with
+// the writer stopped.
 func (l *LocalFS) ReapUploadOrphans(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -296,12 +249,9 @@ func (l *LocalFS) ListObjects(ctx context.Context, bucket, prefix string, maxKey
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			return nil
 		}
-		//`.upload-*` temp files are UNCOMMITTED uploads, never
-		// objects — S3 has no such keys (a PUT is atomic per object), so
-		// returning them here was the shim lying about S3 semantics, and it is
-		// what wedged CompactionByHash8. Exclude them at the source so
-		// ListObjects("ckpt/") really does enumerate exactly the available
-		// checkpoints (snapshot.go's claim, falsified by the orphans).
+		// Temporary uploads are not published objects. Excluding them preserves
+		// S3 PUT semantics and prevents CompactionByHash8 from reading partial
+		// data; checkpoint listings likewise contain only complete images.
 		if strings.HasPrefix(d.Name(), uploadTmpPrefix) {
 			return nil
 		}
@@ -318,7 +268,7 @@ func (l *LocalFS) ListObjects(ctx context.Context, bucket, prefix string, maxKey
 	return keys, nil
 }
 
-// Download implements database.S3Downloader. The caller MUST close the returned
+// Download implements database.S3Downloader. The caller must close the returned
 // ReadCloser.
 func (l *LocalFS) Download(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
 	_ = bucket
@@ -336,20 +286,12 @@ func (l *LocalFS) Download(ctx context.Context, bucket, key string) (io.ReadClos
 	return f, nil
 }
 
-// Delete implements database.S3Deleter (ADR-0021). It removes the file
-// at `key` under `root`. It is IDEMPOTENT: a missing file (os.IsNotExist) is
-// NOT an error — it returns nil, so the L0 reaper's partial-reap retry loop
-// makes forward progress across sweeps (a prior sweep may have already
-// reclaimed the backstop file, or a manual operator may have cleaned it). The
-// `bucket` argument is ignored (LocalFS's single `root` IS the bucket — the
-// same convention Upload/Download/ListObjects use).
+// Delete implements database.S3Deleter (ADR-0021). It removes key beneath the
+// root and ignores bucket. A missing object is not an error, allowing the L0
+// reaper to resume a partially completed sweep.
 //
-// SAFETY NOTE: this is a PLAIN object delete. The L0 reaper (l0_reaper.go) is
-// the ONLY production caller, and it calls Delete on an L0 key ONLY after
-// verifying the manifest's L1 still exists (Stage C). A standalone delete of
-// an L0 that has no verified L1 would remove the sole durable copy — the
-// reaper's Stage C guard exists to prevent exactly that. LocalFS.Delete itself
-// is unopinionated; the safety contract lives in the reaper.
+// Delete does not check whether another durable copy exists. The L0 reaper is
+// responsible for verifying the manifest's L1 before deleting any input L0.
 func (l *LocalFS) Delete(ctx context.Context, bucket, key string) error {
 	_ = bucket
 	if err := ctx.Err(); err != nil {
@@ -361,12 +303,9 @@ func (l *LocalFS) Delete(ctx context.Context, bucket, key string) error {
 	}
 	if err := os.Remove(abs); err != nil {
 		if os.IsNotExist(err) {
-			// File already gone — this is fine. The backstop was already
-			// reclaimed (a prior reaper sweep, or a manual operator). The
-			// reaper's idempotency contract relies on this returning nil so a
-			// partial reap can resume without re-erroring. Log-free on purpose:
-			// NotFound is the EXPECTED steady state once the reaper has caught
-			// up (every superseded L0 it tries again is already gone).
+			// Another sweep or an operator may already have removed the object.
+			// Returning nil lets a partial reap resume, and repeated cleanup does
+			// not produce log noise after the reaper has caught up.
 			return nil
 		}
 		return fmt.Errorf("durability/localfs: delete %s: %w", key, err)
@@ -374,9 +313,7 @@ func (l *LocalFS) Delete(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
-// Compile-time interface satisfaction (catches a signature drift in
-// internal/database the moment it is edited, rather than at the Bridge wiring
-// site).
+// Check the internal/database storage interface signatures at compile time.
 var (
 	_ interface {
 		Upload(ctx context.Context, key string, data io.Reader, size int64) error

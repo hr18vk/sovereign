@@ -16,7 +16,7 @@ import (
 
 func TestDiagCycle(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Skipping concurrent cycle-detection stress in short mode.")
+		t.Skip("skipping concurrent cycle-detection stress in short mode")
 	}
 	const numGoroutines = 64
 	stack := NewEliminationStack()
@@ -46,26 +46,26 @@ func TestDiagCycle(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Walk the central stack WITHOUT popping to detect cycles.
-	// head and next are packed (generation, index) — unpack with elimIndex.
+	// Walk the central stack without popping to detect cycles.
+	// head and next pack a generation and index; unpack them with elimIndex.
 	head := stack.head.Load()
 	visited := make(map[uint64]bool)
 	count := 0
 	for head != NullOffset64 {
 		headIdx := elimIndex(head)
 		if visited[headIdx] {
-			t.Fatalf("CYCLE detected at index %d after %d nodes", headIdx, count)
+			t.Fatalf("cycle detected at index %d after %d nodes", headIdx, count)
 		}
 		visited[headIdx] = true
 		count++
 		if count > elimTestPoolSize+100 {
-			t.Fatalf("stack too deep (%d), pool size=%d — likely cycle or corruption", count, elimTestPoolSize)
+			t.Fatalf("stack depth %d exceeds pool size %d plus cycle allowance", count, elimTestPoolSize)
 		}
 		head = atomic.LoadUint64(&pool.nodes[headIdx].next)
 	}
 	fmt.Printf("Stack depth after quiescence: %d nodes, no cycle detected\n", count)
 
-	// Now try draining with a bounded limit
+	// Drain with a bound that also detects a cycle.
 	prng := &ElimPRNG{}
 	_ = prng.next()
 	var drained int

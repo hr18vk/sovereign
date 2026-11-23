@@ -6,17 +6,15 @@
 
 package durability
 
-//checkpoint_concurrency_test.go — the guards (ADR-0045): T7, T8,
-// T17 — the checkpoint race, the anchor-mismatch loud fallback, and the
-// exact-count contract. T16 (the 503-on-durable-write guard) lives in
-//checkpoint_failure_ack_test.go: it references-only bridge API and must be
-// movable aside for the T7/T17 HEAD-revert RED.
+// These tests cover concurrent checkpoint scheduling and snapshot anchor
+// validation (ADR-0045 §5). The scheduler must write one checkpoint per
+// interval crossing even when single and batched writes overlap. A non-atomic
+// counter with a post-checkpoint reset previously lost crossings and produced
+// 13 checkpoints for 10 crossings in one measured run.
 //
-// T7/T17 REDs are HEAD-reverts of bridge.go (+ the wal.go, commit
-// e274a90, for API compatibility): HEAD's non-atomic mutationsSinceCkpt with
-// the post-body reset stampedes (13 checkpoints for 10 crossings measured) and
-// loses updates; the -race detector convicts it directly for T7. T8's RED is a
-// bug-inject on the new mechanism, named in its doc comment.
+// The anchor tests require a mismatched image to be rejected with a reported
+// fallback to exact WAL replay. Checkpoint failure acknowledgement is covered
+// separately in checkpoint_failure_ack_test.go.
 
 import (
 	"context"
@@ -28,10 +26,9 @@ import (
 	"testing"
 )
 
-// countCheckpoints walks the RAW WAL bytes (the code under test is never its
-// own check) and returns the number of WALRecCheckpoint (0x02) + WALRecCheckpointV2 (0x05) records — the
-// exact checkpoint count, which Replayed structurally cannot report (it keeps
-// only FinalCheckpt).
+// countCheckpoints parses the raw WAL and counts both legacy 0x02 and V2 0x05
+// checkpoint records. Replayed cannot supply this count because it retains only
+// FinalCheckpt.
 func countCheckpoints(t *testing.T, walPath string) int {
 	t.Helper()
 	data, err := os.ReadFile(walPath)
@@ -43,10 +40,8 @@ func countCheckpoints(t *testing.T, walPath string) int {
 	}
 	count := 0
 	for off := 8; off < len(data); {
-		// (C1): records are now 0x06 CRC-framed; walRecordAtForTest
-		// verifies the CRC and unwraps to the inner checkpoint type so this scanner
-		// matches 0x02/0x05 exactly as before — WITHOUT weakening it (a wrapped
-		// record with a bad CRC Fatalf's inside the helper).
+		// Records use 0x06 CRC framing. walRecordAtForTest verifies the CRC and
+		// unwraps the inner checkpoint type; an invalid checksum fails the test.
 		innerType, _, recLen, complete := walRecordAtForTest(t, data, off)
 		if !complete {
 			break // torn tail — end of clean records (a crash boundary, not a record)
@@ -60,47 +55,39 @@ func countCheckpoints(t *testing.T, walPath string) int {
 }
 
 // ---------------------------------------------------------------------------
-// T17 — exactly-once checkpoint under concurrency
+// Exact checkpoint count under concurrency
 // ---------------------------------------------------------------------------
 
-// TestExactlyOnceCheckpointUnderConcurrency is the exactly-once-checkpoint-under-concurrency guard (T17).
-// K=100, 1000 mutations, therefore EXACTLY 10 K-crossings — and the WAL must
-// hold EXACTLY 10 checkpoint records, from a SINGLE goroutine (the control)
-// AND from 8 concurrent ones (the guard). The control is load-bearing: without
-// it "10 == 10" says nothing about concurrency.
-//
-// RED on the pre-fix tree (revert bridge.go + wal.go): the
-// non-atomic mutationsSinceCkpt loses updates AND the post-body reset lets
-// every goroutine in flight see >= K for the whole slow body — the measured
-// HEAD shape is 13 checkpoints for 10 crossings. The concurrent count fires.
+// TestExactlyOnceCheckpointUnderConcurrency writes 1,000 mutations at K=100,
+// first from one goroutine and then from eight. Both runs must leave exactly 10
+// checkpoint records. The single-goroutine control distinguishes a scheduling
+// defect from a concurrent counter defect. A non-atomic counter and reset could
+// instead lose crossings or produce 13 checkpoints for the same 10 crossings.
 func TestExactlyOnceCheckpointUnderConcurrency(t *testing.T) {
 	const K = 100
 	const total = 1000
 
-	// CONTROL: single goroutine. If this ever fails, the concurrent assertion
-	// is meaningless.
+	// Establish the expected count without concurrency first.
 	t.Run("SingleGoroutineControl", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "t17ctl.wal")
+		walPath := filepath.Join(t.TempDir(), "checkpoint-control.wal")
 		live := newLiveBridge(t, walPath, K)
 		for i := 0; i < total; i++ {
 			if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 				t.Fatalf("PutLocal %d: %v", i, err)
 			}
 		}
-		// T-A3: the decouple makes checkpoint completion ASYNC — the WAL
-		// anchor now lands on a background goroutine. Drain BEFORE counting, or a
-		// short count is an artifact of asynchrony, not an exact-count break.
+		// Checkpoint anchors are appended asynchronously. Drain the runner before
+		// counting so an incomplete run is not mistaken for a scheduling error.
 		live.waitCheckpointsIdle()
 		if got := countCheckpoints(t, walPath); got != total/K {
-			t.Fatalf("CONTROL: %d checkpoints, want exactly %d (single-goroutine, no race)", got, total/K)
+			t.Fatalf("single writer produced %d checkpoints, want %d", got, total/K)
 		}
 	})
 
-	// THE GUARD: 8 goroutines x 125 sequential puts. The interval-ownership
-	// predicate designates exactly one owner per K-multiple and the packed-word
-	// scheduler runs one checkpoint per designation, under ANY interleaving.
+	// Eight goroutines each perform 125 sequential puts. Interval ownership and
+	// the packed scheduler must preserve one checkpoint per crossing.
 	t.Run("Concurrent", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "t17.wal")
+		walPath := filepath.Join(t.TempDir(), "checkpoint-concurrent.wal")
 		live := newLiveBridge(t, walPath, K)
 		var wg sync.WaitGroup
 		for g := 0; g < 8; g++ {
@@ -117,34 +104,26 @@ func TestExactlyOnceCheckpointUnderConcurrency(t *testing.T) {
 			}(g)
 		}
 		wg.Wait()
-		// T-A3: drain the async checkpoint runner before counting (see
-		// the SingleGoroutineControl note). All designations are already CAS'd
-		// into ckptState (each PutLocal designates synchronously before it
-		// returns), so the pending count is final; the drain waits for the runner.
+		// Every PutLocal records its designation before returning, so the pending
+		// count is final and only runner completion remains to be observed.
 		live.waitCheckpointsIdle()
 		if got := countCheckpoints(t, walPath); got != total/K {
-			t.Errorf("CONCURRENT: %d checkpoints, want exactly %d — a stampede (reset window) or a lost update (non-atomic counter)", got, total/K)
+			t.Errorf("concurrent writers produced %d checkpoints, want %d; check for duplicate or lost crossings", got, total/K)
 		}
 	})
 }
 
 // ---------------------------------------------------------------------------
-// T7 — the -race workhorse: concurrent PutLocal + PutLocals at K > 0
+// Concurrent single and batched writes
 // ---------------------------------------------------------------------------
 
-// TestConcurrentCheckpointRace is the concurrent-checkpoint race guard (T7). It mixes the
-// SINGLE path (PutLocal) and the BATCH path (PutLocals — which advances the
-// counter by len(items), so a batch's interval can CONTAIN the crossing) under
-// 8-way concurrency, and asserts BOTH the race detector's verdict (this test
-// runs under -race in the battery) AND the exact checkpoint count. The batch
-// leg is the one that exercises the interval predicate's n>1 case.
-//
-// RED on HEAD: `go test -race` convicts the non-atomic mutationsSinceCkpt
-// (W/W at the increment and the reset), and the count diverges from the
-// crossing count.
+// TestConcurrentCheckpointRace mixes PutLocal and PutLocals across eight
+// goroutines at K=100. Batch calls advance the counter by len(items), exercising
+// crossings inside multi-mutation intervals. The race-enabled test suite checks
+// synchronization, and the WAL must contain exactly 10 checkpoints.
 func TestConcurrentCheckpointRace(t *testing.T) {
 	const K = 100
-	walPath := filepath.Join(t.TempDir(), "t7.wal")
+	walPath := filepath.Join(t.TempDir(), "checkpoint-race.wal")
 	live := newLiveBridge(t, walPath, K)
 
 	var wg sync.WaitGroup
@@ -180,7 +159,7 @@ func TestConcurrentCheckpointRace(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
-	// T-A3: drain the async checkpoint runner before counting (see T17).
+	// Wait for all asynchronously designated checkpoints before counting anchors.
 	live.waitCheckpointsIdle()
 	if got := countCheckpoints(t, walPath); got != 10 {
 		t.Errorf("%d checkpoints for 1000 mutations at K=100, want exactly 10", got)
@@ -188,29 +167,20 @@ func TestConcurrentCheckpointRace(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T8 — snapshot anchor mismatch => LOUD fallback
+// Snapshot anchor mismatch
 // ---------------------------------------------------------------------------
 
-// TestSnapshotAnchorMismatchLoudFallback is the snapshot-anchor-mismatch loud-fallback guard (T8). An image
-// whose embedded LamportHigh disagrees with the ckpt/<N> key it is stored
-// under is a torn or rewritten artifact — recovery must REFUSE it, mark the
-// fallback, and rebuild from the WAL alone.
+// TestSnapshotAnchorMismatchLoudFallback stores an image whose LamportHigh
+// disagrees with its ckpt/<N> key. Recovery must reject the rewritten or torn
+// artifact, report ExactWALFallback, and rebuild the live root from the WAL.
 //
-// LAYERED-DEFENSE DISCLOSURE: the anchor is guarded TWICE on the LocalFS path.
-// The PRIMARY guard is the loader check (snapshot.go:281, commit
-// 1c7ed86 — LoadSnapshotImage itself refuses a header/key mismatch), which
-// surfaces here as the load-failed fallback; the recovery-side check
-// (recovery.go `if snapshotLamportHigh != lh`) is the store-INDEPENDENT guard
-// for SnapshotStore implementations that do not re-validate. A single-site
-// inject therefore CANNOT flip this guard — its RED neutralizes BOTH guards
-// (snapshot.go:281 + recovery.go:204), proving the guard detects total absence
-// of the anchor defense. T8b isolates the recovery-side guard as live code.
-//
-// RED (bug-inject, both guards off): the forged image is USED, the marker
-// stays clear, and the witness claims a bounded recovery that never happened.
+// LocalFS.LoadSnapshotImage checks the header against the key, and recovery
+// independently compares snapshotLamportHigh with the anchor for stores that do
+// not validate. TestRecoveryAnchorGuardNonValidatingStore isolates the second
+// check; disabling both provides the negative control for this test.
 func TestSnapshotAnchorMismatchLoudFallback(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t8.wal")
+	walPath := filepath.Join(t.TempDir(), "anchor-mismatch.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -234,8 +204,8 @@ func TestSnapshotAnchorMismatchLoudFallback(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// Rewrite the image with a FORGED header watermark (the file stays at the
-	// honest key ckpt/<ckptLamport>).
+	// Rewrite the image header's watermark while retaining its legitimate
+	// ckpt/<ckptLamport> key.
 	img, err := lfs.LoadSnapshotImage(context.Background(), ckptLamport)
 	if err != nil {
 		t.Fatalf("LoadSnapshotImage: %v", err)
@@ -252,28 +222,26 @@ func TestSnapshotAnchorMismatchLoudFallback(t *testing.T) {
 
 	rec, witness := recoverBounded(t, walPath, lfs)
 	if !witness.ExactWALFallback {
-		t.Errorf("MARKER: ExactWALFallback=false — a forged-anchor image was used SILENTLY")
+		t.Errorf("ExactWALFallback=false after anchor mismatch; the forged image must not be used")
 	}
 	if !strings.Contains(witness.FallbackReason, "watermark mismatch") {
-		t.Errorf("MARKER: FallbackReason=%q, want it to name the watermark mismatch", witness.FallbackReason)
+		t.Errorf("FallbackReason=%q, want a watermark mismatch explanation", witness.FallbackReason)
 	}
 	if got := countDots(t, rec); got != 4 {
-		t.Errorf("DOT COUNT: recovered %d != 4", got)
+		t.Errorf("recovered dot count=%d, want 4", got)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x (the WAL alone must rebuild the live state)", got, liveRoot)
+		t.Errorf("recovered root %x != live %x; exact WAL replay must rebuild live state", got, liveRoot)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// T8b — the recovery-side anchor guard, isolated (non-validating store)
+// Recovery-side anchor validation
 // ---------------------------------------------------------------------------
 
-// rawImageStore is a SnapshotStore that returns a caller-supplied image with
-// NO loader-side watermark validation (LocalFS validates at snapshot.go:281; a
-// remote store that streams bytes and decodes without checking would not). It
-// exists to isolate recovery.go's own anchor guard from the loader's — so the
-// recovery-side check is proven LIVE CODE, not unreachable defense-in-depth.
+// rawImageStore returns a caller-supplied image without loader-side watermark
+// validation. It isolates recovery's anchor check from the equivalent LocalFS
+// loader check.
 type rawImageStore struct{ img *SnapshotImage }
 
 func (s *rawImageStore) SnapshotExists(_ context.Context, _ uint64) (bool, error) {
@@ -283,17 +251,13 @@ func (s *rawImageStore) LoadSnapshotImage(_ context.Context, _ uint64) (*Snapsho
 	return s.img, nil
 }
 
-// TestRecoveryAnchorGuardNonValidatingStore is T8's isolation leg: the
-// genuine image content with a FORGED header watermark, served by a store that
-// does not validate. recovery.go's `snapshotLamportHigh != lh` check is then
-// the ONLY guard. The fallback must fire, loudly, and the rebuild must be
-// correct from the WAL alone.
-//
-// RED (bug-inject): neutralize recovery.go's check alone (`if false &&...`)
-// → the forged image is used → the MARKER assertion fires.
+// TestRecoveryAnchorGuardNonValidatingStore serves a valid image with a forged
+// header watermark through rawImageStore. Recovery's snapshotLamportHigh != lh
+// check is then the only anchor guard; it must trigger ExactWALFallback and
+// rebuild the live root from the WAL.
 func TestRecoveryAnchorGuardNonValidatingStore(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t8b.wal")
+	walPath := filepath.Join(t.TempDir(), "anchor-guard.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -321,19 +285,19 @@ func TestRecoveryAnchorGuardNonValidatingStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSnapshotImage (genuine): %v", err)
 	}
-	img.LamportHigh = ckptLamport + 999 // forged header; raw store does NOT re-validate
+	img.LamportHigh = ckptLamport + 999 // forged header; raw store does not re-validate
 
 	rec, witness := recoverBounded(t, walPath, &rawImageStore{img: img})
 	if !witness.ExactWALFallback {
-		t.Errorf("MARKER: ExactWALFallback=false — a forged-anchor image from a non-validating store was used SILENTLY")
+		t.Errorf("ExactWALFallback=false for a forged image from a non-validating store")
 	}
 	if !strings.Contains(witness.FallbackReason, "watermark mismatch") {
-		t.Errorf("MARKER: FallbackReason=%q, want it to name the watermark mismatch", witness.FallbackReason)
+		t.Errorf("FallbackReason=%q, want a watermark mismatch explanation", witness.FallbackReason)
 	}
 	if got := countDots(t, rec); got != 4 {
-		t.Errorf("DOT COUNT: recovered %d != 4", got)
+		t.Errorf("recovered dot count=%d, want 4", got)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x (the WAL alone must rebuild the live state)", got, liveRoot)
+		t.Errorf("recovered root %x != live %x; exact WAL replay must rebuild live state", got, liveRoot)
 	}
 }

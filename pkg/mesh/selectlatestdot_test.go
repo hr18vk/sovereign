@@ -13,18 +13,14 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// TestSelectLatestDotDeterministic is the pure-function guard for the
-// The total-order tie-break. selectLatestDot must be a TOTAL ORDER over the entry slice:
-// the HIGHER DotCounter wins, and on a tie the SMALLER DotNodeID
-// (bytes.Compare) wins — INDEPENDENT of slice iteration order. The OLD strict
-// `>` tie-break made the pick depend on iteration order (first-encountered
-// wins), so two nodes scanning the same equal-counter multi-origin entries
-// could return a DIFFERENT "latest". This guard asserts the SAME result for
-// every permutation, which the old `>` fails (it returns whichever entry
-// appears first in the slice).
+// TestSelectLatestDotDeterministic checks the total order used by
+// selectLatestDot. The higher DotCounter wins; equal counters are resolved by
+// the smaller DotNodeID under bytes.Compare. Trying several permutations
+// ensures that the result does not depend on which entry appears first, so
+// peers scanning the same entries select the same latest dot.
 func TestSelectLatestDotDeterministic(t *testing.T) {
-	// Two entries with EQUAL DotCounter but DIFFERENT DotNodeID. The total
-	// order picks the SMALLER DotNodeID regardless of slice order.
+	// Two entries with equal DotCounter but different DotNodeID. The total
+	// order picks the smaller DotNodeID regardless of slice order.
 	small := eng.CRDTEntry{DotNodeID: [16]byte{0x00}, DotCounter: 7, OriginNodeID: [16]byte{0x00}}
 	large := eng.CRDTEntry{DotNodeID: [16]byte{0x01}, DotCounter: 7, OriginNodeID: [16]byte{0x01}}
 	perms := [][]eng.CRDTEntry{
@@ -43,7 +39,7 @@ func TestSelectLatestDotDeterministic(t *testing.T) {
 		}
 	}
 
-	// Two entries with DIFFERENT DotCounter: the HIGHER counter wins regardless
+	// Two entries with different DotCounter: the higher counter wins regardless
 	// of slice order (the primary key).
 	lo := eng.CRDTEntry{DotNodeID: [16]byte{0xff}, DotCounter: 3}
 	hi := eng.CRDTEntry{DotNodeID: [16]byte{0x00}, DotCounter: 9}
@@ -62,5 +58,5 @@ func TestSelectLatestDotDeterministic(t *testing.T) {
 	if _, ok := selectLatestDot(nil); ok {
 		t.Fatal("selectLatestDot(nil) returned ok=true; want false for an empty slice")
 	}
-	t.Logf(".B PASS: selectLatestDot is a pure total order (max DotCounter, ties -> smallest DotNodeID), deterministic across all permutations")
+	t.Logf("selectLatestDot is a pure total order (max DotCounter, ties -> smallest DotNodeID), deterministic across all permutations")
 }

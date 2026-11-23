@@ -13,22 +13,15 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// — GATE-FIELD HEADER LIFT (v3 wire format + v2 forward-compat)
+// The v3 header is 96 bytes: dotCounter occupies [72:80] and originNodeID
+// occupies [80:96]. Reading these mirrors from fixed offsets avoids decoding
+// the inner capnp CRDTDeltaEvent on the early rejection paths. Version 2 uses
+// a 72-byte header without mirrors; the receiver accepts it and obtains the
+// gate fields from the inner frame instead. Other versions return ErrMalformed.
 //
-// These tests prove the v3 envelope wire format: the 96-byte
-// header carries the two cheap-gate mirror fields (dotCounter at [72:80],
-// originNodeID at [80:96]) lifted out of the frozen inner capnp
-// CRDTDeltaEvent, so the receiver's cheap 3.1/3.0 gates read them O(1) (two
-// fixed-offset slice reads) instead of a ~1 us capnp decode. They also prove
-// the v2 forward-compat dispatch (): a v2 frame (72-byte header, no
-// mirrors) is ACCEPTED with zero mirrors, and a version other than 2 or 3 is
-// an explicit ErrMalformed (no silent fall-through to zero fields — the C5
-// failure mode). The adversarial header/inner-desync cross-check itself lives
-// in pkg/receive (it needs the receiver's HandleFrame + the engine's Join
-// counter); these tests cover the wire format + accessors + dispatch the
-// cross-check and the cheap gates are built on.
-// ---------------------------------------------------------------------------
+// The header/inner consistency check is in pkg/receive, where HandleFrame can
+// also check the engine's Join counter. These tests cover the wire layout,
+// accessors, and version dispatch used by that check.
 
 // testOriginNodeID is a distinct 16-byte originNodeID the v3 tests use (not
 // the all-zero default, so a mirror-populated frame is distinguishable from a
@@ -38,11 +31,10 @@ var testOriginNodeID = [OriginNodeIDSize]byte{
 	0x89, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40,
 }
 
-// TestV3HeaderLenIs96 proves the v3 header is exactly 96 bytes
-// (2 ver + 2 hopCount + 4 innerLen + 64 originSig + 8 dotCounter + 16
-// originNodeID). HeaderLen is the single source of truth the receiver's
-// raw-frame readers source; pinning its value catches a future field-size
-// change that would silently shift every offset.
+// TestV3HeaderLenIs96 checks the v3 header size: 2 bytes for the version,
+// 2 for hopCount, 4 for innerLen, 64 for originSig, 8 for dotCounter, and 16
+// for originNodeID. The receiver's raw-frame readers use HeaderLen, so this
+// assertion catches a field-size change that would shift every later offset.
 func TestV3HeaderLenIs96(t *testing.T) {
 	if got, want := HeaderLen, 96; got != want {
 		t.Fatalf("HeaderLen = %d, want %d (v3: 2+2+4+64+8+16)", got, want)
@@ -54,10 +46,10 @@ func TestV3HeaderLenIs96(t *testing.T) {
 	}
 }
 
-// TestV3MarshalWritesMirrorsAtFixedOffsets proves Marshal writes the
-// v3 mirror fields at the documented fixed header offsets (dotCounter at
-// [72:80], originNodeID at [80:96]) so the receiver's O(1) header read and
-// the cross-check read the right bytes. It builds a v3 envelope, Marshals it,
+// TestV3MarshalWritesMirrorsAtFixedOffsets proves Marshal writes the v3
+// mirror fields at the documented fixed header offsets (dotCounter at [72:80],
+// originNodeID at [80:96]) so the receiver's O(1) header read and the
+// cross-check read the right bytes. It builds a v3 envelope, marshals it,
 // and inspects the raw header at those offsets.
 func TestV3MarshalWritesMirrorsAtFixedOffsets(t *testing.T) {
 	inner := fakeInnerWire()
@@ -97,8 +89,8 @@ func TestV3MarshalWritesMirrorsAtFixedOffsets(t *testing.T) {
 	}
 }
 
-// TestV3UnmarshalReadsMirrors proves UnmarshalRelayEnvelope surfaces
-// the v3 mirror fields via the DotCounter()/OriginNodeID() accessors, so the
+// TestV3UnmarshalReadsMirrors proves UnmarshalRelayEnvelope surfaces the v3
+// mirror fields via the DotCounter()/OriginNodeID() accessors, so the
 // receiver's cheap gates read them O(1) without a capnp decode. Round-trip:
 // build v3 -> Marshal -> Unmarshal -> accessors return the bound values.
 func TestV3UnmarshalReadsMirrors(t *testing.T) {
@@ -120,13 +112,11 @@ func TestV3UnmarshalReadsMirrors(t *testing.T) {
 	}
 }
 
-// TestV2ForwardCompatAccepted proves a v2 frame (the 72-byte header
-// with NO mirror fields) is ACCEPTED by UnmarshalRelayEnvelope (): the
-// version is an explicit dispatch branch, the v2 header length is used, and
-// the mirror accessors return their zero values (the receiver's v2 dispatch
-// then falls back to a capnp decode for the gate fields). A v2 frame is NOT
-// silently fall-through to zero fields on a v3 parser — the version is
-// honored and the frame parses against the v2 layout.
+// TestV2ForwardCompatAccepted checks that UnmarshalRelayEnvelope recognizes
+// the 72-byte v2 header. Its mirror accessors return zero values, and the
+// receiver's v2 branch decodes the gate fields from the inner capnp frame.
+// Parsing follows the explicit v2 layout rather than treating absent mirrors
+// as v3 values.
 func TestV2ForwardCompatAccepted(t *testing.T) {
 	inner := fakeInnerWire()
 	// Build a v2 frame by hand: version 2, 72-byte header, no mirrors.
@@ -140,7 +130,7 @@ func TestV2ForwardCompatAccepted(t *testing.T) {
 
 	parsed, err := UnmarshalRelayEnvelope(v2)
 	if err != nil {
-		t.Fatalf("v2 frame must be ACCEPTED (forward-compat), got err: %v", err)
+		t.Fatalf("v2 frame must be accepted (forward-compat), got err: %v", err)
 	}
 	if got := parsed.Version(); got != envelopeVersionV2 {
 		t.Fatalf("v2 frame Version = %d, want %d", got, envelopeVersionV2)
@@ -160,10 +150,8 @@ func TestV2ForwardCompatAccepted(t *testing.T) {
 	}
 }
 
-// TestUnknownVersionRejected proves a version other than 2 or 3 is an
-// explicit ErrMalformed — NOT a silent fall-through to zero fields (the C5
-// failure mode closed by the version gate). v1 (version 1) and a future v4 are
-// both rejected with a named error naming the unsupported version.
+// TestUnknownVersionRejected checks that versions other than 2 and 3 return
+// an error instead of being parsed with a known header layout.
 func TestUnknownVersionRejected(t *testing.T) {
 	for _, ver := range []uint16{1, 4, 99, 0} {
 		w := make([]byte, HeaderLen+8)
@@ -177,11 +165,9 @@ func TestUnknownVersionRejected(t *testing.T) {
 	}
 }
 
-// TestV3OpenUnchangedByMirrors proves the v3 mirror fields do NOT
-// affect Open's cryptographic verify: Open verifies the relay hops over the
-// inner wire + signed material (unchanged in v3), and the mirrors are
-// header-only metadata the receiver cross-checks separately. A v3 envelope
-// with mirrors opens identically to a v2 envelope over the same hops.
+// TestV3OpenUnchangedByMirrors checks that the v3 mirror fields do not enter
+// the relay signed material. Open verifies the same relay chain and returns
+// the same inner wire; the receiver checks the mirrors separately.
 func TestV3OpenUnchangedByMirrors(t *testing.T) {
 	inner := fakeInnerWire()
 	env, relayPubs := buildRelayChain(t, inner, 3)

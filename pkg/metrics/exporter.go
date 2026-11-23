@@ -15,19 +15,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Exporter owns the per-process Prometheus Registry and exposes the /metrics
-// scrape handler. The Registry is PER-CMD-PROCESS, NOT the global
-// prometheus.DefaultRegisterer: the global registerer PANICS on duplicate
-// registration across tests (two Recorder instances registering the same
-// instrument names), and a single shared global is the wrong ownership boundary
-// for a binary that may construct the surface once per process. The
-// per-process Registry is the root-cause fix (ADR-0008 §3).
+// Exporter owns a Prometheus registry and its /metrics handler. Each Exporter
+// has independent instruments, so constructing another one does not collide
+// with names already registered elsewhere in the process (ADR-0008).
 //
-// The Exporter registers the Recorder's four hot-path instruments plus three
-// poller-fed gauges (ingest pps, convergence lag, convergence roots-equal).
-// The gauges are Set-style: a 1s poller in the cmd wiring reads
-// gossiper.ConvergenceLag() and the verdict-counter delta off the hot path and
-// calls the Exporter's Set methods. The hot path never touches the gauges.
+// The registry contains the Recorder instruments and three gauges: ingest rate,
+// convergence lag, and convergence root equality. A one-second poller in the
+// command wiring updates the gauges; the receive path does not access them.
 type Exporter struct {
 	reg      *prometheus.Registry
 	recorder *Recorder
@@ -36,18 +30,16 @@ type Exporter struct {
 	convergenceLag     prometheus.Gauge
 	convergenceRootsEq prometheus.Gauge
 
-	// ppsState holds the last counter snapshot + timestamp the poller read,
-	// so the pps gauge is computed as delta(counter)/delta(t). Guarded by the
-	// poller's single-writer discipline (one goroutine); reads under atomic
-	// for the scrape path's safety.
+	// The poller stores its previous count and timestamp so it can compute a
+	// rate from successive samples. A single poller writes both fields; atomic
+	// accesses also make scrapes safe.
 	ppsLastCount uint64 // atomic
-	ppsLastTime  int64  // atomic — unix-nano
+	ppsLastTime  int64  // atomic Unix timestamp in nanoseconds
 }
 
-// NewExporter constructs a fresh per-process Registry, a Recorder bound to it,
-// and the three poller-fed gauges. Constructing two Exporters (two Registries)
-// MUST NOT panic — the per-process Registry is the fixture for
-// TestExportersRegister.
+// NewExporter constructs an independent registry, a Recorder, and the three
+// poller-fed gauges. Separate Exporters may register the same instrument names
+// without affecting one another.
 func NewExporter() *Exporter {
 	reg := prometheus.NewRegistry()
 	rec := NewRecorder(reg)
@@ -62,46 +54,40 @@ func NewExporter() *Exporter {
 	})
 	e.convergenceRootsEq = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "sovereign_convergence_roots_equal",
-		Help: "Binary convergence indicator: 1.0 when the 2-node MerkleRoots match per the last sweep, 0.0 otherwise. A 3-node quorum-aware gauge is a future track.",
+		Help: "Binary convergence indicator: 1.0 when the two nodes' Merkle roots match in the latest sweep, 0.0 otherwise.",
 	})
 	reg.MustRegister(e.ingestPPS, e.convergenceLag, e.convergenceRootsEq)
 	return e
 }
 
-// Registry returns the per-process Registry (test seam + the scrape handler
-// binds to it).
+// Registry returns the registry used by the scrape handler and tests.
 func (e *Exporter) Registry() *prometheus.Registry { return e.reg }
 
-// Recorder returns the hot-path Recorder (the accept loop observes through it).
+// Recorder returns the instrument set used by the accept loop.
 func (e *Exporter) Recorder() *Recorder { return e.recorder }
 
-// Handler returns the /metrics scrape handler. It is promhttp.HandlerFor bound
-// to the per-process Registry; promhttp is non-blocking (the scrape iterates
-// instruments, no hot-path lock). The handler is attached to the SAME plain-HTTP
-// mux as /livecheck (one server, one mux, the --metrics-addr flag already binds
-// it) — /metrics is ops debug, NOT the data plane (the C1 boundary).
+// Handler returns a Prometheus scrape handler for this Exporter's registry.
+// The command serves it from the operational HTTP listener configured by
+// --metrics-addr, separately from the data plane.
 func (e *Exporter) Handler() http.Handler {
 	return promhttp.HandlerFor(e.reg, promhttp.HandlerOpts{
-		// Disable the default Go runtime/process collector: the engine's
-		// observability surface is the seven sovereign_* series, not the
-		// process metrics. Keeping them off avoids a surprise scrape-cost spike
-		// and keeps the gate's seven-series grep unambiguous.
+		// A new Registry has no Go runtime or process collectors. Only the
+		// instruments registered by this package and its callers are exposed.
 		Registry: e.reg,
 	})
 }
 
-// SetIngestPPS sets the instantaneous frames/sec gauge. Called by the 1s
-// poller off the hot path.
+// SetIngestPPS sets the ingest-rate gauge. The poller calls it outside the
+// frame-processing path.
 func (e *Exporter) SetIngestPPS(pps float64) { e.ingestPPS.Set(pps) }
 
-// SetConvergenceLag sets the convergence-lag gauge (seconds). Called by the
-// 1s poller from gossiper.ConvergenceLag().
+// SetConvergenceLag records the value returned by gossiper.ConvergenceLag in
+// seconds.
 func (e *Exporter) SetConvergenceLag(lag time.Duration) {
 	e.convergenceLag.Set(lag.Seconds())
 }
 
-// SetConvergenceRootsEqual sets the binary roots-equal gauge (1.0 match, 0.0
-// diverged). Called by the 1s poller.
+// SetConvergenceRootsEqual records 1 for equal roots and 0 otherwise.
 func (e *Exporter) SetConvergenceRootsEqual(equal bool) {
 	if equal {
 		e.convergenceRootsEq.Set(1.0)
@@ -110,12 +96,10 @@ func (e *Exporter) SetConvergenceRootsEqual(equal bool) {
 	}
 }
 
-// ObserveVerdictDelta feeds the pps gauge: the poller reads the verdict-counter
-// total, and this helper computes frames/sec from the delta since the last
-// call. It is OFF the hot path (the 1s poller). The counter total is the sum
-// across all six verdict labels (every frame, accepted or dropped, is a frame).
+// ObserveVerdictDelta computes frames per second from the total across all
+// verdict labels and the previous sample. The first sample and non-increasing
+// timestamps return zero. It is intended for the poller, not frame processing.
 func (e *Exporter) ObserveVerdictDelta(now time.Time) float64 {
-	// Sum every verdict label's counter value (the full frame count).
 	var total uint64
 	if cv := e.recorder.IngestVerdictCounter(); cv != nil {
 		for _, label := range verdictLabels {
@@ -123,9 +107,8 @@ func (e *Exporter) ObserveVerdictDelta(now time.Time) float64 {
 			if err != nil {
 				continue
 			}
-			// prometheus counters expose their value via the dto; the
-			// test-asserted path is to read through Write. For the poller we
-			// use the lightweight process-collector-free read below.
+			// Counter.Write exposes the current value without adding another
+			// counter or reading any receive-path state.
 			total += readCounterValue(m)
 		}
 	}
@@ -144,8 +127,7 @@ func (e *Exporter) ObserveVerdictDelta(now time.Time) float64 {
 	return float64(total-lastCount) / dt
 }
 
-// verdictLabels is the full ordered label set (every frame, accepted or
-// dropped, increments exactly one of these).
+// verdictLabels lists the bounded set of outcomes in counter-cache order.
 var verdictLabels = []VerdictLabel{
 	VerdictAccept,
 	VerdictDropMalformed,

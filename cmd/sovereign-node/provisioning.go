@@ -4,49 +4,25 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package main (cmd/sovereign-node) — ADR-0040: the OOB peer-Directory
-// pubkey provisioning layer.
+// Package main implements out-of-band peer-directory provisioning (ADR-0040).
 //
-// provisioning.go is the NEW seam that retires the zero-peerID dial hazard
-// (cmd/sovereign-node/main.go:1169 dials `peerSet.Dial(meshCtx, pa, host,
-// zeroPeerID)` — every peer is a 0x00…00 book-keeping key). The region tags the
-// TopologyManager keys under `peerIDForAddr(addr)` (a SHA-256 addr
-// surrogate) never match the zero peerID the dial stores under, so the region
-// lookup misses → every peer routes RegionUnset = intra = byte-identical
-// full-mesh — the ADR-0039 §7.1 N=2 no-op. This provisioning retires the zero peerID by
-// class-elimination: this file reads a `--peer-dir` config mapping each peer
-// addr → {nodeID, Ed25519 pubkey, optional ML-DSA-65 pubkey, optional region},
-// calls `gossiper.RegisterPeer` (+ `dir.RegisterPQ` for the optional PQ arm)
-// + `topo.SetRegion` under the REAL nodeID, and returns an addr→nodeID map the
-// dial loop branches on (provisioned peers dial under the real nodeID;
-// un-provisioned peers keep the zero peerID = byte-identical back-compat).
+// Without a peer directory, the dial loop uses a zero peerID while region tags
+// are keyed by peerIDForAddr(addr), a SHA-256 address surrogate. Those keys do
+// not match, so region lookup fails and peers use the full-mesh route. The
+// --peer-dir file binds each address to a nodeID, an Ed25519 public key, and
+// optionally an ML-DSA-65 public key and region. Provisioning registers those
+// keys and regions under the real nodeID and returns the address-to-nodeID map
+// used by the dial loop. Unprovisioned peers retain the zero-peerID behavior.
 //
-// The PQ arm reconstructs the ML-DSA-65 public key from its 1952-byte wire
-// encoding via `mldsa.NewPublicKey(mldsa.MLDSA65(), encoded1952)` (the
-// `Bytes()`/`NewPublicKey` round-trip — mldsa.go:201 `NewPublicKey` takes the
-// serialized encoding, NOT a private-key seed; the hybrid-sign path carries the
-// in-memory *mldsa.PublicKey and never serializes; this file is the FIRST site
-// that reconstructs a directory PQ pubkey from a serialized config blob).
+// ML-DSA-65 keys use their 1,952-byte public-key encoding.
+// mldsa.NewPublicKey(mldsa.MLDSA65(), encoded) reconstructs the value returned
+// by PublicKey.Bytes; it does not accept a private-key seed.
 //
-// FAILSAFE discipline (the EnableFirstSysSkip precedent, INVERTED for
-// identity): parsePeerRegions (main.go:512) silently SKIPS a malformed region
-// tag (a region tag is a routing hint — wrong is conservative-local, NOT a
-// security defect). A peer pubkey is a VERIFICATION anchor (the receiver's
-// Directory.Lookup resolves originNodeID → pubkey; a wrong pubkey makes a
-// genuine delta DROPPED as a forged signature). So parsePeerDir REJECTS a
-// malformed entry with an error naming the line + the field; it NEVER silently
-// coerces a short/truncated key to zero (the §III RED guard OOB config-parse
-// injects a 16-byte-truncated pubkey + asserts the parser REJECTS it — remove
-// the length check and the guard FAILS, proving the guard is load-bearing).
-//
-// ZERO new module dep: filippo.io/mldsa is ALREADY in go.mod (the blank import
-// at pkg/crypto, pinned at go.mod line 8). This file adds
-// the first DIRECT cmd-side import of the symbol API (the anti-fab discipline
-// of pq_mldsa.go: each mldsa symbol call site cites the module-cache file:line).
-//
-// No frozen file is touched: this file is a new caller of pkg/mesh.Gossiper.RegisterPeer
-// + pkg/identity.Directory.RegisterPQ + pkg/mesh.TopologyManager.SetRegion —
-// all pre-existing seams (it is IDENTITY/ROUTING, NOT CRDT — pkg/sync is untouched).
+// Region parsing and identity parsing have different failure policies. A
+// malformed region suffix can fall back to conservative local routing, but a
+// malformed public key cannot be ignored: Directory.Lookup uses that key to
+// verify the peer's deltas. parsePeerDir therefore reports the line and field
+// for malformed entries instead of coercing truncated keys to zero.
 
 package main
 
@@ -66,41 +42,22 @@ import (
 	"github.com/hr18vk/sovereign/pkg/mesh"
 )
 
-// peerDirConfig is one parsed --peer-dir entry: a peer addr bound to its
-// CRDT-delta signing identity (the Ed25519 pubkey the receiver's Directory
-// resolves) + the OPTIONAL ML-DSA-65 pubkey (the hybrid-verify arm, under
-// --hybrid-verify) + the OPTIONAL region tag (the TopologyManager key).
+// peerDirConfig is one parsed --peer-dir entry. The address is bound to the
+// Ed25519 public key used to verify the peer's CRDT deltas, with optional
+// ML-DSA-65 and region fields for hybrid verification and region-aware routing.
 //
-// The Ed25519 pubkey is the load-bearing field: it is the verification anchor
-// the receiver's Directory.Lookup returns, so a wrong pubkey makes a genuine
-// peer delta DROPPED as a forged signature (the honest-negative posture — a
-// misconfigured deploy is a SILENT PARTITION, NOT a security hole). The ML-DSA-65
-// pubkey is OPTIONAL (nil = the peer is classical-only; the hybrid verify rejects
-// a nil pqPub via the STRICT mode — the SAME posture a peer that registered
-// ONLY the classical key has). The region tag is OPTIONAL (0 = RegionUnset =
-// routes as SAME-region = intra — the conservative default).
+// A wrong Ed25519 key causes the receiver to reject genuine deltas as forgeries,
+// so a configuration error can partition a peer. A nil ML-DSA-65 key means the
+// peer is classical-only; strict hybrid verification rejects a missing PQ key
+// (ADR-0036). RegionUnset, the zero region, uses conservative same-region
+// routing (ADR-0039).
 //
-// hasRegion is the explicit "region field was present" flag (a region of 0 is
-// a VALID tag the operator MAY set explicitly, indistinguishable from "absent"
-// by the RegionTag zero-value alone; the flag keeps the two distinct so a
-// topo.SetRegion(realNodeID, 0) call happens ONLY when the operator named 0,
-// NOT when the field was omitted — the honest distinction the §III guard
-// OOB provision-retires-surrogate asserts).
-// peerDirConfig is one parsed peer-directory line. Field order is the
-// fieldalignment manual reorder per the memory `fieldalignment_fix_is_destructive`
-// (NEVER `fieldalignment -fix`): the two pointers (addr string header +
-// mldsa65Pub) first, then the two fixed byte arrays, then the two bools packed
-// at the tail (72→24 pointer-bytes). The residual "24 could be 16" is a known
-// fieldalignment false-positive for string headers — it counts the string's
-// (ptr,len) as 2 pointers but reports "could be 16" as if the len half were
-// free; 24 IS the structural floor for a struct carrying a string + a pointer.
-// This is a config-parse struct allocated ONCE per peer at boot (NOT a hot-path
-// contended-atomic — the cache law does NOT apply); the reorder is hygiene, not
-// a performance gate. mldsa65Pub is the OPTIONAL reconstructed ML-DSA-65 public
-// key (nil = the peer is classical-only), reconstructed from the 1952-byte wire
-// encoding via mldsa.NewPublicKey(mldsa.MLDSA65(), encoded) (mldsa.go:201 — the
-// Bytes()/NewPublicKey round-trip); owned by the parsed config, never mutated
-// post-parse.
+// hasRegion distinguishes an explicitly configured RegionUnset from an omitted
+// region. applyProvisioning calls SetRegion only in the former case.
+//
+// The address and ML-DSA-65 pointer precede the fixed-size fields to reduce the
+// pointer-bearing portion of the struct. These values are allocated while
+// parsing configuration, not on the write path, and are not mutated afterward.
 type peerDirConfig struct {
 	addr       string
 	mldsa65Pub *mldsa.PublicKey
@@ -112,20 +69,18 @@ type peerDirConfig struct {
 
 // peerDirConfig fields (positional, by column):
 //
-//	1 addr host:port (REQUIRED, must contain a ":")
-//	2 nodeID 32-hex-char (16-byte) node identity (REQUIRED)
-//	3 ed25519_pubkey 64-hex-char (32-byte) Ed25519 public key (REQUIRED)
-//	4 mldsa65_pubkey 3904-hex-char (1952-byte) ML-DSA-65 public key (OPTIONAL)
-//	5 region uint8 region tag 0-255 (OPTIONAL, only if col 4 present)
+//	1  addr            host:port (required, must contain a ":")
+//	2  nodeID          32-hex-char (16-byte) node identity (required)
+//	3  ed25519_pubkey  64-hex-char (32-byte) Ed25519 public key (required)
+//	4  mldsa65_pubkey  3904-hex-char (1952-byte) ML-DSA-65 public key (optional)
+//	5  region          uint8 region tag 0-255 (optional, only if col 4 present)
 //
-// The columns are positional + whitespace-separated (NOT named keys) — the
-// zero-dependency discipline (no TOML/YAML/JSON dep; the spec names this three
-// times). A `#` to end-of-line is a comment (stripped before field split). Blank
-// lines + comment-only lines are skipped. The OPTIONAL columns are TRAILING: a
-// line with 3 fields is classical-only + no region; a line with 4 fields adds the
-// PQ pubkey; a line with 5 fields adds the region. A line with 5 fields where col
-// 4 is "-" is classical-only WITH a region (the explicit-skip sentinel — a peer
-// that has a region but NO PQ key, the common case once region-aware is GA).
+// Columns are positional and whitespace-separated, so parsing needs no
+// configuration-file dependency. Text from # to the end of a line is a comment.
+// Blank and comment-only lines are skipped. Optional columns are trailing: three
+// fields specify a classical-only peer with no region, four add a PQ public key,
+// and five add a region. Use "-" in column 4 to specify a region without a PQ
+// key.
 const (
 	peerDirColAddr = iota
 	peerDirColNodeID
@@ -135,58 +90,41 @@ const (
 	peerDirColCount // the max column count (region + 1)
 )
 
-// mldsa65SkipSentinel is the explicit-skip marker for the OPTIONAL ML-DSA-65
-// column: a line "addr nodeID ed25519 - 3" provisions a classical-only peer in
-// region 3 (the common case — a region-tagged peer with NO PQ key). Without the
-// sentinel a 5-field line would be ambiguous (is col 4 a 3904-hex PQ key or a
-// region?); the sentinel makes col 4's absence explicit so col 5 is unambiguously
-// the region. A line with 4 fields has NO region (col 4 is the PQ key OR the
-// sentinel — but a 4-field line with "-" is classical-only + no region, the
-// honest degenerate case the parser accepts).
+// mldsa65SkipSentinel marks an omitted optional key or region. In
+// "addr nodeID ed25519 - 3" it leaves the peer classical-only and assigns region
+// 3. It also makes a five-field line unambiguous: column 4 contains a key or the
+// sentinel, and column 5 contains the region. A four-field line with "-" is
+// accepted and specifies neither a PQ key nor a region.
 const mldsa65SkipSentinel = "-"
 
-// ErrPeerDirEmpty is returned by applyProvisioning when --peer-dir is empty
-// (the OPT-IN default — no provisioning, the dial loop keeps the zero peerID,
-// byte-identical). It is NOT a boot error: an empty path is the honest
-// "operator did not opt in" signal, surfaced as a logged no-op (the caller
-// returns an empty provisioned map → the dial loop's ELSE arm runs for every
-// peer). Distinct from a NON-EMPTY path that does not exist (a real boot error:
-// the operator named a file that is absent — a deploy misconfiguration that
-// MUST fail loudly, NOT silently fall back to zero-peerID).
-var ErrPeerDirEmpty = errors.New("provisioning: --peer-dir is empty (no OOB provisioning; dial loop keeps the zero peerID — byte-identical)")
+// ErrPeerDirEmpty reports that --peer-dir was not set. parsePeerDir returns this
+// error for the default empty path; the caller treats it as a no-op and leaves
+// the dial loop on its zero-peerID compatibility path. A non-empty path that
+// cannot be opened is a configuration error and fails startup instead.
+var ErrPeerDirEmpty = errors.New("provisioning: --peer-dir is empty (no OOB provisioning; dial loop keeps the zero peerID — byte-identical back-compat)")
 
-// parsePeerDir reads + parses the --peer-dir config file into a []peerDirConfig.
-// The FAILSAFE discipline (inverted from parsePeerRegions' silent-skip):
+// parsePeerDir reads a --peer-dir file and returns its entries in file order.
+// File order also determines registration and gateway-selection order.
 //
-// - a NON-EMPTY path that does not exist → error (a deploy misconfiguration
-// that MUST fail loudly — silently falling back to zero-peerID would mask
-// a missing config as a byte-identical no-op, the silent-partition
-// class the honest-negative posture forbids).
-// - a malformed entry (bad hex, wrong field length, unparseable region) →
-// error naming the line number + the field (NEVER silently coerced to zero;
-// a truncated pubkey is a VERIFICATION anchor defect, NOT a routing hint).
-// - a duplicate addr → error (a deploy conflict the operator must resolve; the
-// dial loop keys byAddr, so a duplicate would silently shadow the first).
-//
-// The returned slice is in FILE ORDER (the order the operator wrote the lines);
-// applyProvisioning iterates it in that order so the provisioned map + the
-// Directory registrations are deterministic across runs (the
-// seeded-determinism discipline generalized to the config layer).
+// A non-empty path that cannot be opened returns an error rather than falling
+// back to zero-peerID dialing. Malformed keys, regions, and field counts return
+// errors naming the line and field. Duplicate addresses and nodeIDs are also
+// rejected: the dial loop is keyed by address, and a second registration for
+// the same nodeID would replace the first peer's Directory binding.
 func parsePeerDir(path string) ([]peerDirConfig, error) {
 	if path == "" {
 		return nil, ErrPeerDirEmpty
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		// A named-but-absent file is a deploy misconfiguration: surface it
-		// loudly. os.Open already names the path in the error; wrap it so the
-		// boot log identifies the --peer-dir that failed.
+		// A named but absent file is a configuration error. os.Open includes the
+		// path; wrapping the error identifies the --peer-dir that failed.
 		return nil, fmt.Errorf("provisioning: open --peer-dir %q: %w", path, err)
 	}
 	defer f.Close()
 	var out []peerDirConfig
 	seen := make(map[string]int)         // addr -> first line seen (1-indexed)
-	seenNodeID := make(map[[16]byte]int) // nodeID -> first line seen (the nodeID-dedup)
+	seenNodeID := make(map[[16]byte]int) // nodeID -> first line seen
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // a 1952B hex pubkey = 3904 chars; allow 4MiB lines
 	lineNo := 0
@@ -195,7 +133,7 @@ func parsePeerDir(path string) ([]peerDirConfig, error) {
 		raw := sc.Text()
 		// Strip a `#` comment (to end-of-line). A `#` inside a hex value is
 		// impossible (hex is [0-9a-f]), so the first `#` is unambiguously a
-		// comment start. The comment is stripped BEFORE the field split so a
+		// comment start. The comment is stripped before the field split so a
 		// trailing comment does not become a spurious 6th field.
 		if h := strings.IndexByte(raw, '#'); h >= 0 {
 			raw = raw[:h]
@@ -217,21 +155,13 @@ func parsePeerDir(path string) ([]peerDirConfig, error) {
 		if first, dup := seen[cfg.addr]; dup {
 			return nil, fmt.Errorf("provisioning: %s:%d: duplicate peer addr %q (first seen at line %d)", path, lineNo, cfg.addr, first)
 		}
-		// A review pass: dedup on NODEID too,
-		// not just addr. Two config lines with the SAME nodeID but DIFFERENT
-		// addrs would both pass the addr-dedup (distinct addrs) + both
-		// applyProvisioning → the second RegisterPeer/RegisterPQ silently
-		// OVERWRITES the first's Directory binding (directory.go d.m[nodeID]=
-		// canonical, no error) → the first peer's deltas (signed under the
-		// first peer's seed) are DROPPED as FORGED at VerifyCRDTFrame → a silent
-		// partition the FAILSAFE parser must catch. A duplicate nodeID is a
-		// deploy misconfiguration (two peers sharing an identity — a copy-paste
-		// error OR a malicious peer presenting a forged nodeID); the boot MUST fail
-		// loudly, NOT silently shadow. The nodeID-dedup is DISTINCT from the
-		// addr-dedup (a peer MAY legitimately appear once per addr; it may NOT
-		// appear twice per identity).
+		// Distinct addresses may not share a nodeID. Otherwise both entries pass
+		// the address check, and the second RegisterPeer or RegisterPQ call would
+		// replace the first entry's Directory binding. Deltas from the first peer
+		// would then fail signature verification. Rejecting the duplicate during
+		// parsing prevents that partial loss of connectivity at startup.
 		if first, dup := seenNodeID[cfg.nodeID]; dup {
-			return nil, fmt.Errorf("provisioning: %s:%d: duplicate peer nodeID %x (first seen at line %d) — two peers sharing an identity silently shadow the first's Directory binding; the boot MUST fail loudly", path, lineNo, cfg.nodeID, first)
+			return nil, fmt.Errorf("provisioning: %s:%d: duplicate peer nodeID %x (first seen at line %d) — two peers sharing an identity silently shadow the first's Directory binding; the boot must fail loudly", path, lineNo, cfg.nodeID, first)
 		}
 		seen[cfg.addr] = lineNo
 		seenNodeID[cfg.nodeID] = lineNo
@@ -243,12 +173,9 @@ func parsePeerDir(path string) ([]peerDirConfig, error) {
 	return out, nil
 }
 
-// parsePeerDirLine parses ONE non-blank, comment-stripped line's fields into a
-// peerDirConfig. The length guard ran in parsePeerDir; this does the per-field
-// decode + the length checks that are the load-bearing FAILSAFE gates (the
-// §III RED guard OOB config-parse injects a 16-byte-truncated nodeID + a
-// 16-byte-truncated pubkey + asserts REJECT; removing the length checks makes
-// the guard FAIL — the guards are load-bearing, NOT vestigial).
+// parsePeerDirLine decodes one non-blank, comment-stripped line after
+// parsePeerDir has checked its field count. Exact key lengths are enforced here
+// so truncated identities cannot enter the Directory or topology registry.
 func parsePeerDirLine(path string, lineNo int, fields []string) (peerDirConfig, error) {
 	cfg := peerDirConfig{addr: fields[peerDirColAddr]}
 	if strings.IndexByte(cfg.addr, ':') < 0 {
@@ -264,7 +191,7 @@ func parsePeerDirLine(path string, lineNo int, fields []string) (peerDirConfig, 
 	}
 	copy(cfg.nodeID[:], nid)
 	// Ed25519 pubkey: 64 hex chars → 32 bytes. The load-bearing verification
-	// anchor — a wrong length is a deploy defect, NOT a hint.
+	// anchor — a wrong length is a deploy defect, not a hint.
 	pub, err := hex.DecodeString(fields[peerDirColEd25519])
 	if err != nil {
 		return peerDirConfig{}, fmt.Errorf("provisioning: %s:%d: ed25519_pubkey %q: %w", path, lineNo, fields[peerDirColEd25519], err)
@@ -273,28 +200,22 @@ func parsePeerDirLine(path string, lineNo int, fields []string) (peerDirConfig, 
 		return peerDirConfig{}, fmt.Errorf("provisioning: %s:%d: ed25519_pubkey: want 32 bytes (64 hex chars), got %d bytes", path, lineNo, len(pub))
 	}
 	copy(cfg.ed25519Pub[:], pub)
-	// OPTIONAL ML-DSA-65 pubkey (col 4) + region (col 5). The trailing columns
-	// are present iff the line has ≥4 / ≥5 fields. The sentinel "-" in col 4
-	// means classical-only (no PQ key) — a 5-field line with col 4 == "-"
-	// provisions a classical-only peer WITH a region (the common region-aware
-	// case). A 4-field line with col 4 == "-" is classical-only + no region
-	// (the degenerate explicit-skip).
+	// Column 4 optionally contains an ML-DSA-65 public key, and column 5 a
+	// region. The "-" sentinel in column 4 selects classical-only operation;
+	// column 5 may then supply a region. A four-field line with "-" has neither
+	// optional value.
 	if len(fields) >= peerDirColMldsa65+1 {
 		mldsaField := fields[peerDirColMldsa65]
 		if mldsaField != mldsa65SkipSentinel {
-			// Reconstruct the ML-DSA-65 public key from its 1952-byte wire
-			// encoding. mldsa.NewPublicKey(params, encoding) — mldsa.go:201,
-			// the inner NewPublicKey65(pk []byte) at internal/.../mldsa.go:309.
-			// A wrong length is a deploy defect (the key cannot verify); reject
-			// it loudly, do NOT coerce.
+			// Reconstruct the ML-DSA-65 public key from its serialized encoding.
+			// NewPublicKey expects the public-key bytes, not a private seed.
 			enc, err := hex.DecodeString(mldsaField)
 			if err != nil {
 				return peerDirConfig{}, fmt.Errorf("provisioning: %s:%d: mldsa65_pubkey %q: %w", path, lineNo, mldsaField, err)
 			}
-			// mldsa.MLDSA65PublicKeySize = 1952 (mldsa.go:22). The exact size is
-			// the load-bearing gate — a truncated PQ key would silently verify
-			// NOTHING (mldsa.Verify rejects a malformed pk), masking a deploy
-			// defect as a "hybrid verify always fails" mystery.
+			// MLDSA65PublicKeySize is 1952 bytes. Reject other lengths here so a
+			// malformed key is reported as a configuration error rather than as a
+			// signature verification failure later.
 			if len(enc) != mldsa.MLDSA65PublicKeySize {
 				return peerDirConfig{}, fmt.Errorf("provisioning: %s:%d: mldsa65_pubkey: want %d bytes (%d hex chars), got %d bytes", path, lineNo, mldsa.MLDSA65PublicKeySize, mldsa.MLDSA65PublicKeySize*2, len(enc))
 			}
@@ -307,11 +228,8 @@ func parsePeerDirLine(path string, lineNo int, fields []string) (peerDirConfig, 
 	}
 	if len(fields) >= peerDirColRegion+1 {
 		regionField := fields[peerDirColRegion]
-		// A region of 0 is a VALID explicit tag (RegionUnset = routes as local).
-		// The sentinel "-" here means "no region" (a 5-field line where the
-		// operator wrote a PQ key but left region absent via "-" — the explicit
-		// no-region sentinel so a 4-field PQ line is NOT ambiguous with a
-		// 4-field region line). Accept uint8 0-255; reject out-of-range.
+		// RegionUnset is valid when written explicitly as 0. The "-" sentinel
+		// leaves hasRegion false, while every other value must fit in a uint8.
 		if regionField == mldsa65SkipSentinel {
 			cfg.hasRegion = false
 		} else {
@@ -326,87 +244,58 @@ func parsePeerDirLine(path string, lineNo int, fields []string) (peerDirConfig, 
 	return cfg, nil
 }
 
-// provisionedMap is the addr→nodeID map applyProvisioning returns for the dial
-// loop to branch on. A peer addr in this map dials under the REAL nodeID (the
-// provisioned path — the selector HITS); an addr NOT in this map keeps the zero
-// peerID (the byte-identical back-compat path). It is the load-bearing
-// return value: the dial loop's IF/ELSE arm keys off it.
+// provisionedMap maps a configured address to its real nodeID. The dial loop
+// uses the mapped identity for provisioned peers and retains the zero peerID
+// for addresses absent from the map.
 type provisionedMap map[string][16]byte
 
-// applyProvisioning parses the --peer-dir config + applies it to the live
-// gossiper Directory + the TopologyManager. For each parsed entry it:
+// applyProvisioning registers pre-parsed entries with the live Directory and
+// TopologyManager. Each non-self entry contributes its Ed25519 key through
+// gossiper.RegisterPeer, its optional ML-DSA-65 key through dir.RegisterPQ, and,
+// when hasRegion is set, its region through topo.SetRegion. PQ registration uses
+// the Directory directly because Gossiper exposes no RegisterPQ method. A nil PQ
+// key leaves LookupBoth with a classical key only, which strict hybrid
+// verification rejects (ADR-0036).
 //
-// 1. gossiper.RegisterPeer(nodeID, ed25519Pub[:]) — registers the peer's Ed25519
-// pubkey in the Directory (gossip.go:597; delegates to the SAME Directory
-// the local node's own pubkey is in via g.domains, gossip.go:288). This is
-// the binary mirror of the in-process gate's gA.RegisterPeer(identB.NodeID,
-// identB.Pub) — the asymmetry it closes: today the
-// binary registers the LOCAL node's own pubkey (main.go:875 dir.Register)
-// but NO peer pubkeys at all.
-// 2. dir.RegisterPQ(nodeID, mldsa65Pub) — registers the OPTIONAL ML-DSA-65
-// pubkey (identity.Directory.RegisterPQ, directory.go:154). The Gossiper
-// exposes NO RegisterPQ (grep-verified: gossip.go has RegisterPeer ONLY), so
-// the PQ arm goes through the Directory DIRECTLY — the SAME path run() uses
-// for the local node's own PQ key (main.go:891 dir.RegisterPQ). A nil
-// mldsa65Pub (the classical-only default) SKIPS the RegisterPQ call (a
-// classical-only peer leaves mPQ unpopulated → LookupBoth returns (edPub,
-// nil, true) → the hybrid verify rejects via the STRICT mode — the
-// documented posture).
-// 3. topo.SetRegion(nodeID, region) — re-keys the TopologyManager's region tag
-// under the REAL nodeID (NOT peerIDForAddr(addr)). This is the load-bearing
-// fix: the region tags key under the addr surrogate
-// (main.go:977), which the zero-peerID dial never populates → the region
-// lookup misses → every peer routes intra. Provisioning under the real
-// nodeID makes the selector HIT → the inter-region arm fires → the telemetry counter
-// counter fires A=1 B=1. ONLY called when hasRegion (an absent region field
-// leaves the peerIDForAddr(addr) registration in place — the honest
-// "operator did not tag this peer" default; the §III guard
-// OOB provision-retires-surrogate asserts a provisioned+tagged peer's
-// region key is the real nodeID, NOT the surrogate).
+// Regions are keyed by real nodeID rather than peerIDForAddr so the topology
+// selector can find the same identity used by peer connections. If hierarchical
+// gateways are enabled, the first configured entries in each region, up to
+// GatewaysPerRegion, are designated as gateways in file order. An entry matching
+// selfNodeID is logged and excluded from registration and the returned map, but
+// still participates in gateway designation.
 //
-// Returns the provisionedMap (addr → real nodeID) for the dial loop + a nil
-// error on success. An empty --peer-dir (ErrPeerDirEmpty) returns an empty map +
-// a nil error (the OPT-IN no-op — the dial loop's ELSE arm runs for every peer,
-// byte-identical). A NON-EMPTY path that fails to parse returns the
-// error + an empty map (the caller FAILS the boot — a deploy misconfiguration
-// MUST surface loudly, NOT silently fall back to zero-peerID).
-//
-// gossiper + topo + dir are all guaranteed non-nil at the call site (constructed
-// unconditionally in run() before applyProvisioning is called — gossiper at
-// main.go:896, topo at main.go:956, dir at main.go:842). No nil-guard needed.
-// applyProvisioning applies the pre-parsed peer-dir configs to the live
-// Directory + TopologyManager: gossiper.RegisterPeer (the CRDT verification
-// pubkey), dir.RegisterPQ (the ML-DSA-65 pubkey, when present — the hybrid
-// arm), + topo.SetRegion(realNodeID, region) (the topology re-key under the
-// REAL nodeID — the surrogate retirement). It returns the
-// provisionedMap (addr → real nodeID) the dial loop reads to pick the
-// dialPeerID. The caller parses --peer-dir ONCE (parsePeerDir) + passes the
-// cfgs here (the refactor: the surrogate region loop in
-// main.go needs the provisioned ADDR SET before applyProvisioning's side
-// effects, to SKIP the dead surrogate SetRegion for a provisioned peer — see
-// main.go's parsePeerDir call before the surrogate loop). Idempotent re-apply
-// is safe (RegisterPeer/RegisterPQ overwrite; SetRegion overwrites).
+// The returned map directs the dial loop to real nodeIDs. Empty cfgs produce an
+// empty map and no error. Registration failures return an error; parsing and
+// missing-file errors are handled by the caller before this function runs. run
+// constructs gossiper, dir, and topo before calling applyProvisioning.
 func applyProvisioning(gossiper *mesh.Gossiper, dir *identity.Directory, topo *mesh.TopologyManager, cfgs []peerDirConfig, selfNodeID [16]byte) (provisionedMap, error) {
 	out := make(provisionedMap, len(cfgs))
+	var gwCountByRegion map[mesh.RegionTag]int
+	gwPerReg := 0
+	if topo != nil {
+		gwPerReg = topo.GatewaysPerRegion()
+		if gwPerReg > 0 {
+			gwCountByRegion = make(map[mesh.RegionTag]int)
+			topo.SetSelfGateway(false)
+		}
+	}
 	for _, c := range cfgs {
-		// SKIP THIS NODE'S OWN ENTRY. This is the ROOT
-		// INGRESS of the self-peer bug: the silicon gate ships ONE shared peerdir
-		// to all 100 nodes, and its LINE 1 is the seed's own entry (verified:
-		// `192.0.2.1:7373 5e669e91… … 1`). applyProvisioning had ZERO
-		// self-checks, so every node registered ITSELF as a peer + handed its own
-		// nodeID to topo.SetRegion — and TopologyManager cannot filter it out
-		// because it never learns its own nodeID (it holds only selfRegion,
-		// topology.go:63). The self-ID then flowed into topology.Select's output
-		// and the sweep tried to Publish to itself, failing at the ps.peers
-		// MAP-MISS branch (13,204 `Publish: no live peer <own-id>` lines on the
-		// seed).
-		//
-		// A node is never its own peer. The skip is LOUD, never a silent drop (the
-		// Law-V disclosure discipline): a shared-peerdir deploy is LEGITIMATE and
-		// this line tells the operator the self entry was recognized and dropped
-		// ON PURPOSE, so it can never be mistaken for a parse failure or a missing
-		// peer. The entry is also kept OUT of the returned provisionedMap, so the
-		// dial loop never dials this node's own address.
+		if gwPerReg > 0 && c.hasRegion && c.region != mesh.RegionUnset {
+			gwCountByRegion[c.region]++
+			if gwCountByRegion[c.region] <= gwPerReg {
+				if c.nodeID == selfNodeID {
+					topo.SetSelfGateway(true)
+				} else {
+					topo.SetGateway(c.nodeID, true)
+				}
+			}
+		}
+		// A shared peer directory can include the local node. TopologyManager
+		// knows its own region but not its own nodeID, so registering that entry
+		// would let Select return the local identity and the sweep would try to
+		// publish to a peer connection that does not exist. Skip registration and
+		// omit the address from provisionedMap so the dial loop also excludes it.
+		// The log distinguishes this intentional skip from a parsing failure.
 		if c.nodeID == selfNodeID {
 			log.Printf("provisioning: skipped SELF entry %x at %s — a node is never its own peer (shared-peerdir deploy)", c.nodeID, c.addr)
 			continue

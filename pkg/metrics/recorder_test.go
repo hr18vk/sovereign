@@ -26,16 +26,14 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// This file builds the bimodality-guard gate and the recorder-overhead
-// bench entirely from the PUBLIC attribution/receive/sync APIs — it
-// does NOT reach into pkg/receive test internals (the scope-hygiene gate
-// confines edits to pkg/metrics/). The frame builders below mirror the
-// pkg/receive test helpers (buildCRDTDeltaWire + relayChain) re-derived against
-// the exported attribution API, not imported.
+// The ingest-latency test constructs valid and malformed frames using exported
+// attribution, receive, and sync APIs. Its frame builders are local so this
+// package does not depend on receive's test helpers. Benchmarks measure the
+// recorder instruments independently of frame processing.
 
 const (
 	testEntityID = "tenant=acme;ledger=txn;id=0a1b2c3d4e5f60718293a4b5c6d7e8f9"
-	testPayload  = "this-is-recoverable-payload-bytes-NOT-its-digest"
+	testPayload  = "this-is-recoverable-payload-bytes-not-its-digest"
 	testWallBase = int64(1_700_000_000_000_000)
 	testBudgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15, admits 1 hop
 )
@@ -53,9 +51,9 @@ func init() {
 	copy(testPayloadDigest[:], d[:])
 }
 
-// testEntityIDFor returns a distinct 40-char entityID per index so a stream of
-// honest frames each carry a unique (entityID, dotCounter) causal dot (the
-// engine dedups dots; a repeated dot is a no-op Apply, not a fresh Accept).
+// testEntityIDFor varies the entity ID's final four hexadecimal digits. Each
+// generated frame then has a distinct causal dot and is applied rather than
+// deduplicated.
 func testEntityIDFor(i uint64) string {
 	return testEntityID[:len(testEntityID)-4] + entityIDSuffix(i)
 }
@@ -114,35 +112,24 @@ func buildInnerWire(t testing.TB, entityID string, dotCounter uint64) []byte {
 	return data
 }
 
-// TestIngestLatencyRecorded is the BIMODALITY guard gate. It drives
-// 100k HandleFrame through the Recorder with a MIX: ~99.8k forged
-// cheap-gate-reject frames (garbage -> DropMalformed, sub-1us) + ~200 honest
-// verify-pass frames (0-hop signed origin -> Accept, single ~60us Ed25519
-// VerifyCRDTFrame). It scrapes /metrics and asserts: histogram _count >= 100k
-// AND the le="1e-06" bucket has samples (the cheap-reject population) AND the
-// le="0.0001" bucket has samples (the verify-pass population). The
-// cheap-gates-before-verify invariant is READABLE in the metrics, not asserted
-// in source comments.
+// TestIngestLatencyRecorded drives malformed frames and valid signed frames
+// through HandleFrame, recording every verdict. The scrape must contain both
+// the early-rejection and signature-verification latency populations, as well
+// as a sample for every input frame.
 //
-// The honest frames are 0-HOP (origin-only, no relay chain): a 0-hop frame
-// skips the rate gate, uses the local clock for the clock gate, runs Open with
-// ZERO outer relay verifies, then does exactly ONE VerifyCRDTFrame (~60us) —
-// the single-verify cost the Battle-Plan FACT 2 names. A 1-hop frame would do
-// TWO verifies (Open's relay verify + VerifyCRDTFrame's origin verify ≈120us)
-// and land ABOVE the 1e-4 (100us) bucket in +Inf, hiding the verify-pass
-// population from the le=1e-4 assertion. The 0-hop shape matches the FACT-2
-// single-verify regime the bucket set was designed for.
+// Valid frames have an origin signature and no relay hops. They therefore need
+// one VerifyCRDTFrame call and no outer relay verification. A relay hop would
+// add another signature verification and could move samples above the bucket
+// boundary used to identify the single-verification population.
 func TestIngestLatencyRecorded(t *testing.T) {
 	const total = 100_000
-	const honest = 200 // ~200 * 60us = ~12ms of Ed25519 verify; enough to populate le=1e-4
+	const honest = 200 // enough signed frames to populate the verify-path bucket
 	const forged = total - honest
 	_ = forged
 
-	// Build ONE honest frame's origin, register it, then build `honest` frames
-	// reusing the SAME origin keypair (the Directory resolves the same origin
-	// for every honest frame; each frame carries a unique causal dot so the
-	// engine admits each as a fresh Accept). Reusing the origin keypair avoids
-	// 200 keygens + 200 Directory registrations.
+	// Valid frames share one registered keypair but have unique causal dots, so
+	// each one is accepted rather than deduplicated. Building and signing the
+	// frames before the loop keeps setup out of the recorded latency samples.
 	originPub, originPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("origin GenerateKey: %v", err)
@@ -152,12 +139,10 @@ func TestIngestLatencyRecorded(t *testing.T) {
 	exp := NewExporter()
 	rec := exp.Recorder()
 
-	// Pre-build the honest frames (unique dots) outside the drive loop.
 	honestFrames := make([][]byte, honest)
 	for i := 0; i < honest; i++ {
 		honestFrames[i] = buildZeroHopHonestFrame(t, uint64(i+1), originPriv)
 	}
-	// Forged frame: garbage bytes -> DropMalformed (sub-1us, no crypto).
 	forgedFrame := []byte("not-a-valid-relay-envelope-just-garbage-bytes")
 
 	for i := 0; i < total; i++ {
@@ -171,47 +156,36 @@ func TestIngestLatencyRecorded(t *testing.T) {
 		rec.RecordIngest(time.Since(start), av.Verdict)
 	}
 
-	// Scrape /metrics and assert the bimodality guard.
 	body := scrapeMetrics(t, exp)
 	countLine := extractHistogramCount(t, body, "sovereign_ingest_latency_seconds")
 	if countLine < total {
-		t.Fatalf("ingest histogram _count = %d, want >= %d (every frame recorded)", countLine, total)
+		t.Fatalf("ingest histogram count = %d, want at least %d", countLine, total)
 	}
-	// The le=0.0001 (1e-4, 100us) bucket holds the verify-pass (~60us)
-	// population. prometheus emits this boundary as "0.0001". This holds
-	// under -race (the verify cost is crypto-bound, not race-perturbed).
+	// Signed-frame samples must reach the 100us bucket, emitted as 0.0001 by
+	// the Prometheus text format. Signature verification keeps this population
+	// separate from early rejection under the race detector as well.
 	if !bucketHasSamples(t, body, "sovereign_ingest_latency_seconds_bucket", "0.0001") {
-		t.Fatalf("le=0.0001 bucket has NO samples — the verify-pass population is missing (the bimodality guard FAILED)")
+		t.Fatalf("the 0.0001 bucket has no samples; verify-path observations are missing")
 	}
-	// The cheap-gate-reject population lands sub-1us in a clean build (the
-	// le=1e-06 bucket). Under -race the race detector's shadow-memory
-	// bookkeeping on every memory access pushes the DropMalformed floor to
-	// ~5-10us, so the sub-1us bucket empties under -race — a measurement-
-	// instrumentation artifact, NOT a bimodality breach. The bimodality
-	// INVARIANT (cheap-reject population strictly below the verify-pass
-	// population) holds either way; the le=1e-06 sub-1us assertion is the
-	// clean-build falsifiability check.
+	// Race instrumentation shifts malformed-frame observations into higher
+	// buckets. Check a wider early-rejection bucket there while retaining the
+	// tighter boundary in an ordinary test run.
 	if raceEnabled {
-		// Under -race: assert the cheap-reject population appears in a bucket
-		// strictly below the verify-pass bucket (le=1e-05, 10us — the race-
-		// perturbed floor). The two populations are still separated.
 		if !bucketHasSamples(t, body, "sovereign_ingest_latency_seconds_bucket", "1e-05") {
-			t.Fatalf("under -race: le=1e-05 bucket has NO samples — the cheap-gate-reject population is missing (the bimodality guard FAILED)")
+			t.Fatalf("under -race, the 1e-05 bucket has no early-rejection samples")
 		}
-		t.Logf("bimodality guard (RACE): _count=%d, le=1e-05 populated (cheap-reject, race-perturbed floor), le=0.0001 populated (verify-pass)", countLine)
+		t.Logf("race run: count=%d; early-rejection and verify-path buckets populated", countLine)
 	} else {
-		// Clean build: the cheap-reject floor is sub-1us (le=1e-06).
 		if !bucketHasSamples(t, body, "sovereign_ingest_latency_seconds_bucket", "1e-06") {
-			t.Fatalf("le=1e-06 bucket has NO samples — the cheap-gate-reject population is missing (the bimodality guard FAILED)")
+			t.Fatalf("the 1e-06 bucket has no early-rejection samples")
 		}
-		t.Logf("bimodality guard: _count=%d, le=1e-06 populated (cheap-reject, sub-1us), le=0.0001 populated (verify-pass)", countLine)
+		t.Logf("count=%d; early-rejection and verify-path buckets populated", countLine)
 	}
 }
 
-// setupTestReceiverWithOriginPub builds a fully-wired Receiver with the origin
-// registered in the Directory, a synthetic clock pinned at testWallBase, and an
-// isolated engine DataDir. The origin keypair is supplied so the 0-hop honest
-// frames share one Directory entry across the 200-frame stream.
+// setupTestReceiverWithOriginPub constructs a Receiver with a registered origin
+// key, a synthetic clock, and a temporary engine data directory. Sharing the
+// origin public key lets all valid frames in the stream use one Directory entry.
 func setupTestReceiverWithOriginPub(t testing.TB, originPub ed25519.PublicKey, originPriv ed25519.PrivateKey) *receive.Receiver {
 	t.Helper()
 	_ = originPriv
@@ -235,11 +209,9 @@ func setupTestReceiverWithOriginPub(t testing.TB, originPub ed25519.PublicKey, o
 	return receive.NewReceiver(bucket, cap, sc, dir, engine, testBudgetNS)
 }
 
-// buildZeroHopHonestFrame builds a 0-hop signed origin envelope the receiver
-// Accepts: the origin signs the inner wire, the v3 header mirrors the inner
-// gate fields, and there are NO relay hops (Open does zero outer verifies; the
-// only crypto is the single VerifyCRDTFrame ~60us). Each frame carries a unique
-// (entityID, dotCounter) so the engine admits it as a fresh Accept.
+// buildZeroHopHonestFrame signs an inner CRDT event and wraps it in a v3
+// envelope with no relay hops. The unique entity ID and dot counter make each
+// frame a new causal update rather than a duplicate application.
 func buildZeroHopHonestFrame(t testing.TB, dotCounter uint64, originPriv ed25519.PrivateKey) []byte {
 	t.Helper()
 	innerWire := buildInnerWire(t, testEntityIDFor(dotCounter), dotCounter)
@@ -250,11 +222,8 @@ func buildZeroHopHonestFrame(t testing.TB, dotCounter uint64, originPriv ed25519
 	return env.Marshal()
 }
 
-// BenchmarkRecordIngest is the FACT-1 settle bench. It measures the
-// per-frame Recorder.RecordIngest overhead (the hot-path observation seam) and
-// reports ns/op. The bench DECIDES whether Prometheus-direct suffices (<=5ns)
-// or the internal/telemetry LongAdder fallback must fire (>5ns); the prose does
-// not pre-assert. The verdict is recorded verbatim in ADR-0008 §3 + the.log.
+// BenchmarkRecordIngest measures histogram observation plus a cached verdict
+// counter increment for one accepted frame.
 func BenchmarkRecordIngest(b *testing.B) {
 	exp := NewExporter()
 	rec := exp.Recorder()
@@ -266,8 +235,7 @@ func BenchmarkRecordIngest(b *testing.B) {
 	}
 }
 
-// BenchmarkRecordVerify measures the per-verify RecordVerify overhead (the
-// verify-path observation seam). Reported alongside the ingest bench.
+// BenchmarkRecordVerify measures a verification-latency observation on its own.
 func BenchmarkRecordVerify(b *testing.B) {
 	exp := NewExporter()
 	rec := exp.Recorder()
@@ -279,10 +247,8 @@ func BenchmarkRecordVerify(b *testing.B) {
 	}
 }
 
-// BenchmarkHistogramObserve isolates the histogram Observe cost (the
-// bucket-search + atomic sum/count update) so the ADR can decompose the
-// RecordIngest ns/op into its histogram vs counter components. The histogram
-// Observe is the immovable floor of the recorder overhead.
+// BenchmarkHistogramObserve isolates histogram bucket selection and sample
+// updates from the counter increment in RecordIngest.
 func BenchmarkHistogramObserve(b *testing.B) {
 	exp := NewExporter()
 	rec := exp.Recorder()
@@ -294,10 +260,8 @@ func BenchmarkHistogramObserve(b *testing.B) {
 	}
 }
 
-// BenchmarkVerdictCounterInc isolates the cached per-verdict counter Inc cost
-// (a single atomic add, no label lookup). This is the component the
-// internal/telemetry LongAdder fallback would replace; the bench shows whether
-// it is the bottleneck (it is not — the histogram is).
+// BenchmarkVerdictCounterInc isolates an increment through the cached counter
+// for Accept, without a CounterVec label lookup.
 func BenchmarkVerdictCounterInc(b *testing.B) {
 	exp := NewExporter()
 	rec := exp.Recorder()
@@ -325,9 +289,8 @@ func scrapeMetrics(t testing.TB, exp *Exporter) string {
 	return string(body)
 }
 
-// extractHistogramCount reads a histogram's _count from the scraped text. It
-// uses the prometheus testutil collector count helper via a Gather: simpler to
-// parse the `_count` line directly.
+// extractHistogramCount reads the integer sample count from a histogram's
+// _count line in the Prometheus text response.
 func extractHistogramCount(t testing.TB, body, name string) uint64 {
 	t.Helper()
 	// The histogram count line is `sovereign_ingest_latency_seconds_count N`.

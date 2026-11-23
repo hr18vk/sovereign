@@ -6,31 +6,27 @@
 
 package main
 
-// accept_log_cap_test.go — a post-review regression guard:
-// the per-Accept log line is CAPPED (the first 8
-// per conn + every 1024th), so the 100-node relay path cannot re-create the
-// log storm on the accept side (120,354 lines on one node in one run
-// pre-cap).
+// acceptLogLine limits per-connection Accept logs to the first 8 and every
+// 1024th thereafter. Verdict metrics retain the full count. Before this cap,
+// one node in a 100-node relay run emitted 120,354 Accept lines.
 
 import "testing"
 
 func TestAcceptLogLine_Capped(t *testing.T) {
-	// The diagnostic window: the first 8 Accepts always log.
+	// The first eight Accepts provide an initial diagnostic window.
 	for n := int64(1); n <= 8; n++ {
 		if !acceptLogLine(n) {
-			t.Fatalf("accept #%d must log (the diagnostic window)", n)
+			t.Fatalf("accept #%d must log within the initial window", n)
 		}
 	}
-	// The storm zone: 9..1023 must be silent.
 	for n := int64(9); n < 1024; n++ {
 		if acceptLogLine(n) {
-			t.Fatalf("accept #%d must NOT log (the cap); the missLogCap=8 class applies to the accept side too", n)
+			t.Fatalf("accept #%d must be suppressed before the next interval", n)
 		}
 	}
-	// The heartbeat: every 1024th logs (liveness at volume).
 	for _, n := range []int64{1024, 2048, 3072} {
 		if !acceptLogLine(n) {
-			t.Fatalf("accept #%d must log (the 1024-heartbeat)", n)
+			t.Fatalf("accept #%d must log at the 1024-accept interval", n)
 		}
 	}
 	if acceptLogLine(1025) {

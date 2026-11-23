@@ -7,39 +7,29 @@
 package chaos
 
 // ---------------------------------------------------------------------------
-// §3 — Merkle convergence after network partition (the §3 gate).
+// Merkle convergence after network partition.
 // ---------------------------------------------------------------------------
 //
-// Ruthless Go Engine Verification Blueprint, §3 ("Simulating Network
-// Partitions and Cryptographic Merkle Roots"):
-// "construct a virtual network of N independent ledger nodes [...] dispatched
-// to the virtual nodes with randomized latency, forced packet duplication,
-// and simulated routing blackholes. Despite the extreme chaos [...] the
-// final state matrices must perfectly converge. [...] assert
-// Node[i].MerkleRoot() == Node[j].MerkleRoot()."
+// This test verifies that after a network partition heals, all nodes converge
+// to identical Merkle roots despite lossy, duplicated, and reordered delivery.
+// The test:
+//   (1) builds 32 independent DeltaCRDTEngine instances, each on its own
+//       arena + EBR.
+//   (2) distributes events via the orchestrator (InsertLocal at the source
+//       node, minting dots from that node's lamport counter — the real
+//       cluster's dot semantics, on the real engine, over a virtual transport).
+//   (3) establishes a bidirectional partition between two node groups and
+//       runs gossip rounds under the partition so cross-group deltas are dropped.
+//   (4) heals the partition (SetPartitions(nil)) and runs gossip rounds until
+//       convergence.
+//   (5) asserts (a) all Merkle roots are byte-identical, (b) every event's
+//       origin dot is present in every node's state (crash-consistency, not
+//       just root-hash collision), and (c) determinism across two independent
+//       runs with identical seeds.
 //
-// This is the GATE that gate delivers the in-memory half of §3. It:
-// (1) builds 32 independent DeltaCRDTEngine instances (the design doc's node
-// count), each on its own arena + EBR.
-// (2) distributes events across them via the orchestrator (InsertLocal at
-// the SOURCE node, minting dots from the source's lamport counter — the
-// real cluster's dot semantics, on the real engine, over a virtual
-// transport).
-// (3) establishes an asymmetric partition (group A ↔ group B blackholed) and
-// runs gossip rounds UNDER the partition so deltas injected during the
-// split are dropped (proving the partition is actually a partition).
-// (4) HEALS the partition (SetPartitions(nil)) and runs gossip rounds until
-// convergence.
-// (5) asserts (a) all 32 Merkle roots are byte-equal, (b) every event's
-// (originDot) is present in every node's state (crash-consistency, not
-// just root-hash collision), and (c) determinism across two independent
-// runs with identical seeds.
-//
-// HONESTY ON SCALE: the design doc's "millions of events" at 1.4e9-record
-// scale would take O(N·nodes) ∈ hours for live MerkleRoot() sweeps per round.
-// This gate runs a REPRESENTATIVE population (32 nodes × bounded events),
-// exactly as the multi-node convergence tests do. The §3 property is
-// scale-free (it's lattice-join over δ-CRDT); scaling up is infra, not math.
+// The test runs a representative population (32 nodes × bounded events), as
+// the multi-node convergence tests do. The convergence property is
+// scale-free (lattice-join over δ-CRDT); scaling up is infrastructure, not math.
 // ---------------------------------------------------------------------------
 
 import (
@@ -50,14 +40,14 @@ import (
 	engsync "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// TestMerkleConvergenceAfterPartition is the §3 gate. See the file doc.
+// TestMerkleConvergenceAfterPartition verifies Merkle convergence after a partition heals.
 func TestMerkleConvergenceAfterPartition(t *testing.T) {
 	if testing.Short() {
-		t.Skip("§3 partition gate runs 32 engines + gossip; skip in -short")
+		t.Skip("partition convergence test runs 32 engines and gossip; skip in -short")
 	}
 
 	const numNodes = 32
-	const eventsPerPhase = 64 // representative, not the planetary scale
+	const eventsPerPhase = 64 // representative scale
 
 	// Build the engines: one DeltaCRDTEngine per virtual node, with distinct
 	// node IDs and isolated DataDirs so their lamport persistence files do
@@ -80,9 +70,9 @@ func TestMerkleConvergenceAfterPartition(t *testing.T) {
 		t.Cleanup(func() { _ = eng.Close() })
 	}
 
-	// A lossy, duplicating, jittered fabric — the design doc's "randomized
-	// latency, forced packet duplication, simulated routing blackholes".
-	// DeliveryBase keeps the test sane (no busy-spin); jitter allows reorder.
+	// A lossy, duplicating, jittered fabric with randomized latency, forced
+	// packet duplication, and simulated routing blackholes. DeliveryBase keeps
+	// the test duration bounded; jitter allows reorder.
 	profile := ChaosProfile{
 		Drop:             0.05, // 5% ambient loss; gossip retransmits on next sweep
 		Duplicate:        0.20, // 20% duplicate-delivery: exercises idempotent Join
@@ -102,33 +92,30 @@ func TestMerkleConvergenceAfterPartition(t *testing.T) {
 	}
 	orch.BindNodes()
 
-	// PHASE 1: generate events BEFORE the partition; allow one gossip round to
+	// Pre-partition: generate events before the partition; allow one gossip round to
 	// propagate a baseline so we can later prove the partition temporarily
 	// halts convergence and the heal restores it.
 	ctx := context.Background()
 	if _, err := orch.GenerateEvents(ctx, eventsPerPhase); err != nil {
-		t.Fatalf("step1 GenerateEvents: %v", err)
+		t.Fatalf("pre-partition GenerateEvents: %v", err)
 	}
 	if _, err := orch.GossipOnce(ctx); err != nil {
-		t.Fatalf("step1 GossipOnce: %v", err)
+		t.Fatalf("pre-partition GossipOnce: %v", err)
 	}
 	quiesce(net, 50*time.Millisecond)
 
-	// PHASE 2: PARTITION the node set into two isolation groups: {0..15} ↔
-	// {16..31}, both directions blackholed. Generate MORE events on both sides
+	// Partition: split the node set into two isolation groups: {0..15} ↔
+	// {16..31}, both directions blackholed. Generate more events on both sides
 	// and gossip — traffic crossing the partition is dropped.
 	//
-	// Honest physics (root cause of the original gate failure):
-	// On a 32-node fabric with 64 events, FULL intra-group convergence under
+	// On a 32-node fabric with 64 events, full intra-group convergence under
 	// IBLT-delta anti-entropy takes ~17 rounds (the IBLT subtract/peel is a
 	// probabilistic sampler; each round catches a fraction of differences).
-	// The §3 mandate is "nodes SEAMLESSLY repair the topology the microsecond
-	// connectivity is restored" — i.e. convergence AFTER the heal, NOT a
-	// requirement that each group is fully converged WHILE the partition is
-	// active. We therefore do NOT assert intra-group convergence during the
-	// partition; we only assert the net FUNCTIONED intra-group (delivered at
-	// least one message within each side), which proves the fabric itself is
-	// healthy, then proceed to the heal.
+	// The requirement is convergence after the heal, not that each group is
+	// fully converged while the partition is active. We therefore do not assert
+	// intra-group convergence during the partition; we only assert the net
+	// functioned intra-group (delivered at least one message within each side),
+	// which proves the fabric itself is healthy, then proceed to the heal.
 	var parts []Partition
 	for _, a := range nodeIDs[:numNodes/2] {
 		for _, b := range nodeIDs[numNodes/2:] {
@@ -137,19 +124,19 @@ func TestMerkleConvergenceAfterPartition(t *testing.T) {
 		}
 	}
 	net.SetPartitions(parts)
-	t.Logf("step2: partition active across %d edges; %d events into each side",
+	t.Logf("partition: active across %d edges; %d events into each side",
 		2*(numNodes/2)*(numNodes/2), eventsPerPhase)
 	if _, err := orch.GenerateEvents(ctx, eventsPerPhase); err != nil {
-		t.Fatalf("step2 GenerateEvents: %v", err)
+		t.Fatalf("partition GenerateEvents: %v", err)
 	}
-	partitionRounds := 12
-	for r := 0; r < partitionRounds; r++ {
+	convergenceRounds := 12
+	for r := 0; r < convergenceRounds; r++ {
 		if _, err := orch.GossipOnce(ctx); err != nil {
-			t.Fatalf("step2 GossipOnce(%d): %v", r, err)
+			t.Fatalf("partition GossipOnce(%d): %v", r, err)
 		}
 		quiesce(net, 15*time.Millisecond)
 	}
-	// Sanity: the partition must have DELIVERED traffic WITHIN each group (not
+	// Sanity: the partition must have delivered traffic within each group (not
 	// have burned the whole fabric down). This is a net-health probe, not a
 	// convergence assertion.
 	anyInA, anyInB := false, false
@@ -163,30 +150,30 @@ func TestMerkleConvergenceAfterPartition(t *testing.T) {
 			anyInB = true
 		}
 	}
-	t.Logf("step2: intra-group deliveries observed: groupA=%v groupB=%v", anyInA, anyInB)
+	t.Logf("partition: intra-group deliveries observed: groupA=%v groupB=%v", anyInA, anyInB)
 	if !anyInA && !anyInB {
-		t.Fatalf("step2: the VirtualNet delivered NO traffic within either group — fabric broken")
+		t.Fatalf("partition: VirtualNet delivered no traffic within either group")
 	}
 	// Prove the partition was a real partition by asserting the two groups'
-	// Merkle roots DIFFER (the events on side B never reached side A's nodes).
+	// Merkle roots differ (the events on side B never reached side A's nodes).
 	rootsGroupA, rootsGroupB := groupRoots(orch, nodeIDs[:numNodes/2], nodeIDs[numNodes/2:])
 	intraA := allEqual(rootsGroupA)
 	intraB := allEqual(rootsGroupB)
-	t.Logf("step2: intra-group convergence A=%v B=%v; cross-group roots differ=%v",
+	t.Logf("partition: intra-group convergence A=%v B=%v; cross-group roots differ=%v",
 		intraA, intraB, !crossGroupAgrees(rootsGroupA, rootsGroupB))
 	if crossGroupAgrees(rootsGroupA, rootsGroupB) && eventsPerPhase > 0 {
-		// If cross-group roots agree WITH events having been inserted on both
+		// If cross-group roots agree with events having been inserted on both
 		// sides, the partition leaked. But tolerate the rare case where IBLT
 		// deltas under a partial intra-group converge happened to land all B
 		// events onto A too — log and continue; the authoritative check is
 		// post-heal byte-equality.
-		t.Logf("step2: WARNING — cross-group roots already agree (partition may have leaked, or deltas fully propagated before partition). Proceeding to heal.")
+		t.Logf("partition: warning — cross-group roots already agree (partition may have leaked, or deltas fully propagated before partition). Proceeding to heal.")
 	}
 
-	// PHASE 3: HEAL the partition. Real anti-entropy now reaches the other
-	// side; the design doc's "the microsecond connectivity is restored" moment.
+	// Heal: heal the partition. Real anti-entropy now reaches the other
+	// side.
 	net.SetPartitions(nil)
-	t.Logf("step3: partition healed; running gossip rounds to convergence")
+	t.Logf("heal: partition healed; running gossip rounds to convergence")
 
 	// Drain in-flight drops from the partition period so the post-heal rounds
 	// start from a clean fabric. The delivery loop coalesces waits up to 250ms,
@@ -196,30 +183,29 @@ func TestMerkleConvergenceAfterPartition(t *testing.T) {
 	conv, rounds := pumpUntilConverged(ctx, orch, net, nodeIDs, 80)
 	if !conv {
 		roots, _ := orch.MerkleRoots()
-		t.Fatalf("step3: did NOT converge after %d gossip rounds; %d distinct roots\n%v",
+		t.Fatalf("heal: did not converge after %d gossip rounds; %d distinct roots\n%v",
 			rounds, countDistinct(roots), shortRootDump(roots, nodeIDs))
 	}
 
-	// PHASE 4: the load-bearing §3 assertion — every node's Merkle root is
+	// Assert: the load-bearing assertion — every node's Merkle root is
 	// byte-identical.
 	roots, converged := orch.MerkleRoots()
 	if !converged {
-		t.Fatalf("convergence gate BROKEN: Merkle roots diverged after the partition healed\n%s",
+		t.Fatalf("partition convergence failed: Merkle roots diverged after the partition healed\n%s",
 			shortRootDump(roots, nodeIDs))
 	}
-	t.Logf("step4: PASS — all %d nodes converged to root %x after %d post-heal rounds",
+	t.Logf("assert: PASS — all %d nodes converged to root %x after %d post-heal rounds",
 		numNodes, roots[nodeIDs[0]], rounds)
 }
 
 // TestConvergenceDeterminismAcrossRuns proves that two independent runs
-// of the §3 scenario with IDENTICAL events converge to the SAME Merkle root —
-// i.e. convergence is deterministic, not probabilistic. This is the §3
-// "mathematical determinism" mandate ("100% mathematical determinism").
-// It uses DEDUP DISABLED so the engine's idempotent Join, not the orchestrator's
-// SeqNo dedup, is what guarantees correctness.
+// of the partition scenario with identical events converge to the same
+// Merkle root — i.e. convergence is deterministic, not probabilistic.
+// It uses dedup disabled so the engine's idempotent Join, not the
+// orchestrator's SeqNo dedup, is what guarantees correctness.
 func TestConvergenceDeterminismAcrossRuns(t *testing.T) {
 	if testing.Short() {
-		t.Skip("§3 determinism gate runs 2× 32-engine nets; skip in -short")
+		t.Skip("partition determinism test runs 2x 32-engine nets; skip in -short")
 	}
 	const numNodes = 8
 	const events = 32
@@ -269,7 +255,7 @@ func TestConvergenceDeterminismAcrossRuns(t *testing.T) {
 	r1 := runOnce(1)
 	r2 := runOnce(2)
 	if r1 != r2 {
-		t.Fatalf("convergence determinism BROKEN: independent runs produced different roots\n run1=%x\n run2=%x",
+		t.Fatalf("partition determinism failed: independent runs produced different roots\n run1=%x\n run2=%x",
 			r1, r2)
 	}
 	t.Logf("PASS: two independent runs converged to the same deterministic root %x", r1)
@@ -340,7 +326,7 @@ func allEqualVals(roots map[[16]byte][32]byte, ids [][16]byte) bool {
 }
 
 // crossGroupAgrees reports whether the two groups share a common root value
-// (i.e. ANY root in A equals ANY root in B). A real partition makes this false
+// (i.e. any root in A equals any root in B). A real partition makes this false
 // while events on both sides remain unseen by the other side.
 func crossGroupAgrees(rootsA, rootsB [][32]byte) bool {
 	seen := make(map[[32]byte]struct{})
@@ -369,7 +355,7 @@ func shortRootDump(roots map[[16]byte][32]byte, ids [][16]byte) string {
 	var s string
 	for _, id := range ids {
 		r := roots[id] // take a copy so it is addressable for slicing
-		s += " node " + hexByte(id[0]) + ": " + hexString(r[:]) + "\n"
+		s += "  node " + hexByte(id[0]) + ": " + hexString(r[:]) + "\n"
 	}
 	return s
 }

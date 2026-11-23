@@ -112,7 +112,7 @@ func (b *EpochBatcher) Stage(lat, lng float64) error {
 
 // FlushEpoch collects all pending H3 results from the C++ worker.
 // B2 FIX: Returns a slice of the pre-allocated results buffer.
-// The caller MUST consume results before the next Stage()/FlushEpoch() cycle.
+// The caller must consume results before the next Stage() or FlushEpoch() call.
 func (b *EpochBatcher) FlushEpoch() []EpochResult {
 	if b.count == 0 {
 		return nil
@@ -140,7 +140,7 @@ func (b *EpochBatcher) FlushEpoch() []EpochResult {
 }
 
 // collectWithTimeout spins for a result with a bounded timeout.
-// Uses UnixNano() comparison instead of time.Now().After(deadline)
+// B1 FIX: Uses UnixNano() comparison instead of time.Now().After(deadline)
 // to avoid *Location heap escape on every check.
 func (b *EpochBatcher) collectWithTimeout(seqID uint64) (uint64, bool) {
 	idx := seqID % uint64(b.ring.capacity)
@@ -170,12 +170,12 @@ func (b *EpochBatcher) collectWithTimeout(seqID uint64) (uint64, bool) {
 				// overwrite a resubmitted slot's data (ABA problem).
 				//
 				// We must handle three possible states:
-				// 1. SlotReady: C++ never picked it up. Safe to reclaim.
+				// 1. SlotReady:      C++ never picked it up. Safe to reclaim.
 				// 2. SlotProcessing: C++ is working. Safe to reclaim, but C++
-				// may later write SlotDone. In the SPSC model,
-				// the next Submit to this slot index won't
-				// happen until after this function returns.
-				// 3. SlotDone: C++ finished during timeout. Recover result.
+				//                    may later write SlotDone. In the SPSC model,
+				//                    the next Submit to this slot index won't
+				//                    happen until after this function returns.
+				// 3. SlotDone:       C++ finished during timeout. Recover result.
 				state := atomic.LoadUint32(&slot.State)
 				switch state {
 				case SlotDone:

@@ -5,48 +5,44 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// RESIDENCY — THE CHAOS LAYER: mmap Page-Fault Mitigation
+// mmap page-fault mitigation (the chaos layer)
 // ---------------------------------------------------------------------------
 //
-// Ruthless Go Engine Verification Blueprint — Residency §1:
-// "The Threat of mmap and the Go Scheduler Collapse."
-//
 // The engine's HAMT topology lives in a raw mmap'd off-heap arena. When a
-// 100-year traversal touches a page that is not resident in RAM, the Linux
-// kernel raises a MAJOR PAGE FAULT and blocks the calling OS thread in a
-// blocking disk I/O. The Go cooperative scheduler maps thousands of
-// goroutines onto a small pool of OS threads (GOMAXPROCS threads); it is
-// entirely blind to the fact that a plain pointer dereference has just
-// become a blocking I/O. A large sweep of cold off-heap data therefore
-// stalls the ENTIRE G-MAXPROCS thread pool and freezes the server, violating
-// the sub-microsecond latency mandate.
+// traversal touches a page that is not resident in RAM, the Linux kernel
+// raises a major page fault and blocks the calling OS thread in blocking
+// disk I/O. The Go cooperative scheduler maps thousands of goroutines onto
+// a small pool of OS threads (GOMAXPROCS threads); it is entirely blind to
+// the fact that a plain pointer dereference has just become a blocking I/O
+// operation. A large sweep of cold off-heap data therefore stalls the
+// entire thread pool and freezes the server, violating the sub-microsecond
+// latency mandate.
 //
 // This file is the defense layer. It is deliberately decoupled from the
-// allocator hot path (hamt_arena.go) so the Zero-GC allocation
-// invariants — proven by 's escape-analysis + AllocsPerOp gates —
-// remain hermetically untouched. Residency control is an off-path concern:
-// the engine calls LockHotPages() once at warmup to pin its hot-path index
-// subset into RAM, and the chaos harness calls EvictPages() to inject the
-// exact major-page-fault scenario the design doc mandates, then the trace
-// gate (residency_test.go) asserts no OS thread blocked > 10 µs in the
-// mmap hot path once pages are pinned.
+// allocator hot path (hamt_arena.go) so the zero-GC allocation invariants
+// — proven by escape-analysis and AllocsPerOp gates — remain untouched.
+// Residency control is an off-path concern: the engine calls LockHotPages()
+// once at warmup to pin its hot-path index subset into RAM, and the chaos
+// harness calls EvictPages() to inject the exact major-page-fault scenario,
+// then the trace gate (residency_test.go) asserts no OS thread blocked
+// > 10 µs in the mmap hot path once pages are pinned.
 //
-// PHYSICS (Linux on aarch64, 4 KiB pages):
-// mlock(2) — pin a virtual address range into RAM, preventing eviction.
-// Requires CAP_IPC_LOCK or a raised RLIMIT_MEMLOCK. In an
-// unprivileged container mlock() returns EPERM; in a capped
-// container it returns ENOMEM once RLIMIT_MEMLOCK is hit.
-// This layer treats BOTH as non-fatal: it pins what it can
-// and reports the residual, because a running-but-unhardened
-// engine is strictly better than one that refuses to boot
-// (the graver failure is a cold-start outage, not a fault).
-// madvise(2) — MADV_DONTNEED tells the kernel it may discard the clean
-// pages of a range, RECLAIMING their RAM without munmap. The
-// next touch faults them back in. This is the EXACT primitive
-// the design doc specifies for simulating the major-page-fault
-// storm the chaos harness must survive.
-// munlock(2)— must precede munmap on a locked range; some kernels refuse
-// to unmap a still-locked region. Free() calls it symmetrically.
+// Linux on aarch64 (4 KiB pages):
+//   mlock(2)  — pin a virtual address range into RAM, preventing eviction.
+//                Requires CAP_IPC_LOCK or a raised RLIMIT_MEMLOCK. In an
+//                unprivileged container mlock() returns EPERM; in a capped
+//                container it returns ENOMEM once RLIMIT_MEMLOCK is hit.
+//                This layer treats both cases as non-fatal: it pins what it
+//                can and reports the residual, because a running-but-unhardened
+//                engine is strictly better than one that refuses to boot
+//                (the graver failure is a cold-start outage, not a fault).
+//   madvise(2) — MADV_DONTNEED tells the kernel it may discard the clean
+//                pages of a range, reclaiming their RAM without munmap. The
+//                next touch faults them back in. This is the primitive for
+//                simulating the major-page-fault storm the chaos harness
+//                must survive.
+//   munlock(2) — must precede munmap on a locked range; some kernels refuse
+//                to unmap a still-locked region. Free() calls it symmetrically.
 // ---------------------------------------------------------------------------
 
 package sync
@@ -98,7 +94,7 @@ type ResidencyStatus struct {
 	// case PagesPinned is 0 and the engine runs unhardened by design.
 	PermDenied bool
 	// Truncated is true when mlock returned ENOMEM partway through the
-	// chunked pin (cap hit). Residual pages beyond the cap are NOT pinned.
+	// chunked pin (cap hit). Residual pages beyond the cap are not pinned.
 	Truncated bool
 }
 
@@ -115,17 +111,16 @@ func (rs ResidencyStatus) Hardened() bool {
 }
 
 // LockHotPages pins the arena byte range [offset, offset+length) into RAM via
-// a CHUNKED mlock. Chunking (one mlock per `chunk` bytes, default one page)
-// is the physics fix for the two production failure modes named in the Residency
-// pre-mortem:
+// a chunked mlock. Chunking (one mlock per `chunk` bytes, default one page)
+// addresses two production failure modes:
 //
-// 1. EPERM on unprivileged containers → a single whole-range mlock would
-// reject the entire pin in one shot; chunking lets a partial pin succeed
-// on hosts that permit SOME locking, and cleanly reports PermDenied.
-// 2. ENOMEM once RLIMIT_MEMLOCK is exceeded → chunking pins as many pages
-// as the cap allows and stops, recording Truncated, instead of failing
-// the whole call. The partial pin still protects the FIRST chunk of the
-// hot index (typically the root + upper HAMT levels — the hottest pages).
+//  1. EPERM on unprivileged containers → a single whole-range mlock would
+//     reject the entire pin in one shot; chunking lets a partial pin succeed
+//     on hosts that permit some locking, and cleanly reports PermDenied.
+//  2. ENOMEM once RLIMIT_MEMLOCK is exceeded → chunking pins as many pages
+//     as the cap allows and stops, recording Truncated, instead of failing
+//     the whole call. The partial pin still protects the first chunk of the
+//     hot index (typically the root and upper HAMT levels — the hottest pages).
 //
 // The method is safe to call concurrently with allocation (mlock does not
 // mutate the mapped memory, only its residency attributes) and is idempotent:
@@ -204,13 +199,13 @@ func (a *HamtArena) UnlockAllPages() {
 	_ = syscall.Munlock(whole)
 }
 
-// EvictPages simulates the major-page-fault scenario mandated by Residency §1:
-// "A dedicated validation script must utilize madvise(MADV_DONTNEED) to
-// aggressively evict pages from the cache, forcing major page faults upon
-// subsequent reads." This is the chaos-harness injection hook — the engine
-// itself never calls it in production. The next traversal of the evicted
-// range will page-fault on every page, exactly reproducing the cold-sweep
-// stall the design doc's mlock defense must defeat.
+// EvictPages simulates the major-page-fault scenario: a dedicated validation
+// script uses madvise(MADV_DONTNEED) to aggressively evict pages from the
+// cache, forcing major page faults on subsequent reads. This is the
+// chaos-harness injection hook — the engine itself never calls it in
+// production. The next traversal of the evicted range will page-fault on
+// every page, exactly reproducing the cold-sweep stall that mlock must
+// defeat.
 //
 // Returns the number of pages evicted (0 if the range is empty or the host
 // refuses madvise, in which case the chaos harness logs a skip and the
@@ -272,21 +267,21 @@ func (a *HamtArena) PrefaultHot(ptrs []NodePtr) uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// RESIDENCY — fault-count instrumentation (deterministic residency accounting)
+// fault-count instrumentation (deterministic residency accounting)
 // ---------------------------------------------------------------------------
 
-// osMajorFaultCount returns the count of MAJOR page faults the calling process
+// osMajorFaultCount returns the count of major page faults the calling process
 // has incurred, read from /proc/self/stat (the majflt field). This is the
-// OS-level truth the design doc's "OS thread blocked >10us in the mmap hot
-// path" verdict is genuinely about: a major fault forces a blocking disk I/O
-// to fault the page back in and is the only wall-time signal that reliably
-// correlates with a multi-millisecond blocked-M stall. Raw worst-case
-// traversal latency is NOT a reliable fault signal — on a host with ample RAM
-// and no swap, MADV_DONTNEED on anonymous private pages often does NOT raise a
-// major fault (the kernel keeps the page instantly reclaimable in core), so a
-// sub-100us latency outlier is usually Go GC / scheduler preemption jitter,
-// not a fault. Fault counting separates physics from noise and makes the
-// residency gate deterministic on a no-swap host.
+// OS-level truth behind the "OS thread blocked >10µs in the mmap hot path"
+// verdict: a major fault forces a blocking disk I/O to fault the page back in
+// and is the only wall-time signal that reliably correlates with a
+// multi-millisecond blocked-M stall. Raw worst-case traversal latency is not a
+// reliable fault signal — on a host with ample RAM and no swap,
+// MADV_DONTNEED on anonymous private pages often does not raise a major fault
+// (the kernel keeps the page instantly reclaimable in core), so a sub-100µs
+// latency outlier is usually Go GC or scheduler preemption jitter, not a
+// fault. Fault counting separates signal from noise and makes the residency
+// gate deterministic on a no-swap host.
 //
 // Returns (count, true) on Linux when /proc/self/stat is readable;
 // (0, false) on non-Linux or sandboxes that mask /proc, in which case callers
@@ -297,7 +292,7 @@ func osMajorFaultCount() (int64, bool) {
 		return 0, false
 	}
 	// The comm field may itself contain spaces and parens; fields are only
-	// safely delimited AFTER the final ')'. majflt is the 10th field after
+	// safely delimited after the final ')'. majflt is the 10th field after
 	// the ')' (it is the post-paren field at index 9 when 0-indexed).
 	r := -1
 	for i := len(b) - 1; i >= 0; i-- {

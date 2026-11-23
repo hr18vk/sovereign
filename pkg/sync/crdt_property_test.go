@@ -14,31 +14,13 @@ import (
 	"pgregory.net/rapid"
 )
 
-// ---------------------------------------------------------------------------
-// — Algebraic CRDT Convergence (Ruthless Go Engine Verification Blueprint)
-// ---------------------------------------------------------------------------
+// DeltaCRDTEngine.Join forms a join-semilattice over Add-Wins Sets. Entries
+// are identified by causal dots, and joining two states takes the union of
+// their dots.
 //
-// The δ-CRDT synchronization protocol relies on Birkhoff's representation
-// theorem for finite distributive lattices. The Join operation must
-// strictly satisfy three algebraic axioms of a join-semilattice:
-//
-// 1. Commutativity: A ⊔ B == B ⊔ A
-// 2. Associativity: (A ⊔ B) ⊔ C == A ⊔ (B ⊔ C)
-// 3. Idempotence: A ⊔ A == A
-//
-// If any of these fail, the decentralized network fractures into
-// permanent state inconsistencies. Property-based testing via rapid
-// generates millions of pseudo-random CRDT states and verifies these
-// invariants hold across the vast state space.
-//
-// The engine's CRDT is an Add-Wins Set (AWSet): entries are identified
-// by CausalDots (NodeID, Counter). The join is the union of all dots.
-// Duplicate dots are deduplicated. This is the standard AWSet
-// join-semilattice from Shapiro et al. (2011).
-//
-// We test the Join operation at the DeltaCRDTEngine level, which is
-// the production code path used by the synchronization mesh.
-// ---------------------------------------------------------------------------
+// These property tests generate deltas with rapid and check commutativity,
+// associativity, idempotence, convergence, and monotonic growth on the same
+// engine used by the synchronization mesh.
 
 // genNodeID generates a random 16-byte node ID via rapid.
 func genNodeID() *rapid.Generator[[16]byte] {
@@ -129,9 +111,8 @@ func statesEqual(a, b map[dotKey]CRDTEntry) bool {
 // makeTestEngineRapid creates a test engine with cleanup, using
 // a unique temp directory for Lamport persistence.
 //
-// Since rapid.T does not have TempDir(), we use a global atomic
-// counter to generate unique directory paths. This prevents Lamport
-// counter recovery from polluting subsequent test iterations.
+// rapid.T has no TempDir method, so an atomic counter gives each iteration a
+// unique directory and prevents Lamport recovery from reading earlier state.
 var rapidDirCounter uint64
 
 func makeTestEngineRapid(t *rapid.T, nodeID [16]byte) *DeltaCRDTEngine {
@@ -241,13 +222,8 @@ func TestCRDTJoinIdempotence(t *testing.T) {
 	})
 }
 
-// TestCRDTConvergenceMultiNode verifies that N nodes with divergent
-// initial states converge to the same state after full mesh sync.
-//
-// This is the ultimate property: the CRDT must guarantee eventual
-// consistency across any topology. We generate N random deltas,
-// distribute them across N engines (one per node), then perform a
-// full mesh sync and verify all engines reach the same state.
+// TestCRDTConvergenceMultiNode checks that every engine reaches the same state
+// after receiving the same generated deltas.
 func TestCRDTConvergenceMultiNode(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		numNodes := rapid.IntRange(2, 6).Draw(t, "numNodes")
@@ -266,10 +242,9 @@ func TestCRDTConvergenceMultiNode(t *testing.T) {
 			engines[i] = makeTestEngineRapid(t, nodeID)
 		}
 
-		// Distribute deltas: engine i receives deltas where origin != i.
+		// Deliver every delta to every engine.
 		for i, engine := range engines {
 			for _, delta := range deltas {
-				// Each engine receives all deltas (simulating full propagation).
 				engine.Join(delta)
 			}
 			_ = i

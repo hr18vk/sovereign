@@ -4,20 +4,11 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package durability is the production write-ahead-log + recovery surface.
+// Package durability provides the engine's write-ahead log and recovery path.
 //
-// wires the PROVEN WAL substrate (internal/chaos/wal.go) into the
-// production origin path. The determinism property — replay a WAL into a
-// fresh engine and the rebuilt Merkle root equals the checkpoint root — is
-// PROVEN by internal/chaos.TestWALRecoveryDeterminism against
-// internal/chaos/wal.go. This package does NOT fork that file: it re-exports
-// the exact types and funcs so the bytes-under-test stay one source of truth.
-// Forking would decouple production durability from the safety net and risk
-// silent divergence (the §8 MEDIOCRITY attack).
-//
-// The re-export is a thin alias layer: every type/func below maps 1:1 to an
-// internal/chaos symbol. Nothing is reinvented; the production surface is the
-// proven surface.
+// The WAL types and functions alias their internal/chaos implementations. Both
+// production recovery and the recovery tests therefore use the same binary
+// codecs, append ordering, and fsync behaviour rather than separate copies.
 package durability
 
 import (
@@ -44,29 +35,25 @@ type WALCheckpoint = chaos.WALCheckpoint
 // WALRecordType identifies the kind of each appended record. Re-exported.
 type WALRecordType = chaos.WALRecordType
 
-// WALRecord is a single record in the append-ordered replay stream (—
-// the ordered mutation|advance stream the recovery replay walks). Re-exported.
+// WALRecord is a single record in the append-ordered replay stream — the
+// ordered mutation|advance stream the recovery replay walks. Re-exported.
 type WALRecord = chaos.WALRecord
 
-// The three WAL record types. WALRecMutation + WALRecCheckpoint are the
-// pair; WALRecClockAdvance (0x03) is the foreign-advance record (the
-// clock jump a peer-driven Join performs, fsync-on-commit). Re-exported so
-// recovery.go can switch on them without importing internal/chaos directly.
+// WAL record types distinguish mutations, checkpoints, clock advances, and
+// their full-fidelity or checksummed representations.
 const (
 	WALRecMutation     = chaos.WALRecMutation
 	WALRecCheckpoint   = chaos.WALRecCheckpoint
 	WALRecClockAdvance = chaos.WALRecClockAdvance
-	// WALRecMutationV2 (ADR-0045) is the full-fidelity 120-byte mutation
+	// WALRecMutationV2 (ADR-0045 §4) is the full-fidelity 120-byte mutation
 	// record — the only form new appends write.
 	WALRecMutationV2 = chaos.WALRecMutationV2
-	// WALRecCheckpointV2 (ADR-0045) is the horizon-cut checkpoint
-	// record (root || watermark || pre-walk CutSeq) — the only checkpoint
-	// form Bridge.AppendCheckpoint writes.
+	// WALRecCheckpointV2 (ADR-0045 §4) binds the root and watermark to the
+	// pre-walk CutSeq used to select the replay tail. It is the checkpoint form
+	// written by Bridge.AppendCheckpoint.
 	WALRecCheckpointV2 = chaos.WALRecCheckpointV2
-	// WALRecChecksummed (0x06) is the CRC32C-framed
-	// wrapper record — the only form new appends write. Its payload is
-	// innerType(1) ‖ innerPayload ‖ crc32c(4); ReplayWAL verifies the CRC before
-	// dispatching to the inner record's decode arm. Re-exported.
+	// WALRecChecksummed (0x06, ADR-0053) wraps innerType, innerPayload, and a
+	// CRC32C. ReplayWAL verifies the checksum before decoding the inner record.
 	WALRecChecksummed = chaos.WALRecChecksummed
 )
 
@@ -77,10 +64,9 @@ type Replayed = chaos.Replayed
 // OpenWAL opens (or creates) the engine WAL at path. Re-exported.
 func OpenWAL(path string) (*WAL, error) { return chaos.OpenWAL(path) }
 
-// NewWALMutation is the ONE construction discipline for a WAL mutation
-// (ADR-0045): the engine-STAMPED dot (InsertLocal's return) + the caller's
-// entry become a full-fidelity 120-byte record with the legacy 80-byte subset
-// derived, never independently built. Re-exported.
+// NewWALMutation constructs a full 120-byte record from InsertLocal's dot and
+// the caller's entry. It derives the legacy 80-byte subset from the same values
+// rather than accepting an independently constructed copy (ADR-0045 §4).
 func NewWALMutation(entityID string, dot eng.CausalDot, entry eng.CRDTEntry) WALMutation {
 	return chaos.NewWALMutation(entityID, dot, entry)
 }
@@ -91,28 +77,19 @@ func NewWALMutation(entityID string, dot eng.CausalDot, entry eng.CRDTEntry) WAL
 // suspect log. Re-exported.
 func ReplayWAL(path string) (*Replayed, error) { return chaos.ReplayWAL(path) }
 
-// ErrWALSeqGap (Part B) is returned by ReplayWAL when the
-// record seqs do not form an unbroken ascending run — a record is genuinely
-// gone. Re-exported.
+// ErrWALSeqGap reports a break in the WAL's ascending record sequence.
 var ErrWALSeqGap = chaos.ErrWALSeqGap
 
-// ErrWALCorrupt is returned by ReplayWAL when a 0x06
-// record's CRC32C does not match its content — a COMPLETE record whose bytes
-// were corrupted. The WAL is the authoritative truth with no fallback, so this
-// propagates to a boot-refusal. Re-exported.
+// ErrWALCorrupt reports a complete 0x06 record whose contents do not match its
+// CRC32C. Because the WAL is the authoritative recovery source, this error
+// propagates to a boot refusal (ADR-0053).
 var ErrWALCorrupt = chaos.ErrWALCorrupt
 
-// MaxCredibleClockHigh is the decode-time
-// credibility ceiling for a 0x05 checkpoint's ClockHigh field. Re-exported.
+// MaxCredibleClockHigh is the credibility ceiling applied to a 0x05
+// checkpoint's ClockHigh during WAL decoding (ADR-0053).
 const MaxCredibleClockHigh = chaos.MaxCredibleClockHigh
 
-// WALAsChaos returns the underlying *chaos.WAL behind a durability WAL handle.
-// It is a TEST-ONLY accessor (ADR-0044): the group-commit count and ack
-// guards need to install the fsync-count / fsync-fail spy via
-// chaos.WAL.SetSyncHookForTest, and durability.WAL is a type ALIAS for chaos.WAL
-// (wal.go:22, the `=`), so the SAME instance underlies both views. The accessor
-// is a no-op cast (the alias is the same type); it exists so the test does not
-// reach into the alias with a raw type assertion (a reader-friendly seam). It is
-// NEVER called by production code — only the test harness uses it to arm
-// the spy on the WAL the Bridge holds.
+// WALAsChaos exposes the aliased *chaos.WAL to tests that install sync hooks
+// with SetSyncHookForTest (ADR-0044). It returns the same handle; production
+// code does not call it.
 func WALAsChaos(w *WAL) *chaos.WAL { return w }

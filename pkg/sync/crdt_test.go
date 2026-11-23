@@ -21,23 +21,11 @@ type seqEntry struct {
 	entry    CRDTEntry
 }
 
-// benchCRDTEngineArenaSize is the single shared bench-only arena size used by
-// the CRDTE engine benchmarks in this file (BenchmarkCRDTEngine_GenerateDelta
-// and BenchmarkCRDTEngine_Join). It is set to 2 GiB — the size Gate 2
-// of proved holds the steady-state fill/reclaim equilibrium
-// for BenchmarkCRDTEngine_Join's write-amplification path: at 64 MiB the Join
-// loop panics with HamtArena OOM at ~1M ops (reclamation lag under
-// write-amplification, NOT arena-size-alone — the sibling GenerateDelta bench
-// passes at the same 64 MiB because it is read-only and does not grow the
-// live-set); at 2 GiB the Join loop completes 3/3 runs at ~5.5M ops with a
-// steady ~8174 ns/op and constant 472 B/op / 6 allocs/op. The whitepaper
-// number we publish is the 2 GiB one. Do NOT bump the HAMT-unit / ABA-oneshot
-// benches (hamt_test.go, aba_immune_test.go) to this size — they use small
-// arenas on purpose to stress the EBR three-epoch ring at fixed cost. New
-// CRDTE-Join-shaped benches should reference THIS constant (or a documented
-// distinct parallel-headroom constant, e.g. benchParallelCRDTEngineArenaSize)
-// rather than re-introducing a magic 64*1024*1024.
-const benchCRDTEngineArenaSize uintptr = 2 * 1024 * 1024 * 1024 // 2 GiB — see §3 Gate 2.
+// benchCRDTEngineArenaSize gives the CRDT engine benchmarks room for path
+// copying and delayed reclamation. Join grows the live set and can exhaust a
+// small arena before reclamation catches up; GenerateDelta is read-only. Other
+// HAMT benchmarks deliberately use smaller arenas to exercise reclamation.
+const benchCRDTEngineArenaSize uintptr = 2 * 1024 * 1024 * 1024
 
 // Helper to make a push-based Seq iterator from a slice of entries
 func makeSeq(entries []seqEntry) Seq {
@@ -120,7 +108,11 @@ func TestIBLT_Subtract(t *testing.T) {
 }
 
 func TestIBLT_ZeroFalsePositives(t *testing.T) {
-	ibltA := NewIBLT(1024, 4)
+	// With 100 differences, four hashes, and 1024 buckets, some seeds leave a
+	// two-element cycle that prevents peeling. Pin the seed so this test checks
+	// exact recovery of the 50 keys on each side deterministically. Cross-process
+	// seed handling is described in ADR-0055.
+	ibltA := NewIBLTWithSeed(1024, 4, Uint64ToSeed(0x9E3779B97F4A7C15))
 	ibltB := NewIBLTWithSeed(1024, 4, ibltA.Seed())
 
 	// Insert 100,000 shared keys
@@ -196,7 +188,7 @@ func TestCRDTEngine_GenerateDelta_FullSync(t *testing.T) {
 		})
 	}
 
-	// Node B sends an empty Bloom filter (knows nothing).
+	// Node B sends an empty IBLT because it has no entries.
 	emptyDigest := NewIBLT(1024, 4)
 	delta := engineA.GenerateDelta(emptyDigest)
 	defer delta.Release()
@@ -287,7 +279,7 @@ func TestCRDTEngine_Join_BackPropagationPrevention(t *testing.T) {
 
 	engineA.Join(bouncedDelta)
 
-	// Entry should NOT be duplicated.
+	// Entry should not be duplicated.
 	state := engineA.State()
 	got := state.Get("doc-1")
 	assert.Len(t, got, 1)
@@ -504,16 +496,9 @@ func BenchmarkCRDTEngine_GenerateDelta(b *testing.B) {
 	}
 	emptyDigest := NewIBLT(1024, 4)
 
-	// warm the delta/EBR steady-state pools (the deltaPool,
-	// participantPool, and EBR's three-epoch retired-ring need ~256
-	// RetireBlock fills before the retiredPool recycles and `maybeAdvanceEpoch`
-	// has advanced the epoch enough that the retired-lists reach steady state).
-	// WITHOUT this warmup the cold fill amortizes across b.N and the bench
-	// reads a spurious ~13 B/op that is NOT steady state — §6(iii) declares the
-	// 0-alloc gate steady-state, not cold-start. Mirrors the
-	// warmEBRPool precedent (hamt_test.go:269). the INSERT setup above and
-	// the emptyDigest line are byte-identical to 355581d; this warmup is BELOW
-	// ResetTimer so it is not measured.
+	// Warm the delta, participant, and EBR retired-node pools before measuring.
+	// Cold pool fills would otherwise be amortized over b.N and obscure the
+	// steady-state allocation behavior this benchmark reports.
 	for w := 0; w < 2048; w++ {
 		wD := engine.GenerateDelta(emptyDigest)
 		wD.Release()
@@ -585,7 +570,7 @@ func TestCRDTEngine_LamportMonotonicPersistence(t *testing.T) {
 	_ = engine2.Close()
 }
 
-// --- ADR 5: Strata Estimator Tests ---
+// --- Strata estimator tests (ADR-0005) ---
 
 func TestStrataEstimator_IdenticalSets(t *testing.T) {
 	seed := maphash.MakeSeed()
@@ -682,37 +667,15 @@ func TestTrailingZeros64(t *testing.T) {
 	}
 }
 
-// TestCRDTEngine_GenerateDeltaWithRemoteIBLT is the M2-FIX contract test
-// (ADR-0034). The deleted primitive
-// `GenerateDeltaStratified(remoteEstimator)` subtracted an EMPTY remote IBLT
-// every round (crdt.go created remoteIBLT then never populated it) → the delta
-// was byte-identical to oversend for any non-empty remote overlap. The fix: the
-// mesh sends the remote's FULL IBLT on the wire + the sweep calls
-// `GenerateDelta(remoteIBLT)` — the frozen, CORRECT primitive that subtracts
-// the POPULATED remote IBLT + peels the real diff. This test PROVES that
-// contract: A holds 5 entries, B holds 3 of them (the overlap), and
-// `GenerateDelta(B's digest)` yields ONLY the 2 A has that B lacks (NOT all
-// 5) — the real bandwidth cut, the contract the deleted primitive violated.
-//
-// THE 3 CORE CONTRACTS (pre-and-post, re-proven):
-//
-//	(a) empty remote IBLT → delta == full set (oversend; the GenerateDelta
-//
-// "diff == local" path — the frozen behavior the OFF sweep relies on).
-//
-//	(b) populated remote IBLT (partial overlap) → delta == the |A−B| diff
-//
-// ONLY (the bandwidth cut — the M2 fix's load-bearing contract).
-//
-//	(c) identical remote IBLT (full overlap) → delta == empty (perfect sync;
-//
-// convergence terminates, no oversend).
+// TestCRDTEngine_GenerateDeltaWithRemoteIBLT checks reconciliation against an
+// empty, partially overlapping, and identical remote digest (ADR-0034). The
+// respective deltas contain the full local set, only the two missing entries,
+// and no entries. In particular, a populated remote IBLT must not be replaced
+// by an empty table, which would resend entries the peer already has.
 func TestCRDTEngine_GenerateDeltaWithRemoteIBLT(t *testing.T) {
-	// A holds 5 entries; B holds the SAME 3 (the overlap). Both engines share
-	// nodeID seed 1 so the CausalDots match (the OriginNodeID is part of the
-	// dot; identical nodeIDs + identical (entityID, SystemTime) make the
-	// overlap keys identical across the two engines — HashCausalDot is a pure
-	// function of the dot + PayloadDigest).
+	// Give both engines the same node ID and insert identical values for the
+	// overlap. Their causal dots and payload digests therefore hash to the same
+	// IBLT keys, leaving exactly two entries unique to A.
 	nodeID := [16]byte{1}
 	engineA := newTestEngine(t, nodeID, 0)
 	engineB := newTestEngine(t, nodeID, 0)
@@ -725,32 +688,25 @@ func TestCRDTEngine_GenerateDeltaWithRemoteIBLT(t *testing.T) {
 		}
 	}
 
-	// Contract (a): empty remote IBLT → delta == full set (oversend). This is
-	// the frozen behavior the OFF sweep relies on (GenerateDelta(emptyIBLT)).
+	// The one-bucket remote exercises the configuration-mismatch fallback:
+	// without a usable difference, GenerateDelta yields the full local set.
 	emptyRemote := NewIBLT(1, 4)
 	emptyRemoteDelta := engineA.GenerateDelta(emptyRemote)
 	emptyRemoteEntries := collectSeq(emptyRemoteDelta.Entries)
 	emptyRemoteDelta.Release()
 	assert.Len(t, emptyRemoteEntries, 5, "contract (a): empty remote IBLT must yield the full 5-entry set (oversend)")
 
-	// Contract (b): populated remote IBLT (B's digest, the 3-entry overlap) →
-	// delta == the |A−B| diff ONLY (2 entries — the M2 bandwidth cut). The
-	// remote IBLT is B's FULL digest (GenerateDigestWithSeed, the SAME 1024-
-	// bucket path the mesh's digest exchange uses — the bucket count matches
-	// GenerateDelta's internal local at crdt.go:1610 so Subtract succeeds);
-	// GenerateDelta subtracts it + peels the real diff. This is the contract
-	// the deleted primitive VIOLATED (it subtracted an empty IBLT → yielded
-	// all 5, not 2).
+	// B's populated digest lets GenerateDelta subtract the three shared keys
+	// and peel only the two entries B lacks. GenerateDelta adopts the remote
+	// bucket count, so these tables have compatible configurations.
 	seed := maphash.MakeSeed()
-	remoteIBLT := engineB.GenerateDigestWithSeed(seed) // crdt.go:1836 (B's FULL digest, 1024 buckets — matches GenerateDelta's local)
-	diffDelta := engineA.GenerateDelta(remoteIBLT)     // crdt.go:1603 (frozen, CORRECT)
+	remoteIBLT := engineB.GenerateDigestWithSeed(seed)
+	diffDelta := engineA.GenerateDelta(remoteIBLT)
 	diffEntries := collectSeq(diffDelta.Entries)
 	diffDelta.Release()
-	assert.Len(t, diffEntries, 2, "contract (b): populated remote IBLT (3-of-5 overlap) must yield ONLY the 2 |A-B| diff entries (the M2 bandwidth cut) — NOT all 5 (the deleted primitive's empty-subtract defect)")
+	assert.Len(t, diffEntries, 2, "populated remote IBLT with a 3-of-5 overlap must yield only the 2 entries missing from the remote set")
 
-	// Contract (c): identical remote IBLT (A's own digest) → delta == empty
-	// (perfect sync — convergence terminates, no oversend). A's digest minus
-	// A's digest is the empty diff.
+	// Subtracting A's own digest leaves no keys to send.
 	ownDigest := engineA.GenerateDigestWithSeed(seed)
 	syncDelta := engineA.GenerateDelta(ownDigest)
 	syncEntries := collectSeq(syncDelta.Entries)

@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TestInitializeSwarmPool_SimpleProtocolEnforcement validates that the
-// simple_protocol defense is correctly applied programmatically.
+// TestInitializeSwarmPool_SimpleProtocolEnforcement checks that the connection
+// configuration selects the simple query protocol without changing the URI.
 func TestInitializeSwarmPool_SimpleProtocolEnforcement(t *testing.T) {
 	tests := []struct {
 		name string
@@ -43,17 +43,17 @@ func TestInitializeSwarmPool_SimpleProtocolEnforcement(t *testing.T) {
 				t.Fatalf("pgxpool.ParseConfig failed: %v", err)
 			}
 
-			// Apply programmatic lock (mirroring InitializeSwarmPool behavior).
+			// Apply the same configuration setting as InitializeSwarmPool.
 			config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
 			if config.ConnConfig.DefaultQueryExecMode != pgx.QueryExecModeSimpleProtocol {
-				t.Errorf("Expected QueryExecModeSimpleProtocol, got %v", config.ConnConfig.DefaultQueryExecMode)
+				t.Errorf("query exec mode = %v, want QueryExecModeSimpleProtocol", config.ConnConfig.DefaultQueryExecMode)
 			}
 		})
 	}
 }
 
-// TestInitializeSwarmPool_RejectsInvalidURI validates error handling for malformed URIs.
+// TestInitializeSwarmPool_RejectsInvalidURI checks malformed connection URIs.
 func TestInitializeSwarmPool_RejectsInvalidURI(t *testing.T) {
 	tests := []struct {
 		name string
@@ -65,28 +65,26 @@ func TestInitializeSwarmPool_RejectsInvalidURI(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// ParseConfig should fail for all of these.
 			_, err := pgxpool.ParseConfig(tc.uri)
 			if err == nil {
-				t.Errorf("Expected error for invalid URI %q, got nil", tc.uri)
+				t.Errorf("ParseConfig accepted invalid URI %q", tc.uri)
 			}
 		})
 	}
 }
 
-// TestUnloggedStagingPromotion_ColumnJoin validates the SQL column construction
-// to prevent SQL injection or malformation in the UPSERT query.
+// TestUnloggedStagingPromotion_ColumnJoin checks the upsert column list.
 func TestUnloggedStagingPromotion_ColumnJoin(t *testing.T) {
 	columns := []string{"id", "title", "content", "embedding"}
 	joined := strings.Join(columns, ", ")
 	expected := "id, title, content, embedding"
 
 	if joined != expected {
-		t.Errorf("Column join mismatch: got %q, expected %q", joined, expected)
+		t.Errorf("joined columns = %q, want %q", joined, expected)
 	}
 }
 
-// TestUnloggedStagingPromotion_StagingTableNaming validates deterministic table naming.
+// TestUnloggedStagingPromotion_StagingTableNaming checks deterministic staging names.
 func TestUnloggedStagingPromotion_StagingTableNaming(t *testing.T) {
 	tests := []struct {
 		target   string
@@ -101,7 +99,7 @@ func TestUnloggedStagingPromotion_StagingTableNaming(t *testing.T) {
 		t.Run(tc.target, func(t *testing.T) {
 			result := tc.target + "_temp_stage"
 			if result != tc.expected {
-				t.Errorf("Staging table name mismatch: got %q, expected %q", result, tc.expected)
+				t.Errorf("staging table = %q, want %q", result, tc.expected)
 			}
 		})
 	}

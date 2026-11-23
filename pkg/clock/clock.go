@@ -11,11 +11,9 @@ import (
 	"time"
 )
 
-// SyntheticClock is a deterministic WallClock for tests. It holds a
-// fixed physical time in microseconds that tests can pin and advance
-// without touching the real clock. The read path (PhysicalNowUSec) is a
-// single atomic load, so a shared SyntheticClock is safe for concurrent
-// Admit callers (race gate).
+// SyntheticClock is a deterministic WallClock for tests. It holds a physical
+// time in microseconds that tests can set and advance without reading the OS
+// clock. Its atomic storage allows a clock to be shared across goroutines.
 type SyntheticClock struct {
 	nowUSec atomic.Int64
 }
@@ -44,10 +42,8 @@ func (c *SyntheticClock) Set(nowUSec int64) {
 	c.nowUSec.Store(nowUSec)
 }
 
-// SystemClock is the production WallClock placeholder for.
-// It reads the OS wall clock via time.Now().UnixMicro(). The real
-// Amazon Time Sync / chrony reader lands in and will
-// replace this implementation; do NOT fabricate a chrony reader here.
+// SystemClock is a WallClock backed by the operating system. It returns wall
+// time only; it does not expose clock-synchronization status or uncertainty.
 type SystemClock struct{}
 
 // NewSystemClock returns a SystemClock reading the OS wall clock.

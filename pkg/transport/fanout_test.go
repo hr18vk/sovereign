@@ -6,22 +6,12 @@
 
 package transport
 
-// INGRESS fanout stickiness guards (in-process seam).
+// These tests cover deterministic routing, flow affinity, and independence
+// from signature verification in ReusePortFanout. Fixed sample sizes make any
+// mis-route a failure rather than one contributor to a throughput average.
 //
-// WHY A TEST, NOT A BENCHMARK (load-bearing idiom choice): a flow-stickiness
-// gate is about the
-// FAILURE RATE across a roam, NOT the average throughput. testing.B's b.N
-// mean re-stabilization is the WRONG idiom — b.N ramps to find a stable MEAN;
-// a stickiness gate needs a FIXED sample size so a single mis-route is a hard
-// FAIL, not averaged away. So these are fixed-sample Tests
-// (`const n = 1000`), NOT Benchmarks.
-//
-// HONEST GEAR: this is an IN-PROCESS deterministic
-// model on the 4c canonical box, NOT a 32c linux-6.18 silicon number. The
-// kernel epoll + SOCKHASH load on c8g with CAP_BPF is future work;
-// this file proves the DETERMINISM + STICKINESS + NO-CRYPTO
-// properties of the in-process analogue, not a silicon measurement. Do NOT
-// label these numbers as 32c silicon.
+// The virtual-network tests exercise the Go selector, not kernel delivery.
+// Kernel coverage lives in ebpf_reuseport_test.go behind the ebpf_kernel tag.
 
 import (
 	"sync"
@@ -32,11 +22,8 @@ import (
 	"github.com/hr18vk/sovereign/pkg/attribution"
 )
 
-// TestSelectRouteDeterminism: SelectRoute(sameCID, n) == sameIndex
-// for 1<<20 iterations. The kernel eBPF program is deterministic BY
-// DEFINITION (a remap keyed on a fixed field hash); the in-process analogue
-// MUST be too. FAIL on any drift — a single differing index is a hard FAIL,
-// not an averaged-away mean.
+// TestSelectRouteDeterminism checks that the same connection ID and socket
+// count produce the same index for 1<<20 calls.
 func TestSelectRouteDeterminism(t *testing.T) {
 	const numSockets uint32 = 32
 	var cid [attribution.OriginNodeIDSize]byte
@@ -59,37 +46,25 @@ func TestSelectRouteDeterminism(t *testing.T) {
 	t.Logf("determinism holds: SelectRoute(cid, %d) == %d for %d iterations", numSockets, want, iters)
 }
 
-// TestRoamStickiness_32ListIncomplete (the load-bearing gate): the
-// 32-listener stickiness property. A peer IP roam changes the connection
-// 4-tuple (the NetMessage source nodeID) while the Application Connection ID
-// (originNodeID) stays CONSTANT. The receipt MUST land on the SAME worker
-// index for all 1000 frames in the roam. Fixed sample = 1000.
-//
-// Uses the in-process internal/chaos VirtualNet:
-// AddNode x32 workers + 1 ingress node; the ingress node routes each
-// received frame via SelectRoute to exactly one of the 32. Send 1000 frames
-// with the SAME originNodeID but a DIFFERENT source nodeID per frame (the
-// roam). Count per-worker receipts; assert they concentrate to ONE worker.
+// TestRoamStickiness_32ListIncomplete sends 1,000 frames with one originNodeID
+// and varying source node IDs through a virtual ingress node. All frames must
+// arrive at the same one of 32 workers, demonstrating that routing ignores the
+// changing network identity.
 func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 	const (
 		numWorkers uint32 = 32
 		n                 = 1000
 	)
 
-	// The FIXED Application Connection ID — the cheap-gate header mirror the
-	// eBPF program keys on (envelope.go:345 OriginNodeID). Constant across the
-	// roam; only the 4-tuple (source nodeID) changes.
+	// The application connection ID remains fixed while the source node ID,
+	// which represents the changing network identity, varies per frame.
 	var cid [attribution.OriginNodeIDSize]byte
 	for i := range cid {
 		cid[i] = byte(0xA0 + (i % 16))
 	}
 
-	// Build the frame via the helper (do NOT hand-roll offsets). A v3
-	// envelope carries originNodeID in the header at [80:96] (envelope.go
-	//:498-503); NewSignedRelayEnvelopeV3 sets it. The inner wire / originSig
-	// / hops are irrelevant to routing — the selector reads ONLY OriginNodeID
-	// — so a minimal envelope suffices (the no-crypto guard, Test 3, proves
-	// the selector never touches the crypto path).
+	// NewSignedRelayEnvelopeV3 places originNodeID at [80:96]. The remaining
+	// fields can stay empty because the selector consumes only the ID.
 	env := attribution.NewSignedRelayEnvelopeV3(
 		make([]byte, 0),                   // innerWire: unused by the route
 		[attribution.OriginSigSize]byte{}, // originSig: unused by the route
@@ -103,8 +78,8 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 		t.Fatalf("OriginNodeID() round-trip mismatch: want %x got %x", cid, routedCID)
 	}
 
-	// Zero-jitter, zero-drop profile so all 1000 frames deliver deterministically
-	// (the stickiness property is the gate, not chaos resilience).
+	// Disable loss and jitter so receipt counts measure routing rather than the
+	// virtual network's fault injection.
 	vn := chaos.NewVirtualNet(chaos.ChaosProfile{
 		Drop:             0,
 		Duplicate:        0,
@@ -113,11 +88,8 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 	})
 	defer vn.Stop()
 
-	// 32 worker nodes — the in-process analogue of a 32-socket SO_REUSEPORT
-	// group. Each worker counts the frames routed to it and signals
-	// completion via the shared WaitGroup, so the test waits for the actual
-	// per-worker RECEIPT (not merely the ingress route decision) before
-	// asserting stickiness — no route-vs-receipt race.
+	// Worker callbacks count actual deliveries. The WaitGroup prevents the
+	// assertions from racing ahead of those callbacks.
 	var receipts [numWorkers]int64
 	var workerIDs [numWorkers][16]byte
 	var wg sync.WaitGroup
@@ -133,45 +105,33 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 		})
 	}
 
-	// The pre-roam worker — the index the flow pins to while the CID is
-	// constant. Every frame in the roam MUST land here. Computed once on the
-	// stateless fanout; the ingress node's route decision uses the SAME
-	// instance so the pre-roam index and the per-frame route are provably the
-	// same call.
+	// Compute the expected worker once, then use the same stateless selector in
+	// the ingress callback for every frame.
 	f := &ReusePortFanout{}
 	preRoamWorker := f.SelectRoute(routedCID, numWorkers)
 	t.Logf("pre-roam worker index: %d (cid=%x)", preRoamWorker, routedCID)
 
-	// The ingress node — the analogue of the socket the kernel delivers the
-	// packet to BEFORE the eBPF program runs. It routes each frame via
-	// SelectRoute to exactly one worker and forwards it. The WaitGroup is
-	// Done in the WORKER callback (the actual receipt), not here, so the test
-	// blocks until every routed frame is counted.
+	// The ingress callback selects one worker and forwards the frame. Completion
+	// is signaled by the receiving worker, not by this forwarding step.
 	const ingressID = 0xFF
 	var ingressNode [16]byte
 	ingressNode[0] = ingressID
 	vn.AddNode(ingressNode, func(msg chaos.NetMessage) {
-		// The route decision: hash the Application Connection ID (read from
-		// the frame header, BEFORE any crypto) to a worker index. The 4-tuple
-		// (msg.From) is IGNORED by the route — that is the stickiness property.
+		// Route by the application connection ID; msg.From does not participate.
 		worker := f.SelectRoute(routedCID, numWorkers)
 		if worker >= numWorkers {
 			t.Errorf("route out of range: %d >= %d", worker, numWorkers)
 			wg.Done() // do not leak the WaitGroup on a (impossible) out-of-range
 			return
 		}
-		// Forward to the chosen worker (in-process analogue of the kernel
-		// delivering to the SOCKHASH-pinned socket). msg.To == ingressNode,
-		// so this sends from the ingress node to the pinned worker.
+		// msg.To is the ingress node, so this forwards from ingress to the worker.
 		if err := vn.Send(msg.To, workerIDs[worker], frame); err != nil {
 			t.Errorf("forward to worker %d: %v", worker, err)
 			wg.Done() // do not leak the WaitGroup on a send failure
 		}
 	})
 
-	// Simulate the roam: 1000 frames, SAME originNodeID, DIFFERENT source
-	// nodeID per frame (the 4-tuple changes). Each Send is from a distinct
-	// roaming peer to the ingress node.
+	// Vary the source node ID for every frame while retaining the envelope.
 	for i := 0; i < n; i++ {
 		var src [16]byte
 		src[0] = byte(i >> 8)
@@ -184,9 +144,7 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 
 	wg.Wait()
 
-	// The stickiness assertion: all n frames concentrate to ONE worker (the
-	// pre-roam worker). Any frame landing on a different worker is a roam
-	// failure (a cache-miss / thread-migration in the kernel analogue).
+	// Count both delivery loss and receipts outside the expected worker.
 	var failures int
 	var totalReceipts int64
 	for w := uint32(0); w < numWorkers; w++ {
@@ -200,14 +158,14 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 		t.Errorf("receipt count mismatch: want %d got %d (frames lost by the net)", n, totalReceipts)
 	}
 
-	// The t.Logf table: worker before, worker after, n, failures.
+	// Log the expected worker and observed distribution for diagnosis.
 	t.Logf("roam stickiness table: pre-roam-worker=%d post-roam-worker=%d n=%d failures=%d",
 		preRoamWorker, preRoamWorker, n, failures)
 	t.Logf("per-worker receipts: worker %d -> %d (the pinned core); all others -> 0",
 		preRoamWorker, atomic.LoadInt64(&receipts[preRoamWorker]))
 
 	if failures != 0 {
-		t.Fatalf("roam stickiness FAILED: %d/%d frames landed on a worker other than the pinned core %d",
+		t.Fatalf("roam stickiness failed: %d/%d frames landed on a worker other than the pinned core %d",
 			failures, n, preRoamWorker)
 	}
 	if got := atomic.LoadInt64(&receipts[preRoamWorker]); got != int64(n) {
@@ -215,18 +173,9 @@ func TestRoamStickiness_32ListIncomplete(t *testing.T) {
 	}
 }
 
-// TestNoCryptoBeforeRoute (the anti-guard, the eBPF-invariant): the
-// eBPF program runs BEFORE Verify (the whole point of strip-from-packet). The
-// selector MUST NOT touch any ed25519 Verify path. We instrument the
-// attribution package's exported VerifyHookCount seam (verify_hook.go:51, the
-// exported analogue of the package-level verifyHook var at envelope.go:59)
-// and assert the count stays 0 across the routing decision. A future change
-// that adds a verify-before-route (routing-by-verified-identity, defeating
-// the cheap-gate layer) FAILS this guard.
-//
-// Honest framing: a routing-by-verified-identity is not WRONG, it is just a
-// DIFFERENT architecture — but it is NOT the in-kernel design and
-// NOT this file.
+// TestNoCryptoBeforeRoute instruments attribution.VerifyHookCount and checks
+// that SelectRoute performs no signature verification. Header-based routing
+// must remain independent of the later verification step.
 func TestNoCryptoBeforeRoute(t *testing.T) {
 	count := new(attribution.VerifyHookCount)
 	attribution.SetVerifyHook(count.Hook)
@@ -247,20 +196,18 @@ func TestNoCryptoBeforeRoute(t *testing.T) {
 	}
 
 	if got := count.Load(); got != 0 {
-		t.Fatalf("strip-from-packet eBPF invariant violated: SelectRoute issued %d Verify calls (route-before-Verify is the load-bearing cheap-gate property)", got)
+		t.Fatalf("SelectRoute issued %d Verify calls, want 0: routing must precede verification", got)
 	}
-	t.Logf("no-crypto guard holds: SelectRoute issued 0 Verify calls across %d routing decisions", iters)
+	t.Logf("no-crypto check holds: SelectRoute issued 0 Verify calls across %d routing decisions", iters)
 }
 
-// TestNoPanicOnZeroFrame — robustness: a zero-length / malformed header
-// routes to DropMalformed, not a panic. The kernel eBPF program's `return 0`
-// (drop) analogue. numSockets == 0 is the empty socket-group case (returns 0,
-// the drop index); a zero-value CID with a valid socket group routes
-// deterministically (all-zero hashes to a fixed index) without panicking.
+// TestNoPanicOnZeroFrame covers zero-valued inputs to SelectRoute. An empty
+// socket group returns the zero sentinel without panicking, while a zero-value
+// connection ID still hashes deterministically when sockets are available.
 func TestNoPanicOnZeroFrame(t *testing.T) {
 	f := &ReusePortFanout{}
 
-	// Empty socket group: the drop analogue. Must not panic; returns 0.
+	// An empty group returns the zero sentinel without panicking.
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("SelectRoute panicked on numSockets=0: %v", r)
@@ -269,13 +216,13 @@ func TestNoPanicOnZeroFrame(t *testing.T) {
 	var zeroCID [attribution.OriginNodeIDSize]byte
 	got := f.SelectRoute(zeroCID, 0)
 	if got != 0 {
-		t.Fatalf("numSockets=0 must return 0 (drop), got %d", got)
+		t.Fatalf("SelectRoute(zeroCID, 0)=%d, want 0", got)
 	}
 
-	// Zero-value CID with a valid socket group: deterministic, no panic.
+	// A zero-value CID with a valid group still produces an in-range index.
 	got2 := f.SelectRoute(zeroCID, 32)
 	if got2 >= 32 {
 		t.Fatalf("zero-CID route out of range: %d >= 32", got2)
 	}
-	t.Logf("zero-frame robustness holds: numSockets=0 -> drop(0); zero-CID -> worker %d (no panic)", got2)
+	t.Logf("zero inputs: empty group returned 0; zero CID selected worker %d", got2)
 }

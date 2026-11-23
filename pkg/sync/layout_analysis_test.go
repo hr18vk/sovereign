@@ -12,22 +12,19 @@ import (
 	"unsafe"
 )
 
-// TestMemoryLayoutAnalysis prints the exact byte-level memory layout of
-// all hot-path structs to identify false sharing vulnerabilities.
-//
-// This is of the AWS Graviton Crucible: we must know the EXACT
-// byte offsets of every atomic field to determine which ones share a
-// 64-byte L1 cache line.
+// TestMemoryLayoutAnalysis prints the byte-level layout of hot-path structs.
+// Field offsets and sizes show which atomics share a 64-byte cache line and
+// may therefore contend through false sharing.
 func TestMemoryLayoutAnalysis(t *testing.T) {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ MEMORY LAYOUT ANALYSIS — FALSE SHARING DETECT ║")
+	fmt.Println("║     Memory layout analysis — false sharing detection           ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
 	// --- HamtNode ---
 	fmt.Println("━━━ HamtNode ━━━")
-	fmt.Printf(" sizeof(HamtNode) = %d bytes\n", unsafe.Sizeof(HamtNode{}))
+	fmt.Printf("  sizeof(HamtNode) = %d bytes\n", unsafe.Sizeof(HamtNode{}))
 	printFields("HamtNode", []fieldInfo{
 		{"refCount", unsafe.Offsetof(HamtNode{}.refCount), unsafe.Sizeof(HamtNode{}.refCount)},
 		{"bitmap", unsafe.Offsetof(HamtNode{}.bitmap), unsafe.Sizeof(HamtNode{}.bitmap)},
@@ -40,7 +37,7 @@ func TestMemoryLayoutAnalysis(t *testing.T) {
 
 	// --- EBRManager ---
 	fmt.Println("━━━ EBRManager ━━━")
-	fmt.Printf(" sizeof(EBRManager) = %d bytes\n", unsafe.Sizeof(EBRManager{}))
+	fmt.Printf("  sizeof(EBRManager) = %d bytes\n", unsafe.Sizeof(EBRManager{}))
 	printFields("EBRManager", []fieldInfo{
 		{"globalEpoch", unsafe.Offsetof(EBRManager{}.globalEpoch), unsafe.Sizeof(EBRManager{}.globalEpoch)},
 		{"head", unsafe.Offsetof(EBRManager{}.head), unsafe.Sizeof(EBRManager{}.head)},
@@ -52,7 +49,7 @@ func TestMemoryLayoutAnalysis(t *testing.T) {
 
 	// --- Participant ---
 	fmt.Println("━━━ Participant ━━━")
-	fmt.Printf(" sizeof(Participant) = %d bytes\n", unsafe.Sizeof(Participant{}))
+	fmt.Printf("  sizeof(Participant) = %d bytes\n", unsafe.Sizeof(Participant{}))
 	printFields("Participant", []fieldInfo{
 		{"active", unsafe.Offsetof(Participant{}.active), unsafe.Sizeof(Participant{}.active)},
 		{"epoch", unsafe.Offsetof(Participant{}.epoch), unsafe.Sizeof(Participant{}.epoch)},
@@ -63,7 +60,7 @@ func TestMemoryLayoutAnalysis(t *testing.T) {
 
 	// --- DeltaCRDTEngine ---
 	fmt.Println("━━━ DeltaCRDTEngine ━━━")
-	fmt.Printf(" sizeof(DeltaCRDTEngine) = %d bytes\n", unsafe.Sizeof(DeltaCRDTEngine{}))
+	fmt.Printf("  sizeof(DeltaCRDTEngine) = %d bytes\n", unsafe.Sizeof(DeltaCRDTEngine{}))
 	printFields("DeltaCRDTEngine", []fieldInfo{
 		{"shards", unsafe.Offsetof(DeltaCRDTEngine{}.shards), unsafe.Sizeof(DeltaCRDTEngine{}.shards)},
 		{"routeSeed", unsafe.Offsetof(DeltaCRDTEngine{}.routeSeed), unsafe.Sizeof(DeltaCRDTEngine{}.routeSeed)},
@@ -86,13 +83,11 @@ func TestMemoryLayoutAnalysis(t *testing.T) {
 	fmt.Println()
 
 	// --- Cache line analysis for DeltaCRDTEngine ---
-	fmt.Println("━━━ CACHE LINE ANALYSIS (64-byte lines) ━━━")
+	fmt.Println("--- Cache line analysis (64-byte lines) ---")
 	analyzeCacheLines("DeltaCRDTEngine", []fieldInfo{
-		// the per-shard atomic.Pointer[HAMT]s sit inside e.shards
-		// (each shardRoot is its own cache-line-padded slot); the standalone
-		// `state` cache line is gone. Here we surface the engine-level
-		// lamport/epoch/metrics hot atomics, which remain single-shared across
-		// shards.
+		// Per-shard root pointers occupy their own padded slots in e.shards.
+		// These engine-level Lamport, epoch, and metrics atomics remain shared
+		// across shards, so their cache-line placement needs separate review.
 		{"lamportCounter", unsafe.Offsetof(DeltaCRDTEngine{}.lamportCounter), unsafe.Sizeof(DeltaCRDTEngine{}.lamportCounter)},
 		{"lastSavedCounter", unsafe.Offsetof(DeltaCRDTEngine{}.lastSavedCounter), unsafe.Sizeof(DeltaCRDTEngine{}.lastSavedCounter)},
 		{"epochCounter", unsafe.Offsetof(DeltaCRDTEngine{}.epochCounter), unsafe.Sizeof(DeltaCRDTEngine{}.epochCounter)},
@@ -106,17 +101,17 @@ func TestMemoryLayoutAnalysis(t *testing.T) {
 
 	// --- slabFreeHead ---
 	fmt.Println("━━━ slabFreeHead ━━━")
-	fmt.Printf(" sizeof(slabFreeHead) = %d bytes\n", unsafe.Sizeof(slabFreeHead{}))
-	fmt.Printf(" head offset = %d\n", unsafe.Offsetof(slabFreeHead{}.head))
+	fmt.Printf("  sizeof(slabFreeHead) = %d bytes\n", unsafe.Sizeof(slabFreeHead{}))
+	fmt.Printf("  head offset = %d\n", unsafe.Offsetof(slabFreeHead{}.head))
 	fmt.Println()
 
 	// --- HamtArena ---
 	fmt.Println("━━━ HamtArena ━━━")
-	fmt.Printf(" sizeof(HamtArena) = %d bytes\n", unsafe.Sizeof(HamtArena{}))
-	fmt.Printf(" freeHeads offset = %d, size = %d\n",
+	fmt.Printf("  sizeof(HamtArena) = %d bytes\n", unsafe.Sizeof(HamtArena{}))
+	fmt.Printf("  freeHeads offset = %d, size = %d\n",
 		unsafe.Offsetof(HamtArena{}.freeHeads), unsafe.Sizeof(HamtArena{}.freeHeads))
-	fmt.Printf(" bumpOffset offset = %d\n", unsafe.Offsetof(HamtArena{}.bumpOffset))
-	fmt.Printf(" base offset = %d\n", unsafe.Offsetof(HamtArena{}.base))
+	fmt.Printf("  bumpOffset offset = %d\n", unsafe.Offsetof(HamtArena{}.bumpOffset))
+	fmt.Printf("  base offset = %d\n", unsafe.Offsetof(HamtArena{}.base))
 	fmt.Println()
 }
 
@@ -128,7 +123,7 @@ type fieldInfo struct {
 
 func printFields(structName string, fields []fieldInfo) {
 	for _, f := range fields {
-		fmt.Printf(" %-30s offset=%-4d size=%-4d cacheLine=%d\n",
+		fmt.Printf("  %-30s offset=%-4d size=%-4d cacheLine=%d\n",
 			f.name, f.offset, f.size, f.offset/64)
 	}
 }
@@ -155,9 +150,9 @@ func analyzeCacheLines(structName string, fields []fieldInfo) {
 		for _, f := range lineMap[ln].fields {
 			names += fmt.Sprintf("%s(%d-%d) ", f.name, f.offset, f.offset+f.size-1)
 		}
-		fmt.Printf(" Line %d (bytes %d-%d): %s", ln, ln*64, ln*64+63, names)
+		fmt.Printf("  Line %d (bytes %d-%d): %s", ln, ln*64, ln*64+63, names)
 		if len(lineMap[ln].fields) > 1 {
-			fmt.Printf(" ⚠️ FALSE SHARING RISK!")
+			fmt.Printf(" [false-sharing risk]")
 		}
 		fmt.Println()
 	}

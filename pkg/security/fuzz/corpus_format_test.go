@@ -11,27 +11,20 @@ import (
 	"strconv"
 )
 
-// corpus_format_test.go holds the go-fuzz on-disk corpus-file parser helpers.
-// Kept in a _test.go file (corpus parsing is a test-tier concern; no production
-// code reads the corpus). The format is documented at readSeedFile.
+// These helpers parse the on-disk corpus format documented at readSeedFile.
+// They are test-only; production code does not read the corpus.
 //
-// The parser uses strconv.Unquote for the string literal body — Go's OWN
-// unquote rules — so binary seeds (with \xNN escapes) round-trip byte-identical
-// to what `go test -fuzz` wrote. A hand-rolled unquoter would risk drift; the
-// stdlib is the single source of truth for Go string-literal syntax.
+// strconv.Unquote decodes the string literal body, including \xNN escapes, with
+// the same Go syntax used by `go test -fuzz` when it writes a corpus entry.
 
-// errCorruptSeed is returned when a committed corpus file does not match the
-// go-fuzz format (missing header, missing the []byte("...") wrapper, or an
-// unquote failure). A corrupt committed seed is a CI flake the
-// TestSeedCorpusIsValid guard catches.
+// errCorruptSeed reports a corpus file whose []byte("...") wrapper or Go string
+// literal cannot be parsed. TestSeedCorpusIsValid identifies the affected file.
 var errCorruptSeed = errors.New("fuzz: corrupt go-fuzz corpus seed (want `go test fuzz v1\\n[]byte(\"...\")`)")
 
-// unquoteGoString unquotes a Go double-quoted string literal (the body inside
-// `[]byte("...")`) to its raw bytes via strconv.Unquote. strconv.Unquote
-// handles \xNN (binary), \n, \t, \\, \", \uXXXX, and the full Go escape set —
-// the faithful inverse of what `go test -fuzz` writes.
+// unquoteGoString decodes the quoted body of []byte("...") with
+// strconv.Unquote, preserving binary escapes exactly as Go defines them.
 func unquoteGoString(literal string) ([]byte, error) {
-	// strconv.Unquote expects the literal WITH surrounding quotes.
+	// strconv.Unquote expects the literal with surrounding quotes.
 	out, err := strconv.Unquote(`"` + literal + `"`)
 	if err != nil {
 		return nil, errCorruptSeed

@@ -4,18 +4,12 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — End-to-End Wire-Format Roundtrip Test.
+// CRDT wire-format roundtrip tests.
 //
-// This file is the proof the benchmark suite
-// never provided: a CRDT delta generated on host A, serialized through the
-// capnp TriTemporalEvent wire format (api/capnp/api/capnp/schema.capnp),
-// transported over a Go channel (stand-in for the network), unmarshaled on
-// host B, applied via Join, and asserted field-by-field to preserve every
-// field the CRDT contract defines.
-//
-// Scope discipline: this file is a TEST ONLY. If it surfaces a real
-// wire-format defect (a C5/C6-class failure), it is left RED and reported —
-// this file is the test, not the fix.
+// A delta generated on one engine is encoded as CRDTDeltaEvent, sent through a
+// channel, decoded on a second engine, and joined. The assertions compare every
+// CRDTEntry field and the full entity ID and payload. Separate tests pin the
+// ingestion and CRDT schema accessor surfaces and single-segment framing.
 package sync
 
 import (
@@ -29,17 +23,16 @@ import (
 
 // Deterministic, field-distinct sentinel constants. No time.Now(), no RNG.
 // Every temporal dim is a distinct nonzero sentinel; the entityID is long;
-// the payload string is recoverable bytes that are deliberately NOT byte-equal
+// the payload string is recoverable bytes that are deliberately not byte-equal
 // to its SHA-256 digest.
 const (
 	// 40-char entityID so a 16-byte-truncated entityIDHash[:16] regression
 	// changes both the length and the content of the emitted string.
 	rtEntityID = "tenant=acme;ledger=txn;id=0a1b2c3d4e5f60718293a4b5c6d7e8f9"
 
-	// rtPayload is the recoverable wire payload. It is a printable string
-	// that is by construction not byte-equal to rtPayloadDigest (one is a
-	// 48-char ASCII string, the other is 32 raw digest bytes).
-	rtPayload = "this-is-recoverable-payload-bytes-NOT-its-digest"
+	// rtPayload is recoverable payload text, distinct from the 32 raw bytes
+	// of rtPayloadDigest.
+	rtPayload = "this-is-recoverable-payload-bytes-not-its-digest"
 
 	// Distinct nonzero sentinels for every CRDTEntry temporal/dot field.
 	rtSystemTime     int64  = 0x1111111111111111
@@ -49,12 +42,9 @@ const (
 	rtDecisionTime   int64  = 0x5555555555555555
 	rtH3Index        uint64 = 0x8928308280fffff
 
-	// rtLatSentinel / rtLngSentinel ride the two capnp pointer-less fields
-	// (latitude/longitude) that the schema exposes but CRDTEntry does not
-	// name. Using sentinels means a future engineer who "recycles" latitude
-	// to carry, say, SystemTime would change the value on the wire and the
-	// far-side SystemTime assertion would still fail (the schema is missing
-	// a real field for it). The sentinels document the overflow, not a fix.
+	// Latitude and longitude belong only to the ingestion schema; CRDTEntry
+	// has no corresponding fields. Distinct sentinels keep those dimensions
+	// separate in the accessor-surface test.
 	rtLatSentinel = 1.5
 	rtLngSentinel = -2.5
 )
@@ -83,21 +73,16 @@ func init() {
 	copy(rtPayloadDigest[:], d[:])
 }
 
-// replayTriple is what the receiver unmarshals from the wire for each event:
-// the entityID string, the payload bytes (kept so the C6 byte-equality guards
-// can assert against the actual wire payload, not its digest), and the wire
-// reconstruction of CRDTEntry (which the schema only partially fills).
+// replayTriple holds the entity ID and payload alongside the CRDTEntry copied
+// from one decoded event. Keeping the payload permits a direct byte comparison
+// independently of the digest field.
 type replayTriple struct {
 	entityID string
 	payload  string
 	entry    CRDTEntry
 }
 
-// makeReplaySeq mirrors crdt_test.go's makeSeq: it builds a push-based Seq
-// that yields the reconstructed triples into Join. Defining the closure as a
-// free helper (not as an inline composite-literal field) keeps the function
-// literal out of the composite-literal grammar so gofmt/vet parse it
-// unambiguously — exactly the idiom the existing test file already uses.
+// makeReplaySeq yields reconstructed entries to Join in wire order.
 func makeReplaySeq(rec []replayTriple) Seq {
 	return func(yield func(entityID string, entry CRDTEntry) bool) {
 		for i := range rec {
@@ -128,37 +113,30 @@ func setupRTEngine(tb testing.TB, nodeID [16]byte, initialCounter uint64) *Delta
 	return eng
 }
 
-// CRDTDeltaEventWireVersion is the single production source of truth for the
-// compiled-in wire version (defined in crdt_apply.go). These tests read it
-// directly by name rather than redefining a package-local duplicate —
-// I consolidated the prior test-local const into the production symbol so a
-// future bump changes exactly one site.
+// The tests use CRDTDeltaEventWireVersion from crdt_apply.go directly so the
+// wire version has one definition.
 
-// encodeEntryToCRDTDeltaEvent serializes a single (entityID, payload, entry)
-// triple through the dedicated capnp CRDTDeltaEvent schema (engine<->engine
-// sync, distinct from the client->engine ingestion TriTemporalEvent). This is
-// the load-bearing step: by using a wire contract whose field set is
-// the CRDT delta contract, the test proves every CRDTEntry field has a real
-// field on the wire — closing C5 (schema-vs-CRDT disjoint) and C6 (payload
-// written as digest).
+// encodeEntryToCRDTDeltaEvent serializes an entity ID, payload, and entry with
+// the engine-to-engine CRDTDeltaEvent schema, distinct from the client
+// ingestion TriTemporalEvent schema. Every CRDTEntry field has a wire field.
 //
 // Field mapping onto CRDTDeltaEvent (12 contract fields + 1 version tag):
 //
-//	version <- CRDTDeltaEventWireVersion (forward-compat tag)
-//	payloadDigest <- entry.PayloadDigest ([32]byte -> Data)
-//	originNodeID <- entry.OriginNodeID ([16]byte -> Data)
-//	dotNodeID <- entry.DotNodeID ([16]byte -> Data)
-//	dotCounter <- entry.DotCounter (uint64 -> UInt64)
-//	h3Index <- entry.H3Index (uint64 -> UInt64)
-//	systemTime <- entry.SystemTime
+//	version        <- CRDTDeltaEventWireVersion (forward-compat tag)
+//	payloadDigest  <- entry.PayloadDigest  ([32]byte -> Data)
+//	originNodeID   <- entry.OriginNodeID   ([16]byte -> Data)
+//	dotNodeID      <- entry.DotNodeID      ([16]byte -> Data)
+//	dotCounter     <- entry.DotCounter     (uint64 -> UInt64)
+//	h3Index        <- entry.H3Index        (uint64 -> UInt64)
+//	systemTime     <- entry.SystemTime
 //	validTimeStart <- entry.ValidTimeStart
-//	validTimeEnd <- entry.ValidTimeEnd
-//	assertionTime <- entry.AssertionTime
-//	decisionTime <- entry.DecisionTime
-//	entityId <- entityID string (C6: NOT entityIDHash[:16])
-//	payload <- payload string (C6: bytes, NOT the digest)
+//	validTimeEnd   <- entry.ValidTimeEnd
+//	assertionTime  <- entry.AssertionTime
+//	decisionTime   <- entry.DecisionTime
+//	entityId       <- entityID string       (not entityIDHash[:16])
+//	payload        <- payload string        (bytes, not the digest)
 //
-// CRDTDeltaEvent carries NO latitude/longitude: ingestion-only dimensions.
+// CRDTDeltaEvent carries no latitude/longitude: ingestion-only dimensions.
 func encodeEntryToCRDTDeltaEvent(t *testing.T, entityID, payload string, entry CRDTEntry) []byte {
 	t.Helper()
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
@@ -199,12 +177,8 @@ func encodeEntryToCRDTDeltaEvent(t *testing.T, entityID, payload string, entry C
 	return data
 }
 
-// decodeCRDTDeltaEvent unmarshals raw wire bytes back into a CRDTDeltaEvent
-// via the shared schema and asserts the version tag matches the compiled-in
-// wire version. A mismatch is an explicit fatal — it NEVER silently falls
-// through to zero-received fields, because that silent path is exactly how
-// C5 hid the schema-vs-CRDT gap. The version check is the decoder's own
-// protection; the roundtrip test does not assert it separately.
+// decodeCRDTDeltaEvent unmarshals a CRDTDeltaEvent and rejects an unsupported
+// wire version instead of interpreting it with zero-valued fields.
 func decodeCRDTDeltaEvent(t *testing.T, data []byte) capnp_schema.CRDTDeltaEvent {
 	t.Helper()
 	m, err := capnp.Unmarshal(data)
@@ -216,22 +190,18 @@ func decodeCRDTDeltaEvent(t *testing.T, data []byte) capnp_schema.CRDTDeltaEvent
 		t.Fatalf("ReadRootCRDTDeltaEvent: %v", err)
 	}
 	if ev.Version() != CRDTDeltaEventWireVersion {
-		t.Fatalf("CRDTDeltaEvent wire version mismatch: got %d, want %d — refusing silent fall-through to zero-received fields (C5 guard)",
+		t.Fatalf("CRDTDeltaEvent wire version mismatch: got %d, want %d; refusing to decode zero-valued fields",
 			ev.Version(), CRDTDeltaEventWireVersion)
 	}
 	return ev
 }
 
-// TestCapnpWireFormatRoundtrip is the End-to-End Roundtrip Test.
-//
-// Roundtrip path exercised (exact):
-//
-//	InsertLocal -> GenerateDelta -> delta.Entries(ForEach) -> capnp
-//	TriTemporalEvent encode -> chan []byte transport -> capnp
-//	TriTemporalEvent decode -> reconstruct CRDTDelta -> Join -> field-by-field
-//	assertions on host B's State().
+// TestCapnpWireFormatRoundtrip runs InsertLocal and GenerateDelta on the
+// source, transports encoded CRDTDeltaEvent frames over a channel, and joins
+// the reconstructed entries on the receiver. It compares all fields after the
+// roundtrip.
 func TestCapnpWireFormatRoundtrip(t *testing.T) {
-	// ---- Host A: source engine ---------------------------------------------------
+	// Source engine.
 	engineA := setupRTEngine(t, rtHostA, 0)
 
 	srcEntry := CRDTEntry{
@@ -256,7 +226,7 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 		t.Fatalf("InsertLocal dot.Counter %d, want 1 (initial counter 0)", dot.Counter)
 	}
 
-	// ---- Generate the delta (full sync — remote digest is empty) ----------------
+	// An empty remote IBLT requests the source's full state.
 	// An empty IBLT means "peer B knows nothing," so the delta contains every
 	// entry host A has. This is the simplest deterministic generate path and
 	// avoids the stratified estimator's dynamic sizing.
@@ -277,12 +247,12 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 		t.Fatalf("delta emitted %d entries, want 1", len(emitted))
 	}
 
-	// EARLY C6 GUARDS (producer side): the delta iterator MUST yield the real
+	// Early producer-side check: the delta iterator must yield the real
 	// entityID string, not a 16-byte hash. If the in-process generator were
 	// ever regressed to entityIDHash[:16], the emitted string would be 16 raw
 	// bytes and would not equal the 40-char rtEntityID.
 	if emitted[0].entityID != rtEntityID {
-		t.Fatalf("producer-side entityID: got %q (len %d), want %q (len %d) — C6 entityIDHash[:16] regression on the producer",
+		t.Fatalf("producer-side entityID: got %q (len %d), want %q (len %d) — entityIDHash[:16] regression on the producer",
 			emitted[0].entityID, len(emitted[0].entityID), rtEntityID, len(rtEntityID))
 	}
 
@@ -291,9 +261,8 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 	go func() {
 		defer close(transport)
 		for i := range emitted {
-			// C6 payload-not-digest: serialize the payload string, NEVER
-			// rtPayloadDigest. If a future serializer substitutes the digest,
-			// the receiver-side byte-equality assertion fails.
+			// Serialize the payload itself; receiver assertions detect digest
+			// substitution or truncation.
 			data := encodeEntryToCRDTDeltaEvent(t, emitted[i].entityID, rtPayload, emitted[i].entry)
 			transport <- data
 		}
@@ -315,14 +284,9 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 			t.Fatalf("Payload(): %v", err)
 		}
 
-		// Reconstruct a CRDTEntry from the wire. CRDTDeltaEvent carries every
-		// CRDTEntry field the contract defines, so there is nothing left to
-		// fabricate: the dot comes off the wire (DotNodeID/DotCounter), the
-		// digest comes off the wire (PayloadDigest, NOT recomputed from the
-		// payload), and all temporal/H3 dimensions come off the wire too. We
-		// do NOT re-hash the payload into PayloadDigest: the wire carries both
-		// the digest and the bytes, and the assertion block cross-checks them
-		// to detect any C6 digest-substitution regression.
+		// CRDTDeltaEvent carries every CRDTEntry field. Copy the dot, digest,
+		// origin, temporal values, and H3 index directly; the later assertions
+		// independently compare payload and digest.
 		dotID, err := ev.DotNodeID()
 		if err != nil {
 			t.Fatalf("DotNodeID(): %v", err)
@@ -361,7 +325,7 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 	}
 	engineB.Join(incomingDelta)
 
-	// ---- THE GUARDS: field-by-field assertions on host B's state -----------------
+	// ---- Field-by-field assertions on host B's state -----------------
 	got := engineB.State().Get(rtEntityID)
 	if len(got) == 0 {
 		t.Fatalf("host B State().Get(%q) returned no entries — Join did not apply the delta", rtEntityID)
@@ -372,85 +336,65 @@ func TestCapnpWireFormatRoundtrip(t *testing.T) {
 	gotEntry := got[0]
 	gotPayloadOnWire := reconstructed[0].payload
 
-	// Entity ID equality by string (not hash) — C6 catch on the far side.
-	// The fact that rtEntityID returned exactly one entry proves the wire
-	// carried the full 40-char string; had the producer emitted
-	// entityIDHash[:16], host B would store the entry under a 16-byte key and
-	// this Get(rtEntityID) would have returned zero entries (caught above).
+	// Looking up the full entity string on the receiver detects accidental use
+	// of a truncated entityIDHash as the map key.
 	t.Logf("entityID preserved: State().Get(%q) returned 1 entry", rtEntityID)
 
 	// Payload byte-equality (the actual []byte payload, not its digest). This
-	// is the exact C6 payload-lost assertion: if the serializer ever wrote
+	// is the payload-lost assertion: if the serializer ever wrote
 	// the digest in the payload slot or dropped the payload field,
 	// gotPayloadOnWire would be wrong/empty and this assertion fails.
 	if gotPayloadOnWire != rtPayload {
-		t.Errorf("payload byte-equality: got %q, want %q — C6 payload-lost/digest-substitution regression",
+		t.Errorf("payload byte-equality: got %q, want %q — payload-lost/digest-substitution regression",
 			gotPayloadOnWire, rtPayload)
 	}
 	if gotPayloadOnWire == string(rtPayloadDigest[:]) {
-		t.Errorf("payload equals the digest bytes — C6 digest-substitution regression")
+		t.Errorf("payload equals the digest bytes — digest-substitution regression")
 	}
 	if gotPayloadOnWire == string(rtPayloadDigest[:16]) {
-		t.Errorf("payload equals digest[:16] — C6 entityIDHash[:16]-style truncation regression")
+		t.Errorf("payload equals digest[:16] — entityIDHash[:16]-style truncation regression")
 	}
 
-	// AssertionTime — the schema's only named temporal field. If even this
-	// fails, the named wire field itself is broken.
+	// AssertionTime is also present in the client-ingestion schema; the fields
+	// below distinguish the dedicated CRDT schema.
 	if gotEntry.AssertionTime != rtAssertionTime {
 		t.Errorf("AssertionTime: got %#x, want %#x (schema carries this — named-field break if this fails)",
 			gotEntry.AssertionTime, rtAssertionTime)
 	}
 
-	// --- Assertions that surface the C5-class schema-vs-CRDT gap ----------------
-	// Each of the following asserts a CRDTEntry field the TriTemporalEvent
-	// schema has NO field for. Against the current schema they fail —
-	// surfacing the C5/C6 defect this test exists to expose. If a
-	// future wire-format fix phase extends the schema to carry these, the
-	// asserts become green with no test change required.
+	// The dedicated CRDTDeltaEvent schema carries these fields even though the
+	// client-ingestion TriTemporalEvent schema does not.
 	if gotEntry.SystemTime != rtSystemTime {
-		t.Errorf("SystemTime: got %#x, want %#x (schema has no SystemTime field — C5)",
-			gotEntry.SystemTime, rtSystemTime)
+		t.Errorf("SystemTime after roundtrip: got %#x, want %#x", gotEntry.SystemTime, rtSystemTime)
 	}
 	if gotEntry.ValidTimeStart != rtValidTimeStart {
-		t.Errorf("ValidTimeStart: got %#x, want %#x (schema has no ValidTimeStart field — C5)",
-			gotEntry.ValidTimeStart, rtValidTimeStart)
+		t.Errorf("ValidTimeStart after roundtrip: got %#x, want %#x", gotEntry.ValidTimeStart, rtValidTimeStart)
 	}
 	if gotEntry.ValidTimeEnd != rtValidTimeEnd {
-		t.Errorf("ValidTimeEnd: got %#x, want %#x (schema has no ValidTimeEnd field — C5)",
-			gotEntry.ValidTimeEnd, rtValidTimeEnd)
+		t.Errorf("ValidTimeEnd after roundtrip: got %#x, want %#x", gotEntry.ValidTimeEnd, rtValidTimeEnd)
 	}
 	if gotEntry.DecisionTime != rtDecisionTime {
-		t.Errorf("DecisionTime: got %#x, want %#x (schema has no DecisionTime field — C5)",
-			gotEntry.DecisionTime, rtDecisionTime)
+		t.Errorf("DecisionTime after roundtrip: got %#x, want %#x", gotEntry.DecisionTime, rtDecisionTime)
 	}
 	if gotEntry.H3Index != rtH3Index {
-		t.Errorf("H3Index: got %#x, want %#x (schema has no H3Index field — C5)",
-			gotEntry.H3Index, rtH3Index)
+		t.Errorf("H3Index after roundtrip: got %#x, want %#x", gotEntry.H3Index, rtH3Index)
 	}
 	if gotEntry.DotNodeID != dot.NodeID {
-		t.Errorf("DotNodeID: got %x, want %x (schema has no DotNodeID field — C5/C6 causal-dot lost)",
-			gotEntry.DotNodeID, dot.NodeID)
+		t.Errorf("DotNodeID after roundtrip: got %x, want %x", gotEntry.DotNodeID, dot.NodeID)
 	}
 	if gotEntry.DotCounter != dot.Counter {
-		t.Errorf("DotCounter: got %d, want %d (schema has no DotCounter field — C5/C6 causal-dot lost)",
-			gotEntry.DotCounter, dot.Counter)
+		t.Errorf("DotCounter after roundtrip: got %d, want %d", gotEntry.DotCounter, dot.Counter)
 	}
 	if gotEntry.OriginNodeID != rtHostA {
-		t.Errorf("OriginNodeID: got %x, want %x (schema has no OriginNodeID field — C5)",
-			gotEntry.OriginNodeID, rtHostA)
+		t.Errorf("OriginNodeID after roundtrip: got %x, want %x", gotEntry.OriginNodeID, rtHostA)
 	}
 	if gotEntry.PayloadDigest != rtPayloadDigest {
-		t.Errorf("PayloadDigest: got %x, want %x (schema has no PayloadDigest field — C5)",
-			gotEntry.PayloadDigest, rtPayloadDigest)
+		t.Errorf("PayloadDigest after roundtrip: got %x, want %x", gotEntry.PayloadDigest, rtPayloadDigest)
 	}
 }
 
-// TestTriTemporalEventSchemaSurfaceIsFiveFields is the C5 structural
-// guard: it pins the canonical accessor surface of the capnp schema. If a
-// future engineer drops a field from TriTemporalEvent (a C5 drift), the
-// corresponding accessor call here fails to compile. If they add a field that
-// CRDTEntry also grows, this guard forces them to add a matching roundtrip
-// assertion rather than silently letting the field fall off the wire.
+// TestTriTemporalEventSchemaSurfaceIsFiveFields pins the ingestion schema's
+// five accessors and checks their values and single-segment framing.
 func TestTriTemporalEventSchemaSurfaceIsFiveFields(t *testing.T) {
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
 	if err != nil {
@@ -500,15 +444,9 @@ func TestTriTemporalEventSchemaSurfaceIsFiveFields(t *testing.T) {
 	}
 }
 
-// TestCRDTDeltaEventSchemaSurface is the structural guard for
-// the new CRDTDeltaEvent wire schema. It pins the canonical accessor surface
-// of the capnp-generated Go binding. If a future engineer drops or renames a
-// field on CRDTDeltaEvent (a C5-style drift on the sync protocol the way the
-// existing guard protects the ingestion protocol), the corresponding accessor
-// call here fails to compile. If they add a CRDTEntry-bound field, this guard
-// forces them to wire it through the encode/decode path AND add a matching
-// roundtrip assertion, rather than silently letting the field fall off the
-// wire. The version-tag accessor is pinned too: dropping it fails to compile.
+// TestCRDTDeltaEventSchemaSurface pins every CRDTDeltaEvent accessor,
+// including the version tag. Removing or renaming a field fails compilation;
+// accessor values and single-segment framing are checked at run time.
 func TestCRDTDeltaEventSchemaSurface(t *testing.T) {
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
 	if err != nil {
@@ -519,8 +457,7 @@ func TestCRDTDeltaEventSchemaSurface(t *testing.T) {
 		t.Fatalf("NewRootCRDTDeltaEvent: %v", err)
 	}
 
-	// Version tag — the single forward-compat surface. Pinned so a future
-	// drift that removes it fails to compile.
+	// Pin the forward-compatibility version accessor.
 	ev.SetVersion(CRDTDeltaEventWireVersion)
 	if got := ev.Version(); got != CRDTDeltaEventWireVersion {
 		t.Fatalf("Version accessor: got %d, want %d", got, CRDTDeltaEventWireVersion)
@@ -607,8 +544,6 @@ func TestCRDTDeltaEventSchemaSurface(t *testing.T) {
 		t.Fatalf("expected single-segment message (segCount-1=0), got %d", segCountMinusOne)
 	}
 
-	// CRDTDeltaEvent MUST NOT carry latitude/longitude: ingestion-only. If
-	// a future drift adds them, ev.SetLatitude/SetLongitude would compile
-	// here and the build would lose the intended negative-protection signal.
-	// The design forbids the merge; this is the guards.
+	// Latitude and longitude are ingestion-only fields and are deliberately
+	// absent from CRDTDeltaEvent.
 }

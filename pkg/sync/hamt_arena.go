@@ -8,6 +8,7 @@ package sync
 
 import (
 	"math/bits"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -33,13 +34,13 @@ type HamtNode struct {
 	childrenPtr NodePtr
 	entriesPtr  NodePtr
 
-	// Cached Merkle branch hash. Mutations path-copy nodes and recompute this
-	// field only along the affected HAMT path, making MerkleRoot() O(1).
+	// Reserved for cached Merkle branch hash. Currently unused; MerkleRoot()
+	// sorts leaves across the tree.
 	merkleHash [32]byte
 
-	// Intrusive pointer for the lock-free free-list.
-	// When a node is dead (refCount == 0), the first 8 bytes of this
-	// region store the uint64 next-offset for the Treiber stack.
+	// Reserved intrusive pointer for the lock-free free-list (offset 64).
+	// In the current free-list implementation, pushFreeNode stores the Treiber next-offset in
+	// bytes 0..7 of the dead node (offset 0) instead of this field.
 	nextFree NodePtr
 }
 
@@ -51,7 +52,7 @@ const nodeSize = unsafe.Sizeof(HamtNode{})
 
 const (
 	// numVarClasses is the number of power-of-2 size classes for variable
-	// allocations. Classes cover [16, 32, 64,..., 524288] bytes.
+	// allocations. Classes cover [16, 32, 64, ..., 524288] bytes.
 	// Index 0 is reserved for 72-byte HamtNode (dedicated class).
 	numVarClasses = 16
 
@@ -74,165 +75,75 @@ type slabFreeHead struct {
 	_    CacheLinePad
 }
 
-// arenaNodeFreelistShardCount is the number of Treiber free-list shards the
-// HamtArena dedicates to the class-0 (72-byte HamtNode) pool.
-// collapsed the engine root into N=256 per-entityID CAS shards and surfaced the
-// relocated CAS storm: every per-shard Set path-allocates a fresh HamtNode via
-// the SINGLE HamtArena freeHeads[0] Treiber head, which at GOMAXPROCS=32 became
-// the new hot stripe (76.47% of CPU cum in sync/atomic.(*Uint64).CompareAndSwap,
-// 92% of it inside AllocNode's freeHeads[0].head.CompareAndSwap).
-//
-// Sharding the class-0 freelist mirrors the byte-faithful precedent shipped in
-// (crdt.go's shards []shardRoot): each class-0 shard owns its own
-// cache-line-padded atomic head, so 32 cores allocating HamtNodes spread across
-// 256 heads instead of contending on one. 256 is a power of two (routing is a
-// clean bitmask & (arenaNodeFreelistShardCount-1)), matches the engine shard
-// count, and is >= any realistic GOMAXPROCS (32-core peak -> 8x cache lines to
-// spread across). A real-traffic may surface a better cardinality (a
-// 1:1 engine-shard-to-freelist-shard mapping may be optimal on heterogeneous
-// engine workloads); this is the honest, reasoned default, not a tuned value.
-//
-// A const (not a runtime setter) is chosen deliberately: the gate turns on the
-// SHAPE (sharded nodeFreelist + routeNodeFreelistShard + per-shard CAS), not on
-// a runtime knob, and a const keeps blast radius minimal and the diff
-// reviewable (the setter precedent in crdt.go's SetShardCount exists for the
-// engine root, which has a persistMu re-root path; the arena has no such mutex
-// and the const shape is simpler and safer here).
+// arenaNodeFreelistShardCount spreads recycled HamtNode allocations across
+// independent, cache-line-padded Treiber heads. This prevents one shared head
+// from serializing path-copying allocations on every core. The power-of-two
+// count permits mask-based routing and matches the engine's root shard count.
+// It is fixed because the arena has no re-rooting path that could coordinate a
+// runtime change.
 const arenaNodeFreelistShardCount = 256
 
-// arenaVarFreelistShardCount is the number of Treiber free-list shards the
-// HamtArena dedicates to EACH VARIABLE size class (1..numVarClasses). Phase
-// 2.5a.1 carried the var-alloc CAS concentrate forward as recorded 7% of CPU at
-// GOMAXPROCS=4. S1 re-measured this at GOMAXPROCS=32 under a
-// heavy JoinParallel bench: allocVar/freeHeads[classIdx].head.CompareAndSwap
-// rose to 57.91% cum (94.48s) — the dominant concentrate at 32c under Join
-// traffic. 2.5d closes it by mirroring the 2.5a/2.5a.1 256-way sharding
-// pattern: every var class now owns a [256]slabFreeHead shard array, the
-// routing counter is bumped OUTSIDE the CAS retry loop, and freeHeads[classIdx]
-// is preserved as the per-class cold-path fallback (two-tier pop/push,
-// byte-faithful to the 2.5a.1 freeHeads[0]→nodeFreelist[i] pattern). Power-of-
-// two (256) keeps the route a clean & (N-1) bitmask, matches the engine shard
-// count, and matches the proved-good 2.5a/2.5a.1 cardinality. The same const-
-// not-setter discipline as arenaNodeFreelistShardCount (of 2.5a.1) applies.
+// arenaVarFreelistShardCount applies the same contention avoidance to each
+// variable-size class. Allocation and reclamation use independent routing
+// counters, advanced once per call rather than on each CAS retry.
 const arenaVarFreelistShardCount = 256
 
-// arenaVarFreelistSweep is the bounded number of shards allocVar probes per
-// call before falling through to the bump allocator. The pop-routed shard may
-// be empty even when OTHER shards for the same class hold recycled blocks
-// (freeVar routes on a SEPARATE counter — pop and push visit shards in
-// counter-phase over time). Without a sweep, a pop landing on an empty routed
-// shard bumps — and at steady state over 20K ops, that initial lag accumulates
-// into a 1.4 GB bump-offset leak (S1 measured; pre-sweep). The bounded sweep
-// probes the routed shard + the next (arenaVarFreelistSweep-1) shards for this
-// class, all under ONE EBR pin taken before the sweep. 64 is chosen because
-// under steady-state the per-shard emptiness probability is a function of the
-// push/pop counter-phase drift; 8 reduced leak 5× but residual leak exceeded
-// the 64 MiB gate. The leak scales inversely with sweep size — doubling the
-// sweep squares the cold-fallback probability. 64 yields 256/64 = 4× full-class
-// sweeps per round, exponential reduction. Power-of-two so the
-// (start+probe)&(N-1) bitmask routing wraps cleanly.
+// arenaVarFreelistSweep bounds the shards allocVar probes before using the
+// bump allocator. Since pushes and pops use separate routing counters, the
+// first shard can be empty while nearby shards hold blocks of the right class.
+// Probing 128 shards under one EBR pin reuses those blocks without an
+// unbounded scan. The power-of-two bound also wraps cleanly in mask-based
+// routing.
 const arenaVarFreelistSweep = 128
 
-// hamtNodeFreelistShards is the sharded class-0 (72-byte HamtNode) Treiber
-// free-list. It REPLACES the single freeHeads[0] slot as the hot allocation
-// surface for HamtNode; freeHeads[0] is kept as a vestigial slot only because
-// the [numSizeClasses]slabFreeHead cartesian layout is shared with the
-// variable-size classes (1..16), which are left byte-identical (allocVar/
-// pushFreeVar carry only 7% of CPU — below the 43% CAS gate). Each entry is its
-// own CacheLinePad-wrapped slabFreeHead, so the 256 shards live on distinct
-// cache lines — byte-faithful to crdt.go's shards []shardRoot.
+// hamtNodeFreelistShards stores independent Treiber heads for the dedicated
+// HamtNode class. Padding separates their cache lines. freeHeads[0] remains in
+// the common size-class array but is not used by node allocation.
 type hamtNodeFreelistShards [arenaNodeFreelistShardCount]slabFreeHead
 
-// varFreelistShards is the sharded variable-size Treiber free-list type. Each
-// of the numVarClasses (=16) variable classes owns an independent 256-shard
-// array of slabFreeHead. slabFreeHead.head is atomic.Uint64 (offsets), the SAME
-// offset-Treibier shape as the class-0 nodeFreelist — byte-identical signature
-// so the allocVar / freeVar CAS frames are byte-faithful to AllocNode /
-// pushFreeNode modulo the class-indexed cartesian outer dimension. The two-tier
-// pop (shard first, freeHeads[classIdx] as cold-path fallback) mirrors the
-// 2.5a.1 freeHeads[0]→nodeFreelist[i] pattern. declares this type; the
-// arena struct field below owns the instance.
+// varFreelistShards gives every variable-size class its own set of sharded
+// Treiber heads. Each head contains a tagged word offset, as documented on
+// freeVar.
 type varFreelistShards [numVarClasses][arenaVarFreelistShardCount]slabFreeHead
 
-// HamtArena is a concurrent, zero-GC, off-heap allocator for HAMT nodes
-// and variable-sized arrays.
-//
-// ADR 9: Upgraded from single freeHead to segregated slab allocator.
-// Class 0 is dedicated to 72-byte HamtNode slots (zero fragmentation).
-// Classes 1-16 are power-of-2 geometric classes for variable allocations
-// (children arrays, entries arrays, strings, CRDT entry arrays).
-//
-// ABA immunity is provided by the EBRManager: blocks are deferred via
-// RetireBlock() and only recycled when the global epoch proves zero
-// lingering readers.
+// HamtArena allocates HAMT nodes and variable-sized arrays in an mmap region.
+// Class 0 holds HamtNode slots; classes 1 through 16 are power-of-two sizes for
+// child arrays, entry arrays, strings and CRDT entries. RetireBlock defers
+// reuse until EBR establishes that no reader from an earlier epoch remains.
 type HamtArena struct {
 	_ CacheLinePad
-	// freeHeads[0] = dedicated 72-byte HamtNode class
-	// freeHeads[1] = 16-byte class
-	// freeHeads[2] = 32-byte class
-	// freeHeads[3] = 64-byte class
-	//
+	// freeHeads[0]  = dedicated 72-byte HamtNode class
+	// freeHeads[1]  = 16-byte class
+	// freeHeads[2]  = 32-byte class
+	// freeHeads[3]  = 64-byte class
+	// ...
 	// freeHeads[16] = 524288-byte class
 	freeHeads [numSizeClasses]slabFreeHead
-	// nodeFreelist is the sharded class-0 (72-byte HamtNode) Treiber free-list.
-	// It REPLACES freeHeads[0] as the hot HamtNode allocation surface (Phase
-	// 2.5a.1): freeHeads[0] is kept only to preserve the [numSizeClasses]
-	// cartesian layout shared with the variable-size classes 1..16, which
-	// are left byte-identical. Every AllocNode/pushFreeNode now routes
-	// through nodeFreelist[routeNodeFreelistShard()] — a per-shard
-	// cache-line-padded head, byte-faithful to crdt.go's shards []shardRoot.
+	// nodeFreelist is the allocation and reclamation surface for HamtNode.
+	// AllocNode and pushFreeNode choose a padded shard head once per call.
 	nodeFreelist hamtNodeFreelistShards
-	// nodeFreelistRoutePop is the per-call routing counter for the POP side
-	// (AllocNode). Each AllocNode call advances it by 1 ONCE — OUTSIDE the
-	// CAS retry loop (mandate) — and masks with
-	// (arenaNodeFreelistShardCount-1) to pick a shard. Routed per-call (not
-	// per-CAS-retry) so the counter increment never enters the hot CAS frame
-	// Tier-2's <=43% CAS gate polices. CacheLinePad-isolated from the other
-	// atomics so the routing counter's own writes do not false-share with
-	// bumpOffset or a shard head.
+	// nodeFreelistRoutePop selects an allocation shard. Advancing once per
+	// call keeps the routing write outside the CAS retry loop.
 	_                    CacheLinePad
 	nodeFreelistRoutePop atomic.Uint64
 	_                    CacheLinePad
-	// nodeFreelistRoutePush is the per-call routing counter for the PUSH side
-	// (pushFreeNode, invoked from EBR RetireBlock processing). A SEPARATE
-	// counter from the pop counter: push and pop may execute on different
-	// goroutines (the popper is the allocating worker; the pusher is the EBR
-	// epoch-advance reclaimer), so a shared counter would itself become a hot
-	// stripe between the two paths. The push/pop asymmetry is SAFE because
-	// every nodeFreelist shard services the same 72-byte class-0 HamtNode (a
-	// pop from shard A and a push to shard B is benign); EBR's global epoch
-	// retains the ABA guarantee.
+	// nodeFreelistRoutePush is independent of the pop counter because EBR
+	// reclamation and allocation can run on different goroutines. All shards
+	// hold the same node size, so their push and pop routes need not agree.
 	_                     CacheLinePad
 	nodeFreelistRoutePush atomic.Uint64
 	_                     CacheLinePad
-	// varFreelist is the sharded variable-size Treiber free-list (Phase
-	// 2.5d). It REPLACES the per-class freeHeads[classIdx] (classIdx 1..16)
-	// hot path with a 256-way sharded Treiber head array, mirroring the
-	// 2.5a.1 nodeFreelist pattern. freeHeads[classIdx] is kept as the per-
-	// class cold-path FALLBACK (two-tier pop/push): try shard first, fall
-	// back to freeHeads[classIdx] when the routed shard is empty (pop) or
-	// use it as the fallback push target when the routed shard push is
-	// cold-path. Each entry is its own CacheLinePad-wrapped slabFreeHead,
-	// byte-identical offset-Treiber shape to nodeFreelist shards.
+	// varFreelist holds sharded lists for variable-size classes. allocVar
+	// sweeps these shards and freeVar pushes to one of them; the parallel
+	// freeHeads entries are retained only for the common class layout.
 	varFreelist varFreelistShards
-	// varFreelistRoutePop is the per-call routing counter for the POP side
-	// (allocVar). Advanced by 1 ONCE per call — OUTSIDE the CAS retry loop
-	// (mandate). CacheLinePad-isolated so the routing counter's writes
-	// do not false-share with the shard heads or bumpOffset. The pop is
-	// routed per-call (NOT per-CAS-retry) so the increment can never land in
-	// the hot CAS frame.
+	// varFreelistRoutePop selects the first allocation shard once per call.
 	_                   CacheLinePad
 	varFreelistRoutePop atomic.Uint64
 	_                   CacheLinePad
-	// varFreelistRoutePush is the asymmetric twin of the pop router for the
-	// PUSH side (freeVar, invoked from EBR RetireBlock processing — variable
-	// blocks are reclaimed by the epoch-advance reclaimer goroutine, NOT
-	// the allocating worker). A SEPARATE counter from the pop counter keeps
-	// the two routing streams independent — the same 2.5a.1 push/pop
-	// asymmetry discipline. The asymmetry is SAFE: every varFreelist shard
-	// services the SAME size class (blockSizeForClass), so a pop from shard
-	// A and a push to shard B is benign; EBR's global epoch retains the ABA
-	// guarantee across the sharding.
+	// varFreelistRoutePush is separate because EBR reclamation need not run on
+	// the allocating goroutine. All shards within a class hold equal-sized
+	// blocks, so independent push and pop routes are valid.
 	_                    CacheLinePad
 	varFreelistRoutePush atomic.Uint64
 	_                    CacheLinePad
@@ -244,13 +155,9 @@ type HamtArena struct {
 	size       uintptr
 	// ebr manages safe epoch-based deferred reclamation of offsets.
 	ebr *EBRManager
-	// freed makes Free idempotent. Cold tail field — never
-	// touched on any hot path (only Free reads it), so it costs no hot cache
-	// line. The guard exists so a test-engine Close registered BOTH by the
-	// test and by the newTestEngine constructor cleanup is a no-op the second
-	// time instead of a Munmap on a possibly-REUSED address range (a later
-	// engine in the same test binary may have mmap'd the freed span — an
-	// unguarded double-Free would unmap THAT engine's live arena).
+	// freed makes Free idempotent. Without it, a second call could unmap an
+	// address range that the operating system has since assigned to another
+	// arena. Only Free accesses this field.
 	freed atomic.Bool
 }
 
@@ -272,22 +179,14 @@ func NewHamtArena(size uintptr, ebr *EBRManager) (*HamtArena, error) {
 	for i := range arena.freeHeads {
 		arena.freeHeads[i].head.Store(NullOffset64)
 	}
-	// initialize the sharded class-0 HamtNode freelist (mirrors the
-	// freeHeads init above). Every class-0 shard head starts empty; the
-	// routing counters default to 0 (atomic.Uint64 zero value) so the first
-	// AllocNode routes to shard 0 and the first pushFreeNode to shard 0 —
-	// Stripe 0 is no busier than any other under steady state because each
-	// call bumps the counter by 1 before masking.
+	// Every node shard starts empty. The zero-valued routing counters select
+	// shard 0 for the first allocation and reclamation, then advance on each
+	// subsequent call.
 	for i := range arena.nodeFreelist {
 		arena.nodeFreelist[i].head.Store(NullOffset64)
 	}
-	// (2.5d): initialize the sharded variable-size freelist. Each of
-	// numVarClasses (=16) classes owns an [arenaVarFreelistShardCount]slabFreeHead
-	// shard array; every shard head starts empty (NullOffset64). The route
-	// counters default to 0 (atomic.Uint64 zero value) so the first allocVar
-	// routes to shard 0 and the first freeVar to shard 0 — stripe 0 is no
-	// busier than any other under steady state because each call bumps the
-	// counter by 1 before masking.
+	// Initialize every variable-class shard to the empty sentinel. Its routing
+	// counters start at zero and advance once per call.
 	for c := range arena.varFreelist {
 		for s := range arena.varFreelist[c] {
 			arena.varFreelist[c][s].head.Store(NullOffset64)
@@ -299,27 +198,18 @@ func NewHamtArena(size uintptr, ebr *EBRManager) (*HamtArena, error) {
 	return arena, nil
 }
 
-// Base returns the raw mmap base address of the off-heap arena.
-//
-// RESIDENCY §2 chaos-probe seam: the decoupled Worker crash-probe (internal/chaos)
-// needs read-only access to the arena's base/size so it can construct a guaranteed-
-// faulting dereference entirely within off-heap C-space — the unrecoverable SIGSEGV
-// the Supervisor must observe and recover from via the WAL. This accessor is the
-// minimum surface that makes that possible without exporting NodePtr arithmetic or
-// the whole free-list internals. It is read-only and off the hot path, so the
-// Zero-GC invariants proven by are hermetically untouched.
+// Base returns the mmap base address. Crash tests in internal/chaos use it
+// with Size to construct a faulting off-heap dereference without exposing the
+// allocator's free-list internals. The accessor does not allocate.
 func (a *HamtArena) Base() uintptr { return a.base }
 
 // Size returns the total mapped byte size of the off-heap arena.
 func (a *HamtArena) Size() uintptr { return a.size }
 
-// HighWater returns the arena's bump-allocation high-water mark in bytes.
-// Monotonic non-decreasing (the freelist reuses freed offsets but never lowers
-// the mark), so it is the machine-observable signal for "this path allocated
-// arena": a checkpoint or root-compute path that leaves HighWater unmoved
-// provably built no merged view (the merkle_sharded.go no-merged-view
-// invariant, carried to the checkpoint path by ADR-0045). Read-only,
-// one atomic load, off the hot path.
+// HighWater returns the bump allocator's byte offset. Free-list reuse never
+// lowers it, so an unchanged value proves that a checkpoint or root-compute
+// path allocated no new arena memory for a merged view (ADR-0045 §7). The
+// accessor performs one atomic load.
 func (a *HamtArena) HighWater() uint64 { return a.bumpOffset.Load() }
 
 // ---------------------------------------------------------------------------
@@ -334,12 +224,14 @@ func (a *HamtArena) HighWater() uint64 { return a.bumpOffset.Load() }
 //
 // Class mapping (totalSize = payload + 8-byte header):
 //
-//	class 1 → 16 bytes (payload ≤ 8)
-//	class 2 → 32 bytes (payload ≤ 24)
-//	class 3 → 64 bytes (payload ≤ 56)
+//	class 1 → 16 bytes  (payload ≤ 8)
+//	class 2 → 32 bytes  (payload ≤ 24)
+//	class 3 → 64 bytes  (payload ≤ 56)
 //	class 4 → 128 bytes (payload ≤ 120)
+//	...
 //
-// CRITICAL: size == 0 is explicitly handled to prevent underflow panic.
+// A zero payload returns class 0 and size 0 so the caller can avoid an
+// allocation and the power-of-two calculation cannot underflow.
 func varSizeClassIndex(payloadSize uintptr) (classIdx int, blockSize uintptr) {
 	if payloadSize == 0 {
 		return 0, 0 // Caller should handle: no allocation needed
@@ -374,7 +266,7 @@ func blockSizeForClass(classIdx int) uintptr {
 	if classIdx == 0 {
 		return uintptr(nodeSize) // 72 bytes
 	}
-	// Class 1 = 16, class 2 = 32, class 3 = 64,...
+	// Class 1 = 16, class 2 = 32, class 3 = 64, ...
 	return uintptr(1) << uint(classIdx+3)
 }
 
@@ -382,28 +274,11 @@ func blockSizeForClass(classIdx int) uintptr {
 // HamtNode Allocation (Class 0 — Dedicated 72-byte slab)
 // ---------------------------------------------------------------------------
 
-// AllocNode provisions a new HamtNode, preferring recycled memory from the
-// lock-free Treiber free-list (class 0) before falling back to the bump allocator.
-//
-// routeNodeFreelistShard picks the class-0 HamtNode freelist shard this
-// AllocNode call should POP from. It is the byte-faithful sibling of the engine's
-// routeShard (crdt.go): instead of maphash(entityID) & (N-1), it routes by a per-
-// call atomic counter advanced by 1 OUTSIDE the CAS retry loop and masked by
-// (arenaNodeFreelistShardCount-1) — a clean power-of-two bitmask route with no
-// modulo. Routed per-CALL (not per-CAS-retry) so the counter increment can never
-// land in the hot CAS frame Tier-2's <=43% CAS gate polices; the CAS loop body is
-// byte-identical in shape to the pre-change loop, just over a per-shard head instead
-// of freeHeads[0].head.
-//
-// Per-goroutine vs per-counter: the standard proc-pin would tie a goroutine to
-// one shard, but Go exposes no proc-pin; an atomic counter masked by &(N-1) is
-// the textbook race-free shape (mimalloc's sharded-free-list, jemalloc's per-
-// arena-bucket use the same idea). It spreads concurrent AllocNode callers
-// uniformly across the N shards (the Arena counter advances by 1 per call, so
-// back-to-back allocations from the same goroutine land on consecutive shards —
-// strictly better than pinning to one). The counter lives in HamtArena,
-// CacheLinePad-isolated from the shard heads and bumpOffset so its own writes do
-// not false-share.
+// routeNodeFreelistShard selects the shard used for an entire AllocNode call.
+// A per-call counter distributes allocations across shards without relying on
+// goroutine pinning. The counter advances outside the CAS retry loop, and a
+// power-of-two mask normally replaces integer modulo. Padding isolates this
+// write from shard heads and bumpOffset.
 func (a *HamtArena) routeNodeFreelistShard() int {
 	// arenaNodeFreelistShardCount is a power of two, so & (N-1) is a clean
 	// bitmask with no modulo; the defensive power-of-two branch mirrors
@@ -416,23 +291,11 @@ func (a *HamtArena) routeNodeFreelistShard() int {
 	return int((idx - 1) % uint64(n))
 }
 
-// routeNodeFreelistShardPush picks the class-0 HamtNode freelist shard this
-// pushFreeNode call should PUSH to. It is the asymmetric twin of the pop router:
-// pushFreeNode is invoked from EBR RetireBlock processing (the epoch-advance
-// reclaimer goroutine), NOT from the allocating worker, so the pop and push paths
-// are run by DIFFERENT goroutine populations and would contend on a SHARED
-// routing counter. A SEPARATE push counter keeps the two routing streams
-// independent — documenting both counter sites honestly (/), not
-// straw-manning "single counter is fine".
-//
-// The push/pop asymmetry is SAFE: every nodeFreelist shard services the SAME
-// 72-byte class-0 HamtNode, so a pop from shard A and a push to shard B is
-// benign (both are class-0 72-byte slots). EBR's global epoch holds ABA across
-// the sharding: a recycled node cannot be re-popped concurrently because EBR
-// retains the block until the global epoch proves zero readers (the existing
-// line-228 comment's invariant holds PER SHARD now). The engine's existing
-// per-CAS EBR participant.Enter/Exit is unchanged; only the freelist head each
-// pop/push touches is now one of N=256 instead of one.
+// routeNodeFreelistShardPush selects the shard used for an entire pushFreeNode
+// call. EBR reclamation and allocation may run on different goroutines, so they
+// use separate counters and avoid contending on a shared routing word. Every
+// shard holds the same node size, and EBR protects readers across all shards;
+// independent push and pop routes therefore preserve the reclamation contract.
 func (a *HamtArena) routeNodeFreelistShardPush() int {
 	n := arenaNodeFreelistShardCount
 	idx := a.nodeFreelistRoutePush.Add(1)
@@ -442,14 +305,24 @@ func (a *HamtArena) routeNodeFreelistShardPush() int {
 	return int((idx - 1) % uint64(n))
 }
 
-// routeVarFreelistShardPop picks the variable-size freelist shard this
-// allocVar call should POP from. It is the byte-faithful sibling of
-// routeNodeFreelistShard, routed per-CALL (NOT per-CAS-retry) so the counter
-// increment can never land in the hot CAS frame Tier-2's <=43% CAS gate polices.
-// The CAS loop body is byte-identical in shape to the pre-change allocVar loop,
-// just over a per-shard composite head instead of freeHeads[classIdx].head.
-// Masked by (arenaVarFreelistShardCount-1) — a clean power-of-two bitmask.
+// routeVarFreelistShardPop selects the first shard probed by allocVar. It uses
+// the same per-call routing discipline as node allocation.
+//
+// The fault switches exercise the variable free-list regression tests.
+// varFreelistABAYieldFault routes both directions to shard 0 and yields around
+// header reads to widen the race window. untaggedVarFreelistFault selects the
+// legacy untagged representation and non-atomic header write so the tests can
+// demonstrate the corruption that tagged heads and atomic headers prevent.
+// Both default to false.
+var (
+	varFreelistABAYieldFault atomic.Bool
+	untaggedVarFreelistFault atomic.Bool
+)
+
 func (a *HamtArena) routeVarFreelistShardPop() int {
+	if varFreelistABAYieldFault.Load() {
+		return 0
+	}
 	n := arenaVarFreelistShardCount
 	idx := a.varFreelistRoutePop.Add(1)
 	if n&(n-1) == 0 {
@@ -458,16 +331,14 @@ func (a *HamtArena) routeVarFreelistShardPop() int {
 	return int((idx - 1) % uint64(n))
 }
 
-// routeVarFreelistShardPush picks the variable-size freelist shard this
-// freeVar call should PUSH to. It is the asymmetric twin of the pop router:
-// freeVar is invoked from EBR RetireBlock processing (the epoch-advance
-// reclaimer goroutine), NOT from the allocating worker. A SEPARATE push
-// counter keeps the two routing streams independent — the same 2.5a.1
-// push/pop asymmetry discipline. The asymmetry is SAFE: every varFreelist
-// shard for a given classIdx services the SAME blockSizeForClass(classIdx)
-// slot, so a pop from shard A and a push to shard B is benign; EBR's global
-// epoch retains the ABA guarantee across the sharding.
+// routeVarFreelistShardPush selects the shard used for an entire freeVar
+// call. Push and pop counters are independent because reclamation and
+// allocation may run on different goroutines. Blocks in every shard of a class
+// have the same size, so independent routes do not violate type or EBR safety.
 func (a *HamtArena) routeVarFreelistShardPush() int {
+	if varFreelistABAYieldFault.Load() {
+		return 0
+	}
 	n := arenaVarFreelistShardCount
 	idx := a.varFreelistRoutePush.Add(1)
 	if n&(n-1) == 0 {
@@ -476,21 +347,17 @@ func (a *HamtArena) routeVarFreelistShardPush() int {
 	return int((idx - 1) % uint64(n))
 }
 
-// MANDATE 1 FIX: The goroutine is pinned to the current EBR epoch during
-// the Treiber pop CAS loop. This mathematically prevents any concurrent
-// RetireBlock physically recycling 'head' back onto the stack
-// during this loop, eliminating ABA without generation counters.
+// AllocNode recycles a node from one sharded Treiber list when possible and
+// otherwise uses the bump allocator. It holds an EBR participant across the
+// pop, preventing a concurrent RetireBlock from returning the observed head to
+// any list and causing ABA while the CAS is in progress.
 func (a *HamtArena) AllocNode() NodePtr {
 	// Pin to EBR epoch — prevents ABA during Treiber pop
 	participant := a.ebr.Acquire()
 	participant.Enter(a.ebr)
 
-	// route this AllocNode to ONE class-0 freelist shard for the WHOLE call.
-	// Computed ONCE, OUTSIDE the CAS retry loop — the loop's Load and CAS read
-	// and write the SAME shard's head throughout (EBR ABA safety is per-shard
-	// now). The routing-counter increment is on the cold path (once per call);
-	// the CAS loop body is byte-identical in shape to the pre-change loop, just over
-	// a composite-shard head instead of freeHeads[0].head.
+	// Select one shard for the whole call so every retry observes the same
+	// head. EBR protection covers all shards.
 	shardIdx := a.routeNodeFreelistShard()
 	shard := &a.nodeFreelist[shardIdx]
 
@@ -503,17 +370,14 @@ func (a *HamtArena) AllocNode() NodePtr {
 			break
 		}
 
-		// Read the 64-bit next-pointer stored in the dead node's memory.
-		// SAFETY: head points into mmap'd C-space; the GC cannot move it.
-		// EBR epoch pin guarantees this memory cannot be recycled during read.
+		// The next link occupies the dead node's first word. The mmap
+		// address cannot move, and the EBR pin prevents reuse during this
+		// read and the CAS below.
 		nextPtr := (*uint64)(unsafe.Pointer(a.base + uintptr(head)))
 		nextOffset := atomic.LoadUint64(nextPtr)
 
-		// Pure 64-bit CAS — no generation counter needed.
-		// EBR guarantees ABA safety: no concurrent pushFree() can recycle
-		// 'head' while we hold an active epoch pin. (Invariant holds PER
-		// SHARD now: the shard head replaces freeHeads[0].head but the EBR
-		// global epoch is shared across all 256 freelist shards.)
+		// No generation is needed in a node-list head: EBR prevents the
+		// observed node from being recycled while this participant is active.
 		if shard.head.CompareAndSwap(head, nextOffset) {
 			// Successfully popped — initialize the recycled node
 			ptr := NodePtr(a.base + uintptr(head))
@@ -563,36 +427,16 @@ func (a *HamtArena) bumpAllocateNode() NodePtr {
 // ADR 9: Variable-Size Allocation (Classes 1-16)
 // ---------------------------------------------------------------------------
 
-// allocVar allocates a variable-sized block from the segregated slab allocator.
-// The block is prepended with an 8-byte header storing the size class index
-// for O(1) free routing. Returns a pointer to the PAYLOAD (past the header).
+// allocVar allocates a variable-sized block and returns the payload address
+// after its 8-byte class header. It probes arenaVarFreelistSweep shards under
+// one EBR pin, starting at routeVarFreelistShardPop, before falling back to
+// the bump allocator.
 //
-// sharded pop with bounded shard sweep. The hot path routes
-// ONE shard via routeVarFreelistShardPop() OUTSIDE the CAS retry loop and races
-// the CAS over the per-shard head `a.varFreelist[classIdx-1][shardIdx].head`.
-// If the routed shard is empty, the pop SWEEPS the NEXT arenaVarFreelistSweep
-// shards for this class — bounded 8-shard probe — before falling through to the
-// bump allocator. The sweep is the load-bearing correctness fix: a freelist
-// push (freeVar) routes on a SEPARATE counter from pop, so over time pop and
-// push visits to a given shard drift in counter-phase. Without the sweep, a
-// pop landing on an empty routed shard would bump even when other shards for
-// the same class are stacked (40-100 blocks pushed but pop visited a different
-// shard) — a steady-state arena-bump leak (S1 measured 1.4 GB / 20K ops = 70
-// KB/op leak pre-sweep). The bounded sweep covers the per-shard lag window:
-// if ANY of {pop_routed_shard + next 7 shards} for this class is non-empty, the
-// pop succeeds from there; the bump fallback fires only when an 8-shard
-// neighborhood is empty (extremely rare at steady state — 8 × 4.7 ≈ 37 blocks
-// would need to be simultaneously drained). The CAS-loop body is byte-identical
-// in shape to the pre-change loop, just over a per-shard head; EBR's global epoch
-// holds ABA across the sharding.
-//
-// Flow: route shard -> try shard pop -> if empty, sweep next 7 shards -> if all
-// 8 empty, fall through to bump allocator. The cold-path freeHeads[classIdx]
-// two-tier fallback (mirroring 2.5a.1's freeHeads[0]→nodeFreelist[i] contract)
-// is omitted here because freeVar never pushes to freeHeads (its hot path is
-// the shard); freeHeads[classIdx] is retained only to preserve the
-// [numSizeClasses]slabFreeHead cartesian layout shared with the const
-// declarations and the init loop.
+// The sweep matters because freeVar uses an independent routing counter: the
+// first shard can be empty while nearby shards hold reusable blocks. Probing
+// only one shard would advance bumpOffset even with sufficient recycled
+// memory. freeHeads is not a second allocation source because freeVar never
+// pushes there; it remains only for the common size-class layout.
 func (a *HamtArena) allocVar(payloadSize uintptr) uintptr {
 	if payloadSize == 0 {
 		return 0
@@ -603,19 +447,15 @@ func (a *HamtArena) allocVar(payloadSize uintptr) uintptr {
 		return 0 // Should not happen — payloadSize > 0 guaranteed
 	}
 
-	// route this allocVar to ONE var freelist shard for the WHOLE call.
-	// Computed ONCE, OUTSIDE the CAS retry loop — the loop's Load and CAS read
-	// and write the SAME shard's head throughout (EBR ABA safety is per-shard
-	// now). The routing-counter increment is on the cold path (once per call);
-	// the CAS loop body is byte-identical in shape to the pre-change loop, just over
-	// a per-shard head instead of freeHeads[classIdx].head.
+	// Select the starting shard once. Each CAS retry stays on its current
+	// shard, and the bounded sweep determines where to probe next.
 	shardIdxStart := a.routeVarFreelistShardPop()
 	shards := &a.varFreelist[classIdx-1]
 
 	// 1. Try to pop from the routed shard, then sweep the next
-	// arenaVarFreelistSweep-1 shards (bounded probe). EBR Acquire/Enter is
-	// taken before the sweep so the goroutine is pinned across all probes
-	// (one EBR pin per allocVar call, regardless of which probe succeeds).
+	//    arenaVarFreelistSweep-1 shards (bounded probe). EBR Acquire/Enter is
+	//    taken before the sweep so the goroutine is pinned across all probes
+	//    (one EBR pin per allocVar call, regardless of which probe succeeds).
 	participant := a.ebr.Acquire()
 	participant.Enter(a.ebr)
 
@@ -623,24 +463,76 @@ func (a *HamtArena) allocVar(payloadSize uintptr) uintptr {
 		shardIdx := (shardIdxStart + probe) & (arenaVarFreelistShardCount - 1)
 		shard := &shards[shardIdx]
 
+		if untaggedVarFreelistFault.Load() {
+			for {
+				head := shard.head.Load()
+				if head == NullOffset64 {
+					break
+				}
+				if head < uint64(nodeSize) || (head&7) != 0 || head+uint64(blockSize) > a.bumpOffset.Load() {
+					// The untagged fault can leave an invalid byte offset in
+					// shard.head. Return its payload address instead of performing
+					// an unaligned ARM64 atomic load, so the regression test can
+					// report the invalid allocation rather than crash with SIGBUS.
+					_ = shard.head.CompareAndSwap(head, NullOffset64)
+					participant.Exit()
+					a.ebr.Release(participant)
+					return a.base + uintptr(head) + varAllocHeaderSize
+				}
+				nextPtr := (*uint64)(unsafe.Pointer(a.base + uintptr(head)))
+				if varFreelistABAYieldFault.Load() {
+					runtime.Gosched()
+				}
+				nextOffset := atomic.LoadUint64(nextPtr)
+				if varFreelistABAYieldFault.Load() {
+					runtime.Gosched()
+				}
+				if shard.head.CompareAndSwap(head, nextOffset) {
+					participant.Exit()
+					a.ebr.Release(participant)
+
+					blockPtr := a.base + uintptr(head)
+					*(*uint64)(unsafe.Pointer(blockPtr)) = uint64(classIdx)
+					payload := blockPtr + varAllocHeaderSize
+					clearMem(payload, payloadSize)
+					return payload
+				}
+			}
+			continue
+		}
+
 		for {
 			head := shard.head.Load()
-			if head == NullOffset64 {
+			wordOffset := head & 0xFFFFFFFF
+			if wordOffset == 0 {
 				// Routed shard (or current probe shard) is empty — break out
 				// of the inner CAS retry loop and try the next probe shard.
 				break
 			}
-
-			nextPtr := (*uint64)(unsafe.Pointer(a.base + uintptr(head)))
-			nextOffset := atomic.LoadUint64(nextPtr)
-
-			if shard.head.CompareAndSwap(head, nextOffset) {
+			blockOffset := wordOffset << 3
+			if blockOffset < uint64(nodeSize) || blockOffset+uint64(blockSize) > a.bumpOffset.Load() || (blockOffset&7) != 0 {
+				break
+			}
+			blockPtr := a.base + uintptr(blockOffset)
+			hdrPtr := (*uint64)(unsafe.Pointer(blockPtr))
+			if varFreelistABAYieldFault.Load() {
+				runtime.Gosched()
+			}
+			hdr := atomic.LoadUint64(hdrPtr)
+			if int(hdr&0xFF) != classIdx {
+				break
+			}
+			nextWordOffset := (hdr >> 8) & 0xFFFFFFFF
+			if varFreelistABAYieldFault.Load() {
+				runtime.Gosched()
+			}
+			newHead := ((head + (1 << 32)) & 0xFFFFFFFF00000000) | nextWordOffset
+			if shard.head.CompareAndSwap(head, newHead) {
 				participant.Exit()
 				a.ebr.Release(participant)
 
-				blockPtr := a.base + uintptr(head)
-				// Write size class header
-				*(*uint64)(unsafe.Pointer(blockPtr)) = uint64(classIdx)
+				// Write size class header atomically (nextWordOffset = 0)
+				atomic.StoreUint64(hdrPtr, uint64(classIdx))
 				// Zero the payload region
 				payload := blockPtr + varAllocHeaderSize
 				clearMem(payload, payloadSize)
@@ -661,53 +553,66 @@ func (a *HamtArena) allocVar(payloadSize uintptr) uintptr {
 	}
 
 	blockPtr := a.base + uintptr(startOffset)
-	// Write size class header
-	*(*uint64)(unsafe.Pointer(blockPtr)) = uint64(classIdx)
+	// Write size class header atomically (nextWordOffset = 0, low 8 bits = classIdx)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(blockPtr)), uint64(classIdx))
 	// Return pointer past the header
 	return blockPtr + varAllocHeaderSize
 }
 
 // freeVar pushes a variable-sized block back onto its slab free-list.
-// CRITICAL: This MUST ONLY be called by the EBR manager on safe epoch processing.
 //
-// The payload pointer is adjusted backward by 8 bytes to reach the block
-// header, which contains the size class index for O(1) routing.
-//
-// two-tier sharded push. The hot path routes ONE shard via
-// routeVarFreelistShardPush() OUTSIDE the CAS retry loop and races the CAS over
-// the per-shard head `a.varFreelist[classIdx-1][shardIdx].head`. The CAS-loop
-// body is byte-identical in shape to the pre-change freeVar loop, just over a
-// per-shard head. The asymmetry (pop and push route on DIFFERENT counters) is
-// SAFE: every varFreelist shard for a given classIdx services the SAME
-// blockSizeForClass(classIdx) slot.
+// The list is a tagged Treiber stack. shard.head packs a 32-bit generation tag
+// (upper half) with the block's word offset, blockOffset >> 3 (lower half), and
+// every push increments the tag, so a compare-and-swap cannot succeed against a
+// head that was popped and pushed again in between (the ABA problem). The
+// block's 8-byte header stores (nextWordOffset << 8) | classIdx in one atomic
+// word, so a concurrent push cannot tear it. Both the EBR-deferred path
+// (freeVar) and the direct paths (pushFreeVar, ReleaseLocal) rely on this.
 func (a *HamtArena) freeVar(payloadPtr uintptr) {
 	if payloadPtr == 0 {
 		return
 	}
 
 	blockPtr := payloadPtr - varAllocHeaderSize
-	classIdx := int(*(*uint64)(unsafe.Pointer(blockPtr)))
+	if untaggedVarFreelistFault.Load() {
+		classIdx := int(*(*uint64)(unsafe.Pointer(blockPtr)))
+		if classIdx < 1 || classIdx >= numSizeClasses {
+			return
+		}
+		offset := uint64(blockPtr - a.base)
+		offsetPtr := (*uint64)(unsafe.Pointer(blockPtr))
+		shardIdx := a.routeVarFreelistShardPush()
+		shard := &a.varFreelist[classIdx-1][shardIdx]
+		for {
+			head := shard.head.Load()
+			atomic.StoreUint64(offsetPtr, head)
+			if shard.head.CompareAndSwap(head, offset) {
+				return
+			}
+		}
+	}
+
+	hdrPtr := (*uint64)(unsafe.Pointer(blockPtr))
+	classIdx := int(atomic.LoadUint64(hdrPtr) & 0xFF)
 
 	if classIdx < 1 || classIdx >= numSizeClasses {
 		return // Corrupt or invalid — silently skip
 	}
 
 	offset := uint64(blockPtr - a.base)
-	offsetPtr := (*uint64)(unsafe.Pointer(blockPtr))
+	wordOffset := (offset >> 3) & 0xFFFFFFFF
 
-	// route this freeVar push to ONE var freelist shard for the WHOLE
-	// call. Computed ONCE, OUTSIDE the CAS retry loop. The push routes on the
-	// SEPARATE push counter (varFreelistRoutePush) — the 2.5a.1 push/pop
-	// asymmetry discipline (the popper is the allocating worker; the pusher is
-	// the EBR epoch-advance reclaimer).
+	// Select one shard for the whole push, outside the CAS retry loop.
 	shardIdx := a.routeVarFreelistShardPush()
 	shard := &a.varFreelist[classIdx-1][shardIdx]
 
 	// 1. Try to push onto the routed shard (hot path)
 	for {
 		head := shard.head.Load()
-		atomic.StoreUint64(offsetPtr, head)
-		if shard.head.CompareAndSwap(head, offset) {
+		headWordOffset := head & 0xFFFFFFFF
+		atomic.StoreUint64(hdrPtr, (headWordOffset<<8)|uint64(classIdx))
+		newHead := ((head + (1 << 32)) & 0xFFFFFFFF00000000) | wordOffset
+		if shard.head.CompareAndSwap(head, newHead) {
 			return
 		}
 	}
@@ -772,47 +677,18 @@ func (a *HamtArena) allocCRDTEntries(entries []CRDTEntry) (NodePtr, uint32) {
 	return NodePtr(ptr), uint32(len(entries))
 }
 
-// ---------------------------------------------------------------------------
-// MANDATE (Zero-GC Microscope): Off-heap HAMT wrapper allocation
-// ---------------------------------------------------------------------------
-
-// hamtWrapperSize is the on-arena footprint of a HAMT struct (root NodePtr +
-// arena *HamtArena + seed maphash.Seed + count int). It is computed at
-// compile time so the size-class lookup is branchless.
+// hamtWrapperSize is the arena footprint of a HAMT wrapper, including its
+// root, arena pointer, hash seed and count.
 const hamtWrapperSize = unsafe.Sizeof(HAMT{})
 
-// allocHAMTWrapper provisions a HAMT struct in the mmap'd segregated slab
-// allocator (class computed from hamtWrapperSize). Returns a *HAMT whose
-// backing bytes are in mmap'd C-space — therefore invisible to the Go GC.
+// allocHAMTWrapper allocates a HAMT wrapper in the mmap arena. Its arena field
+// points back to a Go-heap object but is invisible to the GC, so the caller
+// must keep that HamtArena reachable for every wrapper's lifetime.
+// DeltaCRDTEngine.arena provides this root in the engine; tests hold the arena
+// directly. maphash.Seed contains no pointer payload and can reside off-heap.
 //
-// ZERO-GC MICROSCOPE FIX:
-//
-//	HAMT.Set previously allocated the result wrapper on the Go heap via
-//	`res:= &HAMT{...}`, which the compiler's escape analysis moved to the
-//	heap because the struct was returned as a pointer. Every hot-path Set
-//	thus paid one heap allocation, violating the strict Zero-GC mandate.
-//	Routing the wrapper through the same mmap'd arena that owns the HamtNode
-//	tree severs the last heap-allocation source on the Set path.
-//
-// SAFETY CONTRACT — GC-INVISIBLE POINTER FIELD:
-//
-//	The returned *HAMT's `arena` field stores a Go-heap pointer that the
-//	GC will NOT see, because the struct itself is in C-space. The caller
-//	MUST keep the owning HamtArena reachable from the Go heap for the
-//	lifetime of all wrappers it has produced. In the DeltaCRDTEngine this
-//	invariant is held by `DeltaCRDTEngine.arena` which directly roots the
-//	arena; tests likewise hold the arena reference before constructing a
-//	HAMT. A separate Go-heap root for the arena therefore exists for any
-//	off-heap wrapper that reads its own `arena` field.
-//
-//	The `seed maphash.Seed` field is an 8-byte opaque random value (no
-//	pointer payload), making it safe to store off-heap.
-//
-// LIFECYCLE:
-//
-//	The wrapper MUST be reclaimed via freeHAMTWrapper, which routes the
-//	block back through EBR RetireBlock. Direct pushFreeVar use would bypass
-//	EBR and risk ABA during physical recycling.
+// Wrappers must be released through freeHAMTWrapper so their memory is retired
+// through EBR rather than immediately reused.
 func (a *HamtArena) allocHAMTWrapper() *HAMT {
 	// allocVar pins the goroutine to the EBR epoch, attempts to pop a
 	// recycled block from the slab free-list, and falls back to the bump
@@ -824,23 +700,13 @@ func (a *HamtArena) allocHAMTWrapper() *HAMT {
 	return (*HAMT)(unsafe.Pointer(payload))
 }
 
-// freeHAMTWrapper defer-recycles the 32-byte (or class-block-aligned) HAMT
-// wrapper slot back to the segregated slab free-list, via the EBR Manager.
-//
-// MANDATE: This MUST NOT push directly to the Treiber stack; doing so would
-// race against concurrent AllocNode/allocVar CAS loops and reintroduce ABA.
-// RetireBlock defers physical reclamation until the global epoch has
-// advanced by 2, mathematically proving zero lingering readers.
-//
-// Caller invariants:
-// - ptr was produced by allocHAMTWrapper (this arena, this baseline).
-// - The wrapper's `root` subtree has ALREADY been DecRef'd recursively
-// (DecRef is the responsibility of the EBR Retire callback in
-// reclamation.go, which also invokes freeHAMTWrapper in sequence).
-// - The owning HamtArena is still reachable from the Go heap (so the
-// `arena` field is a valid pointer until this function returns).
-//
-// After this call the caller MUST NOT dereference ptr.
+// freeHAMTWrapper clears a wrapper and retires its arena block through EBR.
+// Directly pushing it to a free-list could recycle memory while readers from
+// earlier epochs still hold it. ptr must come from this arena's
+// allocHAMTWrapper, its root subtree must already have been released with
+// DecRef, and the owning arena must remain reachable until this call returns.
+// The reclamation callback in reclamation.go performs these steps in order.
+// The caller must not dereference ptr afterward.
 func (a *HamtArena) freeHAMTWrapper(ptr *HAMT) {
 	if ptr == nil {
 		return
@@ -932,18 +798,11 @@ func (a *HamtArena) IncRef(ptr NodePtr) {
 	node.refCount.Add(1)
 }
 
-// DecRef decrements the reference count of a node.
-// If the count reaches zero, the node's children are iteratively decremented
-// and ALL owned memory (children array, entries array, leaf strings, leaf
-// CRDT entries) is DEFERRED for reclamation via EBR RetireBlock.
-//
-// ADR 9 FIX: After the deep-copy fix in hamt.go, every node exclusively
-// owns its childrenPtr and entriesPtr arrays. We can unconditionally free
-// them when the node dies — no sharing hazard remains.
-//
-// MANDATE 1 FIX: Physical reclamation is encapsulated in an EBR callback.
-// The offset is pushed back to the Treiber stack ONLY when the global epoch
-// advances by 2, proving zero lingering readers.
+// DecRef decrements a node's reference count. At zero, it iteratively
+// decrements child nodes and retires the node's child array, entry array,
+// leaf keys and CRDT entries. Path copying gives each node exclusive ownership
+// of these arrays and leaf payloads, so all can be released. RetireBlock
+// defers their return to the free-lists until EBR has excluded earlier readers.
 func (a *HamtArena) DecRef(ptr NodePtr) {
 	var stackBuf [256]NodePtr
 	stack := stackBuf[:0]
@@ -1014,19 +873,12 @@ func (a *HamtArena) DecRef(ptr NodePtr) {
 	}
 }
 
-// pushFreeNode physically reclaims a HamtNode by pushing its offset onto
-// the class-0 lock-free Treiber stack. This is STRICTLY invoked by the
-// EBRManager when memory safety is mathematically proven via epoch advancement.
+// pushFreeNode returns a node to one class-0 Treiber list. EBR invokes it only
+// after epoch advancement has excluded earlier readers. The push counter is
+// independent of allocation routing because reclamation can run on another
+// goroutine; every shard holds the same node size.
 func (a *HamtArena) pushFreeNode(offset uint64) {
-	///route this push to ONE class-0 freelist shard for the WHOLE call.
-	// Computed ONCE, OUTSIDE the CAS retry loop. pushFreeNode is invoked from EBR
-	// RetireBlock processing (the epoch-advance reclaimer), NOT from the
-	// allocating worker goroutine, so the pop counter and push counter are
-	// SEPARATE (routeNodeFreelistShard vs routeNodeFreelistShardPush) — a shared
-	// counter would itself contended between the two goroutine populations. The
-	// push/pop asymmetry is SAFE: every nodeFreelist shard services the same
-	// 72-byte class-0 HamtNode, so a pop from shard A and a push to shard B is
-	// benign; EBR's global epoch retains the ABA guarantee across the sharding.
+	// Select the shard once, outside the CAS retry loop.
 	shardIdx := a.routeNodeFreelistShardPush()
 	shard := &a.nodeFreelist[shardIdx]
 	offsetPtr := (*uint64)(unsafe.Pointer(a.base + uintptr(offset)))
@@ -1041,18 +893,12 @@ func (a *HamtArena) pushFreeNode(offset uint64) {
 	}
 }
 
-// Free destroys the arena, returning memory to the OS.
-//
-// RESIDENCY (Chaos Layer): any page range locked via LockHotPages MUST be
-// munlocked before munmap. Several Linux kernels refuse to unmap a
-// still-locked region, and even where they tolerate it the residency
-// accounting leaks. UnlockAllPages is idempotent (munlock on an unlocked
-// page is a kernel no-op), so calling it unconditionally is correct
-// whether or not the arena was ever locked, and costs one syscall on free.
+// Free unlocks and unmaps the arena. UnlockAllPages is safe even if no pages
+// were locked and ensures LockHotPages does not leave residency accounting
+// behind. The freed CAS makes concurrent and repeated calls idempotent and
+// prevents two calls from unmapping the same address range.
 func (a *HamtArena) Free() error {
-	// idempotent — the second call is a no-op (see the freed
-	// field doc). The CAS, not a plain load-then-store: two concurrent Frees
-	// must not both Munmap.
+	// Only the caller that changes freed from false to true may unmap.
 	if !a.freed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -1063,18 +909,14 @@ func (a *HamtArena) Free() error {
 
 // --- Pointer conversion utilities ---
 
-// toPtr converts a NodePtr to unsafe.Pointer.
-//
-// SAFETY: This is safe ONLY because NodePtr values reference mmap'd C-space
-// memory that the Go GC never moves. Passing a Go-heap-derived NodePtr
-// would trigger memory corruption.
+// toPtr converts a NodePtr to unsafe.Pointer. NodePtr must refer to the mmap
+// arena: the Go GC cannot move that memory, whereas converting an arbitrary
+// Go-heap integer could produce an invalid pointer.
 func toPtr(p NodePtr) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(p))
 }
 
-// toUintptrPtr converts a raw uintptr to unsafe.Pointer.
-//
-// SAFETY: Same invariant as toPtr() — must reference mmap'd C-space memory.
+// toUintptrPtr applies the same arena-only pointer conversion to a uintptr.
 func toUintptrPtr(p uintptr) unsafe.Pointer {
 	return unsafe.Pointer(p)
 }

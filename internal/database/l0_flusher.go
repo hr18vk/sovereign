@@ -21,39 +21,27 @@ import (
 	"github.com/hr18vk/sovereign/internal/telemetry"
 )
 
-// MaxValidTimeEndNs is the int64-safe sentinel for an OPEN-ENDED valid-time
-// interval endpoint (ADR-0021 §2.1). It is 9e18 ns from epoch = year
-// ~2253, comfortably below math.MaxInt64 (~9.22e18).
+// MaxValidTimeEndNs is the int64-safe sentinel for an open-ended valid-time
+// interval endpoint (ADR-0021). It equals 9e18 ns from epoch (2255-03-14T16:00:00Z),
+// comfortably below math.MaxInt64 (~9.22e18).
 //
-// The prior `var MaxValidTime = time.Date(9999,12,31,...)` was conceptually an
-// open-ended end but `.UnixNano()` OVERFLOWS int64: year 9999 → ~633e9 seconds
-// → ~6.33e20 ns, which is NEGATIVE when truncated to int64 (the high bit is
-// set) — every call site that passed MaxValidTime.UnixNano() as ValidTimeEnd
-// sent a garbage NEGATIVE into the Arrow index (a half-open interval
-// [validStart, validEnd<0) is EMPTY for every positive validTime → the row is
-// silently invisible to AsOf's Filter3). The mesh's OpenEndedValidEndNs
-// (pkg/mesh/control.go:118) has ALWAYS used the concrete-const-9e18
-// pattern — this closes the WRITE-schema side to match the READ/mesh side.
-//
-// ZERO production callers of MaxValidTime.UnixNano() existed (every caller was
-// a _test.go); the var is DELETED. The WRITE path (FlushArenaToIPC) reads
-// validTimeEndNs from the packed value bytes directly (line 223), and the
-// production injectors now feed MaxValidTimeEndNs — the int64-in-range sentinel
-// — into the MemTable via InsertLocalEvents / control.go. No time.Time is
-// materialized on the open-ended path.
+// Storing time.Date(9999, 12, 31, ...).UnixNano() overflows int64 and wraps
+// negative, making [validStart, validEnd) empty for positive valid times.
+// Both the Arrow write path and the node control path use MaxValidTimeEndNs
+// directly without materializing a time.Time.
 const MaxValidTimeEndNs int64 = 9_000_000_000_000_000_000
 
 // ArrowSchema defines the tri-temporal event schema for L0 SSTables.
 var ArrowSchema = arrow.NewSchema(
 	[]arrow.Field{
-		{Name: "entity_id_hash", Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}}, // Override 8.4: 128-bit hash
+		{Name: "entity_id_hash", Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}}, // 128-bit SHA-256 prefix
 		{Name: "system_time", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
 		{Name: "valid_time_start", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
 		{Name: "valid_time_end", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
 		{Name: "assertion_time", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
 		{Name: "h3_index", Type: arrow.PrimitiveTypes.Uint64},
 		{Name: "payload_digest", Type: &arrow.FixedSizeBinaryType{ByteWidth: 32}},
-		{Name: "entity_id", Type: arrow.BinaryTypes.LargeBinary}, // Override 8.3: LargeBinary for UTF-8 safety
+		{Name: "entity_id", Type: arrow.BinaryTypes.LargeBinary}, // LargeBinary preserves raw entity ID bytes
 		{Name: "payload", Type: arrow.BinaryTypes.LargeBinary},
 	},
 	nil,
@@ -66,7 +54,7 @@ type S3Uploader interface {
 }
 
 // L0Flusher serializes a frozen SkipListArena directly into Arrow IPC format
-// and uploads to S3. Zero intermediate Go heap structs (Override O2.2).
+// and uploads to S3 without intermediate Go heap structs.
 type L0Flusher struct {
 	allocator *JemallocAllocator
 	uploader  S3Uploader
@@ -83,67 +71,67 @@ func NewL0Flusher(allocator *JemallocAllocator, uploader S3Uploader, bucket stri
 	}
 }
 
-// SetCompactor injects the EpochCompactor for ADR 7 tombstone pruning.
+// SetCompactor injects the EpochCompactor for epoch-based tombstone pruning.
 func (f *L0Flusher) SetCompactor(c *EpochCompactor) {
 	f.compactor = c
 }
 
 // L0Partition is one per-entity Arrow IPC blob produced by a flush.
 //
-// ADR-0018: every entity in a checkpoint's flush gets its OWN file
+// ADR-0018: every entity in a checkpoint's flush gets its own file
 //
 //	l0/{hex(EntityHash[:8])}/{FirstSysTimeNs}.arrow
 //
 // so AsOf's prefix-list (l0/{hex(sha256(queried)[:8])}/) can never miss. The
-// OLD single-blob path (one file for the whole list, keyed under the smallest-
-// hash entity) is DELETED — it co-located every entity of a checkpoint into
+// old single-blob path (one file for the whole list, keyed under the smallest-
+// hash entity) is deleted — it co-located every entity of a checkpoint into
 // one file, making every non-smallest entity a silent ErrEntityNotFound on
-// AsOf for data that IS on disk.
+// AsOf for data that is on disk.
 type L0Partition struct {
 	// EntityHash is key[:16] (the 128-bit sha256(entityID)). The per-entity
-	// file is keyed under hex(EntityHash[:8]) — the SAME 8-byte prefix AsOf
-	// computes (query.go:137) for the queried entity.
+	// file is keyed under hex(EntityHash[:8]) — the 8-byte prefix AsOf's
+	// EntityHash8 computes for the queried entity.
 	EntityHash [16]byte
 	// FirstSysTimeNs is the partition's smallest key[16:24] (BigEndian) — the
-	// {txTimeNs} segment of the filename. The SAME field the old UploadBuffer
+	// {txTimeNs} segment of the filename. The field the old UploadBuffer
 	// used, now per-partition (not per-blob).
 	FirstSysTimeNs int64
 	// Buf is the serialized Arrow IPC for this entity's rows. Owned by the
-	// caller of emit (flushed lazily across the upload retry loop), who MUST
+	// caller of emit (flushed lazily across the upload retry loop), which must
 	// Free() it before the next partition's buffer starts (streaming → O(1)
 	// live memory regardless of entity count).
 	Buf *JemallocBuffer
 }
 
-// FlushArenaToIPC serializes a frozen SkipListArena into ONE Arrow IPC blob PER
-// ENTITY (per-entity split-merge) and streams each through `emit` as
+// FlushArenaToIPC serializes a frozen SkipListArena into one Arrow IPC blob per
+// entity (per-entity split-merge) and streams each through `emit` as
 // soon as it is serialized. The SkipList is sorted by key[:16] (the 128-bit
-// sha256(entityID)); contiguous same-hash entries ARE one entity-partition,
-// so the split is a single pass with ZERO re-sort and ZERO re-read of the
+// sha256(entityID)); contiguous same-hash entries are one entity-partition,
+// so the split is a single pass with zero re-sort and zero re-read of the
 // frozen arena.
 //
-// STREAMING (O(1) memory): `emit` is invoked once per partition with that
+// Streaming (O(1) memory): `emit` is invoked once per partition with that
 // partition's L0Partition, and the partition's Arrow builder is released (and
-// its buffer MUST be freed by `emit` before returning) BEFORE the next
-// partition begins. Only ONE partition is live at a time regardless of the
+// its buffer must be freed by `emit` before returning) before the next
+// partition begins. Only one partition is live at a time regardless of the
 // per-checkpoint entity count — the OOM cliff of materializing 50K unique
 // entities' buffers simultaneously is closed. The async upload-retry concern
-// (Override 9.2 — retain a buffer across upload retries) is the caller's:
+// (retain a buffer across upload retries) is the caller's:
 // `emit` may hold the partition.Buf through its retry loop, then free it.
 //
-// A zero-row entity produces NO partition (no empty blobs). The degenerate
-// N=1 case yields exactly one emit — the existing single-entity guards stay green.
+// A zero-row entity produces no partition (no empty blobs). The degenerate
+// N=1 case yields exactly one emit — the existing single-entity tests stay green.
 //
-// Override O2.2: zero intermediate Go heap structs — reads raw off-heap
+// Zero intermediate Go heap structs — reads raw off-heap
 // SkipList bytes directly into Arrow builders.
-// Override O2.3: Arrow column buffers via JemallocAllocator.
-// Override O2.4: ipc.NewFileWriter serialization.
+// Arrow column buffers via JemallocAllocator.
+// ipc.NewFileWriter serialization.
 func (f *L0Flusher) FlushArenaToIPC(sl *SkipListArena, emit func(L0Partition) error) error {
 	if sl.Count() == 0 {
 		return nil
 	}
 
-	// ADR 7: prune sweep once per flush (the set is the same for every partition).
+	// Prune sweep once per flush (the set is the same for every partition).
 	var pruned map[string]struct{}
 	if f.compactor != nil {
 		pruned, _ = f.compactor.PruneTombstones()
@@ -151,7 +139,7 @@ func (f *L0Flusher) FlushArenaToIPC(sl *SkipListArena, emit func(L0Partition) er
 
 	allocator := f.allocator
 
-	// Per-partition builder — only ONE live at a time (streaming, O(1) memory).
+	// Per-partition builder — only one live at a time (streaming, O(1) memory).
 	var curBuilder *array.RecordBuilder
 	var curHash [16]byte
 	var curFirstSys int64
@@ -210,7 +198,7 @@ func (f *L0Flusher) FlushArenaToIPC(sl *SkipListArena, emit func(L0Partition) er
 		entityIDLen := int(binary.LittleEndian.Uint16(val[0:2]))
 		entityIDBytes := val[2 : 2+entityIDLen]
 
-		// ADR 7: tombstone pruning — skip the row if the entity is causally stable.
+		// Tombstone pruning — skip the row if the entity is causally stable.
 		if pruned != nil {
 			entityIDStr := unsafe.String(unsafe.SliceData(entityIDBytes), len(entityIDBytes))
 			if _, isPruned := pruned[entityIDStr]; isPruned {
@@ -268,17 +256,12 @@ func (f *L0Flusher) FlushArenaToIPC(sl *SkipListArena, emit func(L0Partition) er
 }
 
 // FlushFromArena serializes a frozen SkipListArena to per-entity Arrow IPC
-// blobs and uploads EACH as it is serialized — O(1) live memory regardless of
-// entity count (per-entity streaming). SYNCHRONOUS path (Close/Flush): each
-// partition is uploaded (no retry) inside the emit callback and its buffer
-// freed before the next partition starts.
+// blobs and uploads each as it is serialized so live memory stays O(1)
+// regardless of entity count. The synchronous path uploads each partition once
+// inside the emit callback and frees its buffer before the next partition starts;
+// the async path (swapAndFlushAsync) supplies an emit callback with upload retries.
 //
-// The async path (swapAndFlushAsync) drives FlushArenaToIPC directly with its
-// own emit callback running the per-partition upload retry loop (Override 9.2).
-//
-// Returns the count of per-entity uploads (was one upload for the
-// WHOLE list, keyed under the smallest-hash entity — the silent-read-miss
-// defect, now DELETED).
+// Returns the count of per-entity uploads.
 func (f *L0Flusher) FlushFromArena(ctx context.Context, sl *SkipListArena) (int, error) {
 	if sl.Count() == 0 {
 		return 0, nil
@@ -298,18 +281,12 @@ func (f *L0Flusher) FlushFromArena(ctx context.Context, sl *SkipListArena) (int,
 	return uploaded, nil
 }
 
-// UploadPartition uploads a single per-entity L0Partition to S3 under its own key:
+// UploadPartition uploads a single per-entity L0Partition to S3 under:
 //
 //	l0/{hex(EntityHash[:8])}/{FirstSysTimeNs}.arrow
 //
-// ADR-0018: aligns the WRITE keying with the READ keying — AsOf lists
-// by l0/{hex(sha256(queriedEntityID)[:8])}/, so per-entity blobs can never be
-// missed by the prefix list. The OLD UploadBuffer keyed the whole blob under
-// the FIRST (smallest-hash) entry → every co-located non-smallest entity was
-// invisible to AsOf. DELETED.
-//
-// Override 7.2: pass JemallocBuffer directly as io.Reader; the caller resets
-// the read cursor as needed.
+// ADR-0018: aligns write keying with Resolver.AsOf prefix listing. Passes
+// JemallocBuffer directly as io.Reader after resetting the read cursor.
 func (f *L0Flusher) UploadPartition(ctx context.Context, part L0Partition) error {
 	var keyBuf [128]byte
 	keyBytes := append(keyBuf[:0], "l0/"...)

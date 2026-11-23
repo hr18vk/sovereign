@@ -6,11 +6,11 @@
 
 package receive
 
-// hybrid_batch_retain_test.go — POST-REVIEW guard for
-// /code-review finding #5: a HYBRID-signed foreign batch that is Accepted must
-// be retained for the relay, exactly like the classical batch path. Pre-fix,
-// HandleHybridFrame never fired onAcceptRelayBatch, so hybrid foreign deltas
-// propagated one hop and stopped (silent one-hop gap on the opt-in PQ path).
+// This test verifies that a HYBRID-signed foreign batch that is accepted
+// is retained for the relay, exactly like the classical batch path.
+// Before the fix, HandleHybridFrame never fired onAcceptRelayBatch, so
+// hybrid foreign deltas propagated one hop and stopped (silent one-hop gap
+// on the opt-in PQ path).
 
 import (
 	"testing"
@@ -71,14 +71,14 @@ func TestHybridBatchRetained(t *testing.T) {
 
 	v := recv.HandleHybridFrame(frame)
 	if v.Verdict != Accept {
-		t.Fatalf("hybrid batch verdict=%s, want Accept (reason: %v) — the guard's premise (a valid hybrid frame) failed", v.Verdict, v.Reason)
+		t.Fatalf("hybrid batch verdict=%s, want Accept (reason: %v) — the test's premise (a valid hybrid frame) failed", v.Verdict, v.Reason)
 	}
 	if retained != 1 {
-		t.Fatalf("finding #5: an Accepted hybrid batch was retained %d times, want 1 — the hybrid path never fired the relay retainer (one-hop propagation on the opt-in PQ path)", retained)
+		t.Fatalf("an accepted hybrid batch was retained %d times, want 1 — the hybrid path never fired the relay retainer (one-hop propagation on the opt-in PQ path)", retained)
 	}
-	// The retained bytes must be the FULL HYBRID frame (re-publishable onward:
-	// the next hop's DispatchFrame routes by the magic byte to ITS
-	// HandleHybridFrame, which re-verifies BOTH sigs).
+	// The retained bytes must be the full hybrid frame (re-publishable onward:
+	// the next hop's DispatchFrame routes by the magic byte to its
+	// HandleHybridFrame, which re-verifies both sigs).
 	if !attribution.IsHybridFrame(retainedFrame) {
 		t.Fatalf("retained frame is not a hybrid frame (%d bytes) — the onward hop could not route it to HandleHybridFrame", len(retainedFrame))
 	}

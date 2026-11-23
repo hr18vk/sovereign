@@ -26,8 +26,8 @@ import (
 // Per-entity split-merge means a single async flush now produces up to
 // maxEntries uploads (one per entity) from a background goroutine, racing with
 // the test's len(uploads) reads. The struct therefore serializes the map under
-// a Mutex — mirroring the thread-safety a real S3 client (and LocalFS Upload)
-// provide. The original one-blob path produced ONE upload per flush, so the
+// a mutex — mirroring the thread-safety a real S3 client (and LocalFS Upload)
+// provide. The original one-blob path produced one upload per flush, so the
 // race window was negligible; the split path materializes the latent race.
 type mockS3Uploader struct {
 	mu      sync.Mutex
@@ -65,8 +65,8 @@ func (m *mockS3Uploader) Len() int {
 // insertTestEvents populates a SkipListArena with test events using O2.1 packing.
 
 // collectPartitions drives FlushArenaToIPC's streaming emit callback and
-// collects every partition into a slice for assertion (the streaming API).
-// The caller MUST free each partition's Buf (the emit contract does NOT free
+// collects every partition into a slice for assertion. The caller must
+// free each partition's Buf (the emit contract does not free
 // on success — the streaming call site does).
 func collectPartitions(t *testing.T, flusher *L0Flusher, sl *SkipListArena) []L0Partition {
 	t.Helper()

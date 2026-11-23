@@ -5,31 +5,29 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // Package sovereign is the client library for the Sovereign Engine control
-// port. A developer who has NEVER read the engine internals connects to a
+// port. A developer who has never read the engine internals connects to a
 // running mesh over mutual TLS and performs a state operation in under 50
 // lines of Go (see examples/sdk/main.go).
 //
-// THE HONEST READ-PATH BOUNDARY (ADR-0011 §1.1, §5 — encode it, do NOT hide it):
+// The read-path boundary (ADR-0011 §1.1, §5):
 //
-//	The engine stores ONLY the PayloadDigest on a joined CRDTEntry (by design —
-//	the payload is discarded after the integrity cross-check to keep the
+//	The engine stores only the PayloadDigest on a joined CRDTEntry (ADR-0045 §7
+//	— the payload is discarded after the integrity cross-check to keep the
 //	on-disk footprint at the digest, not 10x the value). The original value
-//	survives ONLY on the originator node's payload cache (the node that
+//	survives only on the originator node's payload cache (the node that
 //	InsertLocalEvents-ed it). A peer that received the delta via gossip has
-//	the digest, NOT the value.
+//	the digest, not the value.
 //
-//	Get returns a GetResult that makes the boundary VISIBLE:
-//
-// - On the ORIGINATOR node, Payload is the cached string (a cache hit).
-// - On a PEER node, Payload is "" and PayloadDigest carries the digest the
-// value was hashed to before the peer-side payload discard.
-//
+//	Get returns a GetResult that makes the boundary visible:
+//	  - On the originator node, Payload is the cached string (a cache hit).
+//	  - On a peer node, Payload is "" and PayloadDigest carries the digest the
+//	    value was hashed to before the discard.
 //	A Get that reports the digest hex as if it were the value is a
-//	FABRICATION; this library reports both paths honestly.
+//	fabrication; this library reports both paths.
 //
-// The control port is a LOW-RATE manageability surface (1 op/sec to ~1K
-// ops/sec). InsertLocal returns at LOCAL-apply; peer convergence is EVENTUAL
-// (the next gossip sweep ships the delta). This library does NOT claim
+// The control port is a low-rate manageability surface (1 op/sec to ~1K
+// ops/sec). InsertLocal returns at local apply; peer convergence is eventual
+// (the next gossip sweep ships the delta). This library does not claim
 // linearizability — the doc says so (ADR-0011 §6).
 package sovereign
 
@@ -48,23 +46,23 @@ import (
 )
 
 // Client is a connection to a Sovereign Engine control port. It holds an
-// *http.Client whose transport enforces TLS 1.3 ONLY (Min==Max==1.3) and
-// presents the caller's client certificate (mTLS — the SAME trust root as the
+// *http.Client whose transport enforces TLS 1.3 only (Min==Max==1.3) and
+// presents the caller's client certificate (mTLS — the same trust root as the
 // peer path, ADR-0006). Use Dial to construct one; Close releases it.
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
 }
 
-// GetResult is the typed result of Get. The Payload field is NON-EMPTY only on
+// GetResult is the typed result of Get. The Payload field is non-empty only on
 // the originator node (the cache hit); on a peer it is "" and PayloadDigest
-// carries the digest the value was hashed to before the peer-side payload discard. Both are
-// honest results this struct reports WITHOUT faking a value.
+// carries the digest the value was hashed to before the discard. Both are
+// results this struct reports without faking a value.
 type GetResult struct {
 	EntityID      string
 	Present       bool
-	Payload       string // NON-EMPTY only on the originator node (peers keep only the digest)
-	PayloadDigest string // hex; ALWAYS present when Present=true
+	Payload       string // non-empty only on the originator node (ADR-0045 §7)
+	PayloadDigest string // hex; always present when Present=true
 	DotNodeID     string // hex
 	DotCounter    uint64
 	OriginNodeID  string // hex
@@ -77,11 +75,11 @@ type NodeStatus struct {
 	TLSVersion string
 }
 
-// MetricSample is ONE scraped Prometheus series: a metric name, its label set,
-// and its scalar value. Metrics() returns the FULL set so a CounterVec (e.g.
+// MetricSample is one scraped Prometheus series: a metric name, its label set,
+// and its scalar value. Metrics() returns the full set so a CounterVec (e.g.
 // sovereign_ingest_verdicts_total{verdict=...}) does not collapse to one
 // last-wins scalar. The old MetricsSnapshot map[string]float64 keyed by name
-// only and DROPPED the labels, so a six-value CounterVec collapsed to one value
+// only and dropped the labels, so a six-value CounterVec collapsed to one value
 // (silent data loss in the SDK's own metrics reader); MetricSample preserves
 // the label dimension so every series survives.
 type MetricSample struct {
@@ -94,7 +92,7 @@ type MetricSample struct {
 // sovereign_* series, one MetricSample per "name{labels} value" line. The
 // Value and Samples accessors give a caller the old scalar behavior EXPLICITLY
 // (Value returns the sole sample for a name, or 0/false when there are zero or
-// multiple — it never silently last-wins; a caller reading a CounterVec MUST
+// multiple — it never silently last-wins; a caller reading a CounterVec must
 // use Samples).
 type MetricSamples []MetricSample
 
@@ -131,11 +129,11 @@ func (s MetricSamples) Samples(name string) MetricSamples {
 }
 
 // Dial opens a TLS 1.3 connection to the control port at addr (host:port). The
-// caller's tlsCfg carries a client certificate signed by the mesh CA (the SAME
+// caller's tlsCfg carries a client certificate signed by the mesh CA (the same
 // trust root as the peer path, ADR-0006). Dial forces Min==Max==VersionTLS13 so
 // a <1.3 negotiation is a hard failure — a 1.2 path is impossible. A tlsCfg
 // with no client cert fails the server's RequireAndVerifyClientCert gate at the
-// first request (the mTLS guard).
+// first request (the control port mTLS and TLS 1.3 gates, ADR-0011 §9).
 func Dial(addr string, tlsCfg *tls.Config) (*Client, error) {
 	// Clone so the caller's config is not mutated, then force 1.3-only.
 	cfg := tlsCfg.Clone()
@@ -183,13 +181,13 @@ func DialWithCerts(addr, certPath, keyPath, caPath, serverName string) (*Client,
 }
 
 // InsertLocal stages a key/value pair on the node. It POSTs /v1/insert, which
-// routes through Gossiper.InsertLocalEvents (gossip.go:202) — NEVER
-// engine.InsertLocal — so the payload is cached for a future gossip sweep. It
+// routes through Gossiper.InsertLocalEvents (the map-miss branch in gossip.go)
+// — not engine.InsertLocal — so the payload is cached for a future gossip sweep. It
 // returns the hex of the CausalDot (NodeID||Counter) the engine assigned: the
 // receipt the caller uses to prove the insert landed locally.
 //
-// HONEST: the insert is LOCAL-ONLY at return. Peer convergence is EVENTUAL —
-// the next gossip sweep ships the delta. This method does NOT wait for peers.
+// The insert is local-only at return. Peer convergence is eventual —
+// the next gossip sweep ships the delta. This method does not wait for peers.
 func (c *Client) InsertLocal(key, val string) (dotHex string, err error) {
 	body := struct {
 		Key string `json:"key"`
@@ -210,7 +208,7 @@ func (c *Client) InsertLocal(key, val string) (dotHex string, err error) {
 }
 
 // Get reads the latest entry for key. The returned GetResult reports the
-// originator-vs-peer payload boundary HONESTLY (ADR-0011 §1.1): on the
+// originator-vs-peer payload boundary (ADR-0011 §1.1): on the
 // originator Payload is the cached string; on a peer Payload is "" and
 // PayloadDigest carries the digest. A Get that returns the digest as if it
 // were the value is a fabrication this method does not commit.
@@ -284,7 +282,7 @@ func (c *Client) Status() (NodeStatus, error) {
 // over the exposition lines; lines without a sovereign_ prefix, with a
 // non-numeric value, or with malformed braces are skipped (HELP/TYPE/comment
 // lines and bad scrapes never panic — a panic in Metrics() on a bad scrape is a
-// NEW bug).
+// bug).
 func (c *Client) Metrics() (MetricSamples, error) {
 	resp, err := c.get("/metrics")
 	if err != nil {
@@ -305,11 +303,11 @@ func (c *Client) Close() error {
 
 // RunDemo is the canonical demo workload the examples/sdk binary drives: insert
 // 100 key/val pairs, read the MerkleRoot, then Get the first key back on the
-// originator (the cache hit — the value stays on the originator). It
+// originator (the cache hit — ADR-0045 §7 keeps the value on the originator). It
 // lives in the SDK (not the example) so the <50-line example stays a readable
 // connection shell (flag parse + dial + defer Close) while the workload logic
-// is the SDK's job (ADR-0011 §8 MEDIOCRITY 1). It returns the first error so the
-// example's run() can surface it through its defers (no log.Fatal leak).
+// is the SDK's job (ADR-0011 §8). It returns the first error so the
+// example's run() can surface it through its defers.
 func (c *Client) RunDemo() error {
 	for i := 0; i < 100; i++ {
 		if _, err := c.InsertLocal(fmt.Sprintf("key-%d", i), fmt.Sprintf("value-%d", i)); err != nil {
@@ -361,13 +359,13 @@ func (c *Client) post(path string, body any) (*http.Response, error) {
 
 // parsePrometheusText parses the Prometheus text exposition format into a
 // label-preserving MetricSamples slice (one MetricSample per "name{labels}
-// value" line). It PRESERVES the label set so a CounterVec's N label series
+// value" line). It preserves the label set so a CounterVec's N label series
 // each survive as their own sample (the old map[string]float64 keyed by name
-// only and kept the LAST per name — a six-value CounterVec collapsed to one
+// only and kept the last per name — a six-value CounterVec collapsed to one
 // scalar, silent data loss). Lines starting with '#' (HELP/TYPE) and
 // non-sovereign lines are skipped. A line with a malformed brace group (a '{'
 // with no matching '}', or a label with no '=') is skipped, never panicked on
-// — a panic in Metrics() on a bad scrape is a NEW bug.
+// — a panic in Metrics() on a bad scrape is a bug.
 func parsePrometheusText(r io.Reader) (MetricSamples, error) {
 	var out MetricSamples
 	sc := bufio.NewScanner(r)
@@ -378,7 +376,7 @@ func parsePrometheusText(r io.Reader) (MetricSamples, error) {
 			continue
 		}
 		// A sample line is "name{labels} value" or "name value". Split on the
-		// LAST whitespace to separate the value from the name{labels} prefix.
+		// last whitespace to separate the value from the name{labels} prefix.
 		idx := strings.LastIndex(line, " ")
 		if idx < 0 {
 			continue

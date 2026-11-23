@@ -11,38 +11,27 @@ import (
 	"testing"
 )
 
-// TestExportersRegister is the per-process Registry gate (no duplicate
-// registration across separate per-process registries). It constructs
-// the Registry TWICE (two Exporter/Recorder instances) and asserts NO panic.
-// The root cause it fixtures: the global prometheus.DefaultRegisterer PANICS
-// on duplicate registration across tests (two Recorders registering the same
-// sovereign_* instrument names); the per-process Registry (NewRegistry per
-// Exporter) is the fix. A panic here = gate FAIL.
+// TestExportersRegister constructs three independent Exporters. Reusing the
+// global Prometheus registerer would panic on the second set of identical
+// instrument names; separate registries must coexist and scrape successfully.
 func TestExportersRegister(t *testing.T) {
-	// Construct three independent Exporters (three per-process Registries).
-	// Each registers the same seven sovereign_* series against its OWN
-	// registry; the global DefaultRegisterer would panic on the second.
 	var exporters []*Exporter
 	for i := 0; i < 3; i++ {
-		// MustRegister panics on a duplicate within ONE registry; across
-		// separate registries it must NOT.
+		// Duplicate names within one registry panic; separate registries do not.
 		e := NewExporter()
 		exporters = append(exporters, e)
 	}
-	// Drive a few observations through each so the instruments are exercised
-	// (not just constructed), then scrape each — no panic, distinct bodies.
 	for i, e := range exporters {
 		body := scrapeMetrics(t, e)
 		if !strings.Contains(body, "sovereign_ingest_latency_seconds") {
 			t.Fatalf("exporter %d scrape missing sovereign_ingest_latency_seconds", i)
 		}
 	}
-	t.Logf("constructed %d per-process Registries with NO duplicate-registration panic", len(exporters))
+	t.Logf("constructed and scraped %d independent registries", len(exporters))
 }
 
-// TestSevenSeriesScrapeable asserts the seven sovereign_* series each carry a
-// HELP + TYPE line in the scrape (the falsifiability gate, exercised
-// in-process here; the live-binary curl is the gate proper).
+// TestSevenSeriesScrapeable checks that every sovereign_* metric family has
+// HELP and TYPE metadata in a fresh Exporter's scrape.
 func TestSevenSeriesScrapeable(t *testing.T) {
 	e := NewExporter()
 	body := scrapeMetrics(t, e)
@@ -63,5 +52,5 @@ func TestSevenSeriesScrapeable(t *testing.T) {
 			t.Fatalf("scrape missing # TYPE for %s", name)
 		}
 	}
-	t.Logf("all seven sovereign_* series carry HELP + TYPE (falsifiable scrape)")
+	t.Logf("all seven sovereign_* metric families have HELP and TYPE metadata")
 }

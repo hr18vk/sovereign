@@ -116,34 +116,34 @@ func TestVerifyCRDTFrame_AllZeroKeyRejected(t *testing.T) {
 
 // TestRejectSmallOrderKey_IdentityPointDerived is the load-bearing
 // ZIP-215 small-order assertion. It derives the canonical small-order point
-// — the identity (order 1, [8]P == O) — AT RUNTIME from the curve itself via
+// — the identity (order 1, [8]P == O) — at runtime from the curve itself via
 // edwards25519.NewIdentityPoint().Bytes(), and proves RejectSmallOrderKey
 // rejects it. Zero hard-coded crypto hex: the curve code is the ground truth,
 // not human memory.
 //
-// HONEST SCOPE NOTE: the full Ed25519 torsion subgroup is the cyclic group
+// Scope note: the full Ed25519 torsion subgroup is the cyclic group
 // Z/8 = {O, T2, T4a, T4b, T8a, T8b, T8c, T8d} containing 1 identity, 1
 // order-2, 2 order-4, and 4 order-8 points. Constructing the order-{2,4,8}
-// torsion encodings fabrication-free with the exported edwards25519 API
-// is mathematically obstructed:
-// - ScalarMult operates modulo l (the prime subgroup order), so [l]*Q == O
-// for every Q — scalar multiplication CANNOT reach any torsion point.
-// - MultByCofactor computes [8]*Q in the PRIMARY direction (projects onto
-// the prime-order subgroup), not the inverse; it cannot fabricate torsion.
-// - Random SetBytes hits an order-{2,4,8} torsion point with probability
-// ~8/2^255 = ~6.9e-77; a brute-force non-zero-middle sweep only finds the
-// identity and the single order-2 point (all-zero y is the only low-byte
-// torsion y-value reachable).
+// torsion encodings fabrication-free with the exported edwards25519 API is
+// mathematically obstructed:
+//   - ScalarMult operates modulo l (the prime subgroup order), so [l]*Q == O
+//     for every Q — scalar multiplication cannot reach any torsion point.
+//   - MultByCofactor computes [8]*Q in the primary direction (projects onto
+//     the prime-order subgroup), not the inverse; it cannot fabricate torsion.
+//   - Random SetBytes hits an order-{2,4,8} torsion point with probability
+//     ~8/2^256 ≈ 6.9e-77; a brute-force non-zero-middle sweep only finds the
+//     identity and the single order-2 point (all-zero y is the only low-byte
+//     torsion y-value reachable).
 //
-// The identity point is therefore the ONLY torsion encoding that this test
+// The identity point is therefore the only torsion encoding that this test
 // can derive fabrication-free today. Verifying the order-2/4/8 rejection
 // path requires either (a) a future change to land RFC 8032 §7.1 vectors
-// pasted verbatim from the authoritative RFC text (not from memory), or
-// (b) upstream `edwards25519` exposing a torsion-generator constructor. The
-// cofactor gate's MATH (MultByCofactor computes [8]P; Equal(identity) tests
-// [8]P==O) is PROVEN-by-construction to fire for any torsion point; this
+// pasted verbatim from the authoritative RFC text, or (b) upstream
+// `edwards25519` exposing a torsion-generator constructor. The cofactor
+// gate's math (MultByCofactor computes [8]P; Equal(identity) tests
+// [8]P==O) is proven by construction to fire for any torsion point; this
 // test proves it fires for the identity, the only fabrication-free vector
-// available in-scope.
+// available in scope.
 func TestRejectSmallOrderKey_IdentityPointDerived(t *testing.T) {
 	// Fabrication-free: let the curve emit the identity point encoding.
 	identity := edwards25519.NewIdentityPoint().Bytes()
@@ -151,7 +151,7 @@ func TestRejectSmallOrderKey_IdentityPointDerived(t *testing.T) {
 		t.Fatalf("NewIdentityPoint().Bytes() length = %d, want 32", got)
 	}
 	if RejectSmallOrderKey(identity) {
-		t.Fatalf("identity point (order 1, [8]P==O) was ACCEPTED — ZIP-215 cofactor gate failed; identity bytes=%x", identity)
+		t.Fatalf("identity point (order 1, [8]P==O) was accepted — ZIP-215 cofactor gate failed; identity bytes=%x", identity)
 	}
 	t.Logf("identity point %x rejected by [8]P==identity cofactor gate (fabrication-free derivation)", identity)
 }

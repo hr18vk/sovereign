@@ -18,18 +18,11 @@ const (
 	HazardSlots   = 4
 )
 
-// arenaRetiredFreelistShardCount is the number of Treiber free-list shards the
-// EBRManager dedicates to EACH of the 3 epoch retired lists. pprof measured
-// m.retired[idx].PushBlock at 16.49% cum @32c — the EBR retire path CAS
-// concentrate — re-confirmed at 11.20% cum @32c on the production build (above
-// the 10% gate). The fix mirrors the engine root's 256-way sharding pattern:
-// each of the 3 epoch lists becomes [256]RetiredList, the route counter is
-// bumped OUTSIDE the CAS retry loop, and the 3-epoch ring buffer (idx:= e%3)
-// and grace invariant (safeIdx = (currentEpoch+2)%3) are PRESERVED
-// byte-for-byte — only the per-epoch LIST HEAD is sharded to 256. Power-of-two
-// (256) keeps the route a clean & (N-1) bitmask, matches the engine shard
-// count, and matches the proved-good engine-root cardinality. The same
-// const-not-setter discipline applies.
+// arenaRetiredFreelistShardCount distributes each epoch's retired list across
+// 256 Treiber stacks to reduce contention on their compare-and-swap heads. The
+// power-of-two count permits mask-based routing and matches the engine's shard
+// count. Retirement selects one stack per call; epoch advancement still drains
+// every stack in the safe epoch, preserving the three-epoch grace interval.
 const arenaRetiredFreelistShardCount = 256
 
 // OffHeapNode simulates a pointer to an off-heap HAMT node.
@@ -39,17 +32,9 @@ type OffHeapNode struct {
 
 // EBRManager manages epoch-based reclamation with hazard pointers.
 //
-// CACHE COHERENCE & FALSE SHARING ELIMINATION (AWS Graviton):
-//
-// globalEpoch is CAS'd by AdvanceEpoch; head is CAS'd by Register.
-// Both are hot atomics accessed by different goroutines concurrently.
-// They are now isolated onto separate cache lines to prevent HITM storms.
-//
-// Layout (post-padding):
-//
-//	Cache Line 0: globalEpoch (CAS'd by AdvanceEpoch)
-//	Cache Line 1: head (CAS'd by Register)
-//	Cache Line 2+: retired lists, pools (less hot)
+// AdvanceEpoch updates globalEpoch while Register updates head. Padding places
+// these contended atomics on separate cache lines so writes to one do not
+// invalidate the other. Retired lists and pools occupy the following lines.
 type EBRManager struct {
 	_globalEpochPad0 CacheLinePad
 	globalEpoch      atomic.Uint64
@@ -60,29 +45,20 @@ type EBRManager struct {
 	_headPad1 CacheLinePad
 
 	retired [3][arenaRetiredFreelistShardCount]RetiredList
-	// retiredRoute is the per-call routing counter for the EBR retire path
-	// (RetireBlock / Retire). Advanced by 1 ONCE per call — OUTSIDE the CAS
-	// retry loop — and masked by (arenaRetiredFreelistShardCount-1). Routed
-	// per-call (NOT per-CAS-retry) so the routing counter increment never
-	// lands in the hot CAS frame. The pop-side (AdvanceEpoch drain) does NOT
-	// route — it walks ALL 256 shards of the safe epoch unconditionally, so
-	// no symmetric pop counter is needed. CacheLinePad-isolated from the
-	// other EBR atomics (globalEpoch, head) so the routing counter's writes
-	// do not false-share with the CAS surfaces those hold.
+	// retiredRoute selects a retired-list shard once per Retire or RetireBlock
+	// call, outside the compare-and-swap retry loop. AdvanceEpoch drains every
+	// shard and needs no corresponding pop counter. Padding keeps these writes
+	// off the cache lines used by globalEpoch and head.
 	_retiredRoutePad0 CacheLinePad
 	retiredRoute      atomic.Uint64
 	_retiredRoutePad1 CacheLinePad
 	pool              sync.Pool
 	retiredPool       sync.Pool
 
-	// closing is the engine-teardown flag. It
-	// is Set ONCE by (*DeltaCRDTEngine).Close (via SetClosing) BEFORE the
-	// quiesce+free, and read on the Join/Get/InsertLocal entry and in
-	// maybeAdvanceEpoch to (a) fail LOUD on a post-Close arena access (a
-	// programming error, like send-on-closed-channel) and (b) skip the
-	// post-Close reclamation. Read-mostly (written exactly once), so it gets
-	// its OWN cache line: the hot-path reads must never false-share with the
-	// WRITTEN atomics above (globalEpoch, retiredRoute).
+	// closing is set once by DeltaCRDTEngine.Close before quiescence and arena
+	// teardown. Join, Get, and InsertLocal reject later arena access, and
+	// perhapsAdvanceEpoch stops reclamation. Its cache line is separate from the
+	// atomics that continue to be written during operation.
 	_closingPad0 CacheLinePad
 	closing      atomic.Bool
 	_closingPad1 CacheLinePad
@@ -221,14 +197,10 @@ func (l *RetiredList) PushBlock(arena *HamtArena, offset uint64, isNode bool, po
 	}
 }
 
-// routeRetiredShard picks the EBR retired-list shard this RetireBlock / Retire
-// call should push to. It is the byte-faithful sibling of the routeVarFreelist
-// routers in hamt_arena.go: routed per-CALL (NOT per-CAS-retry) so the counter
-// increment can never land in the hot CAS frame. The route counter is bumped
-// ONCE here, masked by (arenaRetiredFreelistShardCount-1) — a clean power-of-
-// two bitmask. The AdvanceEpoch drain does NOT route — it walks ALL 256 shards
-// of the safe epoch unconditionally (the grace invariant holds PER SHARD now;
-// the drain fans out the 3-epoch ring's safe bucket to 256 heads).
+// routeRetiredShard selects one retired-list stack for a Retire or RetireBlock
+// call. Incrementing the route counter here, outside PushBlock or PushHAMT,
+// keeps it out of their compare-and-swap retry loops. AdvanceEpoch does not use
+// this router because it must drain every stack in the safe epoch.
 func (m *EBRManager) routeRetiredShard() int {
 	n := arenaRetiredFreelistShardCount
 	idx := m.retiredRoute.Add(1)
@@ -241,11 +213,8 @@ func (m *EBRManager) routeRetiredShard() int {
 func (m *EBRManager) Retire(ptr unsafe.Pointer) {
 	e := m.globalEpoch.Load()
 	idx := e % 3
-	// route this Retire push to ONE retired-list shard for the WHOLE call.
-	// Computed ONCE, OUTSIDE the CAS retry loop (PushHAMT's own CAS retry is
-	// byte-identical in shape to the unsharded body, just over a per-shard head).
-	// The 3-epoch routing (idx:= e % 3) is the GRACE invariant — preserved
-	// byte-for-byte; only the per-epoch LIST HEAD is sharded to 256.
+	// Select the epoch before choosing its shard. PushHAMT retries only on that
+	// shard's head, so routeRetiredShard remains outside the retry loop.
 	shard := m.routeRetiredShard()
 	m.retired[idx][shard].PushHAMT(ptr, &m.retiredPool)
 }
@@ -253,12 +222,8 @@ func (m *EBRManager) Retire(ptr unsafe.Pointer) {
 func (m *EBRManager) RetireBlock(arena *HamtArena, offset uint64, isNode bool) {
 	e := m.globalEpoch.Load()
 	idx := e % 3
-	// route this RetireBlock push to ONE retired-list shard. The ordering
-	// is load-bearing: idx:= e%3 (the 3-epoch routing — the GRACE invariant)
-	// MUST be computed BEFORE the shard route (the route sits AFTER idx:= e%3).
-	// The shard route is OUTSIDE the CAS retry loop (PushBlock's own CAS retry
-	// is byte-identical in shape to the unsharded body, just over a per-shard
-	// head).
+	// Compute the epoch index before advancing the route counter. The block then
+	// enters exactly one shard of that epoch, and PushBlock retries on that head.
 	shard := m.routeRetiredShard()
 	m.retired[idx][shard].PushBlock(arena, offset, isNode, &m.retiredPool)
 }
@@ -280,70 +245,60 @@ func (m *EBRManager) AdvanceEpoch() {
 
 	if canAdvance {
 		if m.globalEpoch.CompareAndSwap(currentEpoch, currentEpoch+1) {
-			// The safe epoch's retired ring is now 256-way sharded. The
-			// 3-epoch grace invariant is PRESERVED — safeIdx = (currentEpoch+2) % 3
-			// unchanged; only the head drain fans out to 256 shards.
-			//
-			// CORRECTNESS — two-phase Swap-then-walk: the drain MUST swap-Nil
-			// ALL 256 shards BEFORE walking any shard's list. The semantic gap:
-			// freeRetiredList (walk phase) recursively calls RetireBlock via
-			// DecRef cascades. If globalEpoch advances to (currentEpoch+2)
-			// mid-walk, those recursive RetireBlock calls route onto the very
-			// bucket I'm draining (safeIdx = (currentEpoch+2)%3). With a single
-			// shard-at-a-time Swap-during-walk those fresh retires would land on
-			// an UN-SWAPPED shard that my own drain loop later reaches —
-			// stealing them into the current drain with 0-epoch grace (a UAF
-			// when their wrappers are still in use). Two-phase Swap-then-walk
-			// makes my walk operate over a SNAPSHOT of shard heads captured
-			// BEFORE any recursive RetireBlock lands on safeIdx: pushes after
-			// the snapshot phase append onto a FRESH head on each shard and are
-			// deferred to a future epoch's drain (full 2-epoch grace preserved).
-			// This mirrors the original single-Swap-then-walk invariant the
-			// unsharded AdvanceEpoch relied on; the shard fan-out adds 256 Swaps
-			// but preserves the grace contract.
+			// Detach every head in the safe epoch before walking any of them.
+			// DecRef during the walk can recursively retire more blocks. If the
+			// epoch advances concurrently, those blocks can select this same ring
+			// slot. They must encounter fresh heads and wait for a later drain;
+			// swapping and walking one shard at a time could instead pick up a new
+			// retirement before it has received the full grace interval.
 			safeIdx := (currentEpoch + 2) % 3
 			var heads [arenaRetiredFreelistShardCount]*RetiredNode
+			hasWork := false
 			for shard := 0; shard < arenaRetiredFreelistShardCount; shard++ {
 				heads[shard] = m.retired[safeIdx][shard].head.Swap(nil)
+				if heads[shard] != nil {
+					hasWork = true
+				}
 			}
+			if !hasWork {
+				for shard := 0; shard < arenaRetiredFreelistShardCount; shard++ {
+					m.freeRetiredList(heads[shard])
+				}
+				return
+			}
+			var hazardSnapshot [64]unsafe.Pointer
+			hazards := m.snapshotHazards(&hazardSnapshot)
 			for shard := 0; shard < arenaRetiredFreelistShardCount; shard++ {
-				m.freeRetiredList(heads[shard])
+				if heads[shard] != nil {
+					m.freeRetiredListWithHazards(heads[shard], hazards)
+				}
 			}
 		}
 	}
 }
 
-// SetClosing arms the teardown flag. It is
-// called ONCE by (*DeltaCRDTEngine).Close BEFORE Quiesce + arena.Free. After
-// it, the Join/Get/InsertLocal entry fails LOUD (a post-Close arena access is
-// a programming error, like send-on-closed-channel) and maybeAdvanceEpoch
-// skips the reclamation. Teardown-only; the hot path's only cost is the single
-// Closing() load.
+// SetClosing marks the start of engine teardown. DeltaCRDTEngine.Close calls it
+// before Quiesce and arena.Free. Subsequent Join, Get, and InsertLocal calls
+// reject arena access, and perhapsAdvanceEpoch stops reclamation. Operational
+// reads incur one atomic load through Closing.
 func (m *EBRManager) SetClosing() { m.closing.Store(true) }
 
-// Closing reports whether the engine has begun teardown. Read on the
-// Join/Get/InsertLocal entry and in maybeAdvanceEpoch. A single shared-line
-// atomic load: the flag is written exactly once (at Close), so the line stays
-// in shared state and the read never contends.
+// Closing reports whether engine teardown has begun. Join, Get, InsertLocal,
+// and perhapsAdvanceEpoch read it. The flag is written only once by Close, so
+// ordinary reads do not contend with repeated writes.
 func (m *EBRManager) Closing() bool { return m.closing.Load() }
 
-// Quiesce blocks until NO EBR participant is
-// active — i.e. no in-flight Join/Get/InsertLocal holds an arena pointer.
-// Close calls it after SetClosing + the persist drain, before arena.Free.
-// Because reclamation (AdvanceEpoch) is driven ONLY from the Join/InsertLocal
-// path (there is no background ticker) and maybeAdvanceEpoch skips once
-// closing is set, an all-participants-inactive state means NO arena access and
-// NO reclamation can be in flight — so munmap is safe.
+// Quiesce waits until no EBR participant is active. Close calls it after
+// SetClosing and the persist drain, before arena.Free. Since AdvanceEpoch runs
+// from Join and InsertLocal and stops after closing is set, an inactive
+// participant list means neither arena access nor reclamation remains in
+// flight.
 //
-// PRECONDITION (load-bearing): the caller MUST have stopped feeding new
-// operations — the production receive drain, or the VirtualNet goroutine join
-// in the harness. Quiesce waits for IN-FLIGHT operations; SetClosing (not
-// Quiesce) prevents NEW ones. A participant stuck active (a leaked, un-Released
-// delta) is a genuine outstanding arena reference: Quiesce spins rather than
-// free a referenced arena — a detectable hang, never a silent UAF.
-//
-// Hot-path cost: ZERO. Quiesce runs only at Close; it adds no field, atomic,
-// or branch to Join/Get/Set/AdvanceEpoch.
+// The caller must stop submitting operations before calling Quiesce. SetClosing
+// rejects new operations; Quiesce only waits for existing ones. An active
+// participant that is never released keeps Quiesce waiting rather than allowing
+// referenced arena memory to be unmapped. Quiesce adds no work to normal
+// operations.
 func (m *EBRManager) Quiesce() {
 	for {
 		quiescent := true
@@ -360,89 +315,59 @@ func (m *EBRManager) Quiesce() {
 	}
 }
 
-// freeRetiredList physically reclaims every retired node whose EBR grace
-// period has elapsed (the global epoch has advanced by 2 since retirement,
-// proving zero lingering readers).
+// freeRetiredList reclaims entries whose grace period has elapsed. For a HAMT,
+// DecRef first retires the root tree, then freeHAMTWrapper clears and retires
+// the 32-byte wrapper. Those recursive retirements enter the current epoch and
+// are reclaimed by a later AdvanceEpoch, not by the walk already in progress.
 //
-// Zero-GC fix:
+// A HAMT or arena block protected by a hazard pointer is requeued unchanged for
+// another epoch. The protecting reader can continue to follow it until a later
+// reclamation attempt finds the hazard clear.
 //
-//	Before this fix, Type 0 (HAMT) nodes were DecRef'd recursively but
-//	the 32-byte HAMT wrapper struct itself was NEVER returned to the
-//	slab free-list. With the wrapper now allocated from the off-heap
-//	HamtArena (allocHAMTWrapper), that omission would silently leak 32
-//	bytes per Set/Delete and eventually trigger the Linux OOM killer
-//	without ever tripping the Go GC. We sequence the teardown as:
-//
-// 1. DecRef h.root — recursively frees the HamtNode tree and any
-// leaf-owned strings / CRDT entry arrays via EBR RetireBlock.
-// The HAMT wrapper is STILL VALID while this runs.
-// 2. freeHAMTWrapper — zeros the wrapper (defensively masking the
-// GC-invisible `arena *HamtArena` field) and routes the
-// 32-byte slot back through EBR RetireBlock for ABA-safe
-// physical recycling into the slab free-list.
-//
-//	Both calls defer their physical pushes behind EBR; nothing is
-//	physically freed during this function — only during a future
-//	AdvanceEpoch's recursive freeRetiredList. Two recursions may push
-//	new RetiredNodes onto the CURRENT epoch list; this is safe because
-//	we are iterating the OLDEST epoch list (offset +2 mod 3) — the two
-//	are disjoint per EBR's three-epoch ring buffer.
-//
-// HAZARD-PROTECTED HAMT REQUEUE:
-//
-//	If the wrapper is currently protected by a hazard pointer slot
-//	(some reader is still traversing its root tree), the HAMT cannot
-//	be safely torn down this epoch. The RetiredNode is re-queued via
-//	Retire, where it sits in the current epoch's list waiting for the
-//	NEXT epoch to attempt reclamation. The wrapper struct is left
-//	untouched in this branch (NOT zeroed, NOT freed) so the protecting
-//	reader can still follow its root pointer. The next AttemptEpoch
-//	will run this branch again; if the hazard clears, the wrapper is
-//	fully torn down then.
-func (m *EBRManager) freeRetiredList(head *RetiredNode) {
-	// O(N²) → O(N) hazard-scan fix:
-	// The original implementation called isHazardProtected(ptr) for
-	// EVERY retired node, and each call iterated ALL participants ×
-	// ALL hazard slots. When the retired list grew large (because
-	// epochs couldn't advance while goroutines were active), this
-	// became O(N × P × H) — a catastrophic quadratic blowup that
-	// caused livelock under high concurrency.
-	//
-	// The fix: snapshot ALL active hazard pointers into a
-	// stack-allocated array ONCE at the start of freeRetiredList.
-	// Each retired node is then checked against this snapshot in
-	// O(1) via a linear scan of the (typically tiny) hazard array.
-	// This transforms the complexity from O(N × P × H) to
-	// O(P × H + N × H_snapshot) where H_snapshot is the number of
-	// non-nil hazard pointers (typically 0-4 in practice).
-	//
-	// The snapshot is safe because EBR's epoch guarantee ensures
-	// that no new hazard pointers can be set on the OLDEST epoch's
-	// retired nodes — any reader that started after the epoch
-	// advanced is pinned to a LATER epoch and cannot reference
-	// these nodes.
-	var hazardSnapshot [64]unsafe.Pointer
+// ebrIgnoreHazardsFault is false in production. Tests can set it to bypass
+// hazard protection as a negative control for the reclamation race checks.
+var ebrIgnoreHazardsFault atomic.Bool
+
+func (m *EBRManager) snapshotHazards(buf *[64]unsafe.Pointer) []unsafe.Pointer {
 	hazardCount := 0
-	curr := m.head.Load()
-	for curr != nil {
+	for curr := m.head.Load(); curr != nil; curr = curr.next {
 		for i := 0; i < HazardSlots; i++ {
 			hp := unsafe.Pointer(curr.hazards[i].Load())
-			if hp != nil && hazardCount < len(hazardSnapshot) {
-				hazardSnapshot[hazardCount] = hp
+			if hp != nil && hazardCount < len(buf) {
+				buf[hazardCount] = hp
 				hazardCount++
 			}
 		}
-		curr = curr.next
 	}
+	return buf[:hazardCount]
+}
 
+func (m *EBRManager) freeRetiredList(head *RetiredNode) {
+	var hazardSnapshot [64]unsafe.Pointer
+	hazards := m.snapshotHazards(&hazardSnapshot)
+	if head == nil {
+		return
+	}
+	m.freeRetiredListWithHazards(head, hazards)
+}
+
+func (m *EBRManager) freeRetiredListWithHazards(head *RetiredNode, hazards []unsafe.Pointer) {
+	// AdvanceEpoch takes one hazard snapshot for all 256 detached lists instead
+	// of scanning every participant for every retired node. The stack buffer holds
+	// 64 pointers. When it is full, isProtected performs a complete live scan for
+	// each candidate so additional hazards are not missed and no heap allocation
+	// is needed.
 	isProtected := func(ptr unsafe.Pointer) bool {
-		if ptr == nil {
+		if ptr == nil || ebrIgnoreHazardsFault.Load() {
 			return false
 		}
-		for i := 0; i < hazardCount; i++ {
-			if hazardSnapshot[i] == ptr {
+		for i := 0; i < len(hazards); i++ {
+			if hazards[i] == ptr {
 				return true
 			}
+		}
+		if len(hazards) == 64 {
+			return m.isHazardProtected(ptr)
 		}
 		return false
 	}
@@ -452,25 +377,19 @@ func (m *EBRManager) freeRetiredList(head *RetiredNode) {
 
 		if head.Type == 0 {
 			if isProtected(head.Ptr) {
-				// Re-queue this HAMT for another epoch's attempt. The
-				// wrapper is still alive — its `arena` field is intact
-				// and protected from overwrite by the hazard pointer.
+				// Leave the wrapper and its arena pointer intact for the protecting
+				// reader, and retry reclamation in another epoch.
 				m.Retire(head.Ptr)
 			} else {
-				// Hazard-free lifetime window — safe to dismantle.
-				// 1. Recursively decrement the root subtree via the
-				// wrapper's still-valid arena pointer. Each child
-				// RetireBlock lands in the CURRENT epoch list
-				// (different from this iteration's OLDEST list).
+				// DecRef the root through the wrapper's valid arena pointer. Child
+				// blocks enter the current epoch, not the oldest list being drained.
 				h := (*HAMT)(head.Ptr)
 				arenaLocal := h.arena
 				root := h.root
 				arenaLocal.DecRef(root)
 
-				// 2. Recycle the 32-byte HAMT wrapper itself. This
-				// zeros the struct (clearing the GC-invisible
-				// `arena *HamtArena` field) and push the offset
-				// through RetireBlock → future pushFreeVar.
+				// Clear and retire the wrapper as well. Its offset returns through
+				// RetireBlock and is recycled by pushFreeVar after another grace period.
 				arenaLocal.freeHAMTWrapper(h)
 			}
 			head.Ptr = nil

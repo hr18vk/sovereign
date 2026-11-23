@@ -103,7 +103,7 @@ func NewAWSS3Uploader(ctx context.Context) *AWSS3Uploader {
 // allocate separate physical partitions for each prefix, distributing
 // I/O across multiple backend disk arrays.
 //
-// ZERO ALLOCATION: Uses fixed-size stack buffers for SHA-256 input
+// Zero allocation: uses fixed-size stack buffers for SHA-256 input
 // and hex encoding. No heap escape.
 func ShardedKey(nodeID [16]byte, txTimeNs int64, suffix string) string {
 	// Stack-local buffer: 16 bytes nodeID + 8 bytes timestamp = 24 bytes
@@ -136,7 +136,7 @@ func ShardedKey(nodeID [16]byte, txTimeNs int64, suffix string) string {
 // For payloads > MultipartThreshold: uses S3 Multipart Upload with
 // concurrent chunked parts to maximize 100 Gbps network utilization.
 //
-// ZERO-GC on the PutObject path: UnsignedPayload prevents the AWS SDK
+// Zero-GC on the PutObject path: UnsignedPayload prevents the AWS SDK
 // from buffering or re-reading the io.Reader. TLS ensures integrity.
 func (u *AWSS3Uploader) Upload(ctx context.Context, key string, data io.Reader, size int64) error {
 	if size > MultipartThreshold {
@@ -169,11 +169,11 @@ func (u *AWSS3Uploader) singleUpload(ctx context.Context, key string, data io.Re
 // by opening multiple TCP streams simultaneously."
 //
 // Protocol:
-// 1. CreateMultipartUpload — allocates the upload ID
-// 2. UploadPart × N — sends 16MB chunks sequentially
-// (concurrent goroutine fan-out deferred to a future optimization)
-// 3. CompleteMultipartUpload — commits all parts atomically
-// 4. On error: AbortMultipartUpload — releases server-side resources
+//  1. CreateMultipartUpload — allocates the upload ID
+//  2. UploadPart × N — sends 16MB chunks sequentially
+//     (concurrent goroutine fan-out is a future optimization)
+//  3. CompleteMultipartUpload — commits all parts atomically
+//  4. On error: AbortMultipartUpload — releases server-side resources
 func (u *AWSS3Uploader) multipartUpload(ctx context.Context, key string, data io.Reader, size int64) error {
 	// Step 1: Initiate multipart upload
 	createResp, err := u.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{

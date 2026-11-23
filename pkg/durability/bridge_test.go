@@ -18,10 +18,9 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// These guards productize the PROVEN internal/chaos.TestWALRecovery
-// Determinism contract OUT of the chaos harness and into pkg/durability. A
-// green TestRecoveryDeterminism_KillRebuildMerkleEqual is the proof these
-// guards exist for; a PASS-claim without it green is a FABRICATION.
+// These tests exercise WAL recovery directly through pkg/durability, without
+// the chaos harness. TestRecoveryDeterminism_KillRebuildMerkleEqual checks the
+// central contract: replay reconstructs the live Merkle root and Lamport clock.
 
 const testArenaSize uintptr = 64 * 1024 * 1024
 
@@ -33,9 +32,8 @@ func testNodeID() [16]byte {
 	return n
 }
 
-// stagedEntry mirrors internal/chaos.stagedEntry: a deterministic CRDTEntry
-// whose OriginNodeID + SystemTime vary per index. PayloadDigest is left zero
-// here; PutLocal stamps it from the payload (step 1 of the physical order).
+// stagedEntry returns a deterministic CRDTEntry with index-dependent origin
+// and system time. PutLocal fills PayloadDigest from the corresponding payload.
 func stagedEntry(i int) eng.CRDTEntry {
 	var origin [16]byte
 	binary.BigEndian.PutUint64(origin[:8], uint64(i+100))
@@ -45,9 +43,8 @@ func stagedEntry(i int) eng.CRDTEntry {
 	}
 }
 
-// stagedPayload returns the payload whose SHA-256 equals the digest PutLocal
-// stamps. It mirrors the proven test's digest derivation so the WAL-recorded
-// digest matches the engine's PayloadDigest by construction.
+// stagedPayload returns three deterministic bytes whose SHA-256 is the digest
+// PutLocal stores in both the engine entry and WAL record.
 func stagedPayload(i int) string {
 	var b [3]byte
 	b[0] = byte(i)
@@ -62,21 +59,19 @@ func stagedEntityID(i int) string {
 	return "entity-" + string(buf)
 }
 
-// stagedDigest is the SHA-256 of stagedPayload(i) — what PutLocal stamps into
-// entry.PayloadDigest and what the WAL persists. Tests cross-check it.
+// stagedDigest is SHA-256(stagedPayload(i)).
 func stagedDigest(i int) [32]byte {
 	return sha256.Sum256([]byte(stagedPayload(i)))
 }
 
-// newLiveBridge builds a live engine + WAL + Bridge exactly as the production
-// origin path would, isolating the engine's dataDir in a fresh temp dir (the
-// same discipline as the proven test's sync.DataDir = t.TempDir()).
+// newLiveBridge constructs an engine, WAL, and Bridge with an isolated engine
+// data directory.
 func newLiveBridge(t *testing.T, walPath string, checkpointInterval uint64) *Bridge {
 	return newLiveBridgeArena(t, walPath, checkpointInterval, testArenaSize)
 }
 
-// newLiveBridgeArena is newLiveBridge with an explicit arena size, for tests
-// whose measured arena pressure exceeds the shared 64 MiB default.
+// newLiveBridgeArena is newLiveBridge with an explicit arena size for tests
+// whose concurrent readers and writers exceed the shared 64 MiB default.
 func newLiveBridgeArena(t *testing.T, walPath string, checkpointInterval uint64, arenaSize uintptr) *Bridge {
 	t.Helper()
 	eng.DataDir = t.TempDir()
@@ -91,22 +86,18 @@ func newLiveBridgeArena(t *testing.T, walPath string, checkpointInterval uint64,
 	}
 	t.Cleanup(func() { _ = wal.Close() })
 	b := NewBridge(engine, wal, checkpointInterval)
-	// (teardown guard): under the decouple the periodic
-	// checkpoint runs on a BACKGROUND goroutine. Drain it before the engine/WAL
-	// close cleanups run — t.Cleanup is LIFO, so this (registered last) runs
-	// FIRST — or a checkpoint could outlive the test and write to a closed
-	// WAL/engine (the use-after-free class). No-op when no checkpoint is
-	// pending, so it is safe for the K=0 / caller-driven tests too.
+	// Under the decouple the periodic checkpoint runs on a background goroutine.
+	// Drain it before the engine/WAL close cleanups run — t.Cleanup is LIFO, so
+	// this (registered last) runs first — or a checkpoint could outlive the test
+	// and write to a closed WAL/engine (a use-after-free class). No-op when no
+	// checkpoint is pending, so it is safe for the K=0 / caller-driven tests too.
 	t.Cleanup(func() { b.waitCheckpointsIdle() })
 	return b
 }
 
-// TestRecoveryDeterminism_KillRebuildMerkleEqual is THE gate this package exists for.
-// Build a live engine + WAL, PutLocal K mutations, AppendCheckpoint, CLOSE the
-// WAL, construct a SECOND engine via RecoverEngine, assert
-// recovered.State().MerkleRoot() == live.State().MerkleRoot() AND
-// recovered.LamportCounter() == live.LamportCounter(). GREEN = the
-// determinism contract holds OUT OF THE CHAOS HARNESS, in pkg/durability.
+// TestRecoveryDeterminism_KillRebuildMerkleEqual writes K mutations and a
+// checkpoint, closes the live engine and WAL, then rebuilds from the WAL. The
+// recovered Merkle root and Lamport counter must equal their live values.
 func TestRecoveryDeterminism_KillRebuildMerkleEqual(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "det.wal")
 	const K = 64
@@ -144,8 +135,8 @@ func TestRecoveryDeterminism_KillRebuildMerkleEqual(t *testing.T) {
 
 	recoveredRoot := recovered.State().MerkleRoot()
 	if recoveredRoot != liveRoot {
-		t.Fatalf("WAL recovery determinism BROKEN:\n live root = %x\n recovered root = %x\n"+
-			"Replayer built a different state than the live engine. Recovery is data-lossy.",
+		t.Fatalf("WAL replay produced a different Merkle root:\n  live root      = %x\n  recovered root = %x\n"+
+			"Recovery did not reconstruct the live state.",
 			liveRoot, recoveredRoot)
 	}
 	if recovered.LamportCounter() != liveLamport {
@@ -154,30 +145,17 @@ func TestRecoveryDeterminism_KillRebuildMerkleEqual(t *testing.T) {
 	}
 }
 
-// TestRecoveryForgedRoot_FullPathBootsLoudly is the ADR-0045
-// re-anchoring of what this test always was. It
-// REPLACES TestRecoveryRootMismatchRefusesBoot, whose expectation was WITHDRAWN
-// BY RULING, and the reason is the core of:
+// TestRecoveryForgedRoot_FullPathBootsLoudly verifies that full replay does not
+// reject a checkpoint solely because its root differs from the rebuilt root.
+// The WAL records local mutations but not foreign entries received by gossip,
+// so a valid anchor that includes foreign state and a forged anchor can present
+// the same mismatch. Root equality is meaningful on the bounded path, where the
+// image supplies those entries, but not on full replay.
 //
-//	On the FULL-REPLAY path the post-tail root comparand is UNKNOWABLE. The WAL
-//	records only LOCAL mutations, so the rebuilt root is origin-only; the
-//	anchor's root folds every entry the node ever held, INCLUDING foreign state
-//	that arrives by gossip and is never WAL-recorded. A forged root and a
-//	healthy foreign-folding root are THE SAME BYTES to recovery — refusing on
-//	mismatch is exactly the brick (a node with an intact WAL refused to
-//	boot; reproduced three ways in audit). The assertion therefore arms ONLY
-//	on the bounded path (useSnapshot), where the image supplies the foreign
-//	entries and equality is a valid comparand.
-//
-//	What replaces the coverage HERE: WAL seq contiguity (Part B — a punched-out
-//	record refuses the boot with ErrWALSeqGap; sound, no false-positive path)
-//	and, on the bounded path, the armed pre-tail fingerprint+root and post-tail
-//	root checks (TestRootAssertionArmedWithForeignAdvances's ArmedAndFires proves the bounded path still REFUSES
-//	a forged anchor root — preserved). What is NOT covered on the full path
-//	is bit-rot that changes no seq and no dot — a known, separately-tracked
-//	gap (no checksum). This test pins the NEW contract so the scoped-off path is itself
-//	toothed: a forged root on the full path must BOOT, LOUDLY, with the witness
-//	proving the root check was OFF and the loss check was ON.
+// Full replay instead checks sequence contiguity and record integrity, and the
+// witness must show that its post-tail root comparison is disabled. The bounded
+// path retains root and fingerprint checks, covered by
+// TestRootAssertionArmedWithForeignAdvances and the snapshot integrity tests.
 func TestRecoveryForgedRoot_FullPathBootsLoudly(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "mismatch.wal")
 	const K = 32
@@ -189,9 +167,9 @@ func TestRecoveryForgedRoot_FullPathBootsLoudly(t *testing.T) {
 		}
 	}
 	liveLamport := live.Engine().LamportCounter()
-	// A checkpoint with a DELIBERATELY WRONG root but the correct LamportHigh
-	// (final checkpoint; legacy 0x02 form). To the full-replay path this is
-	// byte-identical to an honest anchor that folded foreign state.
+	// Use a deliberately wrong root with the correct LamportHigh. This legacy
+	// 0x02 final checkpoint is indistinguishable on full replay from an anchor
+	// that legitimately included foreign state.
 	var wrongRoot [32]byte
 	wrongRoot[0] = 0xff
 	if err := live.WAL().AppendCheckpoint(WALCheckpoint{
@@ -209,17 +187,17 @@ func TestRecoveryForgedRoot_FullPathBootsLoudly(t *testing.T) {
 
 	recovered, wal, rep, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, nil, testArenaSize)
 	if err != nil {
-		t.Fatalf("REGRESSION: the full path REFUSED a boot on an unknowable comparand (%v) — the brick is back", err)
+		t.Fatalf("full replay rejected a root mismatch that foreign entries could explain: %v", err)
 	}
 	if recovered == nil || wal == nil {
-		t.Fatalf("boot must hand back a live engine and an open WAL")
+		t.Fatalf("recovery must return a live engine and an open WAL")
 	}
 	defer func() { _ = wal.Close(); _ = recovered.Close() }()
 	if witness == nil || witness.PostTailRootArmed {
-		t.Fatalf("the post-tail root check must be SCOPED OFF on the full path (witness=%+v) — if it armed and passed here, the comparand problem is being hidden, not fixed", witness)
+		t.Fatalf("post-tail root comparison must be disabled on full replay; witness=%+v", witness)
 	}
 	if !rep.SeqContiguityVerified || rep.RecordsVerified != K+1 {
-		t.Fatalf("the loss check must have run over all %d records (verified=%v n=%d) — the scoped-off root check is REPLACED, not abandoned", K+1, rep.SeqContiguityVerified, rep.RecordsVerified)
+		t.Fatalf("sequence verification must cover all %d records; verified=%v count=%d", K+1, rep.SeqContiguityVerified, rep.RecordsVerified)
 	}
 	// The full 32 local mutations must all be back — the WAL is the truth.
 	if got := len(rep.Mutations); got != K {
@@ -227,9 +205,9 @@ func TestRecoveryForgedRoot_FullPathBootsLoudly(t *testing.T) {
 	}
 }
 
-// TestRecoveryColdBoot_NoCheckpoint: a WAL with mutations but NO checkpoint —
-// RecoverEngine succeeds, logs the "no anchor" warning, and the replayed state
-// is still correct up to the replayed mutations (root == the live root).
+// TestRecoveryColdBoot_NoCheckpoint verifies that RecoverEngine accepts a WAL
+// containing mutations but no checkpoint. It logs the missing-anchor warning,
+// and the replayed root and Lamport clock must match the live values.
 func TestRecoveryColdBoot_NoCheckpoint(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "cold.wal")
 	const K = 16
@@ -242,7 +220,7 @@ func TestRecoveryColdBoot_NoCheckpoint(t *testing.T) {
 	}
 	liveRoot := live.Engine().State().MerkleRoot()
 	liveLamport := live.Engine().LamportCounter()
-	// NO checkpoint appended — the cold-boot-with-mutations edge.
+	// No checkpoint appended — the cold-boot-with-mutations edge.
 	if err := live.WAL().Close(); err != nil {
 		t.Fatalf("live WAL close: %v", err)
 	}
@@ -269,11 +247,9 @@ func TestRecoveryColdBoot_NoCheckpoint(t *testing.T) {
 	}
 }
 
-// TestRecoveryTornTailTruncation: truncate the WAL mid-record; RecoverEngine
-// ignores the torn tail (internal/chaos/wal.go ReplayWAL truncates) and
-// rebuilds from the valid prefix. The checkpoint anchor at the prefix boundary
-// stays intact and reproducible; the recovered engine does not regress the
-// Lamport clock past the anchor.
+// TestRecoveryTornTailTruncation removes bytes from the middle of the final WAL
+// record. ReplayWAL must discard the incomplete tail and rebuild from the valid
+// prefix, retaining its checkpoint anchor and Lamport high-water.
 func TestRecoveryTornTailTruncation(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "torn.wal")
 	const K = 32
@@ -316,7 +292,7 @@ func TestRecoveryTornTailTruncation(t *testing.T) {
 
 	// The torn tail dropped the final (trailing) mutation record(s). The
 	// replayed mutation count is strictly less than the pre-tear count — the
-	// torn record was truncated, NOT mis-decoded into a bogus mutation.
+	// torn record was truncated, not mis-decoded into a bogus mutation.
 	if len(rep.Mutations) >= K+trailing {
 		t.Fatalf("torn tail: replayed %d mutations, want < %d (torn tail not truncated)",
 			len(rep.Mutations), K+trailing)
@@ -350,18 +326,16 @@ func tearTail(t *testing.T, path string, n int) {
 	}
 }
 
-// TestPutLocalWALStampsEngineDot is the ORDER guard. PutLocal writes
-// the WAL AFTER InsertLocal; the WALMutation.Counter == the dot the engine
-// returned AND == the dot later RecoverEngine re-mints. Catches a
-// reversed-order regression (AppendMutation before InsertLocal would record a
-// caller-set dot the engine never minted).
+// TestPutLocalWALStampsEngineDot checks the write ordering required by
+// ADR-0013. Each WALMutation must carry the dot returned by InsertLocal, and
+// RecoverEngine must restore that recorded dot rather than minting a new one.
+// Appending first would instead persist caller-supplied zero dot fields.
 func TestPutLocalWALStampsEngineDot(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "order.wal")
 	const K = 16
 
 	live := newLiveBridge(t, walPath, 0)
-	// Capture the engine-returned dots and cross-check them against the WAL
-	// records AND the replayed dots.
+	// Compare the returned dots and payload digests with the WAL and replayed state.
 	returnedDots := make([]eng.CausalDot, K)
 	for i := 0; i < K; i++ {
 		dot, err := live.PutLocal(stagedEntityID(i), stagedPayload(i), stagedEntry(i))
@@ -369,10 +343,9 @@ func TestPutLocalWALStampsEngineDot(t *testing.T) {
 			t.Fatalf("PutLocal %d: %v", i, err)
 		}
 		returnedDots[i] = dot
-		// The stamped digest MUST equal SHA-256(payload) — the order guard's
-		// first half: the digest was stamped BEFORE InsertLocal, so the WAL
-		// carries the same digest the engine folded into the Merkle root.
-		got := live.Engine().State().Get(stagedEntityID(i))
+		// PutLocal computes the digest before InsertLocal, so the engine and WAL
+		// must cover the same payload bytes. PointGet avoids building State per entity.
+		got := live.Engine().PointGet(stagedEntityID(i))
 		if len(got) == 0 {
 			t.Fatalf("PutLocal %d: entry not found in engine state", i)
 		}
@@ -391,8 +364,7 @@ func TestPutLocalWALStampsEngineDot(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// The WAL records the engine-STAMPED dots: replay and assert each recorded
-	// counter == the dot PutLocal returned.
+	// Each WAL mutation must carry the dot returned by InsertLocal.
 	rep, err := ReplayWAL(walPath)
 	if err != nil {
 		t.Fatalf("ReplayWAL: %v", err)
@@ -402,20 +374,18 @@ func TestPutLocalWALStampsEngineDot(t *testing.T) {
 	}
 	for i, m := range rep.Mutations {
 		if m.Counter != returnedDots[i].Counter {
-			t.Fatalf("order guard: WALMutation[%d].Counter=%d != engine-returned dot.Counter=%d "+
-				"(WAL did not carry the engine-STAMPED dot — reversed order?)",
+			t.Fatalf("order check: WALMutation[%d].Counter=%d != engine-returned dot.Counter=%d "+
+				"(WAL did not carry the engine-stamped dot; check append order)",
 				i, m.Counter, returnedDots[i].Counter)
 		}
 		if m.NodeID != returnedDots[i].NodeID {
-			t.Fatalf("order guard: WALMutation[%d].NodeID %x != engine-returned dot.NodeID %x",
+			t.Fatalf("order check: WALMutation[%d].NodeID %x != engine-returned dot.NodeID %x",
 				i, m.NodeID, returnedDots[i].NodeID)
 		}
 	}
 
-	// RecoverEngine RESTORES the recorded dots (ADR-0045: the seed-
-	// derivation era is over — replay Joins each mutation at its recorded dot,
-	// never re-mints). Its LamportHigh == the live engine's (the clock nail),
-	// so its Merkle root matches the live root.
+	// RecoverEngine joins each mutation at its recorded dot (ADR-0045 §4), so
+	// its Lamport high-water and Merkle root match the live engine.
 	recovered, wal, _, err := RecoverEngine(testNodeID(), walPath, testArenaSize)
 	if err != nil {
 		t.Fatalf("RecoverEngine: %v", err)
@@ -423,14 +393,14 @@ func TestPutLocalWALStampsEngineDot(t *testing.T) {
 	t.Cleanup(func() { _ = wal.Close() })
 	t.Cleanup(func() { _ = recovered.Close() })
 	if recovered.LamportCounter() != liveLamport {
-		t.Fatalf("order guard: recovered lamport %d != live lamport %d (re-minted dots diverged)",
+		t.Fatalf("order check: recovered lamport %d != live lamport %d (re-minted dots diverged)",
 			recovered.LamportCounter(), liveLamport)
 	}
 }
 
 // foreignNodeID is a distinct nodeID for the foreign engine in the real-Join
-// guards — it MUST differ from testNodeID() so the foreign entries carry a
-// foreign DotNodeID (the honest physics: a foreign Join merges foreign STATE,
+// tests — it must differ from testNodeID() so the foreign entries carry a
+// foreign DotNodeID (a foreign Join merges foreign state,
 // not just a clock jump).
 func foreignNodeID() [16]byte {
 	var n [16]byte
@@ -440,41 +410,20 @@ func foreignNodeID() [16]byte {
 	return n
 }
 
-// TestRecoveryForeignAdvance_RealJoinClockSeedFixed is THE gate
-// (load-bearing). It does a REAL foreign Join — NOT a synthetic
-// AdvanceLamportTo clock jump — so it exercises the honest physics: a foreign
-// Join (crdt.go:1028) BOTH advances the live Lamport clock AND merges foreign
-// entries (foreign DotNodeID) into the live HAMT.
+// TestRecoveryForeignAdvance_RealJoinClockSeedFixed joins entries from a second
+// engine rather than injecting a synthetic clock jump. Join both merges the
+// foreign entries and advances the live Lamport clock; RecordClockAdvance then
+// appends that high-water as a 0x03 WAL record (ADR-0045 §4).
 //
-// The defect: the clock advance was un-recorded, so the replayed clock
-// under-shot the live high-water (historically diagnosed through the
-// seed-derivation lens — "LamportHigh - len(Mutations)" / "firstMutation.
-// Counter - 1" — BOTH formulas REFUTED under concurrent mint/append
-// reordering, ADR-0045). The receiver WAL-records the advance
-// (WALRecClockAdvance=0x03) at the receive seam; recovery replays
-// the append-ordered (mutation|advance) stream and nails the clock to the
-// recorded high-water (AdvanceLamportTo — monotone max, no derivation).
+// Recovery must restore the recorded clock and the exact dots of subsequent
+// origin mutations. Deriving a seed from LamportHigh or the first mutation is
+// not valid when minting and WAL appends can be reordered.
 //
-// HONEST ASSERTIONS (do NOT claim a false victory):
-// 1. recovered.LamportCounter() == live.LamportCounter() — the clock nail is
-// PROVEN: the advance was recorded + replayed, so the recovered clock
-// resumes at the live high-water.
-// 2. recovered.State().MerkleRoot() != live.State().MerkleRoot() — the
-// HONEST divergence: the rebuilt engine is ORIGIN-ONLY (the WAL records
-// origin mutations + clock advances, NOT foreign entries); the live root
-// is origin + foreign. Full root-equality across a foreign Join is
-// physically impossible without WAL-capturing foreign deltas as mutations
-// (an edit to the protected-core crdt.go). This divergence is the protected-core
-// lock limit, NOT data loss — the foreign state regossips on rejoin (eventual
-// consistency). We ASSERT the divergence (do not hide it) and document it.
-// 3. The origin-only projection matches: the RESTORED origin dots equal the
-// recorded origin dots (exact-dot restore, never re-mint — ADR-0045).
-//
-// This guard FAILS on the unrecorded advance (the clock diverges → even the
-// origin-only root differs from the live origin-only projection) and is GREEN
-// once advances are recorded + replayed. It is the honest red→green proof.
-// (The test's NAME keeps the historical "ClockSeedFixed" wording; the seed
-// frame it names is refuted — see above.)
+// The recovered root must differ from the live root because the WAL contains
+// origin mutations and clock advances, not the foreign entries joined into the
+// live engine. This is a limit of full replay, not loss of durable local writes;
+// foreign entries can arrive again through gossip. The test checks the clock,
+// the trailing origin dot, and this expected root divergence separately.
 func TestRecoveryForeignAdvance_RealJoinClockSeedFixed(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "foreign-advance.wal")
 	const K = 8 // origin mutations (counters 2..9)
@@ -490,11 +439,8 @@ func TestRecoveryForeignAdvance_RealJoinClockSeedFixed(t *testing.T) {
 		t.Fatalf("pre-Join lamport %d != %d (origin mint assumption wrong)", got, K+1)
 	}
 
-	// REAL FOREIGN JOIN. Build a second engine (foreign nodeID), PutLocal F
-	// foreign mutations into it, then GenerateDelta + Join into the live engine.
-	// Join (crdt.go:1028) AdvanceLamportTo's per foreign entry AND merges the
-	// foreign entries into the live HAMT. This is the honest physics — NOT a
-	// synthetic clock jump.
+	// Build a foreign engine, generate the entries missing from live, and join
+	// them. Join advances the clock for each foreign entry and merges its state.
 	const F = 5
 	eng.DataDir = t.TempDir()
 	foreign, err := eng.NewDeltaCRDTEngine(foreignNodeID(), 100, testArenaSize)
@@ -505,21 +451,17 @@ func TestRecoveryForeignAdvance_RealJoinClockSeedFixed(t *testing.T) {
 	for i := 0; i < F; i++ {
 		foreign.InsertLocal(stagedEntityID(1000+i), stagedEntry(1000+i))
 	}
-	// GenerateDelta against the live engine's digest yields the foreign delta
-	// (the entries the live engine lacks). Join merges them into live.
 	liveDigest := live.Engine().GenerateDigest()
 	delta := foreign.GenerateDelta(liveDigest)
-	defer delta.Release() // MUST Release (crdt.go:1595): Exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
+	defer delta.Release() // release the delta's EBR participant before foreign.Close quiesces
 	live.Engine().Join(*delta)
-	// Record the foreign clock advance at the receive seam — the
-	// post-Join high-water. This is what Receiver.HandleFrame would fire.
+	// Receiver.HandleFrame records the same post-Join high-water at this seam.
 	if err := live.RecordClockAdvance(); err != nil {
 		t.Fatalf("RecordClockAdvance: %v", err)
 	}
 
-	// One more ORIGIN mutation AFTER the foreign Join — the load-bearing
-	// case: its counter (K+1+gap) must re-mint identically on recovery. This is
-	// the dot the defect seed would have mis-minted.
+	// The next origin mutation must retain its recorded counter (K+1+gap) on
+	// recovery rather than deriving a different counter from mutation counts.
 	trailingDot, err := live.PutLocal(stagedEntityID(K), stagedPayload(K), stagedEntry(K))
 	if err != nil {
 		t.Fatalf("trailing PutLocal: %v", err)
@@ -527,8 +469,8 @@ func TestRecoveryForeignAdvance_RealJoinClockSeedFixed(t *testing.T) {
 	liveRoot := live.Engine().State().MerkleRoot() // origin + foreign
 	liveLamport := live.Engine().LamportCounter()
 
-	// Checkpoint at the LIVE root (origin + foreign). The root-equality
-	// assertion is SCOPED to skip this (advances exist) — see recovery.go.
+	// The anchor covers origin and foreign state. Full replay skips its root
+	// comparison when clock advances show that foreign state may be absent.
 	if err := live.AppendCheckpoint(); err != nil {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
@@ -548,53 +490,39 @@ func TestRecoveryForeignAdvance_RealJoinClockSeedFixed(t *testing.T) {
 	t.Cleanup(func() { _ = wal.Close() })
 	t.Cleanup(func() { _ = recovered.Close() })
 
-	// (1) CLOCK NAIL PROVEN: the recovered clock resumes at the live
-	// high-water — the advance was recorded + replayed (AdvanceLamportTo,
-	// monotone max), and the trailing origin dot is restored at its recorded
-	// counter (never re-minted, ADR-0045).
+	// The ordered advance record must restore the live clock high-water.
 	if recovered.LamportCounter() != liveLamport {
-		t.Fatalf("clock nail BROKEN:\n recovered lamport = %d\n live lamport = %d\n"+
-			"The foreign advance was not recorded/replayed → the recovered clock under-shoots the live high-water.",
+		t.Fatalf("recovered Lamport clock mismatch:\n  recovered lamport = %d\n  live lamport      = %d\n"+
+			"The foreign advance was not restored at the live high-water.",
 			recovered.LamportCounter(), liveLamport)
 	}
 
-	// (3) ORIGIN-ONLY PROJECTION: the trailing origin dot re-minted at the
-	// SAME counter the live engine minted it at (the seed is exact). The
-	// recovered engine's last origin dot must equal the live trailing dot.
-	// We re-mint by replaying the WAL's last mutation record; its recorded
-	// Counter must equal the live trailingDot.Counter.
+	// The last WAL mutation must restore the exact trailing origin counter.
 	lastMut := rep.Mutations[len(rep.Mutations)-1]
 	if lastMut.Counter != trailingDot.Counter {
-		t.Fatalf("origin-dot re-mint BROKEN:\n recovered last origin counter = %d\n live trailing dot counter = %d\n"+
-			"The seed is not exact — the trailing origin dot re-minted at a different counter than the live engine minted it.",
+		t.Fatalf("origin-dot restoration mismatch:\n  recovered last origin counter = %d\n  live trailing dot counter    = %d\n"+
+			"Replay did not restore the counter recorded for the trailing origin mutation.",
 			lastMut.Counter, trailingDot.Counter)
 	}
 
-	// (2) HONEST DIVERGENCE: the recovered root is ORIGIN-ONLY; the
-	// live root is origin + foreign. They MUST differ — this is the
-	// protected-core crdt.go limit (foreign state is not WAL-captured), NOT data loss.
-	// Asserting equality here would be a FALSE victory; asserting the
-	// divergence is the honest physics. The foreign state regossips on rejoin.
+	// Foreign entries are absent from the WAL, so the origin-only recovered root
+	// must differ from the live origin+foreign root. Foreign state can regossip.
 	recoveredRoot := recovered.State().MerkleRoot()
 	if recoveredRoot == liveRoot {
-		t.Fatalf("honest-physics inversion: recovered root == live root (%x).\n"+
-			"A foreign Join merged foreign STATE into the live HAMT; the WAL records only origin mutations + clock advances.\n"+
-			"The recovered root should be ORIGIN-ONLY and DIVERGE from the live origin+foreign root. Equality here means\n"+
-			"either the foreign Join did not merge state (test is synthetic) or the WAL captured foreign deltas (it does not).",
+		t.Fatalf("recovered root unexpectedly equals live root %x.\n"+
+			"The foreign Join should merge foreign state into the live HAMT, while the WAL records only origin mutations and clock advances.\n"+
+			"The recovered root should be origin-only and differ from the live origin+foreign root.\n"+
+			"Equality means either Join did not merge state or the WAL captured foreign entries.",
 			recoveredRoot)
 	}
-	t.Logf("honest physics: recovered(origin-only) root=%x != live(origin+foreign) root=%x — foreign state regossips on rejoin (protected-core crdt.go limit, not data loss); clock/seed fix PROVEN (lamport %d==%d, trailing origin dot %d==%d)",
+	t.Logf("origin-only recovered root=%x != live origin+foreign root=%x; clock %d==%d and trailing origin dot %d==%d restored",
 		recoveredRoot, liveRoot, recovered.LamportCounter(), liveLamport, lastMut.Counter, trailingDot.Counter)
 }
 
-// TestRecoveryForeignAdvance_NoFalseMismatch is the false-mismatch
-// facet. A real foreign Join + a TRAILING checkpoint must NOT surface as
-// ErrRecoveryRootMismatch. Earlier, the defect seed would re-mint different
-// dots → the rebuilt root differed from the checkpoint root → a HEALTHY node
-// refused to boot (the other facet of the same critical defect). Recovery scopes the
-// root-equality assertion to checkpoints with NO foreign advance, so a
-// checkpoint coexisting with advances is logged (foreign state regossips) and
-// boot SUCCEEDS. RecoverEngine returns nil error; the recovered clock matches.
+// TestRecoveryForeignAdvance_NoFalseMismatch joins foreign state and then writes
+// a final checkpoint. Full replay cannot reproduce the foreign entries, so it
+// must not report ErrRecoveryRootMismatch merely because the checkpoint root
+// includes them. Recovery must succeed and restore the live Lamport clock.
 func TestRecoveryForeignAdvance_NoFalseMismatch(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "no-false-mismatch.wal")
 	const K = 4
@@ -618,17 +546,15 @@ func TestRecoveryForeignAdvance_NoFalseMismatch(t *testing.T) {
 		foreign.InsertLocal(stagedEntityID(2000+i), stagedEntry(2000+i))
 	}
 	fdelta := foreign.GenerateDelta(live.Engine().GenerateDigest())
-	defer fdelta.Release() // MUST Release (crdt.go:1595): Exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
+	defer fdelta.Release() // release the delta's EBR participant before foreign.Close quiesces
 	live.Engine().Join(*fdelta)
 	if err := live.RecordClockAdvance(); err != nil {
 		t.Fatalf("RecordClockAdvance: %v", err)
 	}
 
-	// Trailing origin mutation + a FINAL checkpoint (checkpoint is the last
-	// record — checkpointIsFinal is true). The checkpoint root is origin +
-	// foreign; the rebuilt root is origin-only. Earlier this FALSE-fired
-	// ErrRecoveryRootMismatch. Recovery scopes the assertion (advances exist →
-	// skip) so boot SUCCEEDS.
+	// The final checkpoint includes foreign state, while full replay rebuilds
+	// only origin mutations. The clock advance tells recovery not to compare
+	// those roots as though they covered identical state.
 	if _, err := live.PutLocal(stagedEntityID(K), stagedPayload(K), stagedEntry(K)); err != nil {
 		t.Fatalf("trailing PutLocal: %v", err)
 	}
@@ -646,7 +572,7 @@ func TestRecoveryForeignAdvance_NoFalseMismatch(t *testing.T) {
 
 	recovered, wal, _, err := RecoverEngine(testNodeID(), walPath, testArenaSize)
 	if err != nil {
-		t.Fatalf("FALSE mismatch: RecoverEngine returned %v — a healthy node with a foreign Join + trailing checkpoint refused to boot (the defect's other facet). Recovery must scope the root-equality assertion so this SUCCEEDS.", err)
+		t.Fatalf("recovery rejected a healthy foreign Join and final checkpoint: %v", err)
 	}
 	t.Cleanup(func() { _ = wal.Close() })
 	t.Cleanup(func() { _ = recovered.Close() })
@@ -659,13 +585,10 @@ func TestRecoveryForeignAdvance_NoFalseMismatch(t *testing.T) {
 		recovered.LamportCounter(), liveLamport)
 }
 
-// TestRecoveryScratchDirCleaned is the scratch-dir
-// leak fix. Earlier, newEngineAt created a /tmp/sovereign-recover-* dir per
-// durable boot and NEVER removed it (grep-verified: zero RemoveAll). A node
-// that restarted N times leaked N dirs + the persist worker's
-// lamport_<nodeID>.dat. Recovery returns the scratch dir from newEngineAt,
-// stashes it on Replayed.ScratchDir + the Bridge, and Bridge.Close RemoveAll's
-// it. This guard asserts the dir is GONE after Close.
+// TestRecoveryScratchDirCleaned checks that Bridge.Close removes the recovery
+// directory returned in Replayed.ScratchDir. Recovery creates this directory
+// under os.TempDir for constructor and lamport_<nodeID>.dat state; without an
+// owner, each restart would leave another directory behind.
 func TestRecoveryScratchDirCleaned(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "scratch-leak.wal")
 	live := newLiveBridge(t, walPath, 0)
@@ -687,13 +610,13 @@ func TestRecoveryScratchDirCleaned(t *testing.T) {
 		t.Fatalf("RecoverEngine: %v", err)
 	}
 	if rep.ScratchDir == "" {
-		t.Fatalf("Replayed.ScratchDir is empty — newEngineAt did not return the scratch dir (leak fix not wired)")
+		t.Fatalf("Replayed.ScratchDir is empty; recovery must return its scratch directory")
 	}
 	if _, err := os.Stat(rep.ScratchDir); err != nil {
-		t.Fatalf("scratch dir %s does not exist pre-Close (the recovered engine should be using it): %v", rep.ScratchDir, err)
+		t.Fatalf("scratch dir %s is unavailable before Close: %v", rep.ScratchDir, err)
 	}
 
-	// Bind a Bridge (as production does) so Close owns the scratch dir lifecycle.
+	// Bind a Bridge so Close owns the scratch directory lifecycle.
 	bridge := NewBridge(recovered, wal, 0)
 	bridge.SetScratchDir(rep.ScratchDir)
 	if err := bridge.Close(); err != nil {
@@ -701,7 +624,7 @@ func TestRecoveryScratchDirCleaned(t *testing.T) {
 	}
 
 	if _, err := os.Stat(rep.ScratchDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("scratch dir %s STILL EXISTS after Bridge.Close — the leak is not fixed (got err=%v)", rep.ScratchDir, err)
+		t.Fatalf("scratch dir %s remains after Bridge.Close; err=%v", rep.ScratchDir, err)
 	}
-	t.Logf("scratch dir %s removed on Bridge.Close (leak fixed)", rep.ScratchDir)
+	t.Logf("scratch dir %s removed by Bridge.Close", rep.ScratchDir)
 }

@@ -4,44 +4,23 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package sync — iblt_wire is the production IBLT-digest marshal seam for the
-// mesh gossip anti-entropy round.
+// Package sync serializes IBLT digests for mesh anti-entropy exchanges. The
+// deterministic little-endian format uses a fixed header and a flat bucket
+// array rather than a Cap'n Proto schema:
 //
-// WHY THIS FILE EXISTS. pkg/sync.IBLT has NO Marshal/Encode/Decode/Wire
-// method (grep-verified: zero hits). The chaos mesh (internal/chaos) passes
-// the digest *IBLT by POINTER in-process, so it never serializes the seed or
-// the bucket array. The production gossip wire (pkg/mesh) crosses a real TCP+TLS
-// socket, so the digest MUST be serialized. This file is that serialization,
-// a NEW CALLER of the IBLT's public accessors (NumBuckets, K, Seed, the
-// buckets []Bucket slice header), WITHOUT touching iblt.go (the engine's
-// hot-path structure, left byte-identical).
+//	[4] magic        uint32  'IBL1' or 'IBL2'
+//	[4] numBuckets   uint32
+//	[2] k            uint16
+//	[8] seed         uint64  (maphash.Seed backing word)
+//	[numBuckets * 20] buckets (Count int32 | KeySum uint64 | HashSum uint64)
 //
-// WIRE FORMAT (deterministic, little-endian, auditable; NOT capnp — a digest
-// is a flat bucket array, a fixed-size header is simpler and cheaper than a
-// schema round-trip, and this keeps the IBLT wire off the capnp schema's
-// surface area entirely):
+// GenerateDelta rebuilds its local digest with the remote seed, so preserving
+// the backing word is necessary for common keys to cancel during subtraction.
+// A rejected or mismatched digest selects the full-keyset fallback.
 //
-//	[4] magic uint32 'IBL1' = 0x49424C31 (version tag / reject of foreign bytes)
-//	[4] numBuckets uint32
-//	[2] k uint16
-//	[8] seed uint64 (the maphash.Seed backing word; see SeedToUint64)
-//	[numBuckets * 20] buckets (Count int32 LE | KeySum uint64 LE | HashSum uint64 LE)
-//
-// The seed is the load-bearing field: GenerateDelta(remoteDigest) rebuilds the
-// local digest via e.GenerateDigestWithSeed(remoteDigest.Seed()) so both
-// digests hash keys identically before subtract. A wrong seed on reconstruction
-// makes subtract compare buckets hashed under DIFFERENT seeds — the peel
-// yields garbage, and the honest outcome is the delta loopback (oversend,
-// convergence slower but still correct by CRDT idempotency). Correctness is
-// preserved; the seed round-trip is the performance/cleanliness invariant.
-//
-// unsafe usage: maphash.Seed is an opaque struct{s uint64} (size 8 on every
-// Go platform the engine targets, verified by the compile-time assert below +
-// TestIBLTWire_SeedSizeIsEight). There is no public accessor for the backing
-// word, so we read/write 8 bytes via unsafe.Pointer exactly the way the
-// HamtArena allocation paths use unsafe.Slice/unsafe.Sizeof. Go 1.26.1 is the
-// pinned toolchain; a future Go that changes Seed's layout trips the
-// compile-time assert and the test, never a silent wire skew.
+// maphash.Seed has no public accessor for its backing word. SeedToUint64 and
+// Uint64ToSeed use unsafe.Pointer for that single conversion; size checks and
+// round-trip tests guard the assumed eight-byte layout.
 package sync
 
 import (
@@ -52,29 +31,46 @@ import (
 	"unsafe"
 )
 
-// ibltWireMagic is the version tag on the digest wire. A foreign/truncated
-// buffer that does not begin with this tag is an explicit ErrMalformedDigest,
-// never a silent fall-through to zero buckets (the silent-fall-through failure
-// mode).
-const ibltWireMagic uint32 = 0x49424C31 // 'IBL1'
+// ibltWireMagicV1 and IBLTWireMagicV2 identify arithmetic-progression and
+// decorrelated placement respectively. Seed and bucket fields alone cannot
+// distinguish the schemes, so UnmarshalIBLT accepts only the magic for the
+// process's selected scheme. Cross-scheme subtraction would not cancel common
+// keys. Rejection instead selects the full-keyset fallback, which still
+// converges through Join but wastes bandwidth until peers use the same scheme.
+// Unknown or truncated input is rejected rather than decoded as empty buckets.
+const (
+	ibltWireMagicV1 uint32 = 0x49424C31 // 'IBL1' — the legacy double-hash scheme
+	// IBLTWireMagicV2 is exported: the mesh responder's request-peek gate
+	// (pkg/mesh digest.go) compares the peeked [0:8] (magic + numBuckets, one
+	// read) against it before adopting the requester's size.
+	IBLTWireMagicV2 uint32 = 0x49424C32 // 'IBL2' — the k-decorrelated scheme
+)
+
+// ibltActiveWireMagic returns the only frame tag the process accepts: IBL2
+// when --iblt-v2 selected decorrelated placement at initialization, IBL1
+// otherwise. MarshalIBLT instead uses each table's captured scheme.
+func ibltActiveWireMagic() uint32 {
+	if ibltSchemeV2Enabled.Load() {
+		return IBLTWireMagicV2
+	}
+	return ibltWireMagicV1
+}
 
 // ibltWireHeaderLen is the fixed header before the variable-length bucket
 // array: magic(4) + numBuckets(4) + k(2) + seed(8) = 18.
 const ibltWireHeaderLen = 4 + 4 + 2 + 8
 
-// Compile-time guard: if a future Go changes maphash.Seed's layout the
-// constant below fails to compile (the unsafe.Sizeof in a const initializer
-// is rejected), surfacing the break at build time instead of producing a
-// silently-wrong wire. unsafe.Sizeof on a concrete type is a compile-time
-// constant expression in Go (not a runtime call).
+// The seed conversion functions support only an eight-byte maphash.Seed.
+// Their runtime size checks and TestIBLTWire_SeedSizeIsEight detect a
+// toolchain layout change before the backing word is serialized.
 var _ = unsafe.Sizeof(maphash.Seed{})
 
 const ibltSeedSize = 8 //nolint:unused // documented invariant; assert pair below
 
 // SeedToUint64 extracts the backing word of a maphash.Seed. It is the
-// inverse of Uint64ToSeed and is deliberately the ONE place the engine
-// reaches into the opaque Seed layout. Callers MUST pair every To with a
-// matching From and MUST NOT assume the word's meaning beyond round-trip
+// inverse of Uint64ToSeed and is deliberately the one place the engine
+// reaches into the opaque Seed layout. Callers must pair every To with a
+// matching From and must not assume the word's meaning beyond round-trip
 // fidelity. The test TestIBLTWire_SeedRoundTrip pins the round-trip.
 func SeedToUint64(s maphash.Seed) uint64 {
 	if unsafe.Sizeof(s) != ibltSeedSize {
@@ -101,80 +97,35 @@ func Uint64ToSeed(w uint64) maphash.Seed {
 // KeySum uint64 (8) + HashSum uint64 (8) = 20.
 const bucketWireLen = 4 + 8 + 8
 
-// maxFrameSizeBytes is the shared 16 MiB ingress cap — the SAME constant as
-// pkg/receive/receiver.go's `const maxFrameSize = 16 << 20` (the ReadFrame cap
-// `if frameLen > maxFrameSize` enforces). It is DUPLICATED here as a literal
-// (NOT imported) because pkg/receive already imports pkg/sync (aliased `eng`)
-// — importing pkg/receive back into pkg/sync would close a bidirectional
-// import cycle that fails to compile (ADR-0041). The literal is
-// LOCKSTEP-tracked: a future maxFrameSize change in receiver.go MUST be
-// mirrored here; the bound-lockstep guard
-// (pkg/mesh/loopback_convergence_test.go) cross-checks the two at test time
-// (it imports both packages and asserts equality — the test-time equivalent of
-// a build-time cross-package const assert, which Go does not support across an
-// import cycle).
+// maxFrameSizeBytes mirrors the 16 MiB ReadFrame limit in pkg/receive. It is
+// duplicated because pkg/receive imports pkg/sync, so sharing the constant by
+// import would create a cycle. internal/chaos/loopback_convergence_test.go
+// checks that the two values remain equal (ADR-0041).
 const maxFrameSizeBytes = 16 << 20
 
-// maxIBLTBuckets is the upper bound on numBuckets a wire UnmarshalIBLT will
-// accept: the largest n whose HEAP slab (n * sizeof(Bucket) = n * 24) stays
-// within the 16 MiB ingress cap = maxFrameSizeBytes / unsafe.Sizeof(Bucket{}) =
-// 16<<20 / 24 = 699050 (integer division: 16777216 / 24 = 699050.67 -> 699050).
-// A wire claiming n > maxIBLTBuckets is REJECTED with ErrIBLTTooLarge BEFORE
-// the alloc path (NewIBLTWithSeed's make([]Bucket, n) site).
-// This kills:
+// maxIBLTBuckets limits decoded tables to the 16 MiB ingress budget using
+// Bucket's 24-byte heap size: 16<<20 / 24 = 699050. UnmarshalIBLT rejects a
+// larger count with ErrIBLTTooLarge before allocating its bucket slice.
 //
-//	(1) the 1.2× heap amplification — n=838859 (the max-through-ReadFrame
-//
-// shape: 838859*20 = 16,777,180 wire bytes + 18 header <= 16 MiB) drives
-// make([]Bucket, 838859) = 838859*24 = 20,131,616 bytes ≈ 19.2 MiB heap;
-// 838859 > 699050 -> REJECTED (the IBLT-bound guard's headline
-// case); AND
-//
-//	(2) the 32-bit n*bucketWireLen wrap — on a future 32-bit/WASM target, n in
-//
-// [107374183, 2147483647] wraps the product n*20 to a small/negative,
-// defeating `len(wire) < 18 + n*20`; the bound rejects n > 699050 BEFORE
-// the product check. This is DEFENSE-IN-DEPTH — the arm64 production target's
-// 64-bit int + the ReadFrame cap already neutralize the OOM (ADR-0041).
-//
-// THE DENOMINATOR IS THE HEAP BUCKET SIZE (sizeof(Bucket)=24), NOT the wire
-// bucket size (bucketWireLen=20). Bounding by the wire size leaves a 24/20=1.2×
-// heap headroom the n=838859 attack exploits: a naive
-// maxFrameSize/bucketWireLen formula (= 838860) would let n=838859 through
-// (838859 <= 838860), FAILING the IBLT-bound guard (n=838859 ->
-// ErrIBLTTooLarge). The heap-size denominator is the load-bearing correction.
-// The on-wire bucketWireLen=20 is KEPT for the existing short-array bounds
-// check below
-// (it rejects a TRUNCATED wire whose declared n is small but whose actual bytes
-// are fewer — a distinct failure mode from the heap bomb).
-//
-// It is a package var (computed once at init), NOT a const, because
-// unsafe.Sizeof(Bucket{}) is not a compile-time constant expression — Bucket{}
-// is a composite literal, and the Go spec restricts Sizeof's const-ness to
-// type-or-constant arguments (see the maphash.Seed compile-time guard above,
-// the same idiom). It never mutates; reading it in UnmarshalIBLT is a single
-// load of a package-level int. If a future Go changes Bucket's in-memory
-// layout, this var recomputes at init and the bound stays correct
-// automatically (no manual update — the advantage of the sizeof-derived var
-// over a hardcoded literal).
+// Using the 20-byte wire size instead would permit 1.2× heap amplification.
+// For example, 838,859 buckets occupy 16,777,180 wire bytes plus the 18-byte
+// header, but require 20,131,616 heap bytes (about 19.2 MiB). The heap-derived
+// bound rejects that input. It also rejects counts before n*bucketWireLen can
+// overflow on a 32-bit target; bucketWireLen remains in the separate truncated-
+// input check. Deriving the value from unsafe.Sizeof keeps it current if the
+// in-memory layout changes.
 var maxIBLTBuckets = int(maxFrameSizeBytes / unsafe.Sizeof(Bucket{})) // == 699050
 
-// ErrIBLTTooLarge is the sentinel returned by UnmarshalIBLT when the wire's
-// numBuckets exceeds maxIBLTBuckets (the 16 MiB ingress cap / sizeof(Bucket)
-// heap bound). It is a DISTINCT sentinel from pkg/receive's ErrFrameTooLarge
-// (a different layer — the transport frame cap — for clear attribution: a
-// caller surfacing the error knows whether the frame was oversized at the
-// transport boundary OR the IBLT bucket count was oversized at the digest
-// unmarshal boundary).
+// ErrIBLTTooLarge reports a decoded bucket count above maxIBLTBuckets. It is
+// distinct from pkg/receive's ErrFrameTooLarge so callers can distinguish an
+// oversized transport frame from a digest whose bucket allocation would exceed
+// the heap bound (ADR-0041).
 var ErrIBLTTooLarge = errors.New("iblt_wire: IBLT numBuckets exceeds the 16 MiB heap bound (ErrIBLTTooLarge)")
 
-// MarshalIBLT serializes an IBLT digest into the deterministic wire format
-// documented above. It reads only public accessors + the buckets slice header
-// (the Bucket fields are exported: Count int32, KeySum uint64, HashSum
-// uint64). The returned []byte is owned by the caller (a fresh heap buffer;
-// the gossip path is NOT the GenerateDelta hot path and is correctly allowed
-// to allocate — the Zero-GC gate is the sync/apply hot path, not the gossiper
-// wire marshal).
+// MarshalIBLT serializes t into the deterministic digest format. The frame
+// magic comes from t's captured placement scheme. It returns a newly allocated
+// buffer owned by the caller; wire serialization is outside the arena-backed
+// GenerateDelta path.
 func MarshalIBLT(t *IBLT) ([]byte, error) {
 	if t == nil {
 		return nil, fmt.Errorf("iblt_wire: MarshalIBLT: nil digest")
@@ -184,7 +135,14 @@ func MarshalIBLT(t *IBLT) ([]byte, error) {
 		return nil, fmt.Errorf("iblt_wire: MarshalIBLT: negative numBuckets=%d", n)
 	}
 	buf := make([]byte, ibltWireHeaderLen+n*bucketWireLen)
-	binary.LittleEndian.PutUint32(buf[0:4], ibltWireMagic)
+	// The magic declares the table's captured scheme (per-table, not
+	// per-process — a table built under v1 marshals 'IBL1' even if the
+	// process flag flips later; placement and tag stay coherent).
+	magic := ibltWireMagicV1
+	if t.schemeV2 != 0 {
+		magic = IBLTWireMagicV2
+	}
+	binary.LittleEndian.PutUint32(buf[0:4], magic)
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(n))
 	binary.LittleEndian.PutUint16(buf[8:10], uint16(t.K()))
 	binary.LittleEndian.PutUint64(buf[10:18], SeedToUint64(t.Seed()))
@@ -197,60 +155,33 @@ func MarshalIBLT(t *IBLT) ([]byte, error) {
 	return buf, nil
 }
 
-// strataWireMagic is the version tag on the StrataEstimator digest wire. It is
-// DISTINCT from ibltWireMagic ('IBL1') so a per-stratum IBLT blob is never
-// silently parsed as a whole-estimator frame (and vice versa): a foreign/
-// truncated buffer that does not begin with this tag is an explicit
-// ErrMalformedStrata, never a fall-through to zero strata (the
-// silent-fall-through failure mode the IBLT wire refuses). The value spells
-// 'STRA' big-endian.
+// strataWireMagic distinguishes a whole StrataEstimator frame from an
+// individual IBLT frame. UnmarshalStrataEstimator returns ErrMalformedStrata
+// for another tag or a truncated header instead of accepting empty strata.
 const strataWireMagic uint32 = 0x53545241 // 'STRA'
 
-// strataWireHeaderLen is the fixed header before the variable-length stratum
-// IBLT array: strataWireMagic(4) + strataCount(1) + seed(8) = 13. Each stratum
-// follows as a self-delimiting MarshalIBLT blob (its own 18-byte header carries
-// its numBuckets/k/seed), so the array needs NO length prefix per stratum —
-// UnmarshalIBLT consumes exactly the bytes MarshalIBLT emitted, and the loop
-// advances by the parsed length. The seed is hoisted into the strata header so
-// the receiver can reconstruct a NewStrataEstimator with the sender's seed
-// BEFORE unmarshaling strata (the strata IBLTs ALSO carry the seed per
-// MarshalIBLT, belt-and-braces; the hoisted copy is the authoritative one the
-// receiver's GenerateStrataEstimator(remote.Seed()) keys off — the load-bearing
-// field per the iblt_wire.go seed round-trip comment).
+// strataWireHeaderLen is magic(4) + strataCount(1) + seed(8). Each following
+// stratum is a self-delimiting MarshalIBLT frame. The outer seed reconstructs
+// the estimator before decoding; GenerateStrataEstimator also uses this
+// authoritative copy. Per-stratum frames retain their own seed fields.
 const strataWireHeaderLen = 4 + 1 + 8
 
-// ErrMalformedStrata is returned by UnmarshalStrataEstimator when the wire is
-// too short for a header, the magic does not match strataWireMagic, the
-// strataCount is not strataCount (32), or a per-stratum UnmarshalIBLT fails
-// (short bucket array / magic mismatch / k out of range). It is the
-// coarse-diff analog of ErrMalformedDigest — the cheap reject before the peer
-// commits a GenerateDelta subtract against a garbage remote IBLT.
+// ErrMalformedStrata reports a short header, wrong magic or stratum count, or
+// an invalid embedded IBLT. Decoding fails before GenerateDelta can subtract a
+// partially reconstructed estimator.
 var ErrMalformedStrata = fmt.Errorf("iblt_wire: malformed strata estimator wire")
 
-// MarshalStrataEstimator serializes a StrataEstimator into a deterministic wire
-// format: a 13-byte header (magic + strataCount + seed) followed by strataCount
-// self-delimiting MarshalIBLT blobs (one per stratum, highest to lowest or
-// lowest to highest — the order is the array order, which is stable because
-// NewStrataEstimator populates strata[0..strataCount-1] in index order and
-// Estimate subtracts in index order; the wire preserves that order). It is a
-// SIBLING to MarshalIBLT — it calls MarshalIBLT per stratum and does NOT touch
-// iblt.go or the IBLT struct. The returned []byte is owned by the caller
-// (a fresh heap buffer; the gossip digest-exchange is NOT the GenerateDelta hot
-// path and is correctly allowed to allocate — the Zero-GC gate is the sync/apply
-// hot path, not the gossiper digest marshal). A nil estimator is an explicit
-// error (a nil digest on the wire is a protocol violation, not a zero-diff
-// signal — the oversend fallback is the honest zero-diff path, never a nil).
+// MarshalStrataEstimator writes a 13-byte header followed by the 32 strata in
+// array order, each encoded by MarshalIBLT. It allocates one output buffer and
+// temporary per-stratum frames. A nil estimator is an error, not an encoding of
+// an empty difference.
 func MarshalStrataEstimator(se *StrataEstimator) ([]byte, error) {
 	if se == nil {
 		return nil, fmt.Errorf("iblt_wire: MarshalStrataEstimator: nil estimator")
 	}
-	// Pre-size: header + sum of each stratum's wire size. Computing each
-	// stratum's size up front (header + numBuckets*bucketWireLen) lets us
-	// allocate the whole buffer once and copy each MarshalIBLT blob in, rather
-	// than concatenating N buffers (which would allocate N+1 times). The seed
-	// is read via the public Seed() accessor (the StrataEstimator.seed field is
-	// unexported; the wire codec reaches it only through the public seam, the
-	// same discipline MarshalIBLT observes for the IBLT seed).
+	// Precompute the total size so the output needs one allocation and each
+	// marshaled stratum can be copied into place. Read the seed through the
+	// public accessor rather than the unexported field.
 	seed := se.Seed()
 	total := strataWireHeaderLen
 	strataBytes := make([][]byte, strataCount)
@@ -274,23 +205,13 @@ func MarshalStrataEstimator(se *StrataEstimator) ([]byte, error) {
 	return buf, nil
 }
 
-// UnmarshalStrataEstimator parses MarshalStrataEstimator's wire format into a
-// heap-allocated StrataEstimator. It reconstructs the seed from the header
-// (Uint64ToSeed), allocates a NewStrataEstimator with that seed, then overwrites
-// each stratum's IBLT via UnmarshalIBLT (NewStrataEstimator pre-allocates 32
-// IBLTs with the SAME seed; the wire's per-stratum blobs carry the bucket
-// contents that overwrote the sender's pre-inserted empty strata, so the
-// receiver's strata reflect the sender's exact bucket state). The caller does
-// NOT need to Release the returned estimator (it is heap-shaped; StrataEstimator
-// has no Release/EBR lifecycle — it is a short-lived digest, not a pinned root).
+// UnmarshalStrataEstimator reconstructs a heap estimator from the outer seed,
+// then replaces each newly allocated stratum with its decoded wire state. The
+// result is garbage-collected normally; StrataEstimator has no arena lifecycle.
 //
-// The strataCount in the header MUST equal strataCount (32); a mismatch is an
-// ErrMalformedStrata (no silent truncation to a different stratum count — the
-// Estimate subtract would compare wrong strata and yield garbage). A per-stratum
-// UnmarshalIBLT failure (short array / magic mismatch / k out of range) is also
-// an ErrMalformedStrata — the receiver's honest path on a malformed digest is
-// the oversend fallback (GenerateDelta against an empty IBLT), NOT a decode of
-// partial strata.
+// The header must specify exactly 32 strata, and every embedded IBLT must
+// decode successfully. Any failure returns ErrMalformedStrata rather than a
+// partial estimator whose Estimate call would compare mismatched strata.
 func UnmarshalStrataEstimator(wire []byte) (*StrataEstimator, error) {
 	if len(wire) < strataWireHeaderLen {
 		return nil, fmt.Errorf("%w: short header: got %d bytes, want >= %d", ErrMalformedStrata, len(wire), strataWireHeaderLen)
@@ -310,50 +231,39 @@ func UnmarshalStrataEstimator(wire []byte) (*StrataEstimator, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: stratum %d: %v", ErrMalformedStrata, i, err)
 		}
-		// NewStrataEstimator pre-allocated se.strata[i] with the same seed +
-		// strataIBLTBuckets/strataK; replace it with the wire-decoded stratum
-		// (the wire carries the sender's actual bucket state after Insert).
-		// The pre-allocated stratum is GC'd normally (heap-shaped, no EBR).
+		// Replace the empty preallocated stratum with the sender's decoded
+		// bucket state. The unused heap stratum is garbage-collected normally.
 		se.strata[i] = stratum
-		// Advance by the consumed length: UnmarshalIBLT read exactly the bytes
-		// MarshalIBLT emitted (header + numBuckets*bucketWireLen), which we
-		// recompute from the parsed numBuckets so the loop advances even though
-		// UnmarshalIBLT does not return a consumed-count.
+		// UnmarshalIBLT consumes header + numBuckets*bucketWireLen bytes.
+		// Recompute that length from the decoded bucket count because the
+		// decoder does not return a consumed count.
 		nb := stratum.NumBuckets()
 		off += ibltWireHeaderLen + nb*bucketWireLen
 	}
 	return se, nil
 }
 
-// UnmarshalIBLT parses MarshalIBLT's wire format into a heap-allocated IBLT
-// (NewIBLTWithSeed — the arena-backed constructor NewArenaIBLT requires the
-// owning engine's arena, which the gossiper does not have for a remote digest;
-// the heap shape is exactly what subtractArena reads off `other.buckets`,
-// whether `other` is heap- or arena-backed, so the subtract result is
-// byte-identical). The caller MUST Release the returned IBLT (Release is a
-// no-op on a heap IBLT, so the call is safe and documents lifecycle parity
-// with the arena path the chaos mesh already follows).
+// UnmarshalIBLT decodes a heap-allocated remote digest. subtractArena reads
+// the other table's buckets regardless of their backing, so no arena is needed
+// for this reconstruction. Calling Release on the result is safe and is a
+// no-op for its heap storage.
 func UnmarshalIBLT(wire []byte) (*IBLT, error) {
 	if len(wire) < ibltWireHeaderLen {
 		return nil, fmt.Errorf("iblt_wire: UnmarshalIBLT: short header: got %d bytes, want >= %d", len(wire), ibltWireHeaderLen)
 	}
-	if got := binary.LittleEndian.Uint32(wire[0:4]); got != ibltWireMagic {
-		return nil, fmt.Errorf("iblt_wire: UnmarshalIBLT: magic mismatch: got %#x, want %#x (refusing silent fall-through to zero buckets)", got, ibltWireMagic)
+	// The frame must use the process's selected placement scheme. Otherwise
+	// the decoded cells would contain keys placed under one scheme while
+	// isPure and Peel recompute indices under another. Reject the frame so the
+	// caller uses its full-keyset fallback.
+	got := binary.LittleEndian.Uint32(wire[0:4])
+	if want := ibltActiveWireMagic(); got != want {
+		return nil, fmt.Errorf("iblt_wire: UnmarshalIBLT: magic mismatch: got %#x, want %#x (scheme lockstep: v2 rejects 'IBL1'=%#x, v1 rejects 'IBL2'=%#x; refusing silent fall-through or cross-scheme parse)", got, want, ibltWireMagicV1, IBLTWireMagicV2)
 	}
 	n := int(binary.LittleEndian.Uint32(wire[4:8]))
-	// Bound-tightening BEFORE the alloc path (ADR-0041). The
-	// combined check folds the existing n < 0 guard (catches the 0xFFFFFFFF
-	// sign-flip on a 32-bit int target directly) WITH the new heap-bound check
-	// (catches the WIDE positive range that overflows n*bucketWireLen on 32-bit
-	// AND the 838859 heap-bomb shape on arm64). On the 64-bit production target
-	// int(uint32) is always >= 0, so the n < 0 disjunct is dead but harmless
-	// (defense-in-depth for a future 32-bit/WASM arc); the n > maxIBLTBuckets
-	// disjunct is the live reject on arm64. Both return ErrIBLTTooLarge (NOT
-	// the old "negative numBuckets" error) so callers attribute the reject to
-	// the bound, not the sign-flip. The bound fires BEFORE NewIBLTWithSeed (its
-	// make([]Bucket, n) alloc), so a rejected wire never reaches the heap slab
-	// — the 19.2 MiB amplification is killed at the parse boundary, not the
-	// alloc boundary.
+	// Reject before allocation or size multiplication. The upper bound covers
+	// heap amplification and 32-bit length overflow; n<0 also handles a
+	// uint32-to-int sign conversion on 32-bit targets. ErrIBLTTooLarge
+	// identifies the digest-bound rejection at either boundary (ADR-0041).
 	if n < 0 || n > maxIBLTBuckets {
 		return nil, fmt.Errorf("%w: numBuckets=%d exceeds maxIBLTBuckets=%d (the 16 MiB ingress cap / sizeof(Bucket) heap bound — kills the 1.2× amplification + the 32-bit n*bucketWireLen wrap)", ErrIBLTTooLarge, n, maxIBLTBuckets)
 	}

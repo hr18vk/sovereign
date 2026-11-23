@@ -4,55 +4,13 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — production guards for the ApplyCRDTDeltaEvent transport wiring.
+// Tests for the ApplyCRDTDeltaEvent transport wiring.
 //
-// This file is the biting test the mandate requires. It drives the
-// PRODUCTION ApplyCRDTDeltaEvent (pkg/sync/crdt_apply.go) — the FIRST production
-// caller of ReconstructEntry — end-to-end through:
-//
-//	(a) Consistent frame, end-to-end: marshall a CRDTDeltaEvent whose
-//
-// PayloadDigest == SHA-256(payload), call ApplyCRDTDeltaEvent(wire), assert
-// the entry is PRESENT in engine.State().Get(entityID) with every contract
-// field populated from the wire, and Join applied it. Proves the transport
-// wires the seam to Join correctly for the happy path — every
-// field-by-field assertion is reused (not weakened) and re-asserted against
-// the live joined state.
-//
-//	(b) Mismatched frame, end-to-end rejection: marshall a CRDTDeltaEvent whose
-//
-// PayloadDigest != SHA-256(payload), call ApplyCRDTDeltaEvent(wire), assert
-// a *WireIntegrityError is returned with the seam's diagnostic context
-// (entityID, originNodeID, on-wire/recomputed digests) and the entry is
-// NOT in engine.State().Get(entityID) — the rejection prevented Join from
-// applying a corrupt frame. Proves the seam enforces on the LIVE path, not
-// just in the test-local helper.
-//
-// GUARDS (heightened — production enforcement is now live; the test must bite on
-// the live path). The two mandatory mutation proofs:
-//
-//	Mutation A (routing bypass) — introduce a temporary bypass in
-//
-// ApplyCRDTDeltaEvent that decodes a frame and calls Join directly, skipping
-// ReconstructEntry. Build it, run Case 2, confirm Case 2 FAILS because the
-// mismatched pair reached Join and got applied. Restored before commit.
-//
-//	Mutation B (integrity-bypass on the live path) — paste a mismatched pair into
-//
-// the frame, but neuter ReconstructEntry's bytes.Equal check (discard the
-// result). Run Case 2 again — it must STILL FAIL because the mismatch is no
-// longer caught at the seam, so the corrupt frame is applied and Case 2's
-// "entry NOT in state" assertion fires. Restored before commit. This proves
-// the seam's bite survives the full wire path, not just the test-local Phase
-// 2b helper.
-//
-// Scope discipline: this file ADDS a test only. It reuses the shared rt*
-// sentinels and the production CRDTDeltaEventWireVersion from crdt_apply.go
-// (the single source of truth; read directly by name, NOT redefined), and
-// rtReconstructDotCounter from crdt_reconstruct_test.go.
-// It does not modify crdt_capnp_roundtrip_test.go, crdt_capnp_integrity_test.go,
-// crdt_reconstruct.go, or crdt_reconstruct_test.go — the verifier's diff of
-// those four files vs must be empty.
+// A valid frame must reach Join with every CRDTEntry field intact. A frame whose
+// PayloadDigest differs from SHA-256(payload) must return a WireIntegrityError
+// containing the entity, origin, and both digests, without changing the joined
+// state. The fixtures reuse the reconstruction test sentinels and the production
+// CRDTDeltaEventWireVersion so the complete marshal/decode/apply path is covered.
 package sync
 
 import (
@@ -65,19 +23,10 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// buildApplyWireFrame is the test-side wire-byte builder. It assembles a
-// CRDTDeltaEvent with a caller-supplied (payload, payloadDigest) pair, MARSHALS
-// it to capnp bytes, and returns the []byte — exactly the shape an inbound
-// transport frame hands to the production ApplyCRDTDeltaEvent. It mirrors the
-// buildReconstructFrame helper but returns wire bytes (not a decoded
-// event) so the production decode→ReconstructEntry→Join path is exercised across
-// a real marshal/unmarshal-plus-round-trip boundary. Every CRDTEntry contract
-// field is stamped with the rt* sentinels shared with the test;
-// DotCounter is rtReconstructDotCounter so a zero-fill mutation demonstrably
-// changes a nonzero field to zero.
-//
-// dotCounter lets the test override the dot counter (defaults to a distinct
-// nonzero sentinel so the field-equality assertion catches a zero-fill).
+// buildApplyWireFrame marshals a CRDTDeltaEvent from the shared reconstruction
+// sentinels and the supplied digest, payload, and dot counter. Returning wire
+// bytes exercises the same marshal/decode boundary as an inbound transport
+// frame, while nonzero sentinels make accidental zero-filled fields visible.
 func buildApplyWireFrame(t *testing.T, digest [32]byte, payload string, dotCounter uint64) []byte {
 	t.Helper()
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
@@ -118,37 +67,16 @@ func buildApplyWireFrame(t *testing.T, digest [32]byte, payload string, dotCount
 	return data
 }
 
-// TestApplyCRDTDeltaEventRejects is the production biting test.
-// It drives ApplyCRDTDeltaEvent on (a) a consistent frame and (b) a mismatched
-// frame, asserting the live path wires the seam to Join correctly (Case 1) and
-// the seam's rejection prevents Join from applying a corrupt frame (Case 2).
-//
-// Both mandatory mutation proofs (A and B) MUST make Case 2 fail red when
-// applied. Run them by temporarily editing pkg/sync/crdt_apply.go (Mutation A)
-// or pkg/sync/crdt_reconstruct.go (Mutation B), running this test, and pasting
-// the literal failing line into the report. Restore before commit.
+// TestApplyCRDTDeltaEventRejects checks that a valid frame is joined intact and
+// that a digest mismatch returns its typed diagnostic without being applied.
 func TestApplyCRDTDeltaEventRejects(t *testing.T) {
-	engineB := setupRTEngine(t, rtHostB, 100) // bound-vs-existing-fixture resolution (mandate escalation menu,
-	// option (a) — documented): this pre-test mints unrealistically-large
-	// eyecatch DotCounter sentinels (chosen for zero-fill-detection, NOT as
-	// plausible DotCounters). The production default (AbsoluteSlack=1000)
-	// closes A1 on the real wire and is byte-identical to the design constraint; opting THIS
-	// engine into the unbounded slack knob admits the sentinels WITHOUT widening
-	// the production default that closes A1. The skew axis is exercised
-	// on a fresh engine with the production default in crdt_lamport_skew_test.go.
+	engineB := setupRTEngine(t, rtHostB, 100)
+	// The shared fixture uses a large dot counter to detect zero-filled fields.
+	// Disable the skew bound for this digest-routing test; the separate Lamport
+	// skew tests exercise the production bound and its default slack.
 	engineB.SetLamportAbsoluteSlack(LamportSkewAbsoluteSlackUnbounded)
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 1: consistent frame, end-to-end.
-	//
-	//_marshall a CRDTDeltaEvent whose PayloadDigest == SHA-256(payload), call
-	// ApplyCRDTDeltaEvent(wire), and assert the entry is PRESENT in
-	// engine.State().Get(entityID) with EVERY contract field populated from the
-	// wire (the field-by-field assertions reused — not weakened — and
-	// re-asserted against the live joined state, not a ReconstructedEntry
-	// struct). This proves the transport wires the seam to Join correctly for
-	// the happy path.
-	// ─────────────────────────────────────────────────────────────────────
+	// A consistent frame must reach the joined state with every field preserved.
 	consistentWire := buildApplyWireFrame(t, rtPayloadDigest, rtPayload, rtReconstructDotCounter)
 	if err := engineB.ApplyCRDTDeltaEvent(consistentWire); err != nil {
 		t.Fatalf("Case 1 (consistent frame): ApplyCRDTDeltaEvent rejected a consistent (payload, payloadDigest) pair: %v — the live path must succeed when SHA-256(payload) == PayloadDigest and all fields read cleanly", err)
@@ -156,23 +84,19 @@ func TestApplyCRDTDeltaEventRejects(t *testing.T) {
 
 	gotConsistent := engineB.State().Get(rtEntityID)
 	if len(gotConsistent) == 0 {
-		t.Fatalf("Case 1: host B State().Get(%q) returned no entries — Join did NOT apply the validated delta, so the transport did not wire the seam to Join correctly", rtEntityID)
+		t.Fatalf("Case 1: host B State().Get(%q) returned no entries — Join did not apply the validated delta, so the transport did not wire the seam to Join correctly", rtEntityID)
 	}
 	if len(gotConsistent) != 1 {
 		t.Fatalf("Case 1: host B got %d entries for %q, want 1 — Join applied the delta to the wrong cardinality", len(gotConsistent), rtEntityID)
 	}
 	ce := gotConsistent[0]
 
-	// Entity ID preserved by string (not hash) — C6 catch on the far side: a
-	// 16-byte-truncated entityID would have stored the entry under a different
-	// key and the State().Get(rtEntityID) above would have returned zero entries.
+	// Looking up the original entity string also catches accidental truncation
+	// or substitution of the key during reconstruction.
 	t.Logf("Case 1: entityID preserved — State().Get(%q) returned 1 entry", rtEntityID)
 
-	// Every contract field, asserted against the rt* sentinels exactly as in
-	// TestReconstructEntryRejects — except now against the
-	// entry Join actually stored in host B's state, not a freshly-reconstructed
-	// ReconstructedEntry. A zero-fill anywhere (the C5-class silent fall-
-	// through) makes the corresponding assertion fire on the LIVE joined state.
+	// Assert every contract field against the joined entry, not just the
+	// intermediate reconstruction result.
 	if ce.PayloadDigest != rtPayloadDigest {
 		t.Errorf("Case 1 PayloadDigest: got %x, want %x (wire digest must reach Join)", ce.PayloadDigest, rtPayloadDigest)
 	}
@@ -183,7 +107,7 @@ func TestApplyCRDTDeltaEventRejects(t *testing.T) {
 		t.Errorf("Case 1 DotNodeID: got %x, want %x (must come off the wire, not zero-filled)", ce.DotNodeID, rtHostA)
 	}
 	if ce.DotCounter != rtReconstructDotCounter {
-		t.Errorf("Case 1 DotCounter: got %#x, want %#x — MUTATION B CATCH: a zero-fill on the live path makes this fail against the joined state, not just the reconstructed entry", ce.DotCounter, rtReconstructDotCounter)
+		t.Errorf("Case 1 DotCounter: got %#x, want %#x — a zero-fill on the production path makes this fail against the joined state, not just the reconstructed entry", ce.DotCounter, rtReconstructDotCounter)
 	}
 	if ce.H3Index != rtH3Index {
 		t.Errorf("Case 1 H3Index: got %#x, want %#x (must come off the wire, not zero-filled)", ce.H3Index, rtH3Index)
@@ -204,63 +128,39 @@ func TestApplyCRDTDeltaEventRejects(t *testing.T) {
 		t.Errorf("Case 1 DecisionTime: got %#x, want %#x (must come off the wire, not zero-filled)", ce.DecisionTime, rtDecisionTime)
 	}
 
-	// Belt-and-braces: the stored digest MUST equal SHA-256 of the original
-	// payload (which we discard per the design constraint, but the seam validated it before
-	// discarding). Reproduce SHA-256(rtPayload) and assert the joined entry's
-	// PayloadDigest still satisfies it — pinning that the entry Join stored
-	// is the wire-validated one, not a stale-or-substituted digest.
+	// Recompute the digest from the original payload to ensure Join stored the
+	// validated value rather than a stale or substituted digest.
 	recomputedConsistent := sha256.Sum256([]byte(rtPayload))
 	if !bytes.Equal(recomputedConsistent[:], ce.PayloadDigest[:]) {
 		t.Errorf("Case 1: joined PayloadDigest %x != SHA-256(rtPayload) %x — the entry Join stored does not satisfy the integrity property the seam validated", ce.PayloadDigest, recomputedConsistent)
 	}
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 2: mismatched frame, end-to-end rejection.
-	//
-	// Marsha a CRDTDeltaEvent whose PayloadDigest != SHA-256(payload), call
-	// ApplyCRDTDeltaEvent(wire), and assert:
-	// (a) a *WireIntegrityError is returned (errors.As),
-	// (b) the diagnostic context (entityID, originNodeID, on-wire and
-	// recomputed digests) is present,
-	// (c) the entry is NOT in engine.State().Get(entityID) — the rejection
-	// PREVENTED Join from applying the corrupt frame.
-	//
-	// MUTATION A (routing bypass): a temporary bypass in ApplyCRDTDeltaEvent
-	// that decodes + calls Join directly (skipping ReconstructEntry) makes
-	// this Case 2 fail: the mismatched pair reaches Join and the entry appears
-	// in State().Get — the "entry NOT in state" assertion fires. The bypass is
-	// the exact C6-on-the-live-path failure exists to close.
-	//
-	// MUTATION B (neuter bytes.Equal): pasting the mismatched pair into the
-	// frame but neutering ReconstructEntry's bytes.Equal check makes Case 2
-	// fail too: the seam no longer catches the mismatch, the corrupt frame is
-	// applied, and the "entry NOT in state" assertion fires.
-	// ─────────────────────────────────────────────────────────────────────
+	// A mismatched digest must produce a typed error with both digests and the
+	// frame's attribution. State must still contain only the valid entry above.
 	wrongDigest := sha256.Sum256([]byte(rtPayload + "mismatched-by-a-buggy-or-tampering-peer"))
 	if wrongDigest == rtPayloadDigest {
 		wrongDigest[0] ^= 0x01
 		if wrongDigest == rtPayloadDigest {
-			t.Fatalf("Case 2: could not construct a deterministic mismatched digest; give up rather than risk a false green")
+			t.Fatalf("could not construct a digest different from the valid payload digest")
 		}
 	}
 	mismatchedWire := buildApplyWireFrame(t, wrongDigest, rtPayload, rtReconstructDotCounter)
 	err := engineB.ApplyCRDTDeltaEvent(mismatchedWire)
 	if err == nil {
-		t.Fatalf("APPLY-EVENT INVARIANT BROKEN: ApplyCRDTDeltaEvent accepted a mismatched (payload, payloadDigest) pair — MUTATION A CATCH: a routing bypass makes this fire (the mismatch reached Join and got applied). wire-integrity gap is LIVE on the wire path: SHA-256(payload) != PayloadDigest but the entry point returned nil")
+		t.Fatalf("ApplyCRDTDeltaEvent accepted a payload whose SHA-256 digest differs from PayloadDigest")
 	}
 
 	var wie *WireIntegrityError
 	if !errors.As(err, &wie) {
-		t.Fatalf("APPLY-EVENT INVARIANT BROKEN: ApplyCRDTDeltaEvent rejected the mismatched pair with the wrong error type %T; expected *WireIntegrityError (the seam's typed error) so the guards are specific to the wire-integrity failure", err)
+		t.Fatalf("ApplyCRDTDeltaEvent returned %T for a digest mismatch; expected *WireIntegrityError", err)
 	}
 
-	// Diagnostic context — the Option C payoff, now proven reachable on the
-	// LIVE path (not just the test-local/2c helper).
+	// The error retains enough context to attribute and diagnose the bad frame.
 	if wie.EntityID != rtEntityID {
-		t.Errorf("Case 2 diagnostic EntityID: got %q, want %q — the error must carry the entityID so a failed frame is attributable on the live path (Option C payoff)", wie.EntityID, rtEntityID)
+		t.Errorf("diagnostic EntityID: got %q, want %q; the failed frame must remain attributable", wie.EntityID, rtEntityID)
 	}
 	if wie.OriginNodeID != rtHostA {
-		t.Errorf("Case 2 diagnostic OriginNodeID: got %x, want %x — the error must carry the origin peer id on the live path (Option C payoff)", wie.OriginNodeID, rtHostA)
+		t.Errorf("diagnostic OriginNodeID: got %x, want %x", wie.OriginNodeID, rtHostA)
 	}
 	if wie.OnWireDigest != wrongDigest {
 		t.Errorf("Case 2 diagnostic OnWireDigest: got %x, want %x — the error must carry the digest the wire carried", wie.OnWireDigest, wrongDigest)
@@ -272,23 +172,20 @@ func TestApplyCRDTDeltaEventRejects(t *testing.T) {
 		t.Errorf("Case 2 Kind: got %d, want %d (WireIntegrityDigestMismatch)", wie.Kind, WireIntegrityDigestMismatch)
 	}
 
-	// THE CRITICAL LIVE-PATH ASSERTION: the corrupt frame was NOT applied. If a
-	// routing bypass (Mutation A) or a neutered bytes.Equal (Mutation B) let
-	// the mismatched pair through, Join would have applied a SECOND entry
-	// (or a second dotted entry under the same entityID) and this would fail.
+	// Rejection must happen before Join: a bypass or a disabled digest check
+	// would add a second dotted entry under the same entity ID.
 	gotMismatched := engineB.State().Get(rtEntityID)
 	if len(gotMismatched) != 1 {
-		t.Fatalf("APPLY-EVENT INVARIANT BROKEN: after the mismatched frame, State().Get(%q) has %d entries, want exactly 1 (only the consistent Case 1 entry) — MUTATION A/B CATCH: the mismatched frame was applied by Join (bypass or neutered seam), reopening C6 on the live path", rtEntityID, len(gotMismatched))
+		t.Fatalf("after rejecting the mismatched frame, State().Get(%q) returned %d entries; want only the original valid entry", rtEntityID, len(gotMismatched))
 	}
-	// And the one entry present must STILL be the consistent Case 1 entry, not
-	// the corrupt mismatched one: its PayloadDigest must be rtPayloadDigest,
-	// NOT wrongDigest.
+	// The surviving entry must be the valid one, not a substitution from the
+	// rejected frame.
 	if gotMismatched[0].PayloadDigest == wrongDigest {
-		t.Fatalf("APPLY-EVENT INVARIANT BROKEN: the joined entry's PayloadDigest is the MISMATCHED wrongDigest %x — the corrupt frame reached Join. The seam's rejection did not prevent the apply; C6 is live on the wire path", wrongDigest)
+		t.Fatalf("joined state contains rejected digest %x; integrity rejection must precede Join", wrongDigest)
 	}
 	if gotMismatched[0].PayloadDigest != rtPayloadDigest {
-		t.Errorf("Case 2 post-rejection: the surviving entry's PayloadDigest %x != rtPayloadDigest %x — Join must still hold only the consistent Case 1 entry", gotMismatched[0].PayloadDigest, rtPayloadDigest)
+		t.Errorf("surviving PayloadDigest %x does not match the valid frame digest %x", gotMismatched[0].PayloadDigest, rtPayloadDigest)
 	}
 
-	t.Logf("Event-apply GREEN: ApplyCRDTDeltaEvent rejects a mismatched (payload, payloadDigest) frame with %q and the entry is NOT applied to Join — live wire-integrity enforcement holds, every frame through the seam (Option C).", err.Error())
+	t.Logf("ApplyCRDTDeltaEvent rejected a mismatched frame with %q and did not apply it", err.Error())
 }

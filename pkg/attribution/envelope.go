@@ -4,49 +4,32 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package attribution implements the relay-provenance attribution envelope
-// of the planetary-fanout CRDT mesh. AttributionEnvelope is the THIRD
-// admission gate an inbound frame crosses — it runs AFTER the per-peer
-// rate cap and the sub-microsecond IngressHLCScalarCap
-// clock gate, and BEFORE the ~60.2 us/op
-// Ed25519 VerifyCRDTFrame gate (PROVEN by the c8g.8xlarge
-// 32c sweep). Where the clock gate drops Byzantine-TIME frames and the rate gate drops
-// Byzantine-RATE frames, this gate drops BYZANTINE-DEPTH frames: a relayed CRDT
-// frame crossing N hops carries N outer relay signatures + 1 inner origin
-// signature, and an attacker who forges a deep envelope forces the receiver
-// to perform ~(N+1) Ed25519 Verify calls before deciding to drop — a
-// resource-exhaustion DoS the exact resource-exhaustion class the design requires
-// you kill.
+// Package attribution implements signed envelopes for CRDT delta transport.
+// A RelayEnvelope carries the inner origin signature and one signature for
+// each relay hop. Checking the hop limit before any of those signatures keeps
+// a forged deep envelope from consuming verification work proportional to its
+// declared depth.
 //
-// Architectural ordering invariant (load-bearing, tested):
+// Inbound frames cross these checks in order:
 //
-//	[wire] -> PeerBucket.Accept(pub, counter) // rate gate: per-peer cap, ~36 ns @ 32c
+//	[wire] -> PeerBucket.Accept(pub, counter)      // per-peer rate cap
+//	       -> if Keep: IngressHLCScalarCap.Admit    // clock cap
+//	       -> if accept: RelayEnvelope.Open         // hop limit, relay signatures
+//	       -> if envelope ok: VerifyCRDTFrame       // inner origin signature
+//	       -> if verify ok: engine.Join / ApplyCRDTDeltaEvent
 //
-// -> if Keep: IngressHLCScalarCap.Admit // clock gate, ~3.1 ns @ 32c
-// -> if accept: AttributionEnvelope.Open // depth gate: THIS — hop-count check (O(1), then N+1 Verifies)
-// -> if envelope ok: VerifyCRDTFrame // inner origin sig, 60.2 us @ 32c
-// -> if verify ok: engine.Join / ApplyCRDTDeltaEvent // CRDT merge, crdt.go frozen
+// Benchmarks on a 32-core c8g.8xlarge measured about 36 ns for the rate check,
+// 3.1 ns for the clock check, and 60.2 us for an Ed25519 verification. Open
+// compares the hop count with the caller's bound and returns immediately when
+// it is exceeded. Otherwise it verifies the relay chain; the caller verifies
+// the inner origin signature before applying the delta.
 //
-// The hop-count check is O(1): Open reads the hop count from the envelope
-// header, compares it to the bound, and Drops if exceeded BEFORE any
-// crypto. This is the same reject-before-Verify pattern as the clock gate (reject
-// CLOCK before Verify) and the rate gate (reject RATE before Verify); this
-// gate rejects DEPTH before Verify. A forged MaxUint64-depth envelope is dropped in
-// nanoseconds, zero Verifies — the exact defense the design requires.
-//
-// pkg/attribution imports pkg/identity (the Verify reuse seam — This gate's
-// ENTIRE JOB is envelope cryptographic provenance, so reusing
-// VerifyCRDTFrame is honest, not entanglement) and the standard library.
-// It does NOT import pkg/sync (no Join/CRDTDelta/ApplyCRDTDeltaEvent call
-// — Open returns the verified inner wire []byte and the caller, which
-// already imports pkg/sync, calls ApplyCRDTDeltaEvent). It does NOT import
-// pkg/clock or pkg/admission. The outer envelope framing is a deterministic
-// length-prefixed Go-struct layout (option b of the design), NOT a new
-// capnp schema: the inner CRDTDeltaEvent capnp frame (schema.capnp, frozen
-// md5 0b9c1e8383e1f4328a0b0281153205bc) is carried verbatim as the envelope
-// payload and returned byte-identical from Open, so schema.capnp and its
-// generated bindings stay byte-locked and no generation tool dependency is
-// introduced.
+// The package uses identity.VerifyCRDTFrame and circl's Ed25519 implementation.
+// It does not import pkg/sync, pkg/clock, or pkg/admission: Open returns the
+// verified inner wire, and the caller applies it. The outer envelope has its
+// own deterministic length-prefixed layout. It carries the inner capnp
+// CRDTDeltaEvent unchanged, so this package does not depend on the capnp
+// schema or its generator.
 package attribution
 
 import (
@@ -61,116 +44,60 @@ import (
 	"github.com/hr18vk/sovereign/pkg/identity"
 )
 
-// verifyHook is a test-only indirection over identity.VerifyCRDTFrame. It is
-// nil in production (Open calls identity.VerifyCRDTFrame directly); tests
-// set it to a counting wrapper to prove the hop-bound-exceeded path issues
-// ZERO Verify calls. Guarded by verifyHookMu. It is NOT a budget
-// or hop-count magic number, so it is outside the forbidden-budget guard.
+// verifyHook replaces identity.VerifyCRDTFrame in tests that count calls.
+// A nil hook selects the production verification path. verifyHookMu protects
+// both setting the hook and reading it in Open.
 var (
 	verifyHookMu sync.Mutex
 	verifyHook   func(pub ed25519.PublicKey, msg, sig []byte) bool
 )
 
-// verifyCostPerHop32c is the PROVEN per-Ed25519-Verify wall cost at 32c on
-// c8g.8xlarge (Graviton4, CPU part 0xd4f), measured by the sweep:
-// GOMAXPROCS=32, -cpu=32 -benchtime=3s -count=3, BenchmarkVerifyCRDTFrame_32c
-// mean ~= 60,211 ns/op (3 runs: 60198 / 59595 / 60841 ns/op). It is the
-// load-bearing divisor for the relay hop-count bound:
-// MaxHopsForBudget(budget) = floor(budget / verifyCostPerHop32c) - 1 (the
-// -1 accounts for the inner origin Verify that runs AFTER the outer hops).
-// The budget is INJECTED by the caller (deploy config); this source commits
-// ONLY the measured per-hop cost, never a magic number. This is the ONE
-// permitted PROVEN constant in this package; the forbidden-budget guard
-// (TestEnvelope_NoFabricatedBudgetMagicNumber) detector-bans any other
-// hardcoded budget/hop-count magic number from non-test source.
-const verifyCostPerHop32c = 60211 // nanoseconds, PROVEN c8g 32c sweep
+// verifyCostPerHop32c is the measured Ed25519 verification latency on a
+// 32-core c8g.8xlarge (Graviton4, CPU part 0xd4f). BenchmarkVerifyCRDTFrame_32c
+// ran with GOMAXPROCS=32, -cpu=32 -benchtime=3s -count=3 and measured 60,198,
+// 59,595, and 60,841 ns/op, for a mean of approximately 60,211 ns/op.
+// MaxHopsForBudget divides the caller's duration budget by this cost.
+const verifyCostPerHop32c = 60211 // nanoseconds, measured on c8g.8xlarge at 32 cores
 
-// envelopeVersion is the forward-compat tag for the OUTER envelope framing
-// (NOT the inner CRDTDeltaEvent, which carries its own version field). It
-// is a framing constant, not a budget/hop-count magic number, so it is
-// outside the forbidden-budget guard's identifier regex.
+// envelopeVersion identifies the outer framing, independently of the version
+// inside the capnp CRDTDeltaEvent.
 //
-// Version 2 adds the 64-byte originSig slot to the header block
-// (the frozen capnp CRDTDeltaEvent carries originNodeID [16]byte but
-// NO signature field, so the inner origin's Ed25519 signature has nowhere to
-// ride on the wire. Version 2 places it in the OUTER envelope header — NOT
-// on the capnp schema (which stays frozen) — so the live receiver resolves
-// originPub via the identity Directory ) and verifies the wire-carried
-// originSig against the verified inner wire. Version 1 had no such slot; the
-// prior envelope.go:233 comment referenced two unbound symbol names
-// (originPub, originSig) the wire never carried — that probe cheat
-// is closed. The bump is contained to pkg/attribution; schema.capnp is
-// untouched.
+// Version 2 introduced a 64-byte originSig header field. The inner event has
+// originNodeID but no origin signature, so the outer header carries that
+// signature without changing the capnp schema. The receiver resolves the
+// origin public key through the identity Directory and verifies originSig
+// against the inner wire returned by Open.
 //
-// Version 3 lifts the two cheap-gate fields — dotCounter (8B) and
-// originNodeID (16B) — out of the frozen inner capnp CRDTDeltaEvent and into
-// the OUTER envelope header. The bench MEASURED the accept/reject ratio
-// at ~300x (not the 1000x the design claim implies) because the cheap reject
-// gates (the rate, clock, and depth gates) need dotCounter + originNodeID, and
-// BOTH lived INSIDE the frozen capnp frame — so the reject-path floor was a
-// full capnp.Unmarshal+ReadRootCRDTDeltaEvent (~1 us), not an O(1) header
-// read. Version 3 mirrors those two fields into the header so readGateFields
-// becomes two fixed-offset slice reads (tens of ns), dropping the reject-path
-// floor from ~1 us to tens of ns. The inner capnp frame is carried VERBATIM
-// (the frozen schema is untouched); the header fields are MIRRORS, and the
-// receiver cross-checks header == inner on the accept path (the security
-// guard) so a malicious relay cannot put a different dotCounter/originNodeID
-// in the header than the inner carries (a gate-bypass). schema.capnp stays
-// byte-locked; the lift is contained to pkg/attribution + pkg/receive.
+// Version 3 adds 8-byte dotCounter and 16-byte originNodeID mirrors. Earlier
+// versions required a roughly 1 us capnp decode before the rate and clock
+// gates could reject a frame; fixed-offset header reads avoid that work. The
+// inner frame remains unchanged, and the receiver compares both mirrors with
+// the decoded inner fields on the accept path.
 const envelopeVersion uint16 = 3
 
-// framing constants for the deterministic length-prefixed byte layout.
-// The wire format (envelopeVersion 3):
+// The version 3 wire format uses fixed-size little-endian header fields:
 //
-//	[2] envelopeVersion (uint16 little-endian) 3
-//	[2] hopCount (uint16 little-endian)
-//	[4] innerLen (uint32 little-endian)
-//	[64] originSig (Ed25519 signature over the inner wire by the
-//
-// origin; verified by the caller AFTER Open returns
-// the verified inner wire. Open itself
-// verifies NOTHING about originSig.)
-//
-//	[8] dotCounter (uint64 little-endian) NEW v3 — the cheap-gate
-//
-// mirror of the inner capnp CRDTDeltaEvent.DotCounter.
-// The rate gate and the clock gate read THIS
-// field (an O(1) header read), NOT a capnp decode.
-//
-//	[16] originNodeID ([16]byte) NEW v3 — the cheap-gate
-//
-// mirror of the inner capnp CRDTDeltaEvent.OriginNodeID.
-// The Directory.Lookup keys on THIS field.
-//
-//	[innerLen] innerWire (the CRDTDeltaEvent capnp frame, verbatim — the
-//
-// frozen schema is untouched; the two header fields
-// above are MIRRORS the receiver cross-checks against
-// the inner on the accept path, the security guard.)
-//
+//	[2]  envelopeVersion
+//	[2]  hopCount
+//	[4]  innerLen
+//	[64] originSig         (signature over innerWire, verified by the caller)
+//	[8]  dotCounter        (mirror of CRDTDeltaEvent.DotCounter)
+//	[16] originNodeID      (mirror of CRDTDeltaEvent.OriginNodeID)
+//	[innerLen] innerWire   (verbatim capnp CRDTDeltaEvent)
 //	then for each of hopCount hops:
+//	  [32] relayPub        (Ed25519 public key)
+//	  [64] sig             (Ed25519 signature over the signed material)
+//	  [8]  wallUSec         (relay timestamp in microseconds)
 //
-// [32] relayPub (Ed25519 public key, canonical copy)
-// [64] sig (Ed25519 signature over the signed material)
-// [8] wallUSec (relay physical timestamp, microseconds)
+// Open checks the declared hop count before verifying any hop. The rate and
+// clock gates read the two mirror fields without decoding the inner frame,
+// and the accept path checks them against that frame after decoding it.
+// Each relay signs innerWire || precedingHopsSigMaterial || hopIndex ||
+// wallUSec, binding its signature to the inner frame and the preceding chain.
 //
-// The hop count is read from the header BEFORE any hop record is parsed,
-// so the O(1) depth check runs against the declared count without touching
-// crypto. dotCounter and originNodeID are read from the header BEFORE any
-// capnp decode, so the cheap 3.1/3.0 gates run against header fields, not a
-// capnp unmarshal — the reject-path floor is two fixed-offset slice reads
-// (tens of ns), not a ~1 us capnp decode. The signed material per hop is the
-// deterministic byte string (innerWire || precedingHopsSigMaterial || hopIndex
-// || wallUSec), which establishes the chain of custody: a relay cannot splice
-// its signature onto a different inner frame or a different prefix without the Verify
-// failing.
-//
-// OriginSigSize is the size of the origin signature slot added in version 2.
-// It is the Ed25519 signature size (64 bytes), the same value as SigSize,
-// named separately to document that it is the ORIGIN signature (verified by
-// the caller's 1.1 step), distinct from a relay hop's sig (verified inside
-// Open). The forbidden-budget guard's identifier regex does not match
-// "OriginSigSize" (no budget/hop-count keyword), so it is outside that guard.
+// OriginSigSize is the size of the origin signature field introduced in
+// version 2. It equals SigSize but distinguishes the origin signature checked
+// by the caller from a relay signature checked by Open.
 const (
 	PubSize          = 32 // ed25519.PublicKeySize
 	SigSize          = 64 // ed25519.SignatureSize
@@ -182,52 +109,40 @@ const (
 	HeaderLen        = 2 + 2 + 4 + OriginSigSize + DotCounterSize + OriginNodeIDSize // version + hopCount + innerLen + originSig + dotCounter + originNodeID
 )
 
-// ErrHopBoundExceeded is returned by Open when the envelope's hop count
-// exceeds the configured bound. It is the O(1) reject-before-Verify
-// verdict: Open returns it WITHOUT performing any Ed25519 Verify, so a
-// forged deep envelope is dropped in nanoseconds. Callers distinguish it
-// from a cryptographic failure (ErrVerify) to attribute the drop to depth
-// rather than a bad signature.
+// ErrHopBoundExceeded is returned by Open when the hop count exceeds the
+// configured bound. Open performs no signature verification in this case.
+// Callers can distinguish this depth rejection from ErrVerify.
 var ErrHopBoundExceeded = errors.New("attribution: relay hop-count exceeds bound (dropped before Verify)")
 
-// ErrVerify is returned by Open when an outer relay signature or the
-// inner origin signature fails Ed25519 verification. It indicates a
-// tampered or forged envelope, not a depth exceedance.
+// ErrVerify is returned by Open when an outer relay signature fails Ed25519
+// verification. Hop-limit failures return ErrHopBoundExceeded instead.
 var ErrVerify = errors.New("attribution: envelope signature verification failed")
 
-// ErrMalformed is returned by Open when the wire bytes do not conform to
-// the envelope framing (short header, truncated hop record, or inner length
-// inconsistent with the buffer). A malformed envelope is dropped without
-// crypto.
+// ErrMalformed is returned when wire bytes do not conform to the envelope
+// framing, including a short header, truncated hop record, or inner length
+// larger than the available buffer. Parsing fails before signature
+// verification.
 var ErrMalformed = errors.New("attribution: malformed envelope framing")
 
-// Hop is one relay hop in the attribution envelope. Each hop records the
-// relay peer's Ed25519 public key (canonical [32]byte copy, mirroring 3.1's
-// PeerBucketKey discipline — circl's ed25519.PublicKey is a non-comparable
-// slice, so the fixed-size array is the canonical form), the relay's
-// Ed25519 signature over the signed material, and the relay's physical
-// wall timestamp in microseconds (for 3.0's clock cap to check on relay).
+// Hop records one relay's public key, signature, and physical timestamp in
+// microseconds. The public key uses a fixed-size array rather than circl's
+// non-comparable slice type, and the timestamp is available to the clock cap.
 type Hop struct {
 	RelayPub [PubSize]byte // the relay peer's Ed25519 pubkey (canonical copy)
 	Sig      [SigSize]byte // the relay's Ed25519 sig over the signed material
 	WallUSec int64         // the relay's physical timestamp (microseconds)
 }
 
-// RelayEnvelope is the OUTER attribution envelope wrapping the INNER signed
-// CRDT-delta wire bytes (the CRDTDeltaEvent capnp frame, byte-identical —
-// the envelope never re-serializes the inner frame; it carries the inner
-// wire []byte verbatim and returns it from Open). It is immutable post-
-// construction: Open is safe for concurrent use because it reads the hop
-// records and inner wire without mutating shared state.
+// RelayEnvelope wraps a capnp CRDTDeltaEvent without re-serializing it. Open
+// returns those same inner bytes after checking the relay chain. Constructors
+// copy the input slices, and Open does not mutate the envelope, so an envelope
+// can be opened concurrently.
 //
-// originSig (envelopeVersion 2) carries the origin's Ed25519
-// signature over the inner wire. Open verifies NOTHING about originSig: the
-// caller verifies it AFTER Open returns the verified inner wire,
-// resolving originPub via the identity Directory. UnmarshalRelayEnvelope
-// surfaces originSig to the caller so the live receiver has it for
-// VerifyCRDTFrame. A version-1 envelope (NewRelayEnvelope, no originSig)
-// carries an all-zero originSig; the caller treats a zero originSig as a
-// DropVerify (the production receiver never accepts an unsigned origin).
+// Versions 2 and 3 carry originSig, the origin's Ed25519 signature over the
+// inner wire. Open does not verify it. After Open succeeds, the caller resolves
+// originPub through the identity Directory and calls VerifyCRDTFrame.
+// NewRelayEnvelope leaves originSig zero for compatibility with out-of-band
+// origin verification; the production receiver rejects a zero signature.
 type RelayEnvelope struct {
 	innerWire    []byte
 	originSig    [OriginSigSize]byte
@@ -237,27 +152,14 @@ type RelayEnvelope struct {
 	hops         []Hop
 }
 
-// MaxHopsForBudget converts a deploy-time admission budget into the maximum
-// allowable relay hop-count. It is the load-bearing transform that closes
-// the resource-exhaustion ceiling: the per-Verify ns/op ceiling "mathematically
-// determines" the max hop-count because verifyCostPerHop32c IS the divisor
-// and the caller supplies the dividend (budget) at deploy time. The source
-// commits ONLY the measured per-hop cost; the budget is INJECTED, never
-// baked into source (the forbidden-budget guard detector-bans a
-// hardcoded budget).
+// MaxHopsForBudget converts a duration budget into a relay hop limit using
+// the measured verification cost. An N-hop envelope needs N outer relay
+// verifications plus the caller's inner origin verification, so the bound is
+// floor(budget / verifyCostPerHop32c) - 1.
 //
-// The -1 accounts for the inner origin Verify that runs AFTER the outer
-// hops: an N-hop envelope costs (N outer + 1 inner) Verifies, so the
-// budget must cover N+1 Verifies, giving N = floor(budget / cost) - 1.
-// The result is clamped to >= 0: a budget smaller than one Verify cannot
-// afford even a single outer hop (the inner origin Verify alone consumes
-// it), so the bound is 0 and any relayed frame (>= 1 hop) is dropped.
-//
-// Example (honest math, test-proven in TestMaxHopsForBudget_Derivation):
-//
-//	1 ms budget -> floor(1_000_000 ns / 60_211 ns) - 1 = 16 - 1 = 15 hops
-//
-// A budget below verifyCostPerHop32c (e.g. 30 us) returns 0.
+// Negative results are clamped to zero. A budget below one verification cost,
+// including a non-positive budget, therefore admits only a direct origin frame.
+// For example, a 1 ms budget yields floor(1_000_000 / 60_211) - 1 = 15 hops.
 func MaxHopsForBudget(budget time.Duration) int {
 	if budget <= 0 {
 		return 0
@@ -271,19 +173,15 @@ func MaxHopsForBudget(budget time.Duration) int {
 	return int(n)
 }
 
-// NewRelayEnvelope constructs an envelope from the inner signed CRDT-delta
-// wire bytes and an ordered slice of relay hops (hop 0 is the first relay
-// after the origin; the last hop is the relay closest to the receiver). The
-// inner wire is stored verbatim; the caller retains ownership of the slice
-// contents (the envelope copies the bytes it needs). It is the build side
-// of the envelope; Open is the verify side.
+// NewRelayEnvelope constructs an envelope from innerWire and ordered relay
+// hops. Hop 0 is the first relay after the origin; the last is closest to the
+// receiver. The constructor copies both inputs, so the caller retains ownership
+// of its slices.
 //
-// NewRelayEnvelope carries an all-zero originSig: it is the version-1 build
-// path retained for backward compatibility with the 3.2 tests (which build
-// relay chains without an on-wire origin signature and verify the inner
-// origin sig out-of-band via a test-computed signature). The production
-// receiver path uses NewSignedRelayEnvelope so the originSig
-// rides on the wire. A zero originSig is a DropVerify on the live receiver.
+// originSig remains zero for compatibility with callers that verify the origin
+// out of band. Production senders use NewSignedRelayEnvelope or
+// NewSignedRelayEnvelopeV3 to carry the signature on the wire; the production
+// receiver rejects a zero signature.
 func NewRelayEnvelope(innerWire []byte, hops []Hop) *RelayEnvelope {
 	inner := make([]byte, len(innerWire))
 	copy(inner, innerWire)
@@ -292,42 +190,28 @@ func NewRelayEnvelope(innerWire []byte, hops []Hop) *RelayEnvelope {
 	return &RelayEnvelope{innerWire: inner, hops: hs}
 }
 
-// NewSignedRelayEnvelope is the version-2 build path the production relay
-// path uses: it binds the origin's Ed25519 signature over the
-// inner wire into the envelope header so the live receiver can verify the
-// inner origin provenance from the wire alone. originSig is the
-// 64-byte Ed25519 signature produced by the origin signing innerWire; the
-// caller (the origin node) computes it as ed25519.Sign(originPriv, innerWire)
-// before constructing the envelope. Open verifies NOTHING about originSig —
-// the receiver verifies it AFTER Open returns the verified inner wire,
-// resolving originPub via the identity Directory. The inner wire and
-// hops are copied (caller retains slice ownership); originSig is copied into
-// the fixed [64]byte field.
+// NewSignedRelayEnvelope constructs an envelope whose header carries the
+// origin's 64-byte Ed25519 signature over innerWire. The origin computes
+// originSig with ed25519.Sign(originPriv, innerWire). After Open verifies the
+// relay hops, the receiver resolves originPub through the identity Directory
+// and verifies originSig against the returned inner wire.
+//
+// The constructor copies innerWire, hops, and originSig. It does not populate
+// the version 3 mirror fields.
 func NewSignedRelayEnvelope(innerWire []byte, originSig [OriginSigSize]byte, hops []Hop) *RelayEnvelope {
 	e := NewRelayEnvelope(innerWire, hops)
 	e.originSig = originSig
 	return e
 }
 
-// NewSignedRelayEnvelopeV3 is the version-3 build path: it binds the origin's
-// Ed25519 signature (originSig) AND the two cheap-gate mirror fields
-// (dotCounter, originNodeID) into the envelope header. The mirrors are the
-// values the origin ALREADY knows when it builds the inner capnp
-// CRDTDeltaEvent (it set ev.SetDotCounter / ev.SetOriginNodeID), so the
-// origin passes them here directly — the builder does NOT decode the inner
-// capnp (pkg/attribution stays a pure envelope: it imports pkg/identity + the
-// stdlib, NOT the capnp schema, so no generation-tool dependency leaks into
-// the envelope package). The receiver reads the mirrors from the header on
-// the cheap reject path (O(1), no capnp) and cross-checks them against the
-// inner capnp on the accept path (the security guard).
+// NewSignedRelayEnvelopeV3 adds dotCounter and originNodeID to the signed
+// envelope header. The origin already has these values from constructing the
+// inner CRDTDeltaEvent, so the builder need not import or decode the capnp
+// schema. The early admission gates read the mirrors directly; the receiver
+// compares them with the decoded inner fields before accepting the frame.
 //
-// dotCounter is the inner CRDTDeltaEvent.DotCounter; originNodeID is the inner
-// CRDTDeltaEvent.OriginNodeID ([16]byte). A relay forwarding a v3 frame
-// copies the mirrors off the parsed incoming envelope (it already has them
-// from UnmarshalRelayEnvelope) and passes them here unchanged — relays attest
-// custody, they do not alter the origin's gate fields. The inner wire and
-// hops are copied (caller retains slice ownership); originSig, dotCounter, and
-// originNodeID are copied into the fixed fields.
+// A forwarding relay retains both mirrors unchanged and appends its own hop.
+// The constructor copies every input, including innerWire and hops.
 func NewSignedRelayEnvelopeV3(innerWire []byte, originSig [OriginSigSize]byte, dotCounter uint64, originNodeID [OriginNodeIDSize]byte, hops []Hop) *RelayEnvelope {
 	e := NewRelayEnvelope(innerWire, hops)
 	e.originSig = originSig
@@ -336,59 +220,42 @@ func NewSignedRelayEnvelopeV3(innerWire []byte, originSig [OriginSigSize]byte, d
 	return e
 }
 
-// OriginSig returns the origin's Ed25519 signature over the inner wire, as
-// carried in the envelope header (envelopeVersion 2). It is the
-// signature the receiver feeds to identity.VerifyCRDTFrame(originPub, inner,
-// originSig) AFTER Open returns the verified inner wire. On a version-1
-// envelope (NewRelayEnvelope) it is all-zero; the production receiver treats
-// a zero originSig as a DropVerify. Open does NOT verify originSig.
+// OriginSig returns the origin signature carried in version 2 and 3 headers.
+// After Open succeeds, the receiver passes it to VerifyCRDTFrame with the
+// resolved origin public key and returned inner wire. NewRelayEnvelope leaves
+// it zero, which the production receiver rejects. Open does not check it.
 func (e *RelayEnvelope) OriginSig() [OriginSigSize]byte { return e.originSig }
 
-// DotCounter returns the v3 header mirror of the inner capnp
-// CRDTDeltaEvent.DotCounter. The cheap 3.1 rate gate and 3.0 clock gate read
-// THIS field (an O(1) header read), NOT a capnp decode — the reject-path floor
-// is two fixed-offset slice reads, not a ~1 us capnp unmarshal. On a v2
-// envelope (NewSignedRelayEnvelope, no mirror) it is 0; the receiver's v2
-// dispatch falls back to a capnp decode for the gate fields. The
-// receiver cross-checks this against the inner capnp on the accept path.
+// DotCounter returns the v3 mirror of CRDTDeltaEvent.DotCounter. The rate and
+// clock gates read it without decoding the inner frame. It is zero for a v2
+// envelope, whose receiver decodes the inner frame instead. The accept path
+// checks the mirror against the decoded value.
 func (e *RelayEnvelope) DotCounter() uint64 { return e.dotCounter }
 
-// OriginNodeID returns the v3 header mirror of the inner capnp
-// CRDTDeltaEvent.OriginNodeID. The Directory.Lookup keys on THIS field.
-// On a v2 envelope (no mirror) it is all-zero; the receiver's v2 dispatch
-// falls back to a capnp decode. The receiver cross-checks this against the
-// inner capnp on the accept path.
+// OriginNodeID returns the v3 mirror of CRDTDeltaEvent.OriginNodeID, which
+// Directory.Lookup uses to resolve the origin keys. It is zero for a v2
+// envelope, whose receiver decodes the inner frame instead. The accept path
+// checks the mirror against the decoded value.
 func (e *RelayEnvelope) OriginNodeID() [OriginNodeIDSize]byte { return e.originNodeID }
 
 // HopCount returns the number of relay hops in the envelope. It is the O(1)
 // header read the depth check runs against.
 func (e *RelayEnvelope) HopCount() int { return len(e.hops) }
 
-// Version returns the on-wire envelopeVersion this envelope was parsed from
-// (2 or 3) by UnmarshalRelayEnvelope. The receiver dispatches on it for the
-// forward-compat branch: a v3 frame's cheap gates read the header
-// mirrors (O(1)); a v2 frame's cheap gates fall back to a capnp decode (the
-// v2 frame carries the gate fields only inside the inner capnp). It is 0 for
-// a build-side envelope (NewRelayEnvelope / NewSignedRelayEnvelope[V3]) that
-// has not been round-tripped through Marshal/Unmarshal — the production send
-// path builds v3 (envelopeVersion) directly, so a 0 here means "unmarshaled
-// view only"; the receiver always reads the version off the wire it parsed.
+// Version returns the wire version recorded by UnmarshalRelayEnvelope: 2 or
+// 3. It is zero on a newly constructed envelope until that envelope is parsed.
+// Marshal always writes the current version 3 format. Receivers use the parsed
+// version to select header mirrors for v3 or capnp decoding for v2.
 func (e *RelayEnvelope) Version() uint16 { return e.version }
 
-// InnerWire returns the inner signed CRDT-delta wire bytes. It MUST be
-// called only after Open has verified the envelope; on an unverified
-// envelope it returns the unverified bytes (the caller is responsible for
-// the verify-before-use ordering).
+// InnerWire returns the inner CRDT-delta bytes. They are not authenticated
+// until Open and the caller's origin-signature check have both succeeded. The
+// returned slice aliases the envelope and must not be modified.
 func (e *RelayEnvelope) InnerWire() []byte { return e.innerWire }
 
-// Hops returns a read-only copy of the relay hop records. It is the build-
-// side accessor a relay uses to rebuild the chain-of-custody prefix when it
-// forwards a received frame one more hop (relay-forward egress):
-// the relay reads the existing hops, rebuilds the signed-material
-// accumulator, and signs its own new hop over that prefix. The returned
-// slice is a fresh copy (the caller may mutate or discard it without
-// affecting the envelope). It MUST be called only after Open has verified
-// the envelope; on an unverified envelope it returns the unverified hops.
+// Hops returns a copy of the relay records for rebuilding the signed-material
+// prefix when forwarding a frame. Changes to the returned slice do not affect
+// the envelope. The records are not authenticated until Open succeeds.
 func (e *RelayEnvelope) Hops() []Hop {
 	hs := make([]Hop, len(e.hops))
 	copy(hs, e.hops)
@@ -396,32 +263,33 @@ func (e *RelayEnvelope) Hops() []Hop {
 }
 
 // Open verifies the envelope's relay provenance against the configured hop
-// bound and returns the verified inner wire bytes. It is the THIRD admission
+// bound and returns the verified inner wire bytes. It is the third admission
 // gate. The verify order is:
 //
-// 1. O(1) depth check: if len(hops) > maxHops, return ErrHopBoundExceeded
-// WITHOUT any Ed25519 Verify (the reject-before-Verify defense).
-// 2. Outer hops: for each hop in order, verify the relay's Ed25519 sig
-// over the signed material (innerWire || preceding hops' sig material
-// || hopIndex || wallUSec) via identity.VerifyCRDTFrame. A failure
-// returns ErrVerify and the inner wire is never reached.
-// 3. Inner origin: after all outer hops pass, the caller verifies the
-// inner origin sig on the returned innerWire. The -1 in
-// MaxHopsForBudget reserves budget for this inner Verify.
+//  1. O(1) depth check: if len(hops) > maxHops, return ErrHopBoundExceeded
+//     without any Ed25519 Verify (the reject-before-Verify defense).
+//  2. Outer hops: for each hop in order, verify the relay's Ed25519 sig
+//     over the signed material (innerWire || preceding hops' sig material
+//     || hopIndex || wallUSec) via identity.VerifyCRDTFrame. A failure
+//     returns ErrVerify and the inner wire is never reached.
+//  3. Inner origin: after all outer hops pass, the caller verifies the
+//     inner origin sig on the returned innerWire. The -1 in
+//     MaxHopsForBudget reserves budget for this inner Verify.
 //
 // On success, returns (innerWire, hopCount, nil). On any failure, returns
 // (nil, 0, err). The caller (ingestion pipeline) does:
 //
-//	inner, _, err:= envelope.Open(maxHops)
+//	inner, _, err := envelope.Open(maxHops)
 //	if err != nil { drop }
 //	if !identity.VerifyCRDTFrame(originPub, inner, originSig) { drop }
 //	engine.ApplyCRDTDeltaEvent(inner)
 //
-// 3.2 never calls Join / ApplyCRDTDeltaEvent (keeps pkg/sync out of the dep
-// set). Open is safe for concurrent use: it reads the immutable envelope
-// state and allocates only per-call scratch buffers for the signed material.
+// The package never calls Join / ApplyCRDTDeltaEvent (keeps pkg/sync out of
+// the dep set). Open is safe for concurrent use: it reads the immutable
+// envelope state and allocates only per-call scratch buffers for the signed
+// material.
 func (e *RelayEnvelope) Open(maxHops int) ([]byte, int, error) {
-	// 1. O(1) depth check BEFORE any crypto. A forged deep envelope is
+	// 1. O(1) depth check before any crypto. A forged deep envelope is
 	// dropped in nanoseconds, zero Verifies.
 	n := len(e.hops)
 	if n > maxHops {
@@ -456,16 +324,16 @@ func (e *RelayEnvelope) Open(maxHops int) ([]byte, int, error) {
 	}
 
 	// 3. Return the verified inner wire. The inner origin sig is verified
-	// by the caller AFTER all outer hops pass — the ordering
-	// proves outer-before-inner (TestEnvelope_TamperedOriginSig).
+	// by the caller after all outer hops pass — the ordering proves
+	// outer-before-inner (TestEnvelope_TamperedOriginSig).
 	return e.innerWire, n, nil
 }
 
 // SignedMaterial constructs the deterministic byte string a relay signs (and
 // Open verifies) for one hop: innerWire || preceding || hopIndex || wallUSec.
 // hopIndex is a uint16 little-endian so a relay cannot reorder hops without
-// breaking the signature; wallUSec is int64 little-endian so 3.0's clock
-// cap can check the relay's physical timestamp. The preceding slice is the
+// breaking the signature; wallUSec is int64 little-endian so the clock cap
+// can check the relay's physical timestamp. The preceding slice is the
 // signed material of all prior hops, transitively binding the chain of
 // custody.
 func SignedMaterial(innerWire, preceding []byte, hopIndex uint16, wallUSec int64) []byte {
@@ -500,23 +368,15 @@ func SignHop(relayPriv ed25519.PrivateKey, relayPub [PubSize]byte, innerWire, pr
 	return h
 }
 
-// headerLenV2 is the v2 header length (2 ver + 2 hopCount + 4 innerLen + 64
-// originSig), retained for the v2 forward-compat dispatch in
-// UnmarshalRelayEnvelope. It is the v3 HeaderLen MINUS the two v3
-// mirror fields (DotCounterSize + OriginNodeIDSize), expressed from the same
-// consts so a future field-size change propagates and v2/v3 never disagree.
+// headerLenV2 is the 72-byte v2 header: version, hopCount, innerLen, and
+// originSig. Deriving it from HeaderLen by subtracting the v3 mirror fields
+// keeps the two layouts consistent.
 const headerLenV2 = HeaderLen - DotCounterSize - OriginNodeIDSize
 
-// Marshal serializes the envelope to its deterministic length-prefixed wire
-// form (see the framing constants above). The hop count is written to the
-// header BEFORE the hop records, so a receiver can read it and run the O(1)
-// depth check before parsing any hop. The inner wire is carried verbatim.
-// The originSig slot (envelopeVersion 2) is written at header offset
-// [8:72], immediately after the innerLen field. The v3 mirror fields
-// (dotCounter at [72:80], originNodeID at [80:96]) are written immediately
-// after originSig and before the inner wire, so UnmarshalRelayEnvelope
-// surfaces them to the caller without crypto and the cheap gates read them as
-// two fixed-offset slice reads (the reject-path floor, tens of ns).
+// Marshal serializes the current version 3 wire format. It writes hopCount
+// before the hop records, places originSig at [8:72], dotCounter at [72:80],
+// and originNodeID at [80:96], then copies innerWire unchanged. The returned
+// slice is a new allocation owned by the caller.
 func (e *RelayEnvelope) Marshal() []byte {
 	n := len(e.hops)
 	out := make([]byte, HeaderLen+len(e.innerWire)+n*HopSize)
@@ -538,31 +398,15 @@ func (e *RelayEnvelope) Marshal() []byte {
 	return out
 }
 
-// UnmarshalRelayEnvelope parses the deterministic length-prefixed wire form
-// into a RelayEnvelope. It reads the hop count from the header and validates
-// that the buffer is long enough to hold the declared hops and inner wire
-// BEFORE constructing the envelope, so a truncated/malformed buffer is
-// rejected without crypto. It does NOT verify signatures — that is Open's
-// job — so a receiver can run the O(1) depth check on the parsed envelope
-// before paying any Verify cost.
+// UnmarshalRelayEnvelope parses a version 2 or 3 envelope and checks that the
+// buffer contains the declared header, inner wire, and hop records. It does
+// not verify signatures; Open performs the relay checks afterward.
 //
-// It surfaces the originSig slot (envelopeVersion 2) and the v3 mirror
-// fields (dotCounter, originNodeID) to the caller via the returned
-// RelayEnvelope's accessors, so the live receiver has the origin signature
-// for VerifyCRDTFrame and the cheap-gate fields for the 3.1/3.0 gates without
-// a test-computed cheat and without a capnp decode. UnmarshalRelayEnvelope
-// does NOT verify originSig or the mirrors (Open does not either); the caller
-// verifies originSig after Open returns the verified inner wire and
-// cross-checks the mirrors against the inner capnp on the accept path.
-//
-// Forward-compat: a v2 frame (envelopeVersion 2, the 72-byte header
-// with NO mirror fields) is ACCEPTED and parsed against the v2 header
-// layout, with the mirror fields left zero — the receiver's v2 dispatch then
-// falls back to a capnp decode for the gate fields (the v2 frame carries them
-// only inside the inner capnp). A v2 frame is NOT silently fall-through to
-// zero fields (the C5 failure mode): the version is an explicit dispatch
-// branch, and a v2 frame's gate fields come from the capnp decode, named
-// honestly. A version other than 2 or 3 is an explicit ErrMalformed.
+// The returned envelope exposes originSig and, for v3, the gate-field mirrors.
+// The caller verifies originSig after Open and compares the mirrors with the
+// decoded inner frame on the accept path. A v2 envelope leaves both mirrors
+// zero so the receiver decodes those fields from the inner frame instead.
+// Unsupported versions and truncated buffers return ErrMalformed.
 func UnmarshalRelayEnvelope(wire []byte) (*RelayEnvelope, error) {
 	if len(wire) < 2 {
 		return nil, ErrMalformed
@@ -605,17 +449,12 @@ func UnmarshalRelayEnvelope(wire []byte) (*RelayEnvelope, error) {
 	return &RelayEnvelope{innerWire: inner, originSig: originSig, dotCounter: dotCounter, originNodeID: originNodeID, version: ver, hops: hops}, nil
 }
 
-// envelopeVersionV2 is the prior wire version UnmarshalRelayEnvelope accepts
-// for forward-compat: a v2 frame has the 72-byte header with NO
-// mirror fields, so the receiver falls back to a capnp decode for the gate
-// fields. It is a framing constant, not a budget/hop-count magic number.
+// envelopeVersionV2 identifies the earlier 72-byte header without mirror
+// fields. Receivers decode its gate fields from the inner capnp frame.
 const envelopeVersionV2 uint16 = 2
 
-// headerLenForVersion returns the header length for a given envelope version
-// and whether the version is supported. v3 uses HeaderLen (96); v2 uses
-// headerLenV2 (72, no mirror fields). Any other version is unsupported. It
-// is the single dispatch point for the forward-compat branch — sourced from
-// the same consts so v2/v3 header lengths never disagree.
+// headerLenForVersion returns 96 for v3 and 72 for v2. The boolean is false
+// for unsupported versions. Both values derive from the shared size constants.
 func headerLenForVersion(ver uint16) (int, bool) {
 	switch ver {
 	case envelopeVersion:
@@ -627,21 +466,15 @@ func headerLenForVersion(ver uint16) (int, bool) {
 	}
 }
 
-// RelayEnvelopeVersion returns the current (v3) envelope wire version. It is
-// the exported accessor the receiver dispatches on to distinguish a v3 frame
-// (header mirrors present, O(1) gate read) from a v2 frame (forward-compat
-// capnp-decode fallback). The unexported envelopeVersion const stays the
-// single source of truth; this accessor exposes it without re-declaring the
-// literal in a caller (the desync discipline — one source, no drift).
+// RelayEnvelopeVersion returns the current wire version, 3. Callers can use
+// it instead of duplicating the version constant when encoding or dispatching
+// envelopes. Version 2 remains accepted for compatibility.
 func RelayEnvelopeVersion() uint16 { return envelopeVersion }
 
-// HeaderLenForVersion returns the header length for a given on-wire envelope
-// version, or (0, false) if the version is unsupported. It is the exported
-// dispatch the receiver's raw-frame readers (readLastHop) use to pick the
-// correct header offset per version — v3 (96) vs v2 (72) — WITHOUT re-deriving
-// the byte-offset layout in pkg/receive (the desync guard). A v2 frame's hops
-// start at offset 72; a v3 frame's at 96; sourcing both from this single
-// function keeps the receiver and the encoder in lockstep across versions.
+// HeaderLenForVersion exposes the supported wire header sizes to pkg/receive.
+// It returns 96 for v3, 72 for v2, and (0, false) for other versions, allowing
+// raw-frame readers such as readLastHop to locate hop records without
+// duplicating the layout.
 func HeaderLenForVersion(ver uint16) (int, bool) {
 	return headerLenForVersion(ver)
 }

@@ -19,18 +19,15 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// TestParseMessages_RealClient_EndToEnd connects a live TCP client to the
-// EPOLLET server, sends a Cap'n Proto TriTemporalEvent, and verifies the
-// server parses it via the pinned zero-copy path and hands a structurally
-// correct event to the handler — the == proof that runtime.Pinner + the
-// generated bindings + SingleSegment arena agree end-to-end.
+// TestParseMessages_RealClient_EndToEnd sends a TriTemporalEvent over a Unix
+// domain socket and verifies the field values received by the handler.
 func TestParseMessages_RealClient_EndToEnd(t *testing.T) {
 	allocator := database.NewJemallocAllocator()
 
-	var got atomic.Value // stores a parsed TriTemporalEvent copy-snapshot
+	var got atomic.Value // stores value copies of the parsed event fields
 
 	handler := func(event capnp_schema.TriTemporalEvent) error {
-		// Snapshot the parsed fields while Pinner holds the backing memory.
+		// Copy the fields before the event becomes invalid on return.
 		lat := event.Latitude()
 		lng := event.Longitude()
 		ast := event.AssertionTime()
@@ -47,18 +44,17 @@ func TestParseMessages_RealClient_EndToEnd(t *testing.T) {
 
 	server := NewEpollServer(allocator, handler)
 
-	// Pick a fixed port by listening then capturing the bound addr is not
-	// available without an ioctl; use ephemeral by binding the socket first.
-	// Simpler: open a Unix socket in a temp path — deterministic address.
-	sockPath := "/tmp/supremum-test-" + t.Name() + ".sock"
+	// A Unix socket gives the client a deterministic address without needing
+	// to discover a TCP listener's ephemeral port.
+	sockPath := "/tmp/sovereign-test-" + t.Name() + ".sock"
 	addr := "unix:" + sockPath
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- server.ListenAndServe(addr) }()
-	// Give the server a beat to bind.
+	// Allow the listener to bind before dialing.
 	time.Sleep(50 * time.Millisecond)
 
-	// Dial the Unix socket and send a single TriTemporalEvent.
+	// Send one TriTemporalEvent to the listener.
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
 		server.Shutdown()
@@ -71,7 +67,7 @@ func TestParseMessages_RealClient_EndToEnd(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// Wait for the handler to fire (poll up to 2s).
+	// Poll for the handler for up to two seconds.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if v := got.Load(); v != nil {
@@ -93,10 +89,10 @@ func TestParseMessages_RealClient_EndToEnd(t *testing.T) {
 	}
 
 	server.Shutdown()
-	t.Fatal("handler did not fire within 2s — pinned zero-copy ingest path dead")
+	t.Fatal("handler did not receive the event within 2 seconds")
 }
 
-// Reference: buildTestMessage is defined in capnp_server_test.go. Silence
-// unused-import warnings for symbols only referenced via that file.
+// buildTestMessage is defined in capnp_server_test.go. These references retain
+// the encoding-related imports used by this test file.
 var _ = binary.LittleEndian
 var _ = capnp.NewMessage

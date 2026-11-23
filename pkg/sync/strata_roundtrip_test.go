@@ -29,8 +29,7 @@ func TestStrataEstimatorWireRoundTrip(t *testing.T) {
 		t.Fatalf("Unmarshal: %v", err)
 	}
 	// The round-tripped estimator must estimate |A-A|==0 against an identical
-	// estimator (self-diff = the M3 no-op premise, here proving the wire
-	// preserved the bucket state).
+	// estimator. A self-diff of zero proves the wire preserved the bucket state.
 	if got := local.Estimate(remote); got != 0 {
 		t.Fatalf("self-diff after round-trip = %d, want 0 (wire did not preserve bucket state)", got)
 	}

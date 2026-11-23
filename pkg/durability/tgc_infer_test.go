@@ -6,44 +6,18 @@
 
 package durability
 
-//tgc_infer_test.go (ADR-0027) — the REAL *LocalFS inferrer guard.
+// End-to-end tests for transaction-time GC horizon inference (ADR-0027).
 //
-// §2.h — the real-LocalFS inferrer guard: the end-to-end T_gc auto-inference over a REAL
-// *LocalFS — the route half of the inferrer (the in-package guards proved the
-// arithmetic + the clamp; this guard proves the inferrer drives the prune over
-// the production write/compact/read route). The inferrer FLOORS the operator
-// knob: the operator's static floor alone would REFUSE the drop, but the
-// inferrer advances the horizon ABOVE the operator floor (from the observed
-// live-query txTime frontier - backoff), and the prune ADMITS the dominator the
-// operator floor alone would have refused — the load-bearing proof that the
-// inferrer is NOT a no-op (a no-op inferrer leaves the horizon at the operator
-// floor; the drop is refused; the LIVE query still resolves to R' only because
-// R' wins on max-sysTime, NOT because R was pruned — the guard distinguishes
-// these by reading RowsPruned).
+// Two rows have the same valid-time interval. The newer row has SystemTime 250,
+// while the configured operator floor is 100, so that floor alone prevents
+// pruning. An AsOf query at txTime 2000 advances the resolver's observed
+// frontier; with backoff 400, InferHorizon raises the effective horizon to 1600
+// and permits the older row to be pruned. A second AsOf must still return the
+// newer row.
 //
-// The flow (mirrors the green high-water route, + the inferrer step):
-//
-// 1. Write R (sys=100, [0,1000)) + R' (sys=250, [0,1000)) to a real *LocalFS.
-// 2. Drive AsOf at txTime=2000 (a LIVE query) — the §1.a seam advances the
-// Resolver's observed frontier to 2000.
-// 3. Build a compactor with operatorFloor=100 + backoff=400. The inferrer
-// computes effective = max(100, 2000 - 400) = 1600 (admits R' sys'=250).
-// The operator floor ALONE (100) would REFUSE the drop (250 > 100); the
-// inferrer's advance to 1600 is what ADMITS it.
-// 4. Run the inferrer (InferHorizon) + compact -> R DROPPED (RowsPruned=1).
-// 5. Assert a LIVE AsOf (txTime=2000) resolves to R' (the dominator) — NO
-// silent data loss.
-// 6. The load-bearing assertion: an inferrer that did NOT advance the horizon
-// (a no-op) leaves the horizon at the operator floor 100 -> 250 > 100 -> the
-// drop is REFUSED -> RowsPruned=0. The guard asserts RowsPruned=1, proving
-// the inferrer advanced the horizon (the §0.a "engine tracks the frontier"
-// load-bearing claim).
-//
-// The guard REUSES the REAL-LocalFS helpers (newLocalFS,
-// insertRowInterval) + the compactWithHorizon-API SHAPE, but
-// builds its OWN compactor (the inferrer needs the backoff + the InferHorizon
-// step, which compactWithHorizon does NOT expose — it sets a static
-// horizon). The Resolver is the SAME shape compactWithHorizon returns.
+// The no-query control keeps the frontier at zero. Its horizon remains at the
+// operator floor and both rows survive. Checking RowsPruned distinguishes the
+// inferred horizon from a query that merely happens to select the newer row.
 
 import (
 	"context"
@@ -61,82 +35,64 @@ func TestGCFloorInferRealLocalFS(t *testing.T) {
 	const entity = "alpha"
 	flusher := database.NewL0Flusher(alloc, lfs, "compact-bucket")
 
-	// (1) Write R (sys=100, [0,1000)) + R' (sys=250, [0,1000)) — the SAME wide
-	// interval, R' the NEWER (the dominator).
+	// Write two versions with the same valid-time interval. SystemTime 250
+	// dominates SystemTime 100.
 	insertRowInterval(t, alloc, lfs, flusher, entity, 100, 0, openInterval, []byte{'R'})
 	insertRowInterval(t, alloc, lfs, flusher, entity, 250, 0, openInterval, []byte{'D'})
 
-	// (2) A Resolver over the SAME *LocalFS. Drive AsOf at txTime=2000 (a LIVE
-	// query) — the §1.a seam advances the observed frontier to 2000. The AsOf
-	// resolves to R' (the dominator, sys'=250 <= 2000, newer, valid) — the same
-	// answer a Preserve-All resolve gives. The seam fires BEFORE the storage
-	// list, so the frontier is 2000 after this call regardless of the resolve.
+	// AsOf advances the observed transaction-time frontier before reading
+	// storage. The query returns the newer row and leaves the frontier at 2000.
 	resolver := database.NewResolver(lfs, lfs, alloc, "local", database.ResolverConfig{MaxL0Files: 1000})
 	live, err := resolver.AsOf(ctx, entity, nsToTime(500), nsToTime(2000))
-	require.NoError(t, err, "real-LocalFS inferrer: the LIVE AsOf(txTime=2000) must resolve (R' sys'=250 <= 2000, newer, valid)")
-	assert.Equalf(t, []byte{'D'}, live.Payload, "real-LocalFS inferrer: the LIVE AsOf resolves to R' ('D', the dominator); got %q", live.Payload)
-	// The observed frontier MUST be 2000 (the seam advanced it — the §1.a claim).
+	require.NoError(t, err, "AsOf at txTime 2000 failed")
+	assert.Equalf(t, []byte{'D'}, live.Payload, "AsOf returned %q, want the newer row D", live.Payload)
+	// The resolver records this query's transaction time for horizon inference.
 	if got := resolver.QueryTxTimeFrontier(); got != 2000 {
-		t.Fatalf("real-LocalFS inferrer: after AsOf(txTime=2000) the observed frontier=%d, want 2000 (the §1.a seam advanced it; the inferrer reads this)", got)
+		t.Fatalf("observed frontier after AsOf = %d, want 2000", got)
 	}
 
-	// (3) Build a compactor with operatorFloor=100 + backoff=400. The inferrer
-	// computes effective = max(100, 2000 - 400) = 1600. The operator floor ALONE
-	// (100) would REFUSE the drop (the dominator sys'=250 > 100); the inferrer's
-	// advance to 1600 is what ADMITS it — the load-bearing §0.a claim.
+	// The observed frontier and backoff produce max(100, 2000-400) = 1600.
+	// That horizon admits the newer row at SystemTime 250; the operator floor
+	// alone would not.
 	cfg := database.DefaultCompactionConfig()
 	cfg.EnableDominancePruning = true
-	cfg.PruningHorizonInt64Ns = 100 // the operator HARD floor (BELOW the dominator 250)
+	cfg.PruningHorizonInt64Ns = 100 // the operator floor (below the dominator 250)
 	cfg.PruneBackoffInt64Ns = 400   // the backoff
 	compactor := database.NewL1Compactor(lfs, lfs, lfs, alloc, "compact-bucket", cfg)
 
-	// SANITY: the inferrer's EffectiveHorizon(2000) == 1600 (the arithmetic the
-	// in-package floor-arithmetic guard pinned; re-assert here over the route).
+	// Check the inferred horizon directly before running compaction.
 	assert.Equalf(t, int64(1600), compactor.EffectiveHorizon(2000),
-		"real-LocalFS inferrer: EffectiveHorizon(2000) with floor=100 backoff=400 = %d, want 1600 (max(100, 2000-400); the inferrer's arithmetic over the route)", compactor.EffectiveHorizon(2000))
+		"EffectiveHorizon(2000) = %d, want max(100, 2000-400) = 1600", compactor.EffectiveHorizon(2000))
 
-	// (4) Run the inferrer (InferHorizon reads the observed frontier, advances
-	// the compactor's horizon monotonically) THEN compact. The inferrer advances
-	// cfg.PruningHorizonInt64Ns from 100 -> 1600; the prune at 1600 admits R'.
+	// InferHorizon advances the compactor's horizon monotonically from the
+	// resolver's observed frontier. Compaction then uses the inferred horizon.
 	compactor.InferHorizon(resolver)
-	// The compactor's horizon MUST now be 1600 (the inferrer advanced it ABOVE
-	// the operator floor 100 — the §0.a load-bearing advance).
+	// The configured horizon must now be 1600 rather than the operator floor.
 	if got := compactor.Config().PruningHorizonInt64Ns; got != 1600 {
-		t.Fatalf("real-LocalFS inferrer: after InferHorizon the compactor horizon=%d, want 1600 (the inferrer advanced it from the operator floor 100 to the inferred 1600 — the §0.a load-bearing advance)", got)
+		t.Fatalf("horizon after InferHorizon = %d, want 1600 instead of operator floor 100", got)
 	}
 	h8 := database.EntityHash8(entity)
 	res, err := compactor.Compaction(ctx, entity, h8)
-	require.NoError(t, err, "real-LocalFS inferrer: the compaction must succeed")
+	require.NoError(t, err, "compaction failed")
 
-	// (5) R is DROPPED (RowsPruned=1) — the inferrer advanced the horizon to 1600
-	// (>= the dominator 250), so (C3) admits R'. The operator floor ALONE (100)
-	// would have REFUSED (250 > 100) -> RowsPruned=0. The guard asserts
-	// RowsPruned=1, proving the inferrer advanced the horizon (the load-bearing
-	// claim; a no-op inferrer leaves RowsPruned=0).
-	assert.Equalf(t, 1, res.RowsPruned, "real-LocalFS inferrer: RowsPruned=%d, want 1 (the inferrer advanced the horizon to 1600 -> the dominator R' (sys'=250) is floor-admitted -> R is safe-to-drop; the operator floor ALONE (100) would have REFUSED -> RowsPruned=0 — the inferrer is NOT a no-op)", res.RowsPruned)
-	assert.Equalf(t, 1, res.RowsAfter, "real-LocalFS inferrer: RowsAfter=%d, want 1 (only the dominator R' survives)", res.RowsAfter)
+	// A horizon of 1600 admits the newer row at SystemTime 250, allowing the
+	// older row to be pruned. The operator floor alone would retain both rows.
+	assert.Equalf(t, 1, res.RowsPruned, "RowsPruned = %d, want 1 with inferred horizon 1600", res.RowsPruned)
+	assert.Equalf(t, 1, res.RowsAfter, "RowsAfter = %d, want only the newer row", res.RowsAfter)
 
-	// (6) A LIVE AsOf (txTime=2000 >= the inferred horizon 1600) over the PRUNED
-	// set resolves to R' (the dominator) — the SAME answer a Preserve-All resolve
-	// gives (R' wins on max-sysTime). NO silent data loss (the class
-	// stays closed — the inferrer NEVER admits a horizon BELOW the operator
-	// floor, and the LIVE query is at/above the inferred horizon).
+	// The same live query must still return the newer row after pruning.
 	resolverPost := database.NewResolver(lfs, lfs, alloc, "local", database.ResolverConfig{MaxL0Files: 1000})
 	livePost, err := resolverPost.AsOf(ctx, entity, nsToTime(500), nsToTime(2000))
-	require.NoError(t, err, "real-LocalFS inferrer: the LIVE AsOf(txTime=2000 >= inferred horizon 1600) over the PRUNED set must resolve to R'")
-	assert.Equalf(t, []byte{'D'}, livePost.Payload, "real-LocalFS inferrer: the LIVE AsOf over the pruned set resolves to R' ('D'); got %q (R was dropped; the dominator must win — NO silent data loss)", livePost.Payload)
-	assert.Equalf(t, int64(250), livePost.SystemTime, "real-LocalFS inferrer: the dominant is R' (sysTime=250, the newer floor-admitted row)")
+	require.NoError(t, err, "AsOf at txTime 2000 failed after pruning")
+	assert.Equalf(t, []byte{'D'}, livePost.Payload, "AsOf after pruning returned %q, want D", livePost.Payload)
+	assert.Equalf(t, int64(250), livePost.SystemTime, "pruned query did not return the newer row at SystemTime 250")
 
-	t.Logf("real-LocalFS inferrer PASS: the inferrer advanced the horizon 100 -> 1600 (max(100, observed=2000 - backoff=400)) over the REAL route; R was DROPPED (RowsPruned=1 — the operator floor ALONE would have refused); a LIVE AsOf(txTime=2000) resolves to R' (the dominator) — NO silent data loss (the class stays closed; the §0.a load-bearing advance byte-verified)")
+	t.Logf("observed frontier 2000 and backoff 400 advanced the horizon from 100 to 1600; compaction pruned the older row and preserved the query result")
 }
 
-// TestGCFloorInferRealLocalFSNoOpControl is the RED CONTROL: a compactor
-// whose inferrer does NOT advance (the operator floor alone, no observed
-// frontier driven) compacts at the operator floor 100 -> the dominator R'
-// (sys'=250 > 100) is NOT floor-admitted -> R is RETAINED (RowsPruned=0). The
-// guard asserts RowsPruned=0, proving the inferrer's advance is load-bearing
-// (without the advance, the drop is refused — the divergence the
-// real-LocalFS inferrer guard catches). This is the no-op-inferrer φ-break.
+// TestGCFloorInferRealLocalFSNoOpControl leaves the observed frontier at zero.
+// The effective horizon therefore stays at the operator floor 100, below the
+// newer row's SystemTime 250, so compaction must retain both rows.
 func TestGCFloorInferRealLocalFSNoOpControl(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
@@ -146,40 +102,36 @@ func TestGCFloorInferRealLocalFSNoOpControl(t *testing.T) {
 	insertRowInterval(t, alloc, lfs, flusher, entity, 100, 0, openInterval, []byte{'R'})
 	insertRowInterval(t, alloc, lfs, flusher, entity, 250, 0, openInterval, []byte{'D'})
 
-	// A Resolver whose observed frontier is NEVER driven (no AsOf) -> the frontier
-	// stays 0. The inferrer computes effective = max(100, 0 - 400) = max(100,
-	// -400) = 100 (the operator floor — the backoff takes 0-400 negative, the
-	// floor clamps it). The horizon stays at the operator floor 100.
+	// Without AsOf, the observed frontier remains zero. The backoff computes
+	// max(100, 0-400), so the operator floor keeps the horizon at 100.
 	resolver := database.NewResolver(lfs, lfs, alloc, "local", database.ResolverConfig{MaxL0Files: 1000})
 	if got := resolver.QueryTxTimeFrontier(); got != 0 {
-		t.Fatalf("no-op inferrer control: fresh Resolver frontier=%d, want 0 (no AsOf driven — the no-op-inferrer control)", got)
+		t.Fatalf("fresh resolver frontier = %d, want 0 before any AsOf query", got)
 	}
 
 	cfg := database.DefaultCompactionConfig()
 	cfg.EnableDominancePruning = true
-	cfg.PruningHorizonInt64Ns = 100 // the operator floor (BELOW the dominator 250)
+	cfg.PruningHorizonInt64Ns = 100 // the operator floor (below the dominator 250)
 	cfg.PruneBackoffInt64Ns = 400
 	compactor := database.NewL1Compactor(lfs, lfs, lfs, alloc, "compact-bucket", cfg)
 
-	// The no-op inferrer: observed frontier 0 -> effective = max(100, 0-400) = 100.
+	// The zero frontier produces the operator floor rather than an advance.
 	assert.Equalf(t, int64(100), compactor.EffectiveHorizon(0),
-		"no-op inferrer control: EffectiveHorizon(0) with floor=100 backoff=400 = %d, want 100 (max(100, -400); the no-op-inferrer control — the horizon stays at the operator floor)", compactor.EffectiveHorizon(0))
+		"EffectiveHorizon(0) = %d, want operator floor 100", compactor.EffectiveHorizon(0))
 
 	compactor.InferHorizon(resolver)
-	// The horizon stays at 100 (the no-op inferrer did NOT advance it).
+	// InferHorizon must leave the configured horizon unchanged.
 	if got := compactor.Config().PruningHorizonInt64Ns; got != 100 {
-		t.Fatalf("no-op inferrer control: after InferHorizon (no observed frontier) the compactor horizon=%d, want 100 (the no-op inferrer did NOT advance — the operator floor holds)", got)
+		t.Fatalf("horizon after InferHorizon without queries = %d, want operator floor 100", got)
 	}
 	h8 := database.EntityHash8(entity)
 	res, err := compactor.Compaction(ctx, entity, h8)
 	require.NoError(t, err)
 
-	// R is RETAINED (RowsPruned=0) — the operator floor 100 is BELOW the dominator
-	// 250, so (C3) refuses. This is the divergence the real-LocalFS inferrer guard catches:
-	// a no-op inferrer leaves RowsPruned=0; the advancing inferrer (the
-	// production path) leaves RowsPruned=1.
-	assert.Equalf(t, 0, res.RowsPruned, "no-op inferrer control: RowsPruned=%d, want 0 (the no-op inferrer left the horizon at the operator floor 100 -> the dominator R' (sys'=250 > 100) is NOT floor-admitted -> R is RETAINED — the divergence the advancing inferrer in the real-LocalFS inferrer guard catches)", res.RowsPruned)
-	assert.Equalf(t, 2, res.RowsAfter, "no-op inferrer control: RowsAfter=%d, want 2 (both rows survive — the prune refused)", res.RowsAfter)
+	// SystemTime 250 is above horizon 100, so dominance pruning retains both
+	// rows. The advancing-frontier test instead prunes the older row.
+	assert.Equalf(t, 0, res.RowsPruned, "RowsPruned = %d, want 0 with horizon 100 below SystemTime 250", res.RowsPruned)
+	assert.Equalf(t, 2, res.RowsAfter, "RowsAfter = %d, want both rows", res.RowsAfter)
 
-	t.Logf("no-op inferrer control PASS: the no-op inferrer (no observed frontier) left the horizon at the operator floor 100 -> R RETAINED (RowsPruned=0) — the divergence the advancing inferrer in the real-LocalFS inferrer guard catches (RowsPruned=1); the inferrer's advance is load-bearing")
+	t.Logf("without an observed query frontier, the horizon remained at 100 and both rows survived")
 }

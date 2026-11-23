@@ -6,17 +6,12 @@
 
 package durability
 
-//exact_wal_replay_test.go — the exact-WAL guards (ADR-0045):
-// T2, T3, T4, T10, T14, T15. Every guard in THIS file compiles against HEAD
-// recovery.go/wal.go (pre-change..), so its RED is capturable by reverting those
-// two files and re-running: the failure is the PREDICTED defect signature
-// (double-mint / silent loss / duplicate seq / scoped-off assertion), never a
-// compile error. The marker-assertion guards (T5, T9, T13) reference the new
-// witness fields and live inwal_markers_test.go with bug-inject REDs.
-//
-// THE DISCIPLINE: no guard counts without its RED.
-// An assertion that cannot fail is not an assertion — every test below names
-// its RED mechanism in its doc comment.
+// Exact-dot WAL replay tests. The fixtures cover post-checkpoint local writes
+// below a higher foreign dot, a reserved counter at the checkpoint watermark,
+// mint order differing from append order, image and tail overlap, sequence
+// allocation across fsync failures, and root checks with foreign advances.
+// Independent reference engines and raw WAL scans keep the assertions separate
+// from the recovery implementation under test.
 
 import (
 	"context"
@@ -34,11 +29,9 @@ import (
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// engineWith builds a fresh engine and exact-Joins the given records into it
-// (the synthetic-delta route — Join honors the recorded dots verbatim). It is
-// the INDEPENDENT reference the guards compare recovery against: it never goes
-// near restoreEntry, the WAL replay loop, or any code under test, so a recovery
-// defect cannot be masked by a shared implementation (a tautology guard).
+// engineWith builds an independent reference engine by joining snapshot records
+// at their recorded dots. It does not use restoreEntry or the WAL replay loop,
+// so a recovery defect cannot be hidden by sharing that implementation.
 func engineWith(t *testing.T, nodeID [16]byte, initialCounter uint64, recs ...SnapshotRecord) *eng.DeltaCRDTEngine {
 	t.Helper()
 	eng.DataDir = t.TempDir()
@@ -53,17 +46,15 @@ func engineWith(t *testing.T, nodeID [16]byte, initialCounter uint64, recs ...Sn
 	return e
 }
 
-// referenceRoot is the Merkle root of an independently-constructed exact-dot
-// state — the check for "recovery reproduced the live state" that does not
-// depend on the recovery path producing it.
+// referenceRoot computes the Merkle root of an independently constructed
+// exact-dot state for comparison with recovered state.
 func referenceRoot(t *testing.T, nodeID [16]byte, recs ...SnapshotRecord) [32]byte {
 	t.Helper()
 	return engineWith(t, nodeID, 1, recs...).State().MerkleRoot()
 }
 
-// exactRec builds a SnapshotRecord carrying a full 120-byte entry at an
-// EXPLICIT dot — the building block for hand-constructed reference states,
-// images, and checkpoints.
+// exactRec builds a full snapshot record at an explicit dot for reference
+// states, images, and checkpoint fixtures.
 func exactRec(entityID string, nodeID [16]byte, counter uint64, digest [32]byte) SnapshotRecord {
 	return SnapshotRecord{EntityID: entityID, Entry: eng.CRDTEntry{
 		PayloadDigest: digest,
@@ -74,23 +65,20 @@ func exactRec(entityID string, nodeID [16]byte, counter uint64, digest [32]byte)
 	}}
 }
 
-// handMutation builds a WALMutation in EXACTLY the shape production persists
-// post-a full-fidelity 0x04 record built via NewWALMutation (the one
-// construction discipline — the dot is stamped into the full 120-byte entry
-// from the engine-returned CausalDot, the legacy subset is derived, and
-// AppendMutation's validateV2 gate accepts it). The pre--BLOCKER shape
-// (zeroed entry dot/origin) is now LEGACY-only; the T12 mixed-format guard
-// exercises it via AppendMutationV1ForTest.
+// handMutation builds the full-fidelity mutation shape production persists.
+// NewWALMutation stamps the supplied dot into the 120-byte entry and derives the
+// legacy subset from the same values. AppendMutationV1ForTest covers the legacy
+// encoding separately in the mixed-format tests.
 func handMutation(entityID string, nodeID [16]byte, counter uint64, digest [32]byte) WALMutation {
 	return NewWALMutation(entityID,
 		eng.CausalDot{NodeID: nodeID, Counter: counter},
 		eng.CRDTEntry{PayloadDigest: digest, SystemTime: int64(counter) * 1_000})
 }
 
-// readWALRecordSeqs parses the RAW WAL bytes (not ReplayWAL — the code under
-// test cannot be its own check) and returns every record's on-disk seq in
-// file order. Layout: 8-byte file header, then records of
-// seq(8) + type(1) + payloadLen(4) + payload (wal.go:encodeMutationRecord).
+// readWALRecordSeqs parses raw WAL bytes independently of ReplayWAL and returns
+// each record's sequence number in file order. Records follow the 8-byte file
+// header as seq(8), type(1), payloadLen(4), and payload, matching
+// internal/chaos encodeMutationRecord.
 func readWALRecordSeqs(t *testing.T, walPath string) []uint64 {
 	t.Helper()
 	data, err := os.ReadFile(walPath)
@@ -113,15 +101,15 @@ func readWALRecordSeqs(t *testing.T, walPath string) []uint64 {
 	return seqs
 }
 
-// assertSeqsUnique fails unless the raw WAL's record seqs are strictly
-// increasing — no duplicates, no rewinds (contract).
+// assertSeqsUnique requires raw WAL sequence numbers to increase strictly, so
+// the checkpoint sequence cut cannot be ambiguous.
 func assertSeqsUnique(t *testing.T, walPath string) []uint64 {
 	t.Helper()
 	seqs := readWALRecordSeqs(t, walPath)
 	seen := make(map[uint64]int, len(seqs))
 	for i, s := range seqs {
 		if prev, dup := seen[s]; dup {
-			t.Fatalf("seq %d stamped on BOTH record #%d and record #%d — the recovery cut (Seq > FinalCheckptSeq) is ambiguous", s, prev, i)
+			t.Fatalf("seq %d stamped on both record #%d and record #%d — the recovery cut (Seq > FinalCheckptSeq) is ambiguous", s, prev, i)
 		}
 		seen[s] = i
 		if i > 0 && s <= seqs[i-1] {
@@ -131,11 +119,9 @@ func assertSeqsUnique(t *testing.T, walPath string) []uint64 {
 	return seqs
 }
 
-// foreignJoinInto performs a REAL foreign Join against the live bridge (the
-// physics, not a synthetic clock jump): a distinct-origin engine mints
-// n dots starting at foreignStart+1, the delta is generated against the live
-// digest and Joined, and the clock advance is persisted at the receive seam
-// Returns the live clock after the Join (== the foreign max dot).
+// foreignJoinInto mints n dots in a distinct-origin engine and joins its delta
+// into the live bridge. It records the resulting clock advance and returns the
+// live clock, which equals the greatest foreign dot.
 func foreignJoinInto(t *testing.T, live *Bridge, foreignStart uint64, n int) uint64 {
 	t.Helper()
 	eng.DataDir = t.TempDir()
@@ -148,7 +134,7 @@ func foreignJoinInto(t *testing.T, live *Bridge, foreignStart uint64, n int) uin
 		foreign.InsertLocal(utf8EntityID(5000+i), stagedEntry(5000+i))
 	}
 	delta := foreign.GenerateDelta(live.Engine().GenerateDigest())
-	defer delta.Release() // MUST Release (crdt.go:1595): Exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
+	defer delta.Release() // Must release: exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
 	live.Engine().Join(*delta)
 	if err := live.RecordClockAdvance(); err != nil {
 		t.Fatalf("RecordClockAdvance: %v", err)
@@ -156,13 +142,9 @@ func foreignJoinInto(t *testing.T, live *Bridge, foreignStart uint64, n int) uin
 	return live.Engine().LamportCounter()
 }
 
-// collectEntries snapshots an engine's full dot set: entityID → one entry per
-// dot. BOTH the key strings and the entry slices are deep-copied onto the Go
-// heap: ForEach's entityID is a zero-copy string header pointing INTO the mmap
-// arena (and the entries slice is arena-backed), so a map built on the raw
-// keys turns to garbage the instant engine.Close() unmaps the arena. (Found
-// the hard way: T6 compared against a live map collected pre-Close and read
-// post-Close — every key read back as NUL bytes.)
+// collectEntries deep-copies every entity key and entry slice onto the Go heap.
+// ForEach exposes arena-backed strings and slices, which become invalid when
+// engine.Close unmaps the arena.
 func collectEntries(t *testing.T, engine *eng.DeltaCRDTEngine) map[string][]eng.CRDTEntry {
 	t.Helper()
 	out := make(map[string][]eng.CRDTEntry)
@@ -175,13 +157,10 @@ func collectEntries(t *testing.T, engine *eng.DeltaCRDTEngine) map[string][]eng.
 	return out
 }
 
-// writeImageForTest captures eng's live state through the pinned walk
-// (CaptureShardsPinned) and writes the image stamped at a CALLER-CHOSEN
-// watermark wm. The/2 guards use it to FORGE the pre-skew on
-// purpose (T1/T2/T3/T10 build the torn or skewed images the recovery path
-// must survive; production AppendCheckpoint can no longer produce them).
-// Entity keys are cloned out of the arena (the pin is released before the
-// write — the image must not reference arena memory past it).
+// writeImageForTest captures live state through CaptureShardsPinned and writes
+// an image with a caller-selected watermark. Tests use this to construct stale
+// or skewed image and anchor combinations that production checkpointing avoids.
+// Entity keys are copied because the EBR pin ends before the image is written.
 func writeImageForTest(engine *eng.DeltaCRDTEngine, wm uint64, lfs *LocalFS) error {
 	ebr := engine.EBR()
 	participant := ebr.Acquire()
@@ -200,9 +179,8 @@ func writeImageForTest(engine *eng.DeltaCRDTEngine, wm uint64, lfs *LocalFS) err
 	return SnapshotToLSM(context.Background(), nil, lfs, image, nil)
 }
 
-// temporalEntry is a stagedEntry with ALL FIVE temporal/H3 fields set — the
-// T10 carrier proving the 120-byte image bytes deterministically win over the
-// 80-byte WAL bytes at a shared dot (C2/C3).
+// temporalEntry sets all five temporal and H3 fields so overlap tests compare
+// the complete recovered entry, not only its dot and payload digest.
 func temporalEntry(i int) eng.CRDTEntry {
 	e := stagedEntry(i)
 	e.ValidTimeStart = int64(i)*1_000 + 1
@@ -214,27 +192,19 @@ func temporalEntry(i int) eng.CRDTEntry {
 }
 
 // ---------------------------------------------------------------------------
-// T2 — counterexample (i): local tail under a HIGHER leaked foreign dot
+// Local tail below a higher foreign dot.
 // ---------------------------------------------------------------------------
 
-// TestLocalTailUnderHigherLeakedForeignDot is the Fix A
-// killer. The timeline:
+// TestLocalTailUnderHigherLeakedForeignDot checkpoints at watermark 11, appends
+// local dot 12, and then joins foreign dot 1001. The image retains the old
+// watermark while containing both the local tail and the foreign entry.
 //
-//	10 local puts (counters 2..11); checkpoint at wm=11; local put → dot 12
-//	(the leak); a foreign Join lands dot 1001 and advances the clock; the
-//	stale-wm image then holds local {2..12} AND foreign {1001}.
-//
-// RED on HEAD: bounded replay re-mints dot 12 via InsertLocal ABOVE the image's
-// max (the foreign 1001) → the recovered node carries 13 dots vs the live 12,
-// the root diverges, the clock overshoots. RED under the REJECTED Fix A: the
-// image's local 12 is filtered out and the re-mint lands at 1002 → the dot
-// COUNT matches the live 12 while the ROOT still diverges (equal cardinality ≠
-// equal identity — §2.3(i)). Both RED variants are captured artifacts; this
-// guard asserts ALL THREE observables non-fatally so the artifacts show exactly
-// which check fired.
+// Replay must restore local dot 12 rather than minting above the foreign high
+// water. The assertions compare dot count, root, and clock independently so an
+// equal number of dots cannot conceal changed dot identities.
 func TestLocalTailUnderHigherLeakedForeignDot(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t2.wal")
+	walPath := filepath.Join(t.TempDir(), "local-tail.wal")
 	live := newLiveBridge(t, walPath, 0)
 
 	// counters 2..11
@@ -251,15 +221,16 @@ func TestLocalTailUnderHigherLeakedForeignDot(t *testing.T) {
 	if err := live.WAL().AppendCheckpoint(WALCheckpoint{MerkleRoot: rootAtWm, LamportHigh: wm}); err != nil {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
-	// The leaked local dot: 12 — minted in the (T1, T2] window.
+	// Dot 12 is appended after the checkpoint but before the image walk.
 	if _, err := live.PutLocal(utf8EntityID(10), stagedPayload(10), stagedEntry(10)); err != nil {
-		t.Fatalf("PutLocal leaked: %v", err)
+		t.Fatalf("PutLocal post-checkpoint: %v", err)
 	}
-	// The foreign Join: clock → 1001; the image's max dot is now FOREIGN.
+	// The foreign Join advances the clock to 1001, above every local dot.
 	if clock := foreignJoinInto(t, live, 1000, 1); clock != 1001 {
 		t.Fatalf("post-Join clock %d != 1001", clock)
 	}
-	// The T2 image walk with the STALE T1 watermark: holds {2..12} ∪ {1001}.
+	// The image retains watermark 11 while containing local dots 2..12 and the
+	// foreign dot 1001.
 	if err := writeImageForTest(live.Engine(), wm, lfs); err != nil {
 		t.Fatalf("SnapshotToLSM: %v", err)
 	}
@@ -280,43 +251,35 @@ func TestLocalTailUnderHigherLeakedForeignDot(t *testing.T) {
 
 	rec, witness := recoverBounded(t, walPath, lfs)
 	if !witness.Bounded {
-		t.Fatalf("witness.Bounded=false — the bounded path did not engage; T2 is not exercising the T2 window")
+		t.Fatalf("witness.Bounded=false for the local-tail and foreign-dot fixture")
 	}
-	// Non-fatal triple: the RED artifact must name every check that fired.
 	if got := countDots(t, rec); got != liveDots {
-		t.Errorf("DOT COUNT: recovered %d != live %d — the leaked dot was re-minted above the foreign max (double-mint)", got, liveDots)
+		t.Errorf("recovered dot count %d differs from live %d; local tail may have been re-minted", got, liveDots)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x — equal cardinality is NOT equal identity", got, liveRoot)
+		t.Errorf("recovered root %x differs from live root %x; equal dot counts do not prove equal dots", got, liveRoot)
 	}
 	if got := rec.LamportCounter(); got != liveClock {
-		t.Errorf("CLOCK: recovered %d != live %d", got, liveClock)
+		t.Errorf("recovered clock %d differs from live clock %d", got, liveClock)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// T3 — counterexample (ii): reserved counter exactly at the watermark
+// Reserved counter at the checkpoint watermark.
 // ---------------------------------------------------------------------------
 
-// TestReservedCounterAtWatermarkSurvivesRecovery covers the reserved-counter-at-watermark counterexample.
-// InsertLocal reserves counter N BEFORE the record lands; a checkpoint in that
-// window records watermark N with the mutation's record still ABOVE it in the
-// log. The refuted scalar cut (Counter <= watermark → skip) silently drops that
-// durable mutation; the sequence cut (Seq > FinalCheckptSeq) keeps it.
+// TestReservedCounterAtWatermarkSurvivesRecovery models InsertLocal reserving a
+// counter before its WAL append completes. The checkpoint carries watermark 5
+// and a root for counters 2, 3, and 4; the mutation at counter 5 follows the
+// checkpoint record.
 //
-// The scenario is hand-built byte-exactly (this is a WAL-cut contract guard,
-// not a race): mutations at counters 2,3,4; checkpoint{root({2,3,4}), wm=5};
-// then the reserved mutation at counter 5.
-//
-// RED on HEAD (the damning part): the scalar cut skips counter 5 AND the
-// checkpoint anchor PASSES — the rebuilt root equals the checkpoint root
-// because both cover only {2,3,4} — so HEAD returns SUCCESS having silently
-// lost a durable write. Root equality is not a completeness check; this guard
-// compares against an INDEPENDENT reference root that includes the lost dot.
+// A scalar counter cut would discard that durable mutation while still matching
+// the checkpoint root. The sequence cut must retain it, and the test compares
+// against an independent root that includes counter 5.
 func TestReservedCounterAtWatermarkSurvivesRecovery(t *testing.T) {
 	nodeID := testNodeID()
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t3.wal")
+	walPath := filepath.Join(t.TempDir(), "watermark-counter.wal")
 
 	pre := []SnapshotRecord{
 		exactRec(utf8EntityID(1), nodeID, 2, stagedDigest(1)),
@@ -345,7 +308,7 @@ func TestReservedCounterAtWatermarkSurvivesRecovery(t *testing.T) {
 		t.Fatalf("WAL close: %v", err)
 	}
 
-	// The image at the watermark key holds ONLY the pre-reservation dots.
+	// The image at the watermark key holds only the pre-reservation dots.
 	img := engineWith(t, nodeID, 1, pre...)
 	if err := writeImageForTest(img, 5, lfs); err != nil {
 		t.Fatalf("SnapshotToLSM: %v", err)
@@ -359,36 +322,31 @@ func TestReservedCounterAtWatermarkSurvivesRecovery(t *testing.T) {
 		t.Fatalf("witness.Bounded=false — the bounded path did not engage")
 	}
 	if got := countDots(t, rec); got != 4 {
-		t.Errorf("DOT COUNT: recovered %d != 4 — the durable watermark-counter mutation was dropped by the cut", got)
+		t.Errorf("recovered %d dots, want 4 including the watermark-counter mutation", got)
 	}
 	if got := rec.State().MerkleRoot(); got != wantRoot {
-		t.Errorf("ROOT: recovered %x != reference %x — recovered state is not the live state", got, wantRoot)
+		t.Errorf("recovered root %x differs from independent reference %x", got, wantRoot)
 	}
 	if got := rec.LamportCounter(); got != 5 {
-		t.Errorf("CLOCK: recovered %d != 5", got)
+		t.Errorf("recovered clock %d, want 5", got)
 	}
 	if len(collectEntries(t, rec)[utf8EntityID(4)]) != 1 {
-		t.Errorf("ENTITY: the reserved-counter mutation %s is absent from the recovered state", utf8EntityID(4))
+		t.Errorf("reserved-counter mutation %s is absent from recovered state", utf8EntityID(4))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// T4 — counterexample (iii): mint order ≠ append order
+// Mint order differs from append order.
 // ---------------------------------------------------------------------------
 
-// TestMintOrderNeAppendOrderExactRestore covers the mint-order≠append-order counterexample. Under
-// concurrent mint/append, the WAL can record B@3 BEFORE A@2. HEAD seeds the
-// full replay at firstMutation.Counter-1 = 2 and re-mints in APPEND order:
-// B→3 (coincides), A→4 — counter set {3,4} ≠ the live {2,3}, so the checkpoint
-// anchor fires ErrRecoveryRootMismatch and boot is REFUSED on a healthy log.
-// Exact-dot restore replays B@3, A@2 verbatim: no error, root == live.
-//
-// RED on HEAD: RecoverEngineWithSnapshot returns ErrRecoveryRootMismatch
-// (rebuilt {3,4} vs checkpoint {2,3}) — the test's first assertion is that
-// recovery SUCCEEDS.
+// TestMintOrderNeAppendOrderExactRestore appends B at counter 3 before A at
+// counter 2. Re-minting in append order would change A to counter 4 and reject
+// a healthy log through the root anchor. Exact-dot replay must instead restore
+// counters 2 and 3 verbatim, preserve the checkpoint root, and report two
+// replayed records.
 func TestMintOrderNeAppendOrderExactRestore(t *testing.T) {
 	nodeID := testNodeID()
-	walPath := filepath.Join(t.TempDir(), "t4.wal")
+	walPath := filepath.Join(t.TempDir(), "append-order.wal")
 
 	recB := exactRec(utf8EntityID(20), nodeID, 3, stagedDigest(20))
 	recA := exactRec(utf8EntityID(21), nodeID, 2, stagedDigest(21))
@@ -398,7 +356,7 @@ func TestMintOrderNeAppendOrderExactRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
-	// Append order INVERTED vs mint order: B@3 lands first, then A@2.
+	// Append order is inverted relative to mint order: B@3 lands before A@2.
 	if err := w.AppendMutation(handMutation(recB.EntityID, nodeID, 3, recB.Entry.PayloadDigest)); err != nil {
 		t.Fatalf("AppendMutation B: %v", err)
 	}
@@ -412,27 +370,27 @@ func TestMintOrderNeAppendOrderExactRestore(t *testing.T) {
 		t.Fatalf("WAL close: %v", err)
 	}
 
-	// Full-replay path (store == nil): the contract with exact dots.
+	// Full-replay path (store == nil): the exact-dot contract.
 	engine, wal, _, witness, err := RecoverEngineWithSnapshot(nodeID, walPath, nil, testArenaSize)
 	if err != nil {
-		t.Fatalf("T4: exact-dot recovery must NOT trip the root anchor on append-order≠mint-order (HEAD re-mints A→4 and fails here): %v", err)
+		t.Fatalf("exact-dot recovery rejected append order different from mint order: %v", err)
 	}
 	defer func() { _ = wal.Close() }()
 	defer func() { _ = engine.Close() }()
 
 	if got := countDots(t, engine); got != 2 {
-		t.Errorf("DOT COUNT: recovered %d != 2", got)
+		t.Errorf("recovered %d dots, want 2", got)
 	}
 	if got := engine.State().MerkleRoot(); got != ckptRoot {
-		t.Errorf("ROOT: recovered %x != live %x — replay re-minted instead of restoring the recorded dots", got, ckptRoot)
+		t.Errorf("recovered root %x differs from checkpoint root %x", got, ckptRoot)
 	}
 	if got := engine.LamportCounter(); got != 3 {
-		t.Errorf("CLOCK: recovered %d != 3", got)
+		t.Errorf("recovered clock %d, want 3", got)
 	}
 	if witness.ReplayedRecords != 2 {
-		t.Errorf("WITNESS: ReplayedRecords %d != 2", witness.ReplayedRecords)
+		t.Errorf("ReplayedRecords=%d, want 2", witness.ReplayedRecords)
 	}
-	// The dots THEMSELVES (not just their count) are the recorded ones.
+	// Check the recorded dot identities as well as their count.
 	ents := collectEntries(t, engine)
 	if e := ents[recB.EntityID]; len(e) != 1 || e[0].DotCounter != 3 {
 		t.Errorf("B restored at counter %v, want exactly 3", e)
@@ -443,25 +401,21 @@ func TestMintOrderNeAppendOrderExactRestore(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T10 — image/tail exact-dot overlap: the image's bytes win, deterministically
+// A dot present in both the image and WAL tail.
 // ---------------------------------------------------------------------------
 
-// TestImageTailOverlapImageBytesWin covers the image/tail exact-dot overlap (C2/C3). One dot
-// (counter 4) sits in BOTH the 120-byte image (full temporal bytes) and the
-// 80-byte WAL tail (the five temporal/H3 fields zero — restoreEntry's
-// documented limitation, closed by). The merge compares DOTS ONLY and
-// the EXISTING entry keeps its bytes, so the image MUST be Joined first; and
-// the two Joins MUST be separate (a combined delta's unstable sort leaves an
-// unspecified winner). This guard recovers 100 times over the SAME on-disk
-// artifacts and asserts the image's bytes win EVERY time — a combined-Join
-// regression would flap rather than fail once.
+// TestImageTailOverlapImageBytesWin appends counter 4 after the checkpoint and
+// then captures an image that also contains it. Recovery must retain one entry
+// at the recorded dot rather than minting a duplicate. Repeating recovery 100
+// times checks deterministic overlap handling, complete temporal fields, and
+// the live root.
 //
-// RED on HEAD: the tail re-mints dot 4 at counter 5 (InsertLocal), so the
-// overlap entity carries TWO dots — the single-dot assertion fires before the
-// byte comparison is even reached.
+// Current V2 WAL records and images both carry 120-byte entries, so this fixture
+// no longer compares different entry widths. Legacy 80-byte records are covered
+// by the mixed-format tests.
 func TestImageTailOverlapImageBytesWin(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t10.wal")
+	walPath := filepath.Join(t.TempDir(), "image-overlap.wal")
 	live := newLiveBridge(t, walPath, 0)
 
 	// Two quiescent temporal puts: counters 2, 3.
@@ -516,7 +470,7 @@ func TestImageTailOverlapImageBytesWin(t *testing.T) {
 			g.H3Index != liveEntry.H3Index {
 			_ = wal.Close()
 			_ = engine.Close()
-			t.Fatalf("iter %d: the 80-byte WAL bytes beat the 120-byte image bytes at dot 4 — C2/C3 ordering regression (image MUST be Joined first, in a SEPARATE Join)", iter)
+			t.Fatalf("iter %d: temporal or H3 fields changed while resolving the image and WAL overlap at dot 4", iter)
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
 			_ = wal.Close()
@@ -534,15 +488,14 @@ func TestImageTailOverlapImageBytesWin(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T14 — seq uniqueness across a rigged fsync failure
+// Sequence uniqueness across an injected fsync failure.
 // ---------------------------------------------------------------------------
 
 // riggedFsyncWAL opens a WAL whose sync hook fails on sync-call number
-// failOnCall and otherwise returns nil WITHOUT fsyncing (the record bytes are
+// failOnCall and otherwise returns nil without fsyncing (the record bytes are
 // in the page cache regardless; the real fsync happens at Close). The returned
-// WAL must be Closed by the caller before the path is re-read — this helper
-// deliberately does NOT register a cleanup so the caller controls the crash
-// point.
+// WAL must be closed by the caller before the path is re-read — this helper
+// does not register a cleanup so the caller controls the crash point.
 func riggedFsyncWAL(t *testing.T, walPath string, failOnCall int32) *WAL {
 	t.Helper()
 	w, err := OpenWAL(walPath)
@@ -552,35 +505,29 @@ func riggedFsyncWAL(t *testing.T, walPath string, failOnCall int32) *WAL {
 	var calls int32
 	WALAsChaos(w).SetSyncHookForTest(func() error {
 		if atomic.AddInt32(&calls, 1) == failOnCall {
-			return errors.New("T14 rigged fsync failure")
+			return errors.New("injected fsync failure")
 		}
 		return nil
 	})
 	return w
 }
 
-// TestSeqUniqueAcrossFsyncFailure runs one
-// sub-case per append path — proving one does NOT generalize (HEAD fixed the
-// batch path only). A failed fsync MUST still consume the record's seq
-// (advance-as-you-write): the bytes are in the file and a neighbour's fsync
-// can flush them, so re-stamping the same seq onto the NEXT record makes two
-// records share a seq and the recovery cut (Seq > FinalCheckptSeq) silently
-// absorbs one of them.
-//
-// RED on HEAD: AppendMutation/AppendCheckpoint/AppendClockAdvance all bump
-// nextSeq only AFTER a successful sync, so the post-failure append REUSES the
-// failed record's seq → assertSeqsUnique fires on the raw bytes.
+// TestSeqUniqueAcrossFsyncFailure covers mutation, checkpoint, and clock-
+// advance appends separately. A failed fsync must still consume the record's
+// sequence number because its bytes are already in the file and another fsync
+// can flush them. Reusing that sequence number would make the checkpoint cut
+// ambiguous between two records.
 func TestSeqUniqueAcrossFsyncFailure(t *testing.T) {
 	nodeID := testNodeID()
 
 	t.Run("AppendMutation", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "t14m.wal")
+		walPath := filepath.Join(t.TempDir(), "sync-mutation.wal")
 		w := riggedFsyncWAL(t, walPath, 2)
 		if err := w.AppendMutation(handMutation(utf8EntityID(1), nodeID, 2, stagedDigest(1))); err != nil {
 			t.Fatalf("append 1: %v", err)
 		}
 		if err := w.AppendMutation(handMutation(utf8EntityID(2), nodeID, 3, stagedDigest(2))); err == nil {
-			t.Fatalf("the rigged fsync failure did not surface to the caller — durability lies")
+			t.Fatalf("the rigged fsync failure did not surface to the caller")
 		}
 		if err := w.AppendMutation(handMutation(utf8EntityID(3), nodeID, 4, stagedDigest(3))); err != nil {
 			t.Fatalf("append 3: %v", err)
@@ -592,7 +539,7 @@ func TestSeqUniqueAcrossFsyncFailure(t *testing.T) {
 	})
 
 	t.Run("AppendCheckpoint", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "t14c.wal")
+		walPath := filepath.Join(t.TempDir(), "sync-checkpoint.wal")
 		w := riggedFsyncWAL(t, walPath, 2)
 		rec := exactRec(utf8EntityID(1), nodeID, 2, stagedDigest(1))
 		if err := w.AppendMutation(handMutation(rec.EntityID, nodeID, 2, rec.Entry.PayloadDigest)); err != nil {
@@ -600,7 +547,7 @@ func TestSeqUniqueAcrossFsyncFailure(t *testing.T) {
 		}
 		ckptRoot := referenceRoot(t, nodeID, rec)
 		if err := w.AppendCheckpoint(WALCheckpoint{MerkleRoot: ckptRoot, LamportHigh: 2}); err == nil {
-			t.Fatalf("the rigged fsync failure did not surface to the caller — durability lies")
+			t.Fatalf("the rigged fsync failure did not surface to the caller")
 		}
 		if err := w.AppendMutation(handMutation(utf8EntityID(2), nodeID, 3, stagedDigest(2))); err != nil {
 			t.Fatalf("append 3: %v", err)
@@ -612,13 +559,13 @@ func TestSeqUniqueAcrossFsyncFailure(t *testing.T) {
 	})
 
 	t.Run("AppendClockAdvance", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "t14a.wal")
+		walPath := filepath.Join(t.TempDir(), "sync-clock.wal")
 		w := riggedFsyncWAL(t, walPath, 2)
 		if err := w.AppendMutation(handMutation(utf8EntityID(1), nodeID, 2, stagedDigest(1))); err != nil {
 			t.Fatalf("append 1: %v", err)
 		}
 		if err := w.AppendClockAdvance(100); err == nil {
-			t.Fatalf("the rigged fsync failure did not surface to the caller — durability lies")
+			t.Fatalf("the rigged fsync failure did not surface to the caller")
 		}
 		if err := w.AppendMutation(handMutation(utf8EntityID(2), nodeID, 3, stagedDigest(2))); err != nil {
 			t.Fatalf("append 3: %v", err)
@@ -630,21 +577,15 @@ func TestSeqUniqueAcrossFsyncFailure(t *testing.T) {
 	})
 }
 
-// TestSeqCutUnambiguousAfterFsyncFailure is the second half of T14: the
-// CUT, not just the seq counter. A checkpoint whose fsync FAILED still sits in
-// the byte stream with its own seq; bounded recovery must replay EXACTLY the
-// post-checkpoint records. The wm=3/counter-3 pair is deliberate (the
-// counterexample-(ii) shape): with duplicate seqs (HEAD) a seq cut would
-// silently absorb the post-checkpoint record that reuses the checkpoint's seq,
-// and with the refuted scalar cut the same record is skipped outright.
-//
-// RED on HEAD: assertSeqsUnique fires on the raw bytes ([1,2,2,3] — the failed
-// checkpoint's seq is reused by the next mutation). If the bytes somehow
-// passed, the scalar cut would drop counter 3 and the root assertion fires.
+// TestSeqCutUnambiguousAfterFsyncFailure places a checkpoint with a failed
+// fsync before two mutations. Its bytes and consumed sequence number remain in
+// the log, so bounded recovery must replay both later records. Watermark 3 and
+// the following counter-3 mutation also ensure the cut uses record sequence
+// numbers rather than scalar counters.
 func TestSeqCutUnambiguousAfterFsyncFailure(t *testing.T) {
 	nodeID := testNodeID()
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t14cut.wal")
+	walPath := filepath.Join(t.TempDir(), "sync-cut.wal")
 
 	rec1 := exactRec(utf8EntityID(1), nodeID, 2, stagedDigest(1))
 	rec2 := exactRec(utf8EntityID(2), nodeID, 3, stagedDigest(2))
@@ -655,10 +596,10 @@ func TestSeqCutUnambiguousAfterFsyncFailure(t *testing.T) {
 	if err := w.AppendMutation(handMutation(rec1.EntityID, nodeID, 2, rec1.Entry.PayloadDigest)); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
-	// The checkpoint's fsync "fails" — the caller sees an error, but the record
-	// bytes are in the stream with a consumed seq.
+	// The checkpoint reports an fsync error after its bytes and sequence number
+	// have been written.
 	if err := w.AppendCheckpoint(WALCheckpoint{MerkleRoot: ckptRoot, LamportHigh: 3}); err == nil {
-		t.Fatalf("the rigged fsync failure did not surface to the caller — durability lies")
+		t.Fatalf("the rigged fsync failure did not surface to the caller")
 	}
 	if err := w.AppendMutation(handMutation(rec2.EntityID, nodeID, 3, rec2.Entry.PayloadDigest)); err != nil {
 		t.Fatalf("append 2: %v", err)
@@ -671,9 +612,8 @@ func TestSeqCutUnambiguousAfterFsyncFailure(t *testing.T) {
 	}
 	assertSeqsUnique(t, walPath)
 
-	// The image holds ONLY the pre-checkpoint dot (the caller believed the
-	// checkpoint failed, but its bytes — and the image taken against them —
-	// are what they are).
+	// The image contains only the pre-checkpoint dot even though the failed
+	// checkpoint's bytes and sequence number remain in the WAL.
 	img := engineWith(t, nodeID, 1, rec1)
 	if err := writeImageForTest(img, 3, lfs); err != nil {
 		t.Fatalf("SnapshotToLSM: %v", err)
@@ -685,40 +625,34 @@ func TestSeqCutUnambiguousAfterFsyncFailure(t *testing.T) {
 		t.Fatalf("witness.Bounded=false — the bounded path did not engage")
 	}
 	if got := countDots(t, rec); got != 3 {
-		t.Errorf("DOT COUNT: recovered %d != 3 — the cut lost a post-checkpoint record", got)
+		t.Errorf("recovered %d dots, want 3 including both post-checkpoint mutations", got)
 	}
 	if got := rec.State().MerkleRoot(); got != wantRoot {
-		t.Errorf("ROOT: recovered %x != reference %x", got, wantRoot)
+		t.Errorf("recovered root %x differs from independent reference %x", got, wantRoot)
 	}
 	if got := rec.LamportCounter(); got != 4 {
-		t.Errorf("CLOCK: recovered %d != 4", got)
+		t.Errorf("recovered clock %d, want 4", got)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// T15 — root-equality assertion ARMED with foreign advances present
+// Root checks with foreign clock advances.
 // ---------------------------------------------------------------------------
 
-// TestRootAssertionArmedWithForeignAdvances covers the root-equality assertion armed with foreign advances present. On HEAD
-// the crash-consistency assertion is skipped whenever ANY foreign advance
-// exists (`len(rep.Advances) > 0` → SCOPED) — production nodes always have
-// advances, so ErrRecoveryRootMismatch structurally could never fire on
-// silicon. re-arms it on the BOUNDED path (the image carries the foreign
-// entries, so the rebuilt root IS comparable to the checkpoint root) while
-// keeping it scoped off on the full path (the WAL holds no foreign entries).
+// TestRootAssertionArmedWithForeignAdvances compares bounded and replay-only
+// recovery with foreign advances present. A bound image contains the foreign
+// entries, so its rebuilt state is comparable with the checkpoint root: a
+// correct anchor must pass and a corrupted anchor must return
+// ErrRecoveryRootMismatch.
 //
-// Sub-test A (control): correct anchor + advances → recovery succeeds (no
-// false positive). Sub-test B (the guard): a CORRUPTED anchor + advances →
-// ErrRecoveryRootMismatch. Sub-test C (scope boundary): the full path on the
-// SAME corrupted log still succeeds (foreign state regossips on rejoin).
-//
-// RED on HEAD: sub-test B — the assertion is scoped off, recovery SUCCEEDS on
-// a corrupted anchor; the test expected ErrRecoveryRootMismatch.
+// Replay-only recovery has only local WAL records and cannot reproduce that
+// combined root. The same corrupted anchor must therefore not reject the full
+// replay; foreign entries arrive again through anti-entropy.
 func TestRootAssertionArmedWithForeignAdvances(t *testing.T) {
 	build := func(t *testing.T, tamperRoot bool) (walPath string, lfs *LocalFS, liveRoot [32]byte, liveDots int) {
 		t.Helper()
 		lfs = newSnapshotStore(t)
-		walPath = filepath.Join(t.TempDir(), "t15.wal")
+		walPath = filepath.Join(t.TempDir(), "foreign-advances.wal")
 		live := newLiveBridge(t, walPath, 0)
 		for i := 0; i < 5; i++ {
 			if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
@@ -756,22 +690,20 @@ func TestRootAssertionArmedWithForeignAdvances(t *testing.T) {
 		if !witness.Bounded {
 			t.Fatalf("witness.Bounded=false — the bounded path did not engage")
 		}
-		// L1-d: the arming must be machine-observable. This shape is
-		// bounded + checkpoint-final, so the POST-TAIL root assertion is exactly
-		// the one that runs — and it must say so. (The anchor here is a legacy
-		// 0x02, so the PRE-tail fingerprint check cannot arm; the post-tail root
-		// check is the only check on this shape — proving survived Part A.)
+		// This checkpoint-final bounded recovery must arm the post-tail root
+		// assertion. The legacy 0x02 anchor cannot arm the pre-tail fingerprint
+		// check, so the root assertion is the integrity check for this fixture.
 		if !witness.PostTailRootArmed {
-			t.Fatalf("witness.PostTailRootArmed=false on a bounded+final boot — the R7a re-arming did not survive the re-scope (witness=%+v)", witness)
+			t.Fatalf("checkpoint-final bounded recovery did not arm the post-tail root assertion (witness=%+v)", witness)
 		}
 		if !witness.SeqContiguityVerified {
-			t.Fatalf("witness.SeqContiguityVerified=false — the Part-B loss check must run on every boot (witness=%+v)", witness)
+			t.Fatalf("sequence contiguity was not verified during recovery (witness=%+v)", witness)
 		}
 		if got := rec.State().MerkleRoot(); got != liveRoot {
-			t.Errorf("ROOT: recovered %x != live %x — false positive on an honest anchor", got, liveRoot)
+			t.Errorf("recovered Merkle root %x, want live root %x", got, liveRoot)
 		}
 		if got := countDots(t, rec); got != liveDots {
-			t.Errorf("DOT COUNT: recovered %d != live %d", got, liveDots)
+			t.Errorf("recovered %d dots, want %d", got, liveDots)
 		}
 	})
 
@@ -779,7 +711,7 @@ func TestRootAssertionArmedWithForeignAdvances(t *testing.T) {
 		walPath, lfs, _, _ := build(t, true)
 		_, _, _, _, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 		if err == nil {
-			t.Fatalf("corrupted checkpoint anchor + foreign advances: recovery SUCCEEDED — the root assertion was SCOPED OFF by len(Advances)>0 (HEAD behavior; R7a re-arms it on the bounded path)")
+			t.Fatalf("recovery accepted a corrupted checkpoint anchor with foreign advances; want ErrRecoveryRootMismatch")
 		}
 		if !errors.Is(err, ErrRecoveryRootMismatch) {
 			t.Fatalf("want ErrRecoveryRootMismatch, got: %v", err)
@@ -788,13 +720,13 @@ func TestRootAssertionArmedWithForeignAdvances(t *testing.T) {
 
 	t.Run("FullPathStaysScoped", func(t *testing.T) {
 		walPath, _, _, _ := build(t, true)
-		// The WAL holds only ORIGIN records; the rebuilt root legitimately
-		// differs from the origin+foreign checkpoint root. Scoped off — recovery
-		// succeeds with the 5 origin dots and the foreign state regossips on
-		// rejoin. This is the boundary the re-arm must NOT cross.
+		// The WAL holds only origin records, so the rebuilt root legitimately
+		// differs from the origin+foreign checkpoint root. Full recovery does not
+		// apply the bounded post-tail assertion: it succeeds with the five origin
+		// dots, and foreign state can arrive again through gossip.
 		rec, _ := recoverFull(t, walPath)
 		if got := countDots(t, rec); got != 5 {
-			t.Errorf("full path: %d dots, want 5 (origin-only)", got)
+			t.Errorf("full recovery returned %d dots, want 5 origin dots", got)
 		}
 	})
 }

@@ -28,21 +28,15 @@ import (
 var meter atomic.Pointer[metric.Meter]
 
 // Init binds the OTel Meter used to register Observable instruments and
-// constructs the package-level counters against it. STRICTLY ONCE PER PROCESS:
+// constructs the package-level counters against it. It is a startup operation
+// and must be called at most once per process, before data-plane goroutines use
+// the counters.
 //
-// There is a window in which data-plane goroutines concurrently Add() on the
-// package-level *Counter pointers (internal/database/l0_flusher.go,
-// internal/database/memtable.go). A second Init that non-atomically reassigns
-// those globals while a hot-path reader holds the OLD pointer in a register
-// splits the Add traffic across two LongAdders — silent counter drift.
-//
-// Init is once-only. The first call binds the counters; any subsequent call is
-// rejected (logged) and leaves the existing counters in place. Repeat Init is
-// not "safe because the OTel SDK deduplicates": the orphaned Go-side LongAdder
-// still loses its accumulated total. Threading an atomic.Pointer[Counter]
-// through every data-plane call site would add an atomic load on every
-// hot-path Add — unacceptable against the Zero-GC mandate — so the rigorous
-// guard is once-only initiation, applied here.
+// Data-plane callers access the package-level *Counter pointers directly. A
+// later rebind could split Add traffic between the old and new LongAdders and
+// strand the total accumulated by an orphaned counter. The first call binds
+// the counters; later calls are logged and leave the existing counters in
+// place.
 func Init(m metric.Meter) {
 	if initDone.Swap(true) {
 		// A second Init would non-atomically swap the package-level *Counter
@@ -57,218 +51,97 @@ func Init(m metric.Meter) {
 // initDone guards the once-per-process Init contract.
 var initDone atomic.Bool
 
-// Package-level counters consumed by the data plane. Constructed lazily on
-// first import against whatever Meter is bound (or nil). These are the only
-// symbols referenced by internal/database/*.
+// Package-level counters consumed by the data plane. Package initialization
+// constructs them without a Meter; Init reconstructs them when a Meter is
+// supplied. Data-plane callers reference the pointers directly.
 var (
 	ArrowSerialBytes      *Counter
 	MemTableFlushTotal    *Counter
 	OffHeapAllocatedBytes *Counter
 	QueryL0ListCapped     *Counter
-	// The L0→L1 per-entity compaction counters (ADR-0019).
+	// L0→L1 per-entity compaction counters (ADR-0019).
 	QueryL1FilesScanned *Counter
 	CompactionMerged    *Counter
 	CompactionL1Written *Counter
-	// The Level-2 superseded-row prune counter (ADR-0020) — the disclosure
-	// counter: every row the DominancePrune pass drops at the compaction merge
-	// seam under the (C1)&&(C2)&&(C3) SAFE-DROP rule is MEASURED, not asserted.
-	// Preserve-All (EnableDominancePruning=false) never touches it.
+	// Superseded-row pruning counter (ADR-0020): counts rows dropped by
+	// DominancePrune during compaction merge when C1, C2, and C3 hold.
+	// Disabled when EnableDominancePruning is false.
 	CompactionRowsPruned *Counter
-	// The L0 reaper counters (ADR-0021) — the cross-entity superseded-L0
-	// disk-reclaim sweep. The reaper deletes manifest-listed L0 files ONLY
-	// after it has verified the L1 still exists (the Stage C safety guard);
-	// these counters make the reaper's disk reclamation OBSERVABLE.
+	// L0 reaper counters (ADR-0021): tracks manifest-listed L0 files deleted
+	// after verifying their target L1 object still exists.
 	L0ReapSweeps          *Counter // sweeper runs
 	L0ReapL0Deleted       *Counter // total L0 files deleted
-	L0ReapManifestsReaped *Counter // manifests whose L0s were all deleted + the manifest reaped
-	L0ReapSkippedOrphan   *Counter // manifests whose L1 was missing (the L0s preserved as the backstop)
-	// The T_gc auto-inference counters (ADR-0027) — the engine tracks the
-	// observed live-query txTime frontier (queried at AsOf-entry) and feeds
-	// max(operatorFloor, observedFrontier - backoff) back into the DominancePrune
-	// (C3) floor. Two gauges surface the inferrer's state on /metrics (the
-	// operator-visible audit trail a static knob lacks); one counter is the LOUD
-	// retreat-refuse signal (the monotone-clamp contract). All three are
-	// constructed in BOTH init() AND rebuildCounters() AND allCounters() (a
-	// counter missing from rebuildCounters() silently drops to nil under --otel,
-	// the construction-vs-distinct trap).
-	QueryTxTimeHighWaterMark     *Counter // modeGauge — observed live-query txTime frontier (the atomic the Resolver stores)
-	PruningHorizonEffective      *Counter // modeGauge — the effective horizon fed to DominancePrune (max(operatorFloor, observed - backoff))
-	PruningHorizonRetreatRefused *Counter // modeCounter — times SetInferredHorizon refused a retreat (the monotone-clamp loud-path signal)
-	// The filename-bounded download-skip disclosure counter (ADR-0029) — the
-	// transitively-safe elimination the durable read path (AsOf + Range) applies
-	// BEFORE the Download: a file whose filename-encoded FirstSysTimeNs (the
-	// file's MIN sysTime, written by the flush) exceeds the query's txTime
-	// carries ZERO rows visible at txTime (every row fails Filter2) → the
-	// download+decode is skipped. The counter is the disclosure: every skip is
-	// MEASURED, not asserted. Constructed in BOTH init() AND rebuildCounters()
-	// AND allCounters() (a counter missing from rebuildCounters() silently drops
-	// to nil under --otel, the construction-vs-distinct trap).
-	QueryDownloadSkippedFirstSys *Counter // modeCounter — L0/L1 files whose download was skipped because FirstSysTimeNs > txTime
-	// The manifest-channel download-skip disclosure counter (ADR-0030) — the
-	// SAME transitively-safe elimination the file-skip applies, on the SECOND
-	// channel the durable read path opens: loadSupersededL0Keys downloads +
-	// decodes EVERY compaction manifest per query (one per compaction job,
-	// compaction/{hex8}/{firstSys}.manifest) to mark L0 keys superseded before
-	// the tail cap. The manifest's filename-encoded firstSys is the L1's MIN
-	// sysTime (the SAME field the file channel skips on, parsed by the SAME
-	// parseFirstSysFromKey helper — byte-verified ok=true for ".manifest"
-	// tails). When firstSys > the query's txTime (STRICT >), the L1 the manifest
-	// points at is file-skipped AND every L0 the manifest lists is file-skipped
-	// (its firstSys >= manifest.firstSys > txTime) → skipping the manifest
-	// DOWNLOAD leaves the superseded set intersecting ONLY files the scan loop
-	// skips anyway → the tailKeys + the dominant are byte-identical for the
-	// query's VISIBLE rows AND a manifest Download (+ the ParseManifest
-	// strings.Split alloc) is cut. The counter is the disclosure: every manifest
-	// skip is MEASURED, not asserted. Constructed in BOTH init() AND
-	// rebuildCounters() AND allCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel, the
-	// construction-vs-distinct trap). Gated on the EXISTING EnableFirstSysSkip
-	// flag (NOT a new flag — the manifest + file skips are the SAME elimination
-	// on two channels of the SAME query). FAILSAFE: a parse anomaly → no skip →
-	// the full manifest download runs (a corrupt manifest filename is NEVER
-	// silently dropped).
-	QueryManifestSkippedFirstSys *Counter // modeCounter — compaction manifests whose download was skipped because the manifest's filename-encoded FirstSysTimeNs (the L1's MIN sysTime) exceeds the query's txTime
-	// The read-your-writes live-source disclosure counter (ADR-0032) — the
-	// disclosure surface for the live-source consult the Resolver performs AFTER
-	// its durable Arrow scan. The Resolver consults the live δ-CRDT HAMT (via a
-	// LiveSource interface — internal/database owns it; it does NOT import
-	// pkg/sync, so the seam is an interface, NOT a concrete engine) to merge the
-	// live dominant under the SAME bitemporal dominance AsOf already computes,
-	// closing the "POST /v1/insert → immediate GET /v1/query → 404 until the
-	// bridge's periodic AppendCheckpoint flushes SnapshotToLSM→L0" gap (the
-	// read-your-writes gap — --wal-checkpoint-interval=1 was REQUIRED for the
-	// durable read path to work at all). The counter discloses the LIVE-PATH was
-	// taken (NOT every live HIT — a live read can return zero entries; the count
-	// is the path disclosure, the SAME class the download-skip + manifest-skip
-	// counters carry). Constructed in BOTH init() AND rebuildCounters() AND
-	// allCounters() (a counter missing from rebuildCounters() silently drops to
-	// nil under --otel, the construction-vs-distinct trap).
-	QueryLiveSourceReads *Counter // modeCounter — AsOf/Range queries that consulted the live δ-CRDT HAMT (read-your-writes path)
+	L0ReapManifestsReaped *Counter // manifests whose L0s and manifest entry were deleted
+	L0ReapSkippedOrphan   *Counter // manifests skipped because the target L1 was missing
+	// T_gc auto-inference counters (ADR-0027): tracks the live-query txTime
+	// frontier observed at AsOf entry and feeds max(operatorFloor,
+	// observedFrontier - backoff) into DominancePrune's C3 floor. All counters
+	// must be built in both init() and rebuildCounters() so Init(meter) never
+	// reassigns a counter to nil.
+	QueryTxTimeHighWaterMark     *Counter // modeGauge — observed live-query txTime frontier
+	PruningHorizonEffective      *Counter // modeGauge — effective horizon fed to DominancePrune
+	PruningHorizonRetreatRefused *Counter // modeCounter — count of SetInferredHorizon calls rejecting a backward step
+	// Filename-bounded download-skip counter (ADR-0029): counts L0/L1 Arrow
+	// downloads skipped when filename-encoded FirstSysTimeNs exceeds query
+	// txTime, because no row in the file can satisfy SystemTime <= txTime.
+	QueryDownloadSkippedFirstSys *Counter // modeCounter — L0/L1 files skipped because FirstSysTimeNs > txTime
+	// Manifest-channel download-skip counter (ADR-0030): counts compaction
+	// manifest downloads skipped in loadSupersededL0Keys when FirstSysTimeNs >
+	// query txTime (strict inequality). The target L1 and every listed L0 have
+	// firstSys >= manifest.firstSys > txTime, so the scan skips them regardless.
+	// Gated on EnableFirstSysSkip; parse errors fall back to full download.
+	QueryManifestSkippedFirstSys *Counter // modeCounter — compaction manifests skipped because FirstSysTimeNs > txTime
+	// Read-your-writes live-source counter (ADR-0032): counts AsOf and Range
+	// queries that consulted LiveSource after reading durable storage so
+	// uncheckpointed writes are visible immediately.
+	QueryLiveSourceReads *Counter // modeCounter — AsOf/Range queries that consulted the live CRDT HAMT
 
-	// The stratified-anti-entropy fallback disclosure counter (ADR-0034). It
-	// fires every time the mesh's digest-exchange phase (the two-phase
-	// StrataEstimator round) falls back to the FULL-DELTA oversend path — a
-	// digest timeout (the peer did not return its estimator within
-	// digestWaitTimeout), a malformed digest (UnmarshalStrataEstimator
-	// ErrMalformedStrata), a peel failure inside GenerateDelta (which yields
-	// EVERY entry = FULL oversend-equivalent, NEVER nil/empty), or a Publish
-	// failure (the peer dropped mid-round). The fallback is the honest path: the
-	// convergence guarantee HOLDS (the signed delta path is unchanged; oversend
-	// is a strict superset the CRDT-idempotent Join absorbs), the counter is the
-	// DISCLOSURE that lets the operator SEE the mesh converging via oversend vs
-	// via the stratified cut. A node with stratified OFF (the opt-IN default)
-	// never fires it (the oversend path is the baseline, not a fallback). A nil
-	// reporter (the --selftest path, the in-memory test path) leaves the
-	// fallback a silent oversend (the SetRoundReporter precedent — the counter
-	// is the DISCLOSURE, not the mechanism). Constructed in BOTH init() AND
-	// rebuildCounters() AND allCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
-	StratifiedAntiEntropyFallback *Counter // modeCounter — mesh digest-exchange rounds that fell back to oversend (timeout/malformed/peel-failure)
+	// Stratified anti-entropy fallback counter (ADR-0034): increments when a
+	// two-phase StrataEstimator digest round falls back to full-delta oversend
+	// due to digest timeout, malformed estimator, peel failure in GenerateDelta,
+	// or publish failure. Remains zero when stratified anti-entropy is off.
+	StratifiedAntiEntropyFallback *Counter // modeCounter — mesh digest-exchange rounds that fell back to oversend
 
-	// The PKI leaf-rotation + revocation-reject disclosure counters (ADR-0035) —
-	// the disclosure surfaces for the security gate. (1) CertRotationTriggered
-	// fires every time the automated rotation goroutine (StartRotationManager,
-	// the --cert-rotation-enable opt-IN trigger) mints a NEW leaf + Reloads — the
-	// operator SEES the trigger fired (the "zero-downtime leaf cert rotation
-	// every 30 days" goal is a NUMBER, not an adjective; the count is the audit
-	// trail). (2) CertRevokedRejected fires every time the VerifyPeerCertificate
-	// callback rejects a presented leaf whose serial is in the CRL — the
-	// security-gate-PROVEN disclosure (the "a node presenting an expired or
-	// revoked cert is rejected at the TLS handshake" goal's REVOKED claw). Both
-	// are modeCounter (NOT gauges — the gauge count STAYS 3). Constructed in BOTH
-	// init() AND rebuildCounters() AND allCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel, the
-	// construction-vs-distinct trap).
-	CertRotationTriggered *Counter // modeCounter — automated leaf-rotation trigger firings (the operator-visible audit trail)
-	CertRevokedRejected   *Counter // modeCounter — handshakes rejected because the presented leaf serial is in the CRL (the security-gate disclosure)
-	// The post-quantum KEM-negotiated disclosure counter (ADR-0036). A
-	// modeCounter (NOT a gauge — the gauge count STAYS 3). Constructed in BOTH
-	// init() AND rebuildCounters() AND allCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel, the
-	// construction-vs-distinct trap).
-	PQHandshakeNegotiated *Counter // modeCounter — completed TLS handshakes that negotiated the X25519MLKEM768 hybrid post-quantum KEM (the PQ-readiness disclosure)
+	// PKI leaf-rotation and revocation counters (ADR-0035):
+	// CertRotationTriggered counts automated rotations minted and reloaded by
+	// StartRotationManager (--cert-rotation-enable). CertRevokedRejected counts
+	// TLS handshakes rejected by VerifyPeerCertificate when a peer certificate
+	// serial appears in the loaded CRL.
+	CertRotationTriggered *Counter // modeCounter — automated leaf-rotation trigger firings
+	CertRevokedRejected   *Counter // modeCounter — handshakes rejected because the presented leaf serial is in the CRL
+	// Post-quantum KEM-negotiated counter (ADR-0036).
+	PQHandshakeNegotiated *Counter // modeCounter — completed TLS handshakes that negotiated X25519MLKEM768
 
-	// The hybrid-PQ SIGN-WIRE accept disclosure counter (ADR-0037).
-	// HybridFrameAccepted fires every time the receiver's HandleHybridFrame gate
-	// accepts a hybrid-PQ batch that passed the BOTH-verify (VerifyBatchHybrid —
-	// the Ed25519 + ML-DSA-65 both-required gate over the 120-byte SHAKE256 pad).
-	// It is the operator-VISIBLE proof the PQ moat is in USE, not just wired: a
-	// hybrid frame is PRODUCED (under --hybrid-sign) AND ACCEPTED (under
-	// --hybrid-verify) end-to-end. A modeCounter (NOT a gauge — the gauge count
-	// STAYS 3). Constructed in BOTH init() AND rebuildCounters() AND
-	// allCounters() (a counter missing from rebuildCounters() silently drops to
-	// nil under --otel, the construction-vs-distinct trap). The counter value is
-	// 0 on a single-node --selftest run (NO mesh peer dials — a hybrid frame is
-	// produced only when --hybrid-sign arms the sweep AND a peer is present to
-	// receive it); the RUNTIME /verify proves PRESENCE on /metrics (PRESENCE not
-	// value).
-	HybridFrameAccepted *Counter // modeCounter — hybrid-PQ batches accepted by the BOTH-verify gate (the moat-in-USE disclosure)
+	// Hybrid post-quantum batch acceptance counter (ADR-0037): increments in
+	// Receiver.HandleHybridFrame when an incoming frame passes Ed25519 and
+	// ML-DSA-65 verification under VerifyBatchHybrid. Zero on single-node runs.
+	HybridFrameAccepted *Counter // modeCounter — hybrid-PQ batches accepted after dual signature verification
 
-	// The region-aware gossip inter-region-envelope disclosure counter
-	// (ADR-0039). InterRegionEnvelopesShipped fires every time the
-	// AntiEntropySweep's region-aware fan-out selector routes a CRDT-delta
-	// envelope to a CROSS-region peer (an inter-region fan-out selection). It is
-	// the operator-VISIBLE proof the region-aware data-plane path is in USE (not
-	// just wired) — a delta is ROUTED cross-region (under --region-aware)
-	// instead of broadcast full-mesh. A modeCounter (NOT a gauge — the gauge
-	// count STAYS 3). Constructed in BOTH init() AND rebuildCounters() AND
-	// allCounters() (a counter missing from rebuildCounters() silently drops to
-	// nil under --otel, the construction-vs-distinct trap). The counter value is
-	// 0 on a single-node --selftest run (NO mesh peer dials — an inter-region
-	// envelope is shipped only when --region-aware arms the sweep AND a
-	// cross-region peer is in the fan-out selection); the RUNTIME /verify proves
-	// PRESENCE on /metrics (PRESENCE not value). Fires ONLY on the inter-region
-	// arm (intra-region full-mesh is the SAME-AZ baseline, NOT disclosure-worthy
-	// — the disclosure is the CROSS-region fan-out the O(log N) convergence
-	// depends on).
-	InterRegionEnvelopesShipped *Counter // modeCounter — inter-region CRDT-delta envelopes shipped by the region-aware fan-out selector (the data-plane-in-USE disclosure)
+	// Region-aware gossip inter-region envelope counter (ADR-0039): increments
+	// when AntiEntropySweep's region-aware selector routes a CRDT delta
+	// envelope to a peer in another region (--region-aware). Same-region
+	// full-mesh deliveries are not counted.
+	InterRegionEnvelopesShipped *Counter // modeCounter — inter-region CRDT-delta envelopes shipped by the region-aware fan-out selector
+
+	// Mesh write-deadline counter (ADR-0059): increments when a mesh TLS frame
+	// write exceeds --mesh-write-timeout. The connection is closed (Go
+	// crypto/tls write timeouts leave connection state unusable) and the peer
+	// enters write-stall suspect backoff so the serial sweep avoids blocking
+	// behind a half-open peer.
+	MeshWriteTimeouts *Counter // modeCounter — mesh frame writes that exceeded the write deadline
 )
 
-// allCounters returns the single source of truth for every constructed
-// *Counter in this package. CALLED FROM both init() and rebuildCounters() (the
-// only two construction sites), so the slice is ONE literal list, not a
-// per-newCounter append. ADR-0026 closed the two QueryL0ListCapped
-// construction-site landmines ADR-0023 had named: init() built
-// QueryL0ListCapped twice (the first object orphaned on reassignment), and
-// rebuildCounters built it zero times (so an Init(realMeter) call would
-// reassign the var to nil → the use-site guard at query.go silently stops
-// counting the cap-hit disclosure counter). ADR-0026 dedups the init()
-// construction (2 → 1) and fills rebuildCounters (0 → 1) at the SAME position
-// (after MemTableFlushTotal, before OffHeapAllocatedBytes) so the
-// registered-instrument order under the OTel Meter is stable across the two
-// sites. The construction itself is now consistent with its siblings (each is
-// built in BOTH init and rebuildCounters — QueryL0ListCapped was the lone
-// exception). Appending inside newCounter would still emit a duplicate
-// "supremum.l0.query_list_capped" name into the slice -> the prometheus
-// bridge's Registry.MustRegister would PANIC at boot on the duplicate Desc.
-// Building the slice from the distinct package vars (one *Counter per slot)
-// yields exactly the distinct counters, NOT the newCounter INVOCATION count.
-// The var-slice is the unwavering gate; the dedup is at the construction SITE,
-// not the slice, so the bridge's series-count property survives byte-identical
-// (no bridge edit needed).
+// allCounters returns every constructed *Counter in stable bridge-enumeration
+// order. Both init and rebuildCounters populate the package-level pointers and
+// then snapshot this list, so TelemetryBridge exposes one series per metric and
+// Init does not leave any counter nil.
 //
-// The slice is append-only-after-construction: once package init + Init
-// complete (both behind the program-start barrier, before the first /metrics
-// scrape fires at startLivecheck), it is frozen and read by the bridge WITHOUT
-// a mutex. There is exactly ONE list — the bridge enumerates
-// telemetry.Counters() and NEVER maintains a duplicate hardcoded copy (which
-// would drift the instant a future counter is added).
-//
-// OffHeapAllocatedBytes + the two inferrer gauges (QueryTxTimeHighWaterMark,
-// PruningHorizonEffective) are the modeGauges; the rest are modeCounter. The
-// slice grew as disclosure counters were added: the filename-bounded
-// download-skip counter (QueryDownloadSkippedFirstSys, ADR-0029), the
-// manifest-channel download-skip counter (QueryManifestSkippedFirstSys,
-// ADR-0030) — the SAME elimination on the manifest channel, gated on the SAME
-// EnableFirstSysSkip flag — and the read-your-writes live-source counter
-// (QueryLiveSourceReads, ADR-0032), the disclosure surface for the live-HAMT
-// consult the Resolver performs after its durable scan.
+// The slice is immutable after package init and Init complete and read by
+// TelemetryBridge without locking. OffHeapAllocatedBytes,
+// QueryTxTimeHighWaterMark, and PruningHorizonEffective use modeGauge; all
+// other entries use modeCounter.
 func allCounters() []*Counter {
-	// Exactly the DISTINCT package-level *Counter vars, in stable order. The
-	// bridge enumerates this slice automatically — a new counter added here is
-	// surfaced on /metrics with ZERO bridge edit, IF it is constructed in BOTH
-	// init() AND rebuildCounters() (a counter missing from rebuildCounters()
-	// silently drops to nil under --otel).
+	// All 25 package-level *Counter vars in registration order.
 	return []*Counter{
 		ArrowSerialBytes,
 		MemTableFlushTotal,
@@ -285,81 +158,25 @@ func allCounters() []*Counter {
 		QueryTxTimeHighWaterMark,
 		PruningHorizonEffective,
 		PruningHorizonRetreatRefused,
-		// The filename-bounded download-skip disclosure counter (ADR-0029). The
-		// bridge auto-surfaces it — a new supremum_* series appears on /metrics
-		// with NO bridge edit, IF it is constructed in BOTH init() AND
-		// rebuildCounters().
 		QueryDownloadSkippedFirstSys,
-		// The manifest-channel download-skip disclosure counter (ADR-0030). The
-		// bridge auto-surfaces it — a new supremum_* series appears on /metrics
-		// with NO bridge edit, IF it is constructed in BOTH init() AND
-		// rebuildCounters(). The manifest skip is a modeCounter (NOT a gauge — the
-		// gauge count STAYS 3), the SAME mode class as QueryDownloadSkippedFirstSys.
 		QueryManifestSkippedFirstSys,
-		// The read-your-writes live-source disclosure counter (ADR-0032). The
-		// bridge auto-surfaces it — a new supremum_* series appears on /metrics
-		// with NO bridge edit, IF it is constructed in BOTH init() AND
-		// rebuildCounters(). The live-source consult is a modeCounter (NOT a
-		// gauge — the gauge count STAYS 3), the SAME mode class as
-		// QueryDownloadSkippedFirstSys + QueryManifestSkippedFirstSys.
 		QueryLiveSourceReads,
-		// The stratified-anti-entropy fallback disclosure counter (ADR-0034). The
-		// bridge auto-surfaces it — a new supremum_* series appears on /metrics
-		// with NO bridge edit, IF it is constructed in BOTH init() AND
-		// rebuildCounters(). The fallback is a modeCounter (NOT a gauge — the
-		// gauge count STAYS 3), the SAME mode class as the prior modeCounter
-		// siblings.
 		StratifiedAntiEntropyFallback,
-		// The PKI leaf-rotation + revocation-reject disclosure counters
-		// (ADR-0035). The bridge auto-surfaces them — new supremum_* series appear
-		// on /metrics with NO bridge edit, IF both are constructed in BOTH init()
-		// AND rebuildCounters(). Both are modeCounter (NOT gauges — the gauge
-		// count STAYS 3), the SAME mode class as the prior modeCounter siblings.
 		CertRotationTriggered,
 		CertRevokedRejected,
-		// The post-quantum KEM-negotiated disclosure counter (ADR-0036) —
-		// constructed in BOTH init() AND rebuildCounters(). A modeCounter (NOT a
-		// gauge — the gauge count STAYS 3), the SAME mode class as the prior
-		// modeCounter siblings.
 		PQHandshakeNegotiated,
-		// The hybrid-PQ SIGN-WIRE accept disclosure counter (ADR-0037). The
-		// bridge auto-surfaces it — a new supremum_* series appears on /metrics
-		// with NO bridge edit, IF it is constructed in BOTH init() AND
-		// rebuildCounters(). The hybrid-frame accept is a modeCounter (NOT a
-		// gauge — the gauge count STAYS 3), the SAME mode class as the prior
-		// modeCounter siblings. The counter is the operator-VISIBLE proof the PQ
-		// moat is in USE (not just wired): a hybrid frame is PRODUCED (under
-		// --hybrid-sign) AND ACCEPTED (under --hybrid-verify) end-to-end.
 		HybridFrameAccepted,
-		// The region-aware gossip inter-region-envelope disclosure counter
-		// (ADR-0039). The bridge auto-surfaces it — a new supremum_* series
-		// appears on /metrics with NO bridge edit, IF it is constructed in BOTH
-		// init() AND rebuildCounters(). The inter-region envelope ship is a
-		// modeCounter (NOT a gauge — the gauge count STAYS 3), the SAME mode class
-		// as the prior modeCounter siblings. The counter is the operator-VISIBLE
-		// proof the region-aware data-plane is in USE (not just wired) — the
-		// disclosure surface for the inter-region fan-out the O(log N) convergence
-		// depends on.
 		InterRegionEnvelopesShipped,
+		MeshWriteTimeouts,
 	}
 }
 
-// counters is the bridge's snapshot of every constructed *Counter, frozen
-// once after construction completes. Populated by init() and (if boot calls
-// telemetry.Init) rebuildCounters. The prometheus bridge reads this slice at
-// scrape time; it is NEVER mutated on the scrape path. See allCounters above.
+// counters caches allCounters() for TelemetryBridge scrapes after construction
+// completes in init() or rebuildCounters().
 var counters []*Counter
 
-// Counters returns the snapshot of every constructed *Counter in this
-// package, in stable construction order. The prometheus bridge enumerates
-// this slice (the single source of truth — there is no duplicate list). The
-// slice is frozen after package-init + Init complete (both run before the
-// first scrape); the bridge reads it without a lock. The slice carries the
-// DISTINCT counters (it grew as disclosure counters were added across the ADR
-// series). ADR-0026 deduped the init() QueryL0ListCapped double (2 → 1) and
-// filled rebuildCounters (0 → 1), so the newCounter INVOCATION count dropped
-// across the two sites — but the DISTINCT package vars are unchanged, so the
-// bridge still exposes the same series (the var-slice is the unwavering gate).
+// Counters returns the immutable slice of all constructed *Counter metrics in
+// stable order for TelemetryBridge enumeration.
 func Counters() []*Counter { return counters }
 
 func init() {
@@ -381,7 +198,7 @@ func init() {
 	)
 	QueryL0ListCapped = newCounter(m,
 		"supremum.l0.query_list_capped",
-		"AsOf queries that hit the MaxL0Files list cap (older per-entity files may have been silently dropped from the scan — see ADR-0018 §6. Compaction is the future fix.)",
+		"AsOf queries that hit the MaxL0Files list cap (older uncompacted per-entity L0 files may be excluded from the scan; see ADR-0018).",
 		"1",
 		modeCounter,
 	)
@@ -411,19 +228,19 @@ func init() {
 	)
 	CompactionRowsPruned = newCounter(m,
 		"supremum.compaction.l1_rows_pruned",
-		"Rows dropped by the Level-2 superseded-row DominancePrune at the compaction merge seam (ADR-0020). The (C1)&&(C2)&&(C3) SAFE-DROP rule; Preserve-All (EnableDominancePruning=false) never touches it.",
+		"Rows dropped by DominancePrune during compaction merge when C1, C2, and C3 hold (ADR-0020); disabled when EnableDominancePruning is false.",
 		"1",
 		modeCounter,
 	)
 	L0ReapSweeps = newCounter(m,
 		"supremum.compaction.l0_reap_sweeps",
-		"Times the L0 reaper swept the compaction/ manifest tier (ADR-0021). The reaper reclaims manifest-listed L0 files AFTER verifying the L1 still exists.",
+		"Times the L0 reaper swept the compaction manifest tier (ADR-0021) to reclaim manifest-listed L0 files after verifying the target L1 still exists.",
 		"1",
 		modeCounter,
 	)
 	L0ReapL0Deleted = newCounter(m,
 		"supremum.compaction.l0_reap_l0_files_deleted",
-		"L0 files deleted by the L0 reaper across all sweeps (ADR-0021). A delete is issued ONLY for an L0 whose compaction manifest listed it AND whose L1 is verified present. Counted as a Delete that returned nil — INCLUDES the idempotent already-absent path (a prior sweep/manual operator reclaimed the file); the reaper does NOT pre-Stat.",
+		"L0 files deleted by the L0 reaper across all sweeps (ADR-0021). Deletes are issued only for manifest-listed L0 files whose target L1 is verified present; counts successful Delete calls including idempotent already-absent paths without pre-Stat.",
 		"1",
 		modeCounter,
 	)
@@ -435,114 +252,95 @@ func init() {
 	)
 	L0ReapSkippedOrphan = newCounter(m,
 		"supremum.compaction.l0_reap_manifests_skipped_orphan",
-		"Compaction manifests the L0 reaper SKIPPED because the L1 they point at was missing (ADR-0021). The manifest's L0s are PRESERVED as the crash-recovery backstop — the load-bearing safety guard.",
+		"Compaction manifests skipped by the L0 reaper because the target L1 was missing (ADR-0021); their listed L0s are preserved for crash recovery.",
 		"1",
 		modeCounter,
 	)
-	// The T_gc auto-inference counters (ADR-0027) — constructed in BOTH init()
-	// AND rebuildCounters() (a counter missing from rebuildCounters() silently
-	// drops to nil under --otel).
 	QueryTxTimeHighWaterMark = newCounter(m,
 		"supremum.query_txtime_high_water_mark_ns",
-		"Observed live-query transactionTime frontier (the MAX txTime an AsOf call has served) in nanoseconds (ADR-0027). The data source the HorizonInferrer reads to compute the effective DominancePrune floor. The operator-visible 'the engine sees queries up to HERE' signal — absent before.",
+		"Observed live-query transactionTime frontier (maximum txTime served by AsOf) in nanoseconds (ADR-0027), read by HorizonInferrer to compute the DominancePrune floor.",
 		"ns",
 		modeGauge,
 	)
 	PruningHorizonEffective = newCounter(m,
 		"supremum.compaction.pruning_horizon_effective_ns",
-		"Effective DominancePrune (C3) floor T_gc the inferrer computed + fed to the prune: max(operatorFloor, observedFrontier - backoff) in nanoseconds (ADR-0027). The audit-trail pair with the observed frontier: the gap is the backoff in operation. The operator floor dominates only when it exceeds the inferred (the §0.a inferrer-FLOORS-the-knob contract).",
+		"Effective DominancePrune (C3) floor T_gc fed to pruning: max(operatorFloor, observedFrontier - backoff) in nanoseconds (ADR-0027); operatorFloor dominates when larger than the inferred horizon.",
 		"ns",
 		modeGauge,
 	)
 	PruningHorizonRetreatRefused = newCounter(m,
 		"supremum.compaction.pruning_horizon_retreat_refused",
-		"Times SetInferredHorizon refused a RETREAT (a horizon less than the current) — the §0.c monotone-clamp loud-path signal (ADR-0027). ZERO under correct operation (the live-query txTime frontier is monotone non-decreasing); non-zero = a txTime REGRESSION in the query stream (a correctness smell, NOT a relaxation) OR a bug. A rising counter = investigate the query stream's txTime monotonicity.",
+		"Count of SetInferredHorizon calls that refused a retreating horizon (ADR-0027); remains zero while live-query txTime is monotonically non-decreasing.",
 		"1",
 		modeCounter,
 	)
-	// The filename-bounded download-skip disclosure counter (ADR-0029) —
-	// constructed in BOTH init() AND rebuildCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
 	QueryDownloadSkippedFirstSys = newCounter(m,
 		"supremum.l0.query_download_skipped_first_sys",
-		"L0/L1 Arrow files whose Download was SKIPPED because the file's filename-encoded FirstSysTimeNs (the file's MIN sysTime, written by the flush since) exceeds the query's txTime (ADR-0029). A transitively-safe elimination: the file carries ZERO rows visible at txTime (every row fails Filter2 sysTime<=txTime) so the skip preserves Law II. The disclosure counter (Law V): every skip is MEASURED. FAILSAFE: a parse anomaly → no skip → no counter fire → the full download runs (a corrupt/renamed file is NEVER silently dropped).",
+		"L0/L1 Arrow files whose download was skipped because their filename-encoded FirstSysTimeNs exceeds query txTime (ADR-0029); falls back to full download on parse anomaly.",
 		"1",
 		modeCounter,
 	)
-	// The manifest-channel download-skip disclosure counter (ADR-0030) —
-	// constructed in BOTH init() AND rebuildCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
 	QueryManifestSkippedFirstSys = newCounter(m,
 		"supremum.compaction.query_manifest_skipped_first_sys",
-		"Compaction manifests whose Download was SKIPPED because the manifest's filename-encoded FirstSysTimeNs (the L1's MIN sysTime, shared with the L1 key the manifest points at) exceeds the query's txTime (ADR-0030). The tautology on the manifest channel: the L1 it points at is skipped (file-skip) AND every L0 it lists is skipped (file-skip) -> the manifest's superseded-set intersects ONLY files the scan loop skips anyway -> skipping the manifest download preserves the tailKeys byte-identically for the query's visible rows (Law II). The disclosure counter (Law V): every skip is MEASURED. FAILSAFE: a parse anomaly -> no skip -> the full manifest download runs (a corrupt manifest is NEVER silently dropped).",
+		"Compaction manifests whose download was skipped because their filename-encoded FirstSysTimeNs exceeds query txTime (ADR-0030); falls back to full download on parse anomaly.",
 		"1",
 		modeCounter,
 	)
-	// The read-your-writes live-source disclosure counter (ADR-0032) —
-	// constructed in BOTH init() AND rebuildCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
+	// Keep this construction mirrored in rebuildCounters so Init preserves the
+	// read-your-writes live-source counter (ADR-0032).
 	QueryLiveSourceReads = newCounter(m,
 		"supremum.query.live_source_reads",
-		"AsOf/Range queries that CONSULTED the live δ-CRDT HAMT (the read-your-writes path, ADR-0032). After the durable Arrow scan, the Resolver merges the live dominant under the SAME bitemporal dominance (Filter2 sysTime<=txTime + Filter3 validTime window + max-SystemTime selection) so an entry a write placed in the live HAMT is visible to /v1/query IMMEDIATELY, before the bridge's periodic AppendCheckpoint flushes SnapshotToLSM→L0. The counter discloses the LIVE-PATH was taken (NOT every live HIT — a live read can return zero entries; the count is the path disclosure, the SAME Law V class the download-skip + manifest-skip counters carry). A query WITHOUT a live source configured (nil — the research-node default, --lsm-root absent) does NOT increment it (the nil-guard).",
+		"AsOf and Range queries that consulted the live CRDT HAMT when LiveSource is configured (ADR-0032).",
 		"1",
 		modeCounter,
 	)
-	// The stratified-anti-entropy fallback disclosure counter (ADR-0034) —
-	// constructed in BOTH init() AND rebuildCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
 	StratifiedAntiEntropyFallback = newCounter(m,
 		"supremum.mesh.stratified_fallback",
-		"Anti-entropy sweep rounds where the stratified digest-exchange phase (ADR-0034, the M3 two-phase StrataEstimator round) FELL BACK to the full-delta oversend path: a digest timeout (the peer did not return its estimator within digestWaitTimeout), a malformed digest (UnmarshalStrataEstimator ErrMalformedStrata), a peel failure inside GenerateDelta (crdt.go:1603 yields EVERY entry = full oversend-equivalent), or a Publish failure (the peer dropped mid-round). The fallback is the M5 honest path: the convergence guarantee HOLDS (the signed delta path is unchanged; oversend is a strict superset the CRDT-idempotent Join absorbs), the counter is the Law V DISCLOSURE that lets the operator SEE the mesh converging via oversend vs via the stratified cut. A node with stratified OFF (the opt-IN default) never fires it (the oversend path is the baseline, not a fallback).",
+		"Anti-entropy sweep rounds where stratified digest exchange fell back to full-delta oversend on timeout, malformed estimator, peel failure, or publish error (ADR-0034).",
 		"1",
 		modeCounter,
 	)
-	// The PKI leaf-rotation + revocation-reject disclosure counters (ADR-0035) —
-	// constructed in BOTH init() AND rebuildCounters() (a counter missing from
-	// rebuildCounters() silently drops to nil under --otel).
 	CertRotationTriggered = newCounter(m,
 		"supremum.pki.cert_rotation_triggered",
-		"Times the automated leaf-rotation goroutine (ADR-0035, StartRotationManager — the --cert-rotation-enable opt-IN trigger) minted a NEW leaf + Reloaded the transport. the design doc 'zero-downtime leaf cert rotation every 30 days' gate is a NUMBER, not an adjective: the count is the operator-visible audit trail that the trigger fired (a node with --cert-rotation-enable=false — the DEFAULT — never fires it; the manual SIGHUP seam does NOT fire it either, only the automated goroutine).",
+		"Automated TLS leaf certificate rotations triggered and reloaded by StartRotationManager (ADR-0035); zero when automatic rotation is disabled.",
 		"1",
 		modeCounter,
 	)
 	CertRevokedRejected = newCounter(m,
 		"supremum.pki.cert_revoked_rejected",
-		"TLS handshakes rejected because the presented peer leaf's serial is in the CRL (ADR-0035, the VerifyPeerCertificate callback consult). the design doc 'a node presenting an expired or revoked cert is rejected at the TLS handshake' gate's REVOKED claw — byte-proven by the revoked-reject test (a revoked serial is REJECTED; a SIBLING non-revoked serial PASSES — the CRL is serial-scoped, not CA-scoped). The EXPIRED claw is met by default Go-tls chain validation (NOT counted here — that is NOT new work this fork claims). A node with NO CRL loaded (the opt-OUT default) never fires it (the consult returns nil on an empty revoked set = byte-identical pre-).",
+		"TLS handshakes rejected because the presented peer leaf serial appeared in the loaded CRL (ADR-0035); expired certificates are handled by standard TLS chain validation.",
 		"1",
 		modeCounter,
 	)
 	PQHandshakeNegotiated = newCounter(m,
 		"supremum.pki.pq_handshake_negotiated",
-		"Completed TLS handshakes that negotiated the X25519MLKEM768 hybrid post-quantum key exchange (ADR-0036, the TLS.RecordHandshake seam reading ConnectionState().CurveID==4588). The post-quantum-transport-readiness gate is a NUMBER, not an adjective: the count is the operator-visible PROOF the PQ KEM is happening (the engine ALREADY negotiates it by Go 1.24+ default — PROVES, NOT enables; a classical-CurveID fallback for a non-MLKEM peer does NOT increment — the counter is PQ-KEM-only, NOT every handshake). The 4c loopback KEM is byte-proven by the PQ-KEM-negotiated test (CurveID==4588) with the classical-control bug-inject (forced CurvePreferences=[X25519] -> CurveID==29, the cut vanishes). The counter fires on the production dial seam (transport.Dial → RecordHandshake); the server-side control-port accept does NOT fire it (the client-side ConnectionState is the load-bearing proof — disclosed ADR-0036 §6).",
+		"Completed TLS handshakes that negotiated X25519MLKEM768 hybrid post-quantum key exchange on outbound dials (ADR-0036).",
 		"1",
 		modeCounter,
 	)
 	HybridFrameAccepted = newCounter(m,
 		"supremum.hybrid.frame_accepted",
-		"Hybrid-PQ CRDT-delta batches ACCEPTED by the receiver's BOTH-verify gate (ADR-0037, the Receiver.HandleHybridFrame seam firing on a frame that passed VerifyBatchHybrid — the Ed25519 + ML-DSA-65 both-required gate over the 120-byte SHAKE256 pad of batchWire). The post-quantum SIGN moat is a NUMBER, not an adjective: the count is the operator-visible PROOF the PQ moat is in USE (not just wired) — wired the VERIFY + the KEM; wires the SIGN + the frame + the directory provisioning + the dispatch, so a hybrid frame is now PRODUCED (under --hybrid-sign) AND ACCEPTED (under --hybrid-verify) end-to-end. A node with --hybrid-sign=false (the DEFAULT) never produces a hybrid frame so the counter stays 0 (a peer that dials it sends a v1 BatchEnvelope, NOT a hybrid frame); a node with --hybrid-verify=false (the DEFAULT) REJECTS a hybrid frame (the symmetric STRICT mode) so the counter stays 0. The counter value is 0 on a single-node --selftest run (NO mesh peer dials); the RUNTIME /verify proves PRESENCE on /metrics (the bridge auto-surface §0.f — PRESENCE not value, the SAME discipline /30/31 used). The 23rd Counter distinct counter.",
+		"Hybrid post-quantum CRDT delta batches accepted by Receiver.HandleHybridFrame after Ed25519 + ML-DSA-65 verification (ADR-0037).",
 		"1",
 		modeCounter,
 	)
-	// The region-aware gossip inter-region-envelope disclosure counter
-	// (ADR-0039) — constructed in BOTH init() AND rebuildCounters() (a counter
-	// missing from rebuildCounters() silently drops to nil under --otel).
 	InterRegionEnvelopesShipped = newCounter(m,
 		"supremum.mesh.inter_region_envelopes",
-		"Inter-region CRDT-delta envelopes SHIPPED by the AntiEntropySweep's region-aware fan-out selector (ADR-0039, the Gossiper.interRegionReporter seam firing once per peer the sweep routes a delta to whose region differs from the self-region — the inter-region fan-out arm of topology.Select). The region-aware gossip data-plane moat is a NUMBER, not an adjective: the count is the operator-visible PROOF the region-aware path is in USE (not just wired) — the design doc's data-plane half turns the per-sweep full-mesh O(N²) iteration (every peer every round) into the intra-region full-mesh + inter-region fan-out-N O(log N) rounds convergence (intra-region peers full-mesh, inter-region fan-out-N prefer-cross-region seeded-deterministic). A node with --region-aware=false (the DEFAULT) never routes a fan-out selection so the counter stays 0 (the full-mesh peers.Peers() path has NO inter-region arm — every peer is SAME-region by the sameRegion-default-to-true discipline, so IsInterRegion returns false for every peer); a node with --region-aware=true but ALL peers SAME-region (the N=2 no-op) also stays 0 (the fan-out selector returns intra-only). The counter value is 0 on a single-node --selftest run (NO mesh peer dials); the RUNTIME /verify proves PRESENCE on /metrics (the bridge auto-surface §0.f — PRESENCE not value, the SAME discipline /30/31/32 used). Fires ONLY on the inter-region arm (intra-region full-mesh is the SAME-AZ baseline, NOT disclosure-worthy — the disclosure is the CROSS-region fan-out the O(log N) convergence depends on). The 24th Counter distinct counter.",
+		"Inter-region CRDT delta envelopes sent via the region-aware fan-out selector during AntiEntropySweep (ADR-0039); zero when region-aware routing is disabled or all peers share one region.",
 		"1",
 		modeCounter,
 	)
-	// Counter snapshot for the prometheus bridge (single list, frozen after
-	// construction; see allCounters). Built here from the distinct vars so
-	// the QueryL0ListCapped duplicate-construction above does not duplicate
-	// the name in the slice (which would panic MustRegister at boot).
+	MeshWriteTimeouts = newCounter(m,
+		"supremum.mesh.write_timeouts",
+		"Mesh TLS frame writes that exceeded --mesh-write-timeout, forcing connection close and write-stall suspect backoff (ADR-0059).",
+		"1",
+		modeCounter,
+	)
 	counters = allCounters()
 }
 
-// rebuildCounters constructs the package-level counters against `m` exactly
-// once, the first time Init is invoked. Because Init is strictly
-// once-per-process, no data-plane goroutine can observe the pointer
-// reassignment this performs.
+// rebuildCounters constructs the package-level counters against m when Init is
+// invoked. Init must finish before data-plane goroutines use the counters.
 func rebuildCounters(m metric.Meter) {
 	ArrowSerialBytes = newCounter(m,
 		"supremum.l0.arrow_serial_bytes",
@@ -556,18 +354,9 @@ func rebuildCounters(m metric.Meter) {
 		"1",
 		modeCounter,
 	)
-	// The fill (ADR-0026). rebuildCounters now constructs QueryL0ListCapped —
-	// the SAME single construction as init(), placed at the SAME position
-	// (after MemTableFlushTotal, before OffHeapAllocatedBytes) so the
-	// registered-instrument order under the OTel Meter is stable across the two
-	// construction sites (a drift in order is a registered-instrument-order
-	// drift observable to a collector — ADR-0026). This closes the omission
-	// landmine ADR-0023 named: without it, an Init(realMeter) call reassigns
-	// QueryL0ListCapped to nil → the use-site guard at query.go silently stops
-	// counting the cap-hit disclosure counter.
 	QueryL0ListCapped = newCounter(m,
 		"supremum.l0.query_list_capped",
-		"AsOf queries that hit the MaxL0Files list cap (older per-entity files may have been silently dropped from the scan — see ADR-0018 §6. Compaction is the future fix.)",
+		"AsOf queries that hit the MaxL0Files list cap (older uncompacted per-entity L0 files may be excluded from the scan; see ADR-0018).",
 		"1",
 		modeCounter,
 	)
@@ -597,19 +386,19 @@ func rebuildCounters(m metric.Meter) {
 	)
 	CompactionRowsPruned = newCounter(m,
 		"supremum.compaction.l1_rows_pruned",
-		"Rows dropped by the Level-2 superseded-row DominancePrune at the compaction merge seam (ADR-0020). The (C1)&&(C2)&&(C3) SAFE-DROP rule; Preserve-All (EnableDominancePruning=false) never touches it.",
+		"Rows dropped by DominancePrune during compaction merge when C1, C2, and C3 hold (ADR-0020); disabled when EnableDominancePruning is false.",
 		"1",
 		modeCounter,
 	)
 	L0ReapSweeps = newCounter(m,
 		"supremum.compaction.l0_reap_sweeps",
-		"Times the L0 reaper swept the compaction/ manifest tier (ADR-0021).",
+		"Times the L0 reaper swept the compaction manifest tier (ADR-0021).",
 		"1",
 		modeCounter,
 	)
 	L0ReapL0Deleted = newCounter(m,
 		"supremum.compaction.l0_reap_l0_files_deleted",
-		"L0 files deleted by the L0 reaper across all sweeps (ADR-0021). Counted as a DELETE that returned nil — which INCLUDES the idempotent already-absent path (a prior sweep or manual operator reclaimed the file). A successful Delete call counts regardless of whether a file was physically removed THIS sweep; the reaper does NOT pre-Stat (the idempotent-nil contract makes a pre-Stat an IO the safety contract does not require).",
+		"L0 files deleted by the L0 reaper across all sweeps (ADR-0021); counts successful Delete calls including idempotent already-absent paths without pre-Stat.",
 		"1",
 		modeCounter,
 	)
@@ -621,133 +410,85 @@ func rebuildCounters(m metric.Meter) {
 	)
 	L0ReapSkippedOrphan = newCounter(m,
 		"supremum.compaction.l0_reap_manifests_skipped_orphan",
-		"Compaction manifests the L0 reaper SKIPPED because the L1 was missing (ADR-0021) — the L0s preserved as the backstop.",
+		"Compaction manifests skipped by the L0 reaper because the target L1 was missing (ADR-0021); their listed L0s are preserved.",
 		"1",
 		modeCounter,
 	)
-	// The T_gc auto-inference counters (ADR-0027) — the rebuildCounters fill (a
-	// counter missing HERE silently drops to nil under --otel because an
-	// Init(realMeter) call reassigns the var to the newCounter result; without
-	// THIS block the new assignment is nil). Same names/descriptions/modes as
-	// init() so the registered-instrument order under the OTel Meter is stable
-	// across the two construction sites.
 	QueryTxTimeHighWaterMark = newCounter(m,
 		"supremum.query_txtime_high_water_mark_ns",
-		"Observed live-query transactionTime frontier (the MAX txTime an AsOf call has served) in nanoseconds (ADR-0027). The data source the HorizonInferrer reads to compute the effective DominancePrune floor. The operator-visible 'the engine sees queries up to HERE' signal — absent before.",
+		"Observed live-query transactionTime frontier (maximum txTime served by AsOf) in nanoseconds (ADR-0027), read by HorizonInferrer to compute the DominancePrune floor.",
 		"ns",
 		modeGauge,
 	)
 	PruningHorizonEffective = newCounter(m,
 		"supremum.compaction.pruning_horizon_effective_ns",
-		"Effective DominancePrune (C3) floor T_gc the inferrer computed + fed to the prune: max(operatorFloor, observedFrontier - backoff) in nanoseconds (ADR-0027). The audit-trail pair with the observed frontier: the gap is the backoff in operation. The operator floor dominates only when it exceeds the inferred (the §0.a inferrer-FLOORS-the-knob contract).",
+		"Effective DominancePrune (C3) floor T_gc fed to pruning: max(operatorFloor, observedFrontier - backoff) in nanoseconds (ADR-0027); operatorFloor dominates when larger than the inferred horizon.",
 		"ns",
 		modeGauge,
 	)
 	PruningHorizonRetreatRefused = newCounter(m,
 		"supremum.compaction.pruning_horizon_retreat_refused",
-		"Times SetInferredHorizon refused a RETREAT (a horizon less than the current) — the §0.c monotone-clamp loud-path signal (ADR-0027). ZERO under correct operation (the live-query txTime frontier is monotone non-decreasing); non-zero = a txTime REGRESSION in the query stream (a correctness smell, NOT a relaxation) OR a bug. A rising counter = investigate the query stream's txTime monotonicity.",
+		"Count of SetInferredHorizon calls that refused a retreating horizon (ADR-0027); remains zero while live-query txTime is monotonically non-decreasing.",
 		"1",
 		modeCounter,
 	)
-	// The rebuildCounters fill for the download-skip disclosure counter
-	// (ADR-0029): a counter missing HERE silently drops to nil under --otel
-	// because an Init(realMeter) call reassigns the var to the newCounter
-	// result; without THIS block the new assignment is nil. Same
-	// name/description/mode as init() so the registered-instrument order under
-	// the OTel Meter is stable across the two construction sites.
 	QueryDownloadSkippedFirstSys = newCounter(m,
 		"supremum.l0.query_download_skipped_first_sys",
-		"L0/L1 Arrow files whose Download was SKIPPED because the file's filename-encoded FirstSysTimeNs (the file's MIN sysTime, written by the flush since) exceeds the query's txTime (ADR-0029). A transitively-safe elimination: the file carries ZERO rows visible at txTime (every row fails Filter2 sysTime<=txTime) so the skip preserves Law II. The disclosure counter (Law V): every skip is MEASURED. FAILSAFE: a parse anomaly → no skip → no counter fire → the full download runs (a corrupt/renamed file is NEVER silently dropped).",
+		"L0/L1 Arrow files whose download was skipped because their filename-encoded FirstSysTimeNs exceeds query txTime (ADR-0029); falls back to full download on parse anomaly.",
 		"1",
 		modeCounter,
 	)
-	// The rebuildCounters fill for the manifest-channel download-skip disclosure
-	// counter (ADR-0030): a counter missing HERE silently drops to nil under
-	// --otel because an Init(realMeter) call reassigns the var to the newCounter
-	// result; without THIS block the new assignment is nil — the omission
-	// landmine. Same name/description/mode as init() so the
-	// registered-instrument order under the OTel Meter is stable across the two
-	// construction sites.
 	QueryManifestSkippedFirstSys = newCounter(m,
 		"supremum.compaction.query_manifest_skipped_first_sys",
-		"Compaction manifests whose Download was SKIPPED because the manifest's filename-encoded FirstSysTimeNs (the L1's MIN sysTime, shared with the L1 key the manifest points at) exceeds the query's txTime (ADR-0030). The tautology on the manifest channel: the L1 it points at is skipped (file-skip) AND every L0 it lists is skipped (file-skip) -> the manifest's superseded-set intersects ONLY files the scan loop skips anyway -> skipping the manifest download preserves the tailKeys byte-identically for the query's visible rows (Law II). The disclosure counter (Law V): every skip is MEASURED. FAILSAFE: a parse anomaly -> no skip -> the full manifest download runs (a corrupt manifest is NEVER silently dropped).",
+		"Compaction manifests whose download was skipped because their filename-encoded FirstSysTimeNs exceeds query txTime (ADR-0030); falls back to full download on parse anomaly.",
 		"1",
 		modeCounter,
 	)
-	// Counter snapshot for the prometheus bridge (single list, frozen after
-	// construction; see allCounters). ADR-0026 made rebuildCounters construct
-	// QueryL0ListCapped too (the fill at the same position as init), so BOTH
-	// construction sites now build all distinct counters — the slice carries the
-	// same distinct *Counter pointers under either site, and an Init(realMeter)
-	// call no longer reassigns QueryL0ListCapped to nil (the omission landmine
-	// is closed). The same fill discipline extends to the later disclosure
-	// counters (ADR-0027, ADR-0029, ADR-0030). The rebuildCounters fill for the
-	// read-your-writes live-source disclosure counter (ADR-0032): a counter
-	// missing HERE silently drops to nil under --otel because an Init(realMeter)
-	// call reassigns the var to the newCounter result; without THIS block the
-	// new assignment is nil — the omission landmine. Same name/description/mode
-	// as init() so the registered-instrument order under the OTel Meter is
-	// stable across the two construction sites.
 	QueryLiveSourceReads = newCounter(m,
 		"supremum.query.live_source_reads",
-		"AsOf/Range queries that CONSULTED the live δ-CRDT HAMT (the read-your-writes path, ADR-0032). After the durable Arrow scan, the Resolver merges the live dominant under the SAME bitemporal dominance (Filter2 sysTime<=txTime + Filter3 validTime window + max-SystemTime selection) so an entry a write placed in the live HAMT is visible to /v1/query IMMEDIATELY, before the bridge's periodic AppendCheckpoint flushes SnapshotToLSM→L0. The counter discloses the LIVE-PATH was taken (NOT every live HIT — a live read can return zero entries; the count is the path disclosure, the SAME Law V class the download-skip + manifest-skip counters carry). A query WITHOUT a live source configured (nil — the research-node default, --lsm-root absent) does NOT increment it (the nil-guard).",
+		"AsOf and Range queries that consulted the live CRDT HAMT when LiveSource is configured (ADR-0032).",
 		"1",
 		modeCounter,
 	)
-	// The rebuildCounters fill for the stratified-anti-entropy fallback
-	// disclosure counter (ADR-0034): a counter missing HERE silently drops to
-	// nil under --otel because an Init(realMeter) call reassigns the var to the
-	// newCounter result; without THIS block the new assignment is nil — the
-	// omission landmine. Same name/description/mode as init() so the
-	// registered-instrument order under the OTel Meter is stable across the two
-	// construction sites.
 	StratifiedAntiEntropyFallback = newCounter(m,
 		"supremum.mesh.stratified_fallback",
-		"Anti-entropy sweep rounds where the stratified digest-exchange phase (ADR-0034, the M3 two-phase StrataEstimator round) FELL BACK to the full-delta oversend path: a digest timeout (the peer did not return its estimator within digestWaitTimeout), a malformed digest (UnmarshalStrataEstimator ErrMalformedStrata), a peel failure inside GenerateDelta (crdt.go:1603 yields EVERY entry = full oversend-equivalent), or a Publish failure (the peer dropped mid-round). The fallback is the M5 honest path: the convergence guarantee HOLDS (the signed delta path is unchanged; oversend is a strict superset the CRDT-idempotent Join absorbs), the counter is the Law V DISCLOSURE that lets the operator SEE the mesh converging via oversend vs via the stratified cut. A node with stratified OFF (the opt-IN default) never fires it (the oversend path is the baseline, not a fallback).",
+		"Anti-entropy sweep rounds where stratified digest exchange fell back to full-delta oversend on timeout, malformed estimator, peel failure, or publish error (ADR-0034).",
 		"1",
 		modeCounter,
 	)
-	// The rebuildCounters fill for the PKI leaf-rotation + revocation-reject
-	// disclosure counters (ADR-0035): a counter missing HERE silently drops to
-	// nil under --otel because an Init(realMeter) call reassigns the var to the
-	// newCounter result; without THIS block the new assignment is nil — the
-	// omission landmine. Same name/description/mode as init() so the
-	// registered-instrument order under the OTel Meter is stable across the two
-	// construction sites.
 	CertRotationTriggered = newCounter(m,
 		"supremum.pki.cert_rotation_triggered",
-		"Times the automated leaf-rotation goroutine (ADR-0035, StartRotationManager — the --cert-rotation-enable opt-IN trigger) minted a NEW leaf + Reloaded the transport. the design doc 'zero-downtime leaf cert rotation every 30 days' gate is a NUMBER, not an adjective: the count is the operator-visible audit trail that the trigger fired (a node with --cert-rotation-enable=false — the DEFAULT — never fires it; the manual SIGHUP seam does NOT fire it either, only the automated goroutine).",
+		"Automated TLS leaf certificate rotations triggered and reloaded by StartRotationManager (ADR-0035); zero when automatic rotation is disabled.",
 		"1",
 		modeCounter,
 	)
 	CertRevokedRejected = newCounter(m,
 		"supremum.pki.cert_revoked_rejected",
-		"TLS handshakes rejected because the presented peer leaf's serial is in the CRL (ADR-0035, the VerifyPeerCertificate callback consult). the design doc 'a node presenting an expired or revoked cert is rejected at the TLS handshake' gate's REVOKED claw — byte-proven by the revoked-reject test (a revoked serial is REJECTED; a SIBLING non-revoked serial PASSES — the CRL is serial-scoped, not CA-scoped). The EXPIRED claw is met by default Go-tls chain validation (NOT counted here — that is NOT new work this fork claims). A node with NO CRL loaded (the opt-OUT default) never fires it (the consult returns nil on an empty revoked set = byte-identical pre-).",
+		"TLS handshakes rejected because the presented peer leaf serial appeared in the loaded CRL (ADR-0035); expired certificates are handled by standard TLS chain validation.",
 		"1",
 		modeCounter,
 	)
 	PQHandshakeNegotiated = newCounter(m,
 		"supremum.pki.pq_handshake_negotiated",
-		"Completed TLS handshakes that negotiated the X25519MLKEM768 hybrid post-quantum key exchange (ADR-0036, the TLS.RecordHandshake seam reading ConnectionState().CurveID==4588). The post-quantum-transport-readiness gate is a NUMBER, not an adjective: the count is the operator-visible PROOF the PQ KEM is happening (the engine ALREADY negotiates it by Go 1.24+ default — PROVES, NOT enables; a classical-CurveID fallback for a non-MLKEM peer does NOT increment — the counter is PQ-KEM-only, NOT every handshake). The 4c loopback KEM is byte-proven by the PQ-KEM-negotiated test (CurveID==4588) with the classical-control bug-inject (forced CurvePreferences=[X25519] -> CurveID==29, the cut vanishes). The counter fires on the production dial seam (transport.Dial → RecordHandshake); the server-side control-port accept does NOT fire it (the client-side ConnectionState is the load-bearing proof — disclosed ADR-0036 §6).",
+		"Completed TLS handshakes that negotiated X25519MLKEM768 hybrid post-quantum key exchange on outbound dials (ADR-0036).",
 		"1",
 		modeCounter,
 	)
 	HybridFrameAccepted = newCounter(m,
 		"supremum.hybrid.frame_accepted",
-		"Hybrid-PQ CRDT-delta batches ACCEPTED by the receiver's BOTH-verify gate (ADR-0037, the Receiver.HandleHybridFrame seam firing on a frame that passed VerifyBatchHybrid). The fill discipline: this rebuildCounters() site mirrors init() so the counter does NOT silently drop to nil under --otel (the §0.f construction-vs-distinct trap). See init() for the full description.",
+		"Hybrid post-quantum CRDT delta batches accepted by Receiver.HandleHybridFrame after Ed25519 + ML-DSA-65 verification (ADR-0037); mirrors init().",
 		"1",
 		modeCounter,
 	)
-	// The rebuildCounters fill for the region-aware gossip inter-region-envelope
-	// disclosure counter (ADR-0039): a counter missing HERE silently drops to
-	// nil under --otel because an Init(realMeter) call reassigns the var to the
-	// newCounter result; without THIS block the new assignment is nil — the
-	// omission landmine. Same name/description/mode as init() so the
-	// registered-instrument order under the OTel Meter is stable across the two
-	// construction sites.
 	InterRegionEnvelopesShipped = newCounter(m,
 		"supremum.mesh.inter_region_envelopes",
-		"Inter-region CRDT-delta envelopes SHIPPED by the AntiEntropySweep's region-aware fan-out selector (ADR-0039, the Gossiper.interRegionReporter seam firing once per peer the sweep routes a delta to whose region differs from the self-region — the inter-region fan-out arm of topology.Select). The region-aware gossip data-plane moat is a NUMBER, not an adjective: the count is the operator-visible PROOF the region-aware path is in USE (not just wired) — the design doc's data-plane half turns the per-sweep full-mesh O(N²) iteration (every peer every round) into the intra-region full-mesh + inter-region fan-out-N O(log N) rounds convergence (intra-region peers full-mesh, inter-region fan-out-N prefer-cross-region seeded-deterministic). A node with --region-aware=false (the DEFAULT) never routes a fan-out selection so the counter stays 0 (the full-mesh peers.Peers() path has NO inter-region arm — every peer is SAME-region by the sameRegion-default-to-true discipline, so IsInterRegion returns false for every peer); a node with --region-aware=true but ALL peers SAME-region (the N=2 no-op) also stays 0 (the fan-out selector returns intra-only). The counter value is 0 on a single-node --selftest run (NO mesh peer dials); the RUNTIME /verify proves PRESENCE on /metrics (the bridge auto-surface §0.f — PRESENCE not value, the SAME discipline /30/31/32 used). Fires ONLY on the inter-region arm (intra-region full-mesh is the SAME-AZ baseline, NOT disclosure-worthy — the disclosure is the CROSS-region fan-out the O(log N) convergence depends on). The fill discipline: this rebuildCounters() site mirrors init() so the counter does NOT silently drop to nil under --otel (the §0.f construction-vs-distinct trap). See init() for the full lineage.",
+		"Inter-region CRDT delta envelopes sent via the region-aware fan-out selector during AntiEntropySweep (ADR-0039); mirrors init().",
+		"1",
+		modeCounter,
+	)
+	MeshWriteTimeouts = newCounter(m,
+		"supremum.mesh.write_timeouts",
+		"Mesh TLS frame writes that exceeded --mesh-write-timeout, forcing connection close and write-stall suspect backoff (ADR-0059); mirrors init().",
 		"1",
 		modeCounter,
 	)

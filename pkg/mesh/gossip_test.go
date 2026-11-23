@@ -4,22 +4,11 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package mesh — gossip_test.go is the load-bearing gate:
-// TestTwoNodeConvergence_InMemory. It is the FIRST time the engine connects
-// two endpoints over a real TLS 1.3 socket and converges signed CRDT deltas
-// through the full production gate stack (no e.Join shortcut).
-//
-// The acceptance gate: two *DeltaCRDTEngines, each with a
-// CRDT-delta signing NodeIdentity, each REGISTERING the other's pubkey in its
-// Directory (the receive seam), each InsertLocalEvents-ing 1000 events
-// split across both, then running the AntiEntropySweep over a real loopback TLS
-// listener + TLS dial, asserting engine(A).State.MerkleRoot ==
-// engine(B).State.MerkleRoot in <=10 sweep rounds. Race-clean.
-//
-// An HONEST >10-rounds outcome is ACCEPTED-with-NEGATIVE-perf (the property
-// converges; per-delta signing ~60us/delta is the cost amortizes) —
-// recorded verbatim, never padded. A convergence that NEVER completes is the
-// only TRUE FAIL.
+// The two-node convergence test exchanges signed CRDT deltas over TLS 1.3
+// loopback connections. Each node registers the other's public key, inserts
+// half of 1,000 events, and must reach the same sharded Merkle root within ten
+// sweep rounds. The test uses the production receive path rather than joining
+// the engines directly.
 package mesh
 
 import (
@@ -46,34 +35,15 @@ import (
 	"github.com/hr18vk/sovereign/pkg/transport"
 )
 
-// TestTwoNodeConvergence_InMemory is the load-bearing gate.
+// TestTwoNodeConvergence_InMemory requires two nodes to converge within ten
+// rounds over real TLS connections. Each nodeID is the first 16 bytes of its
+// signing public key and is also the leaf certificate's CommonName, so the same
+// identity covers TLS, frame verification, and the CRDT engine.
 //
-// ORDER (auditor-traceable):
-//  1. Mint a dev CA + two per-node leaves (certgen). Each node's TLS leaf
-//     CommonName is the hex nodeID so the mTLS serverName (SNI) round-trips.
-//  2. Derive two NodeIdentity (each from a fresh 32-byte seed). The nodeID is
-//     the first 16 bytes of the derived pubkey; pass it to NewDeltaCRDTEngine
-//     so the engine's localNodeID == the signed OriginNodeID.
-//  3. For each node: build the engine + gate stack (NewReceiver with
-//     PeerBucket + HLC cap + Directory + engine + budget). Register the OTHER
-//     node's CRDT-delta pubkey in the Directory (the receive seam).
-//  4. Each node serves a real tls.Listen on a random loopback port. Each node
-//     dials the other via TLSConnections.Dial (satisfies the dialer iface).
-//  5. InsertLocalEvents 1000 events split 500/500 across the two engines.
-//  6. Run AntiEntropySweep rounds until MerkleRoot(A)==MerkleRoot(B); assert
-//
-// <=10 rounds (target). Race-clean (full test runs under -race).
-//
-// Why a REAL loopback TLS socket (not net.Pipe): the mesh's reader goroutine
-// uses receive.NewFrameReader(*tls.Conn) and the publisher uses
-// transport.TransmitTLSFrame(*tls.Conn). net.Pipe returns net.Conn, not
-// *tls.Conn, so it cannot satisfy either API without a wrapper that would
-// itself be a fabrication (a fake *tls.Conn). A loopback TLS listener is the
-// HONEST in-process simulation of two machines: the bytes cross a real
-// crypto/tls record layer + a real kernel socket on 127.0.0.1, exercising the
-// exact transport + mesh code path. The honest-labeling rule is honored:
-// this is loopback (one box, one kernel), labeled honestly as in-process, NOT
-// silicon.
+// A loopback listener exercises receive.NewFrameReader and
+// transport.TransmitTLSFrame with their concrete *tls.Conn APIs. The test is
+// in-process: frames cross the kernel and TLS record layers on one machine,
+// not a multi-machine network.
 func TestTwoNodeConvergence_InMemory(t *testing.T) {
 	// 1. Dev CA + two leaves.
 	ca, err := crypto.NewMeshCA()
@@ -119,7 +89,7 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 
 	dirA := identity.NewDirectory()
 	dirB := identity.NewDirectory()
-	// Directory seam: each node registers the OTHER's CRDT-delta pubkey.
+	// Each node registers the other node's CRDT-delta public key.
 	if err := dirB.Register(identA.NodeID, identA.Pub); err != nil {
 		t.Fatalf("Register A in B: %v", err)
 	}
@@ -127,7 +97,7 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 		t.Fatalf("Register B in A: %v", err)
 	}
 
-	// Per-node gate stack (the wiring, reused here).
+	// Per-node gate stack (the transport wiring, reused here).
 	bucketA := admission.NewPeerBucket()
 	capA := clock.NewIngressHLCScalarCap(clock.NewSystemClock(), engineA)
 	recvA := receive.NewReceiver(bucketA, capA, clock.NewSystemClock(), dirA, engineA, 50_000_000)
@@ -176,23 +146,21 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 	addrA := lnA.Addr().String()
 	addrB := lnB.Addr().String()
 
-	// Accept loops feed the frozen sink (the same path the serveConn uses).
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go runAcceptLoop(ctx, lnA, recvA, nil, &wg) // nil digester: oversend path (byte-identical HEAD; stratified OFF)
-	go runAcceptLoop(ctx, lnB, recvB, nil, &wg)
 
-	// PeerSets: A dials B, B dials A. The tls leaf CommonName is identHex(nodeID),
-	// so the SNI serverName uses that.
+	// Each TLS leaf CommonName is identHex(nodeID), which is also used for SNI.
 	psA := NewPeerSet(trA, recvA, identA, engineA)
 	psB := NewPeerSet(trB, recvB, identB, engineB)
+	// Register accepted connections and run their connection challenges. A nil
+	// digester selects the oversend path used by this test.
+	go runAcceptLoopWithPeerSet(ctx, lnA, recvA, nil, &wg, psA)
+	go runAcceptLoopWithPeerSet(ctx, lnB, recvB, nil, &wg, psB)
 	gA := NewGossiper(psA, identA, engineA, dirA)
 	gB := NewGossiper(psB, identB, engineB, dirB)
-	// Each gossiper has ALREADY registered the peer's pubkey in its Directory
-	// above (dirA <- B, dirB <- A). Belt-and-braces: also via the gossiper seam
-	// so the API path is exercised.
+	// Exercise RegisterPeer as well as the direct Directory registrations above.
 	_ = gA.RegisterPeer(identB.NodeID, identB.Pub)
 	_ = gB.RegisterPeer(identA.NodeID, identA.Pub)
 
@@ -229,11 +197,11 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 	const maxRounds = 10
 	round := 0
 	converged := false
-	tick := 20 * time.Millisecond // faster than the 100ms steady-state default, since this is an in-process gate (NOT labeled 32c/silicon)
+	tick := 20 * time.Millisecond // faster than the 100 ms steady-state default, since this is an in-process gate (not labeled 32c/silicon)
 	// Run several quick sweep rounds; each round both gossipers oversend.
 	for round = 0; round < maxRounds; round++ {
 		// Run both sweeps concurrently (true parallelism on a real box). The
-		// delta oversend path is CRDT-idempotent (the honest silent).
+		// delta oversend path is CRDT-idempotent.
 		var sweepWG sync.WaitGroup
 		sweepWG.Add(2)
 		go func() { defer sweepWG.Done(); gA.AntiEntropySweep(ctx) }()
@@ -241,8 +209,8 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 		sweepWG.Wait()
 		// Let async readers drain.
 		time.Sleep(tick)
-		ra := engineA.State().MerkleRoot()
-		rb := engineB.State().MerkleRoot()
+		ra := engineA.MerkleRootFromShards()
+		rb := engineB.MerkleRootFromShards()
 		t.Logf("round %d: rootA=%x rootB=%x", round, ra, rb)
 		if ra == rb {
 			converged = true
@@ -251,56 +219,42 @@ func TestTwoNodeConvergence_InMemory(t *testing.T) {
 	}
 	_ = tick
 	if !converged {
-		ra := engineA.State().MerkleRoot()
-		rb := engineB.State().MerkleRoot()
-		// HONEST NEGATIVE: record verbatim, do NOT pad.
-		t.Logf("NEGATIVE: did NOT converge in %d rounds (rootA=%x rootB=%x) — per-delta ~60us signing bounds the 1000-delta sweep; batching is the unlock", maxRounds, ra, rb)
-		t.Fatalf("TestTwoNodeConvergence_InMemory: did NOT converge in <=%d rounds (the convergence target). rootA=%x rootB=%x", maxRounds, ra, rb)
+		ra := engineA.MerkleRootFromShards()
+		rb := engineB.MerkleRootFromShards()
+		t.Logf("roots after %d rounds: rootA=%x rootB=%x", maxRounds, ra, rb)
+		t.Fatalf("two-node convergence did not complete within %d rounds: rootA=%x rootB=%x", maxRounds, ra, rb)
 	}
-	// Belt assertion: converged means identical roots AND the engines hold the
-	// full merged set (each node's State.Cardinality reflects all 1000).
+	// Equal roots alone are insufficient: both engines must contain every key.
 	gotA := cardinality(t, engineA)
 	gotB := cardinality(t, engineB)
 	t.Logf("converged in %d rounds; entries A=%d B=%d (target both=%d)", round+1, gotA, gotB, total)
 	if gotA != total || gotB != total {
-		t.Fatalf("convergence incomplete: A=%d B=%d, want both=%d (delta Merge applied but state incomplete — a JOIN bug, not a sign bug)", gotA, gotB, total)
+		t.Fatalf("converged roots but incomplete state: A=%d B=%d, want both=%d", gotA, gotB, total)
 	}
-	log.Printf("PASS: two-node convergence in %d rounds over real TLS 1.3 loopback (in-process, NOT silicon)", round+1)
+	log.Printf("two-node convergence passed in %d rounds over TLS 1.3 loopback (in-process)", round+1)
 }
 
-// newTestEngine builds a DeltaCRDTEngine with a per-node temp DataDir so the
-// two engine Lamport-recovery files do not collide (the engine writes
-// lamport_<nodeID>.dat into DataDir). arenaSize is small (test-scale); 4c is
-// the dev box, labeled honestly as 4c (NOT 32c).
+// newTestEngine gives each engine a separate DataDir for its Lamport recovery
+// file. The 64 MiB arena is sized for the test, not a throughput benchmark.
 func newTestEngine(t *testing.T, nodeID [16]byte, dataDir string) *eng.DeltaCRDTEngine {
 	t.Helper()
-	eng.DataDir = dataDir // package-global DataDir copied into e.dataDir at construction (crdt.go:255); the persist file is lamport_<nodeID>.dat so two engines with distinct nodeIDs do not collide
+	eng.DataDir = dataDir // package-global DataDir copied into e.dataDir at construction; the persist file is lamport_<nodeID>.dat so two engines with distinct nodeIDs do not collide
 	e, err := eng.NewDeltaCRDTEngine(nodeID, 1, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDeltaCRDTEngine %x: %v", nodeID, err)
 	}
 	return e
-	// NOTE (measured): do NOT register a t.Cleanup(e.Close)
-	// here. Several suites spawn serve-test-conn goroutines that are NOT
-	// WaitGroup-tracked, so they can outlive the test function by a few
-	// microseconds; a cleanup-time Close would munmap the arena under those
-	// in-flight Joins (EBR reclaim -> pushFreeVar on the freed span -> SIGSEGV,
-	// observed under -race). The un-closed engine is a deliberate, bounded
-	// test-binary leak (the process exits). Tests that NEED the Close (the
-	// TempDir-flake class) register it themselves — see newHoistGossiper.
+	// Do not close the engine from this helper. Some serveTestConn goroutines
+	// are not WaitGroup-tracked and can briefly outlive their test; closing here
+	// could unmap the arena during an in-flight join. The engine therefore lives
+	// until the test process exits. Tests that require an earlier close register
+	// their own cleanup, as newHoistGossiper does.
 }
 
-// runAcceptLoop is a copy of cmd/sovereign-node's acceptLoop, exercised here so
-// the test's accepted frames reach recv.HandleFrame (the frozen sink) through
-// the SAME reassembly the production binary uses.
-//
-// (ADR-0034): digester threads the digest sink so the accept-side
-// serveTestConn can route a WireDigestMagic-tagged frame to the Gossiper's
-// DeliverDigest (the sweep's per-peer blocking-receive producer). The 2-node
-// gate calls this with each node's OWN gossiper as the digester (a node
-// receives its peer's digest on the conn the peer dialed in, which the local
-// node reads on its accept side). A nil digester (the oversend path, stratified
-// OFF) keeps the digest branch a no-op drop — the byte-identical HEAD behavior.
+// runAcceptLoop mirrors the node's accept loop so tests use the same frame
+// reassembly and receiver dispatch as production. digester routes digest frames
+// to the Gossiper; a nil digester drops them, which is the expected behavior
+// when stratified anti-entropy is disabled.
 func runAcceptLoop(ctx context.Context, ln net.Listener, recv any, digester DigestSink, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -311,20 +265,15 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, recv any, digester Dige
 			}
 			return
 		}
-		// The accept-symmetry change (ADR-0045): the accept loop registers the inbound peer in
-		// ps.peers so a connection is a bidirectional publishable edge. The 3rd
-		// arg (nil here) is the PeerSet — runAcceptLoop's existing callers pass
-		// nil (byte-identical to the pre-fix path; the callers that need the accept fix
-		// use runAcceptLoopWithPeerSet below).
+		// This legacy helper leaves inbound connections unregistered. Tests that
+		// need a publishable inbound edge use runAcceptLoopWithPeerSet instead.
 		go serveTestConn(ctx, conn, recv, digester, nil)
 	}
 }
 
-// runAcceptLoopWithPeerSet is the PeerSet-threaded variant: it threads the PeerSet so the
-// accept side registers each inbound peer (the bidirectional edge). Used by the
-// asymmetric-dial tests (asymmetric_dial_test.go) that deliberately do NOT
-// dial both directions — they rely on the accept-side registration to make the
-// B→A edge publishable for A.
+// runAcceptLoopWithPeerSet also registers inbound connections in the PeerSet.
+// This makes an accepted connection publishable in both directions, as required
+// by tests that dial from only one side.
 func runAcceptLoopWithPeerSet(ctx context.Context, ln net.Listener, recv any, digester DigestSink, wg *sync.WaitGroup, peerSet *PeerSet) {
 	defer wg.Done()
 	for {
@@ -339,44 +288,47 @@ func runAcceptLoopWithPeerSet(ctx context.Context, ln net.Listener, recv any, di
 	}
 }
 
-// serveTestConn drives reassembly + the frozen sink for an accepted test conn.
+// serveTestConn mirrors serveConnWithDigest: it completes the TLS handshake,
+// registers inbound connections when peerSet is non-nil, and dispatches batch,
+// digest, hybrid, and relay frames through DispatchFrame.
 //
-// (ADR-0034): the digest branch routes a WireDigestMagic-tagged frame
-// to the Gossiper's DeliverDigest (via the digester), NOT the gate stack. It
-// mirrors cmd's serveConnWithDigest: the accept side passes a zero peerID (it
-// does not know the sender); DeliverDigest reads the authoritative senderID
-// from the digest-frame header. The batch + relay paths route through
-// DispatchFrame (the centralized three-way router) so the test infra matches
-// the production dispatch exactly.
-//
-// The accept-symmetry change (ADR-0045): the peerSet arg (nil for the legacy runAcceptLoop
-// callers, non-nil for runAcceptLoopWithPeerSet) registers the inbound peer in
-// ps.peers so a connection is a bidirectional publishable edge — the EXACT mirror
-// of production serveConnWithDigest's RegisterInbound/ReleaseInbound. A nil
-// peerSet skips registration (byte-identical to the pre-fix path).
+// Digest frames are accepted only on a challenge-verified connection whose
+// registered identity matches the frame's claimed sender. Connection challenges
+// are handled before ordinary dispatch. A nil peerSet preserves the legacy test
+// path without registration; those connections cannot pass digest verification.
 func serveTestConn(ctx context.Context, conn net.Conn, recv any, digester DigestSink, peerSet *PeerSet) {
 	defer conn.Close()
 	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
 		_ = closer
 	}
 	var inboundNodeID [16]byte
-	if tc, ok := conn.(*tls.Conn); ok {
+	var myPC *PeerConnHandle
+	var declNodeID [16]byte
+	var declPC *PeerConnHandle
+	var tc *tls.Conn
+	if t, ok := conn.(*tls.Conn); ok {
+		tc = t
 		if err := tc.Handshake(); err != nil {
 			return
 		}
 		if peerSet != nil {
-			// (Fix): MIRROR main.go serveConnWithDigest exactly —
-			// bind the deferred release to the *PeerConnHandle RegisterInbound
-			// installed, not to the nodeID. If this test loop diverged from
-			// production here, every mesh guard would exercise a different
-			// registration/release path than the one silicon runs.
-			var myPC *PeerConnHandle
+			// Release the exact handle returned by registration, including when the
+			// listener accepted a connection for an already-connected identity.
 			inboundNodeID, myPC = peerSet.RegisterInbound(tc)
 			defer peerSet.ReleaseInboundConn(inboundNodeID, myPC)
+			if myPC == nil {
+				declNodeID, declPC = peerSet.ArmDeclinedInbound(tc)
+			}
 		}
 	}
-	sr := recv.(frameSink) // recv is *receive.Receiver, which satisfies frameSink
+	sr := recv.(frameSink)
 	fr := receive.NewFrameReader(conn)
+	// Match the production connection loop's dispatch-busy accounting.
+	noteServeBusy := func(t0 time.Time) {
+		if peerSet != nil {
+			peerSet.NoteDispatchBusy(L0ILoopServe, time.Since(t0).Nanoseconds())
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return
@@ -388,11 +340,38 @@ func serveTestConn(ctx context.Context, conn net.Conn, recv any, digester Digest
 			}
 			return
 		}
-		// three-way dispatch: batch / digest / relay (centralized in
-		// DispatchFrame so the test infra matches the production routing). The
-		// accept side passes a zero peerID (it does not know the sender);
-		// DeliverDigest reads the authoritative senderID from the frame header.
-		_ = DispatchFrame(frame, [16]byte{}, sr, digester)
+		busyT0 := time.Now()
+		// Connection challenges are handled by the PeerSet bound to this connection,
+		// not by ordinary frame dispatch. Declined connections use their separate
+		// challenge handle; unregistered legacy connections have no challenge state.
+		if peerSet != nil && IsChallengeFrame(frame) {
+			if myPC != nil {
+				peerSet.HandleConnChallengeFrame(myPC, tc, frame)
+			} else {
+				peerSet.HandleDeclinedChallengeFrame(declPC, tc, frame)
+			}
+			noteServeBusy(busyT0)
+			continue
+		}
+		// DispatchFrame routes batch, digest, and relay frames as production does.
+		// Digest delivery additionally requires a verified connection and uses its
+		// registered identity rather than trusting the frame's claimed sender.
+		dispatchID := inboundNodeID
+		if frameIsDigest(frame) {
+			activePC := myPC
+			activeID := inboundNodeID
+			if activePC == nil {
+				activePC = declPC
+				activeID = declNodeID
+			}
+			if peerSet == nil || !peerSet.DigestConnVerified(activePC) {
+				noteServeBusy(busyT0)
+				continue
+			}
+			dispatchID = activeID
+		}
+		_ = DispatchFrame(frame, dispatchID, sr, digester)
+		noteServeBusy(busyT0)
 	}
 }
 
@@ -423,19 +402,13 @@ func identHex(id [16]byte) string {
 	return string(b)
 }
 
-// cardinality counts State's entries (the engine has no public Count; iterate
-// via State.RootPtr.ForEach-style if available; here we use ForEach on the
-// HAMT if exposed, else fall back to Get on the known entityIDs). The engine's
-// HAMT exposes ForEach (see hamt.go); the mesh test keys are civic-N so we can
-// count reachable keys directly. For the gate we count the known injected
-// entityIDs present in the merged state.
+// cardinality counts the 1,000 known test keys reachable through PointGet.
 func cardinality(t *testing.T, e *eng.DeltaCRDTEngine) int {
 	t.Helper()
-	// Use State merged view; Count via Get across the injected N names.
-	st := e.State()
+	// PointGet avoids constructing a merged state snapshot for every key.
 	n := 0
 	for i := 0; i < 1000; i++ {
-		if got := st.Get(fmt.Sprintf("civic-%d", i)); len(got) > 0 {
+		if got := e.PointGet(fmt.Sprintf("civic-%d", i)); len(got) > 0 {
 			n++
 		}
 	}

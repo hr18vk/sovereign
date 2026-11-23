@@ -37,8 +37,8 @@ import (
 // faithful CRDTDeltaEvent the engine accepts).
 const rcvEntityID = "tenant=acme;ledger=txn;id=0a1b2c3d4e5f60718293a4b5c6d7e8f9"
 
-// rcvPayload is the recoverable wire payload (NOT byte-equal to its digest).
-const rcvPayload = "this-is-recoverable-payload-bytes-NOT-its-digest"
+// rcvPayload is recoverable wire data, not a digest of different content.
+const rcvPayload = "this-is-recoverable-payload-bytes-not-its-digest"
 
 // rcvOriginNodeID is the origin's 16-byte nodeID (the Directory key).
 var rcvOriginNodeID = [16]byte{
@@ -129,9 +129,9 @@ func buildCRDTDeltaWire(t testing.TB, entityID string, dotCounter uint64) []byte
 	return data
 }
 
-// setupEngine builds a fresh DeltaCRDTEngine with an isolated on-disk Lamport
-// dir and the production-default skew bound (AbsoluteSlack=1000), so a small
-// honest DotCounter (e.g. 7) is admitted by the skew bound. Cleanup is wired.
+// setupEngine builds a DeltaCRDTEngine with an isolated on-disk Lamport
+// directory and the default skew bound, so a small DotCounter such as 7 is
+// admitted. Cleanup restores the package data directory and closes the engine.
 func setupEngine(t testing.TB) *eng.DeltaCRDTEngine {
 	t.Helper()
 	// Isolate DataDir per test (mirrors setupRTEngine in pkg/sync).
@@ -175,13 +175,8 @@ func relayChain(t testing.TB, innerWire []byte, nHops int, wallBase int64) (*att
 		// Thread the signed-material accumulator exactly as Open does.
 		preceding = attribution.SignedMaterial(innerWire, preceding, uint16(i), wall)
 	}
-	// v3: the envelope header mirrors the inner capnp gate fields
-	// (dotCounter, originNodeID) so the receiver's cheap gates read them O(1).
-	// The test helper decodes them off the inner wire it is given (it already
-	// has the inner wire) and binds them into the v3 header via the v3 builder,
-	// so the receiver's cross-check (header == inner) passes and the cheap
-	// gates see the real values. This mirrors what the production origin does
-	// (it knows dotCounter/originNodeID when it builds the inner capnp).
+	// Populate the v3 header mirrors from the inner wire so the receiver's
+	// cheap gates and header/inner cross-check see consistent values.
 	dotCounter, originNodeID := decodeGateFields(t, innerWire)
 	return attribution.NewSignedRelayEnvelopeV3(innerWire, sigArray(originSig), dotCounter, originNodeID, hops), originPub, relayPubs
 }
@@ -214,11 +209,10 @@ func decodeGateFields(t testing.TB, innerWire []byte) (dotCounter uint64, origin
 	return ev.DotCounter(), originNodeID
 }
 
-// setupReceiver builds a fully-wired Receiver: a fresh PeerBucket, a
-// SyntheticClock pinned at clockBaseUSec, an IngressHLCScalarCap over it, a
-// Directory with the origin registered, and a fresh engine. budgetNS is the
-// 3.2 admission budget (nanoseconds). Returns the receiver, the synthetic
-// clock (so tests can advance it), the directory, and the engine.
+// setupReceiver builds a Receiver with a fresh bucket and engine, a synthetic
+// clock at clockBaseUSec, and budgetNS nanoseconds of verification budget.
+// originPub is registered when non-nil. It also returns the clock, directory,
+// and engine for assertions.
 func setupReceiver(t testing.TB, clockBaseUSec int64, budgetNS int64, originPub ed25519.PublicKey) (*Receiver, *clock.SyntheticClock, *identity.Directory, *eng.DeltaCRDTEngine) {
 	t.Helper()
 	bucket := admission.NewPeerBucket()
@@ -235,21 +229,13 @@ func setupReceiver(t testing.TB, clockBaseUSec int64, budgetNS int64, originPub 
 	return r, sc, dir, engine
 }
 
-// ---------------------------------------------------------------------------
-// — COMPOSITION acceptance over a real AF_UNIX socketpair
-// ---------------------------------------------------------------------------
-
-// TestReceiver_CompositionOverSocketpair is the ACCEPTANCE gate: one side
-// builds a signed relay-chain envelope (origin signs inner; one relay signs a
-// hop), length-prefixes it, writes it over a real AF_UNIX socketpair; the
-// receiver reassembles via FrameReader, runs the full §3 ordering, and the
-// engine's LamportCounter advances to the frame's DotCounter (the Join/
-// AdvanceLamportTo seam bites) — the first production caller of
-// ApplyCRDTDeltaEvent wired to real data over metal.
+// TestReceiver_CompositionOverSocketpair sends a signed relay envelope over an
+// AF_UNIX socketpair, reassembles it with FrameReader, and verifies that
+// HandleFrame accepts it and advances the engine's Lamport clock.
 func TestReceiver_CompositionOverSocketpair(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15, admits 1 hop
+	const budgetNS = int64(1_000_000_000) // 1 second; admits one relay hop
 
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
 	env, originPub, _ := relayChain(t, innerWire, 1, wallBase)
@@ -257,7 +243,6 @@ func TestReceiver_CompositionOverSocketpair(t *testing.T) {
 	r, sc, _, engine := setupReceiver(t, wallBase, budgetNS, originPub)
 	_ = sc
 
-	// Marshal + length-prefix the envelope (the GAP-2 wire shape).
 	prefixed := LengthPrefixFrame(env.Marshal())
 
 	// Real AF_UNIX socketpair: write the prefixed frame on one end, reassemble
@@ -282,7 +267,7 @@ func TestReceiver_CompositionOverSocketpair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrame: %v", err)
 	}
-	// The reassembled frame MUST equal the Marshal'd envelope (prefix stripped).
+	// The reassembled frame must equal the envelope without its prefix.
 	if !bytes.Equal(frameBytes, env.Marshal()) {
 		t.Fatalf("reassembled frame != Marshal'd envelope (len got=%d want=%d)", len(frameBytes), len(env.Marshal()))
 	}
@@ -293,29 +278,20 @@ func TestReceiver_CompositionOverSocketpair(t *testing.T) {
 		t.Fatalf("composition must Accept over a real socketpair, got %v: %v", verdict.Verdict, verdict.Reason)
 	}
 
-	// The Join/AdvanceLamportTo seam MUST bite: the engine's LamportCounter
-	// advances to the frame's DotCounter (the first production caller of
-	// ApplyCRDTDeltaEvent wired to real data over metal).
+	// Applying the delta advances the Lamport high-water to its DotCounter.
 	if got := engine.LamportCounter(); got != dotCounter {
 		t.Fatalf("engine.LamportCounter = %d, want %d (Join/Advance seam must advance to the frame's DotCounter)", got, dotCounter)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — EXECUTED reject-before-Verify instrumentation (F2: RUN, not prose)
-// ---------------------------------------------------------------------------
-
-// TestReceiver_RejectBeforeVerify_Depth proves a >maxHops deep envelope is
-// dropped at the 3.2 depth check with ZERO Verify calls (the O(1) depth
-// reject-before-Verify defense). It instruments Verify via the verifyHook seam
-// and asserts the hook counter == 0 on the depth-reject path.
+// TestReceiver_RejectBeforeVerify_Depth verifies that an over-deep envelope
+// fails the hop bound without calling signature verification.
 func TestReceiver_RejectBeforeVerify_Depth(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
-	// Budget sized so MaxHopsForBudget admits only a few hops; build a chain
-	// deeper than the bound. 30us budget -> MaxHopsForBudget=0 (below one
-	// Verify), so ANY relayed frame (>=1 hop) is depth-dropped.
-	const budgetNS = int64(30 * 1_000) // 30us -> MaxHopsForBudget=0
+	// A 30 us budget yields a zero-hop bound, so the three-hop chain is
+	// rejected before any signature verification.
+	const budgetNS = int64(30 * 1_000)
 
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
 	// 3-hop chain, bound 0 -> depth exceed.
@@ -332,18 +308,16 @@ func TestReceiver_RejectBeforeVerify_Depth(t *testing.T) {
 		t.Fatalf("deep envelope must DropDepth, got %v: %v", verdict.Verdict, verdict.Reason)
 	}
 	if got := count.Load(); got != 0 {
-		t.Fatalf("depth reject must issue ZERO Verify calls, got %d", got)
+		t.Fatalf("depth reject called Verify %d times, want 0", got)
 	}
 }
 
-// TestReceiver_RejectBeforeVerify_Rate proves a MaxUint64 dotCounter frame is
-// dropped at the 3.1 rate gate with ZERO Open Verifies (the 5.0 A2 ratchet
-// against the COMPOSED receiver, not just PeerBucket in isolation). The rate
-// gate runs BEFORE Open, so the depth/verify gates never fire.
+// TestReceiver_RejectBeforeVerify_Rate verifies that an excessive DotCounter
+// is rejected by PeerBucket before RelayEnvelope.Open performs verification.
 func TestReceiver_RejectBeforeVerify_Rate(t *testing.T) {
 	const dotCounter = MaxUint64DotCounter
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15 (would admit 1 hop)
+	const budgetNS = int64(1_000_000_000) // 1 second; the hop bound would admit one hop
 
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
 	env, originPub, _ := relayChain(t, innerWire, 1, wallBase)
@@ -359,25 +333,22 @@ func TestReceiver_RejectBeforeVerify_Rate(t *testing.T) {
 		t.Fatalf("MaxUint64 dotCounter frame must DropRate, got %v: %v", verdict.Verdict, verdict.Reason)
 	}
 	if got := count.Load(); got != 0 {
-		t.Fatalf("rate reject must issue ZERO Open Verifies, got %d", got)
+		t.Fatalf("rate reject called Open verification %d times, want 0", got)
 	}
 }
 
-// TestReceiver_RejectBeforeVerify_Clock proves a 3ms-future physical frame is
-// dropped at the 3.0 clock gate with ZERO Open Verifies (the clock reject-
-// before-Verify defense). The clock gate runs BEFORE Open.
+// TestReceiver_RejectBeforeVerify_Clock verifies that a physical timestamp
+// 3 ms ahead of the local clock is rejected before RelayEnvelope.Open.
 func TestReceiver_RejectBeforeVerify_Clock(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15
+	const budgetNS = int64(1_000_000_000) // 1 second
 
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
-	// The relay's wall timestamp is wallBase; pin the local clock 3ms in the
-	// PAST so the frame's physical time is 3ms-future (3000us > 2000us epsilon
-	// -> clock reject). The last hop's WallUSec is wallBase (1 hop).
+	// The last hop's timestamp is wallBase. A local clock 3 ms earlier makes
+	// the frame exceed the 2 ms permitted future drift.
 	env, originPub, _ := relayChain(t, innerWire, 1, wallBase)
 
-	// Local clock 3ms BEFORE the frame's physical time.
 	r, _, _, _ := setupReceiver(t, wallBase-3000, budgetNS, originPub)
 
 	count := new(attribution.VerifyHookCount)
@@ -389,20 +360,12 @@ func TestReceiver_RejectBeforeVerify_Clock(t *testing.T) {
 		t.Fatalf("3ms-future physical frame must DropClock, got %v: %v", verdict.Verdict, verdict.Reason)
 	}
 	if got := count.Load(); got != 0 {
-		t.Fatalf("clock reject must issue ZERO Open Verifies, got %d", got)
+		t.Fatalf("clock reject called Open verification %d times, want 0", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — originSig absent from the wire -> DropVerify (the probe cheat
-// cannot ship as production)
-// ---------------------------------------------------------------------------
-
-// TestReceiver_ZeroOriginSigDropped proves a version-1 envelope (all-zero
-// originSig, the probe-cheat shape) is DropVerify'd at the 1.1 inner origin
-// verify: the production receiver never admits an unsigned origin. This is
-// the HC1 contract — the live receiver resolves originSig from the wire, not
-// from a test-computed cheat.
+// TestReceiver_ZeroOriginSigDropped verifies that an envelope with an all-zero
+// origin signature is rejected rather than admitted using test-supplied proof.
 func TestReceiver_ZeroOriginSigDropped(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
@@ -428,9 +391,8 @@ func TestReceiver_ZeroOriginSigDropped(t *testing.T) {
 	}
 }
 
-// TestReceiver_UnknownOriginDropped proves a frame whose originNodeID is not
-// in the Directory is DropVerify'd (GAP-3: the receiver cannot verify an
-// unknown origin).
+// TestReceiver_UnknownOriginDropped verifies that a frame is rejected when its
+// OriginNodeID has no public key in the Directory.
 func TestReceiver_UnknownOriginDropped(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
@@ -439,10 +401,10 @@ func TestReceiver_UnknownOriginDropped(t *testing.T) {
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
 	env, originPub, _ := relayChain(t, innerWire, 1, wallBase)
 
-	// Register a DIFFERENT origin (so the frame's originNodeID is a miss).
+	// Register a different key under the fixed test OriginNodeID.
 	otherPub, _ := genKey(t)
 	r, _, _, _ := setupReceiver(t, wallBase, budgetNS, otherPub)
-	_ = originPub // intentionally NOT registered
+	_ = originPub // the key that signed the frame is deliberately unregistered
 
 	verdict := r.HandleFrame(env.Marshal())
 	if verdict.Verdict != DropVerify {
@@ -450,8 +412,8 @@ func TestReceiver_UnknownOriginDropped(t *testing.T) {
 	}
 }
 
-// TestReceiver_ForgedOriginSigDropped proves a forged originSig (signed by a
-// different key) is DropVerify'd at the 1.1 inner origin verify.
+// TestReceiver_ForgedOriginSigDropped verifies that an inner payload signed by
+// a key other than the registered origin key is rejected.
 func TestReceiver_ForgedOriginSigDropped(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
@@ -463,10 +425,8 @@ func TestReceiver_ForgedOriginSigDropped(t *testing.T) {
 	// Attacker signs the inner wire with a different key; overwrite originSig.
 	_, attackerPriv := genKey(t)
 	forgedSig := ed25519.Sign(attackerPriv, innerWire)
-	// Rebuild the envelope with the forged originSig. The v3 header mirrors
-	// (dotCounter, originNodeID) are preserved from the original env so the
-	// frame reaches the 1.1 inner origin verify (the gate this test exercises)
-	// rather than dropping earlier at the Directory lookup on a zeroed mirror.
+	// Preserve the original v3 mirrors so the forged frame reaches signature
+	// verification rather than failing an earlier gate.
 	mirrorDot, mirrorOrigin := decodeGateFields(t, innerWire)
 	env2 := attribution.NewSignedRelayEnvelopeV3(innerWire, sigArray(forgedSig), mirrorDot, mirrorOrigin, env.Hops())
 
@@ -478,8 +438,8 @@ func TestReceiver_ForgedOriginSigDropped(t *testing.T) {
 	}
 }
 
-// TestReceiver_MalformedDropped proves a malformed frame (not a relay
-// envelope) is DropMalformed'd without a panic.
+// TestReceiver_MalformedDropped verifies that malformed envelopes return
+// DropMalformed without panicking.
 func TestReceiver_MalformedDropped(t *testing.T) {
 	const wallBase = int64(1_700_000_000_000_000)
 	const budgetNS = int64(1_000_000_000)
@@ -499,9 +459,8 @@ func TestReceiver_MalformedDropped(t *testing.T) {
 	}
 }
 
-// TestReceiver_NoPanicOnAdversarialInput proves the receiver NEVER panics on
-// adversarial input (a forged frame is a Verdict, never a crash). It feeds
-// random bytes of varying lengths through HandleFrame.
+// TestReceiver_NoPanicOnAdversarialInput feeds random inputs around envelope
+// boundaries through HandleFrame and requires every call to return normally.
 func TestReceiver_NoPanicOnAdversarialInput(t *testing.T) {
 	const wallBase = int64(1_700_000_000_000_000)
 	const budgetNS = int64(1_000_000_000)
@@ -516,17 +475,12 @@ func TestReceiver_NoPanicOnAdversarialInput(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — relay A->B->C->D over the composed receiver (multi-hop chain)
-// ---------------------------------------------------------------------------
-
-// TestReceiver_RelayChainABCD proves a 3-hop relay chain A->B->C->D reaches
-// the receiver (D) and verifies all outer hops in Open THEN the inner origin.
-// It exercises the full composition over a multi-hop chain.
+// TestReceiver_RelayChainABCD verifies a three-hop relay chain and checks that
+// the accepted delta advances the Lamport clock.
 func TestReceiver_RelayChainABCD(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15, admits 3 hops
+	const budgetNS = int64(1_000_000_000) // 1 second; admits three relay hops
 
 	innerWire := buildCRDTDeltaWire(t, rcvEntityID, dotCounter)
 	// 3-hop chain B->C->D over A's signed inner frame.
@@ -543,11 +497,9 @@ func TestReceiver_RelayChainABCD(t *testing.T) {
 	}
 }
 
-// TestReceiver_RelayForwardEgress proves the relay-forward egress (2.0 tie):
-// a relay appends a new hop, Marshals, length-prefixes, and sends via
-// TransmitHeapBufferSend over a real AF_UNIX socketpair; the receiver
-// reassembles and accepts the forwarded frame. This proves the egress (2.0
-// TransmitHeapBuffer) and the ingress (3.5 receiver) compose for relay.
+// TestReceiver_RelayForwardEgress appends a relay hop, forwards the envelope
+// over an AF_UNIX socketpair, and verifies reassembly, acceptance, and Lamport
+// advancement at the next receiver.
 func TestReceiver_RelayForwardEgress(t *testing.T) {
 	const dotCounter = uint64(7)
 	const wallBase = int64(1_700_000_000_000_000)
@@ -572,29 +524,23 @@ func TestReceiver_RelayForwardEgress(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 	sendFd, recvFd := fds[0], fds[1]
-	// Arm SO_ZEROCOPY best-effort (the 2.0 conditional; EOPNOTSUPP tolerated).
+	// Enable zero-copy when the socket supports it; forwarding does not depend
+	// on that optimization.
 	_ = unix.SetsockoptInt(sendFd, unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1)
 
-	// Forward: C signs hop index 1 (existingHops has 1 hop at index 0). The
-	// v3 header mirrors (dotCounter, originNodeID) are copied off the verified
-	// incoming env unchanged — relays attest custody, they do not alter the
-	// origin's gate fields.
+	// The new relay signs hop index 1 and preserves the origin's v3 mirrors.
 	sent, err := ForwardEnvelope(relayCPriv, pubArray(relayCPub), innerWire, originSig, env.DotCounter(), env.OriginNodeID(), existingHops, 1, newHopWall, sendFd, nil)
 	if err != nil {
 		t.Fatalf("ForwardEnvelope: %v", err)
 	}
-	// sent is the prefixed-frame length (the 2.0 egress boundary sendmsg'd
-	// the full prefixed frame). Assert it is positive (the send carried the
-	// data over the socketpair).
+	// A positive count confirms that ForwardEnvelope sent the prefixed frame.
 	if sent <= 0 {
 		t.Fatalf("ForwardEnvelope sent = %d, want > 0 (the egress must carry the prefixed frame)", sent)
 	}
 	_ = relayPubs
 
-	// Receiver: reassemble via FrameReader and run the composition. The local
-	// clock is pinned at wallBase so C's newHopWall (wallBase+2000) is within
-	// the 2ms clock drift epsilon (2000us <= 2000us epsilon -> accept; the
-	// bound is > epsilon rejects, == epsilon accepts).
+	// The new hop is exactly 2 ms ahead of the receiving clock. Equality with
+	// the drift bound is accepted; only larger drift is rejected.
 	r, _, _, engine := setupReceiver(t, wallBase, budgetNS, originPub)
 	recvFile := os.NewFile(uintptr(recvFd), "recv")
 	fr := NewFrameReader(recvFile)
@@ -611,15 +557,9 @@ func TestReceiver_RelayForwardEgress(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — -race over 32 concurrent receiver handles
-// ---------------------------------------------------------------------------
-
-// TestReceiver_ConcurrentHandlesNoRace runs 32 goroutines, each building its
-// own signed relay-chain frame and running it through a SHARED receiver, with
-// zero races (the -race gate). The shared receiver's gates are all
-// concurrency-safe (PeerBucket sharded-mutex, IngressHLCScalarCap read-only,
-// Open immutable-envelope, Directory RWMutex, ApplyCRDTDeltaEvent race-proven).
+// TestReceiver_ConcurrentHandlesNoRace runs 32 goroutines through one Receiver
+// and checks that every handle is accepted. Run with -race to exercise the
+// synchronization in the bucket, directory, clock, and engine.
 func TestReceiver_ConcurrentHandlesNoRace(t *testing.T) {
 	const goroutines = 32
 	const dotCounter = uint64(7)
@@ -654,9 +594,7 @@ func TestReceiver_ConcurrentHandlesNoRace(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// (frame reader) — length-prefix reassembler guards
-// ---------------------------------------------------------------------------
+// FrameReader tests cover fragmented and concatenated frames and length bounds.
 
 // TestFrameReader_RoundTrip proves FrameReader reassembles a length-prefixed
 // frame byte-identical to the envelope (prefix stripped), over a pipe that
@@ -737,16 +675,10 @@ func TestFrameReader_TooLarge(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — source guard: no unsafe, no internal imports (static guard)
-// ---------------------------------------------------------------------------
-
-// TestReceiver_SourceGuard greps pkg/receive non-test Go source for the
-// forbidden imports/constructs: no `unsafe` import, no import of
-// internal/transport, internal/chaos, internal/network, internal/database
-// (receive is a leaf over the gate packages), and no runtime.Pin / unix.Mmap
-// (the 2.0-tied forward path uses TransmitHeapBuffer, which is already
-// guarded; pkg/receive source does NOT Pin any mmap/C region).
+// TestReceiver_SourceGuard checks non-test receive sources for imports and
+// operations that would violate package boundaries: unsafe, selected internal
+// packages, direct runtime pinning, and mmap. TransmitHeapBuffer owns pinning
+// for the forwarding path.
 func TestReceiver_SourceGuard(t *testing.T) {
 	dir := "."
 	entries, err := os.ReadDir(dir)
@@ -761,10 +693,10 @@ func TestReceiver_SourceGuard(t *testing.T) {
 		"\"github.com/hr18vk/sovereign/internal/database\"",
 	}
 	forbiddenCalls := []string{
-		"runtime.Pin",    // pkg/receive must NOT Pin directly (2.0 forward path owns the Pin)
+		"runtime.Pin",    // pinning belongs to the forwarding buffer
 		"unix.Mmap",      // no mmap in pkg/receive
 		"unix.Munmap",    // no munmap in pkg/receive
-		"runtime.Pinner", // no direct Pinner use (TransmitHeapBuffer owns it)
+		"runtime.Pinner", // TransmitHeapBuffer owns direct Pinner use
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -778,30 +710,19 @@ func TestReceiver_SourceGuard(t *testing.T) {
 		src := string(b)
 		for _, imp := range forbiddenImports {
 			if strings.Contains(src, imp) {
-				t.Errorf(": forbidden import %s in %s (pkg/receive is a leaf over the gate packages; no unsafe, no internal/*)", imp, name)
+				t.Errorf("forbidden import %s in %s; receive must remain a leaf over public gate packages", imp, name)
 			}
 		}
 		for _, call := range forbiddenCalls {
 			if strings.Contains(src, call) {
-				t.Errorf(": forbidden call %s in %s (pkg/receive must NOT Pin/mmap directly; the 2.0 forward path owns the Pin via TransmitHeapBuffer)", call, name)
+				t.Errorf("forbidden call %s in %s; TransmitHeapBuffer owns pinning and mmap", call, name)
 			}
 		}
 
-		// Desync guard (mandatory, pre-commit action): the envelope
-		// byte-offset layout MUST be sourced from attribution.HeaderLen /
-		// HopSize / PubSize / SigSize, NEVER re-derived as literals in
-		// pkg/receive. A prior draft hardcoded `const hdrLen =
-		// 2 + 2 + 4 + 64` and `const hopSz = 32 + 64 + 8` here; when
-		// envelope.go's WallSize drifted (8 -> 16), the receiver kept the
-		// stale 104-byte hop size while Marshal wrote 112-byte hops, so the
-		// wall-timestamp read drifted into the next hop's relayPub bytes ->
-		// a far-future physical timestamp -> an honest-but-false 3.0 clock-
-		// cap reject that named the WRONG cause (silent misattribution, the
-		// exact class verified live this change). Sourcing
-		// the consts from the single truth in pkg/attribution kills the drift
-		// at the source: a layout change propagates by const-reference, so the
-		// receiver and the encoder can never disagree. This guard ensures the
-		// offset literals never creep back into pkg/receive.
+		// Envelope offsets must come from attribution.HeaderLen, HopSize,
+		// PubSize, and SigSize. Duplicated arithmetic once left the receiver
+		// reading timestamps from the wrong bytes after the hop layout changed.
+		// Constant references propagate that layout from one source instead.
 		forbiddenOffsets := []string{
 			"2 + 2 + 4 + 64",
 			"2+2+4+64",
@@ -810,7 +731,7 @@ func TestReceiver_SourceGuard(t *testing.T) {
 		}
 		for _, off := range forbiddenOffsets {
 			if strings.Contains(src, off) {
-				t.Errorf("-DSYN: forbidden byte-offset literal %q in %s (source from attribution.HeaderLen/HopSize; a hardcoded duplicate silently misattributes on envelope layout drift)", off, name)
+				t.Errorf("forbidden byte-offset arithmetic %q in %s; derive offsets from attribution constants", off, name)
 			}
 		}
 	}

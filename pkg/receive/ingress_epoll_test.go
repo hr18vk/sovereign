@@ -8,30 +8,13 @@
 
 package receive
 
-// — SILICON TESTS closing the four Move-A gaps (ADR-0003 §8):
-// Gap 1 — NO epoll: this file IS the epoll ingress loop on silicon.
-// Gap 2 — loopback: TestEBPFEpollIngress_RealNIC binds to a non-127.0.0.1
-// interface (secondary ENI or tc-redirect).
-// Gap 3 — NO perf: BenchmarkEBPFDelivery_vs_HashFallback_32c (col A vs B).
-// Gap 4 — NOT wired: TestEBPFEpollIngress_DeliveryWiring proves the loop
-// drives the 12.0 KernelFanout group into HandleFrame.
+// These Linux-specific tests exercise EpollIngress with real SO_REUSEPORT
+// sockets and an attached eBPF selector. They cover frame delivery, delivery
+// with the selector detached, and optional non-loopback binding.
 //
-// The test file is GATED by the `ebpf_kernel` build tag (the pq_preview /
-// ebpf_reuseport.go shape). The DEFAULT build EXCLUDES it entirely. Under
-// -tags ebpf_kernel it runs on the c8g box (kernel 6.18, CAP_BPF, GOMAXPROCS=32).
-//
-// Every kernel-symbol call site cites its precedent:
-// - unix.EpollCreate1/EpollCtl/EpollWait/EpollEvent — internal/transport/capnp_server.go:119/486/222/482.
-// - unix.Recvfrom — pkg/transport/ebpf_reuseport_test.go:217.
-// - unix.EAGAIN/EWOULDBLOCK/EINTR — capnp_server.go:255 / ebpf_reuseport_test.go:219 / capnp_server.go:224.
-// - transport.KernelFanout.LoadGroup/LoadGroupOnIP/LoadProgram/PinFlow/AttachProgram/DetachProgram/SocketFD/NumSockets — pkg/transport/ebpf_reuseport.go (12.0 surface, cited at each call).
-// - receiver.HandleFrame — pkg/receive/receiver.go:244 (the PROVEN gate stack).
-// - EpollIngress.Serve/drainFD/deliverDatagram — pkg/receive/ingress_epoll.go (this change's loop).
-//
-// The CAP_BPF probe is self-contained (does NOT call transport's test-internal
-// requireCapBPF): it attempts a BPF_MAP_CREATE via cilium and t.Skip's on
-// EPERM (the non-vacuous silicon guard). Any other error is a real bug
-// (t.Fatalf, anti-fabrication).
+// Tests require CAP_BPF. requireCapBPF skips only when the kernel denies the
+// capability probe with EPERM; other probe failures indicate a broken test
+// environment or invalid map configuration and fail the test.
 
 import (
 	"encoding/binary"
@@ -50,24 +33,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// originNodeIDWireOffset is the byte offset of the Application Connection ID
-// in the envelope wire bytes (envelope.go:498-503). It is 80 (the v3 header
-// mirrors dotCounter at [72:80] and originNodeID at [80:96]). The 12.0 eBPF
-// program reads ctx->data[88:104] = UDP header (8) + originNodeIDWireOffset (80).
-// CITED from pkg/transport/ebpf_reuseport.go:95.
+// originNodeIDWireOffset locates OriginNodeID in a v3 envelope. The selector
+// reads the corresponding bytes after the 8-byte UDP header.
 const originNodeIDWireOffset = 80
 
-// requireCapBPF probes the live CAP_BPF capability by attempting a BPF_MAP_CREATE
-// via cilium (the same shape as pkg/transport/ebpf_reuseport_test.go:75
-// requireCapBPF, but self-contained in pkg/receive so the test doesn't depend on
-// transport's test-internal helper). On EPERM it t.Skip's (the non-vacuous
-// silicon guard — CAP_BPF absent from the effective set). On any other error it
-// t.Fatalf's (a real bug in the map config or box state, NOT a capability gap).
-// Accepts both *testing.T and *testing.B (via testing.TB).
+// requireCapBPF attempts the same SOCKHASH map creation used by the kernel
+// fanout. EPERM skips the calling test or benchmark; every other error fails.
 func requireCapBPF(tb testing.TB) {
 	tb.Helper()
-	// Probe via cilium ebpf.NewMap (the same path KernelFanout.LoadProgram uses).
-	// A 1-entry SOCKHASH map is the minimal probe.
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.SockHash,
 		KeySize:    16,
@@ -78,16 +51,11 @@ func requireCapBPF(tb testing.TB) {
 		_ = m.Close()
 		return
 	}
-	// Classify the error. cilium wraps the bpf(2) errno; EPERM = capability,
-	// EINVAL = parameter bug. errors.Is against unix.EPERM / unix.EINVAL.
 	if errors.Is(err, unix.EPERM) {
-		tb.Skipf(" silicon guard: CAP_BPF not granted on this box (bpf(2) BPF_MAP_CREATE EPERM: %v) — the eBPF load needs CAP_BPF in the effective set (run via sudo on a box with unprivileged_bpf_disabled=1). Skipping honestly; the in-process guards at fanout_test.go still cover the determinism/stickiness properties.", err)
+		tb.Skipf("CAP_BPF unavailable: BPF_MAP_CREATE returned EPERM: %v; in-process fanout tests still cover routing", err)
 		return
 	}
-	// Any other error (EINVAL, ENOMEM,...) is NOT a capability gap — it is a
-	// real bug in the map config or the box state. Fail loudly; do NOT skip
-	// (skipping would fake a pass on a broken map config — anti-fabrication).
-	tb.Fatalf(" silicon guard: BPF_MAP_CREATE failed with a NON-EPERM error (not a capability gap — a real bug in the map config or box state): %v", err)
+	tb.Fatalf("BPF_MAP_CREATE failed for a reason other than missing CAP_BPF: %v", err)
 }
 
 // freeUDPPort returns a UDP port that is free to bind on the given IP, so the
@@ -110,14 +78,9 @@ func freeUDPPort(t testing.TB, bindIP [4]byte) int {
 	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
-// makeFrame builds a v3 relay envelope frame whose wire bytes [80:96] are the
-// given OriginNodeID, via the SAME helper the in-process
-// TestRoamStickiness_32ListIncomplete uses (fanout_test.go:87
-// NewSignedRelayEnvelopeV3). The eBPF program reads payload bytes [80:96] —
-// the EXACT window this frame populates — so a frame built here routes through
-// the kernel program identically to how the in-process SelectRoute routes it.
-// The inner wire / originSig / hops are irrelevant to routing (the selector
-// reads ONLY OriginNodeID — the no-crypto guard, TestNoCryptoBeforeRoute_EBPF).
+// makeFrame builds a v3 envelope with cid in the OriginNodeID bytes read by
+// the eBPF selector. Routing does not inspect the inner wire, signature, or
+// hops, so those fields can remain empty.
 func makeFrame(t testing.TB, cid [attribution.OriginNodeIDSize]byte) []byte {
 	t.Helper()
 	env := attribution.NewSignedRelayEnvelopeV3(
@@ -131,7 +94,7 @@ func makeFrame(t testing.TB, cid [attribution.OriginNodeIDSize]byte) []byte {
 	if got := env.OriginNodeID(); got != cid {
 		t.Fatalf("OriginNodeID() round-trip mismatch: want %x got %x", cid, got)
 	}
-	// Sanity: the wire window [80:96] MUST equal the cid (envelope.go:498-503).
+	// Check the selector's view of the marshaled bytes.
 	if len(frame) < originNodeIDWireOffset+attribution.OriginNodeIDSize {
 		t.Fatalf("frame too short (%d bytes) to carry the [80:96] OriginNodeID window", len(frame))
 	}
@@ -143,11 +106,8 @@ func makeFrame(t testing.TB, cid [attribution.OriginNodeIDSize]byte) []byte {
 	return frame
 }
 
-// lengthPrefixFrame prepends the 4-byte big-endian length prefix to a Marshal'd
-// envelope, producing the GAP-2 wire shape [uint32 frameLen BE][envelope bytes]
-// the receiver's FrameReader (and EpollIngress.deliverDatagram) expects. It is
-// the inverse of FrameReader.ReadFrame (receiver.go:485). The prefix is a
-// pkg/receive framing concern, NOT an envelope concern.
+// lengthPrefixFrame adds the outer framing expected by FrameReader and
+// EpollIngress.deliverDatagram.
 func lengthPrefixFrame(envelopeBytes []byte) []byte {
 	out := make([]byte, frameLenPrefixSize+len(envelopeBytes))
 	binary.BigEndian.PutUint32(out[:frameLenPrefixSize], uint32(len(envelopeBytes)))
@@ -155,12 +115,9 @@ func lengthPrefixFrame(envelopeBytes []byte) []byte {
 	return out
 }
 
-// setupGroup builds a numSockets-member SO_REUSEPORT UDP group on a free port
-// bound to bindIP (zero = INADDR_ANY / loopback; non-zero = specific interface
-// IP for the Gap-2 real-NIC run), loads + attaches the eBPF program, and pins
-// the given CID to socketIndex 0 (the pre-roam pinned socket). It returns the
-// KernelFanout, the port, and a cleanup func. Every Test calls this FIRST
-// (after requireCapBPF) so the gear is asserted once.
+// setupGroup creates a UDP fanout group, loads and attaches its eBPF selector,
+// and pins cid to socket zero. A zero bindIP selects the loopback default used
+// by freeUDPPort; a non-zero value selects a specific interface address.
 func setupGroup(t testing.TB, numSockets uint32, cid [attribution.OriginNodeIDSize]byte, bindIP [4]byte) (*transport.KernelFanout, int, func()) {
 	t.Helper()
 	port := freeUDPPort(t, bindIP)
@@ -188,13 +145,9 @@ func setupGroup(t testing.TB, numSockets uint32, cid [attribution.OriginNodeIDSi
 	return k, port, cleanup
 }
 
-// setupGroupWithMapSize is the Gap-3 bench variant of setupGroup: it sizes the
-// SOCKHASH map to mapMaxEntries (the churn workload pins nCIDs distinct CIDs,
-// so the map MUST hold them all — the default LoadProgram sizes to numSockets=32
-// and the 33rd PinFlow returns E2BIG). It does NOT pin a single CID (the bench
-// pins the full churn set itself via PinFlow). Used only by
-// BenchmarkEBPFDelivery_vs_HashFallback_32c; setupGroup (the single-CID form)
-// is unchanged for the other three tests ().
+// setupGroupWithMapSize creates an attached group whose SOCKHASH map can hold
+// the benchmark's full CID churn set. The default map size only accommodates
+// the socket count, so it would reject additional PinFlow entries with E2BIG.
 func setupGroupWithMapSize(t testing.TB, numSockets uint32, mapMaxEntries uint32, bindIP [4]byte) (*transport.KernelFanout, int, func()) {
 	t.Helper()
 	port := freeUDPPort(t, bindIP)
@@ -262,19 +215,9 @@ func recvCount(t testing.TB, k *transport.KernelFanout, socketIndex uint32, want
 	return count
 }
 
-// -----------------------------------------------------------------------------
-// GAP-1 + GAP-4 GUARD: the epoll loop drives the 12.0 KernelFanout group into
-// HandleFrame. A frame sent to the group is Recvfrom'd by the loop, reassembled,
-// and HandleFrame is called -> EpollIngress.Frames() increments.
-// -----------------------------------------------------------------------------
-
-// TestEBPFEpollIngress_DeliveryWiring proves the Gap-1 (epoll loop) + Gap-4
-// (wiring into HandleFrame) closers on silicon. It builds a 32-socket group,
-// attaches the eBPF program, pins a CID to socket 0, starts the EpollIngress
-// loop (which EpollCtl-ADDs the 32 fds EPOLLIN|EPOLLET and EpollWait-drives
-// them), sends one length-prefixed frame to the group, and asserts that
-// EpollIngress.Frames() == 1 (the loop delivered the frame to HandleFrame).
-// This is the seam in the ENGINE, not in a test file.
+// TestEBPFEpollIngress_DeliveryWiring sends a valid length-prefixed envelope
+// through a 32-socket group and verifies that the epoll loop delivers it to
+// HandleFrame.
 func TestEBPFEpollIngress_DeliveryWiring(t *testing.T) {
 	requireCapBPF(t)
 
@@ -293,7 +236,7 @@ func TestEBPFEpollIngress_DeliveryWiring(t *testing.T) {
 	env, originPub, _ := relayChain(t, innerWire, 1, 1_700_000_000_000_000)
 	frame := lengthPrefixFrame(env.Marshal())
 
-	// Build a Receiver that will Accept this frame (register the origin).
+	// Register the origin so the delivery reaches a valid receive pipeline.
 	r, sc, dir, engine := setupReceiver(t, 1_700_000_000_000_000, 1_000_000_000, originPub)
 	_ = sc
 	_ = dir
@@ -327,28 +270,14 @@ func TestEBPFEpollIngress_DeliveryWiring(t *testing.T) {
 	wg.Wait()
 
 	if ingress.Frames() != 1 {
-		t.Fatalf("DeliveryWiring FAIL: expected Frames()=1, got %d (the epoll loop did not deliver the frame to HandleFrame)", ingress.Frames())
+		t.Fatalf("delivery wiring: got %d frames, want 1", ingress.Frames())
 	}
-	t.Logf(" DELIVERY WIRING: 1 frame sent -> EpollIngress.Frames()=%d (the epoll loop drove the 12.0 KernelFanout group into HandleFrame). SILICON-PROVEN.", ingress.Frames())
+	t.Logf("delivery wiring: one frame sent and %d delivered", ingress.Frames())
 }
 
-// -----------------------------------------------------------------------------
-// GAP-1 CLOSER PROOF (): anti-correlation attach-vs-detach control.
-// attached -> all frames land on the pinned socket (the loop's Recvfrom on
-// the pinned fd sees them; EpollIngress.Frames() == N).
-// detached -> frames spread across sockets (hash fallback; the loop's
-// Recvfrom on the pinned fd sees ~N/32; EpollIngress.Frames()
-// still == N but the per-socket distribution is spread).
-// The test uses the SAME harness; the ONLY delta is AttachProgram vs
-// DetachProgram (the 12.0 stickiness guard holds; the attach-vs-detach control
-// is the NEW guard).
-// -----------------------------------------------------------------------------
-
-// TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation is the Gap-1 closer
-// proof (): a test that FAILS the suite if the eBPF program is detached
-// (the steering must be the cause of pinning; hashing-alone must NOT pin).
-// The 12.0 stickiness guard holds; the attach-vs-detach control is the NEW
-// guard (anti-correlation: detached -> spread; attached -> pinned).
+// TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation checks that delivery
+// works both with eBPF steering and with kernel hash fallback. Per-socket
+// routing is covered separately by the transport fanout tests.
 func TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation(t *testing.T) {
 	requireCapBPF(t)
 
@@ -359,7 +288,7 @@ func TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation(t *testing.T) {
 		cid[i] = byte(i + 0x20)
 	}
 
-	// --- PHASE A: ATTACHED (eBPF steering ON) ---
+	// First deliver with the eBPF selector attached.
 	k, port, cleanup := setupGroup(t, numSockets, cid, [4]byte{})
 	defer cleanup()
 
@@ -399,13 +328,11 @@ func TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation(t *testing.T) {
 	ingress.Shutdown()
 	wg.Wait()
 
-	// --- PHASE B: DETACHED (eBPF steering OFF -> hash fallback) ---
-	// Recreate the group (DetachProgram leaves the group bound; we need a fresh
-	// group for the detached run so the sockets are clean).
+	// Repeat with a fresh socket group and no eBPF selector, leaving kernel
+	// hash fallback responsible for delivery.
 	k2, port2, cleanup2 := setupGroup(t, numSockets, cid, [4]byte{})
 	defer cleanup2()
 
-	// Detach the program -> hash fallback.
 	if err := k2.DetachProgram(); err != nil {
 		t.Fatalf("DetachProgram: %v", err)
 	}
@@ -440,69 +367,43 @@ func TestEBPFEpollIngress_AttachVsDetach_AntiCorrelation(t *testing.T) {
 	ingress2.Shutdown()
 	wg2.Wait()
 
-	// Assert the anti-correlation: attached -> all frames delivered (pinned);
-	// detached -> all frames still delivered (hash fallback delivers, just
-	// spread). The key assertion is that BOTH deliver N frames (the loop works
-	// in both modes), but the per-socket distribution differs. The 12.0
-	// stickiness table (recvCount per socket) is the detailed proof; here we
-	// assert the loop delivers in both modes (the wiring is not broken by
-	// detach).
+	// Both steering modes must deliver every frame to the receive pipeline.
 	if attachedFrames != uint64(nFrames) {
-		t.Fatalf("AttachVsDetach FAIL (attached): expected Frames()=%d, got %d", nFrames, attachedFrames)
+		t.Fatalf("attached delivery: want Frames()=%d, got %d", nFrames, attachedFrames)
 	}
 	if detachedFrames != uint64(nFrames) {
-		t.Fatalf("AttachVsDetach FAIL (detached): expected Frames()=%d, got %d (the loop must still deliver under hash fallback)", nFrames, detachedFrames)
+		t.Fatalf("detached delivery: want Frames()=%d, got %d", nFrames, detachedFrames)
 	}
-	t.Logf(" ATTACH-VS-DETACH ANTI-CORRELATION: attached Frames()=%d, detached Frames()=%d (both deliver; the eBPF steering is the cause of pinning, not the loop). SILICON-PROVEN.", attachedFrames, detachedFrames)
+	t.Logf("delivery with eBPF attached=%d frames, detached=%d frames", attachedFrames, detachedFrames)
 }
 
-// -----------------------------------------------------------------------------
-// GAP-3 PERF BENCH (): BenchmarkEBPFDelivery_vs_HashFallback_32c.
-// col A = eBPF-steered delivery (program attached).
-// col B = kernel-hash-fallback delivery (program detached).
-// Same harness, ONLY delta = attach vs detach. Churn workload (vary CID at
-// high rate so the SOCKHASH lookup exercises cache-miss as well as hit).
-// Assert col A <= col B at -cpu=32 -benchtime=3s -count=3 on c8g box.
-// -----------------------------------------------------------------------------
-
-// BenchmarkEBPFDelivery_vs_HashFallback_32c is the Gap-3 closer ().
-// It drives a churn workload (vary the CID at a high rate so the SOCKHASH
-// lookup path exercises cache-miss as well as hit). Two columns:
-// col A — eBPF-steered delivery (sk_select_reuseport pins the flow).
-// col B — kernel-hash-fallback delivery (the eBPF program detached, so the
-// 4-tuple hash drives — the SAME test harness, program attached = A
-// detached = B, the ONLY delta is the attach).
-// Assert col A is NOT slower than col B at -cpu=32 -benchtime=3s -count=3
-// (the SCISSORS rule: a 4c/16c number is NOT interchangeable with 32c; run
-// on the c8g box). Goal: col A <= col B, ideally < (faster under churn).
-// A finding that col A is SLOWER than col B is an honest NEGATIVE — keep it;
-// record it; do not fabricate a win (the §5 negative-result discipline from
-// 4.E5).
+// BenchmarkEBPFDelivery_vs_HashFallback_32c compares attached eBPF steering
+// with detached kernel hash fallback over a 256-CID churn workload. Both runs
+// execute b.N sends through otherwise identical setups. The benchmark fails if
+// the attached run takes longer; its intended comparison is -cpu=32 with
+// -benchtime=3s -count=3.
 func BenchmarkEBPFDelivery_vs_HashFallback_32c(b *testing.B) {
 	requireCapBPF(b)
 
 	const numSockets = 32
 	const nCIDs = 256 // churn: vary CID across 256 values to exercise cache-miss
 
-	// D3 closer: resolve the bench destination from REAL_NIC_BIND_IP (fall back
-	// to 127.0.0.1 ONLY when unset, tagged "loopback" honestly — never relabeled).
-	// Both columns use the SAME dst; the ONLY delta is attach vs detach (the
-	// scissors rule applies to the COMPARISON, never to relabeling a 4c
-	// number as 32c). A parse error is b.Fatalf, NOT a silent fallback — a
-	// malformed bind IP is a real bug, not a capability gap.
+	// REAL_NIC_BIND_IP selects a non-loopback destination when provided. Both
+	// runs use the same destination; only selector attachment differs. An invalid
+	// address fails rather than silently reverting to loopback.
 	bindIP := [4]byte{127, 0, 0, 1}
 	dst := net.IPv4(127, 0, 0, 1)
 	dstLabel := "loopback"
 	if env := os.Getenv("REAL_NIC_BIND_IP"); env != "" {
 		var p [4]byte
 		if _, err := fmt.Sscanf(env, "%d.%d.%d.%d", &p[0], &p[1], &p[2], &p[3]); err != nil {
-			b.Fatalf("REAL_NIC_BIND_IP parse %q: %v (NOT a silent fallback — a malformed bind IP is a real bug)", env, err)
+			b.Fatalf("invalid REAL_NIC_BIND_IP %q: %v", env, err)
 		}
 		bindIP = p
 		dst = net.IPv4(p[0], p[1], p[2], p[3])
 		dstLabel = env
 	}
-	b.Logf(" GAP-3 bench dst: %s (REAL_NIC_BIND_IP=%q)", dstLabel, os.Getenv("REAL_NIC_BIND_IP"))
+	b.Logf("bench dst: %s (REAL_NIC_BIND_IP=%q)", dstLabel, os.Getenv("REAL_NIC_BIND_IP"))
 
 	// Pre-build frames for each CID (so the bench loop only sends, no Marshal).
 	frames := make([][]byte, nCIDs)
@@ -516,19 +417,12 @@ func BenchmarkEBPFDelivery_vs_HashFallback_32c(b *testing.B) {
 		innerWire := buildCRDTDeltaWire(b, rcvEntityID, uint64(i))
 		env, originPub, _ := relayChain(b, innerWire, 1, 1_700_000_000_000_000)
 		frames[i] = lengthPrefixFrame(env.Marshal())
-		_ = originPub // registered in setupReceiver
+		_ = originPub // the benchmark intentionally leaves origins unregistered
 	}
 
-	// --- Helper: run one bench column (attached or detached) ---
-	// runBench uses b.N as its iteration count. Called DIRECTLY in the bench
-	// body (NOT inside b.Run sub-benches — the 12.1 code wrapped runBench in a
-	// b.N loop, running b.N^2 iterations AND discarding the return; the fix
-	// captures both returns and compares them). Both columns run the SAME b.N
-	// iterations, so the comparison is apples-to-apples.
+	// Each run performs exactly b.N sends and returns its elapsed time.
 	runBench := func(attach bool) int64 {
-		// Size the SOCKHASH map to hold the full churn set (nCIDs=256); the
-		// default LoadProgram sizes to numSockets=32 and the 33rd PinFlow
-		// returns E2BIG (map full). max(numSockets, nCIDs) covers both.
+		// The map must hold every CID in the churn set.
 		k, port, cleanup := setupGroupWithMapSize(b, numSockets, uint32(nCIDs), bindIP)
 		defer cleanup()
 
@@ -584,11 +478,7 @@ func BenchmarkEBPFDelivery_vs_HashFallback_32c(b *testing.B) {
 		return elapsed.Nanoseconds()
 	}
 
-	// D1 closer: capture BOTH columns and COMPARE (the 12.1 code dropped these
-	// returns inside b.Run sub-benches and compared nothing — the honest-NEGATIVE
-	// guard was MISSING from the bytes). The guard fires identically on loopback
-	// and the real NIC; a NEGATIVE on any calibration pass of -benchtime=3s
-	// -count=3 -cpu=32 fails the bench. b.Fatalf is valid on a *testing.B.
+	// Compare both runs on loopback or the selected non-loopback destination.
 	b.ReportAllocs()
 	b.ResetTimer()
 	elapsedNsA := runBench(true)
@@ -598,62 +488,41 @@ func BenchmarkEBPFDelivery_vs_HashFallback_32c(b *testing.B) {
 	b.ReportMetric(float64(elapsedNsB)/float64(b.N), "ns/frame-colB")
 
 	if elapsedNsA > elapsedNsB {
-		b.Fatalf("eBPF steering SLOWER than hash fallback at 32c on %s: "+
-			"col A (attached)=%dns > col B (detached)=%dns — Gap-3 measured "+
-			"NEGATIVE (the cache-locality payoff needs a multi-NIC multi-peer "+
-			"mesh to surface at this single-box scale)",
+		b.Fatalf("eBPF steering slower than hash fallback on %s: "+
+			"attached=%dns, detached=%dns; "+
+			"both runs delivered every frame, "+
+			"but the attached run took longer",
 			dstLabel, elapsedNsA, elapsedNsB)
 	}
 	switch {
 	case elapsedNsA < elapsedNsB:
-		b.Logf("col A (steered) FASTER than col B (hash) at 32c on %s: %d < %d ns "+
-			"(steering wins under churn) — Gap-3 POSITIVE", dstLabel, elapsedNsA, elapsedNsB)
+		b.Logf("eBPF steering faster than hash fallback on %s: "+
+			"attached=%dns, detached=%dns", dstLabel, elapsedNsA, elapsedNsB)
 	case elapsedNsA == elapsedNsB:
-		b.Logf("col A == col B at 32c on %s: %d ns each — Gap-3 PARITY (the "+
-			"cache-locality payoff needs a multi-NIC proof)", dstLabel, elapsedNsA)
+		b.Logf("eBPF steering and hash fallback tied on %s: "+
+			"elapsed=%dns", dstLabel, elapsedNsA)
 	default:
-		b.Logf("col A (steered) <= col B (hash) at 32c on %s: %d <= %d ns — Gap-3 PASS",
-			dstLabel, elapsedNsA, elapsedNsB)
+		b.Logf("eBPF steering no slower than hash fallback on %s: attached=%dns, detached=%dns", dstLabel, elapsedNsA, elapsedNsB)
 	}
 }
 
-// -----------------------------------------------------------------------------
-// GAP-2 REAL-NIC RUN (): bind the SO_REUSEPORT group to a non-127.0.0.1
-// interface. Two acceptable forms (pick one and record which in the.log):
-// (a) secondary ENI attached to the Spot box — bind the group to the ENI's
-// private IP; send frames from a peer (a second box, OR a loop from the
-// same box via the ENI IP, NOT loopback).
-// (b) tc-redirect — use `tc filter add... action skbedit` to mirror a
-// clsact ingress into the group, exercising a real netdev path.
-// The test still asserts 0/N mis-routes across a 4-tuple roam (the 12.0
-// stickiness gate, now on a real interface). Record nproc=<eniness>, the
-// interface name, and `ethtool -l` (channel counts) in the.log header.
-// -----------------------------------------------------------------------------
-
-// TestEBPFEpollIngress_RealNIC is the Gap-2 closer (). It binds the
-// SO_REUSEPORT group to a non-127.0.0.1 interface (the secondary ENI's private
-// IP 172.31.5.252, or a tc-redirect target). It records the interface name,
-// nproc, and ethtool -l channel counts in the test log header. It asserts the
-// 12.0 stickiness gate (0 mis-routes across a 4-tuple roam) on the real NIC.
-// The test is GATED on the presence of a non-loopback bind IP (env var
-// REAL_NIC_BIND_IP=172.31.5.252). If absent, it t.Skip's with an honest
-// message (the 12.0 honest STOP discipline).
+// TestEBPFEpollIngress_RealNIC binds the group to REAL_NIC_BIND_IP and checks
+// that all sent frames reach HandleFrame. The test skips when that address is
+// not configured. REAL_NIC_IFACE and REAL_NIC_ETHTOOL_L add optional interface
+// details to the log. Per-socket stickiness is asserted by the transport tests;
+// this test checks delivery through the selected interface.
 func TestEBPFEpollIngress_RealNIC(t *testing.T) {
 	requireCapBPF(t)
 
-	// The real-NIC bind IP is provided via env var (the harness sets it).
-	// If absent, skip honestly (the 12.0 gate-1 discipline: the code ships,
-	// the measurement defers).
 	bindIPStr := os.Getenv("REAL_NIC_BIND_IP")
 	if bindIPStr == "" {
-		t.Skip(" Gap-2: REAL_NIC_BIND_IP not set — the real-NIC run requires a secondary ENI IP or tc-redirect target. Skipping honestly; the loopback tests still cover the epoll + wiring closers.")
+		t.Skip("REAL_NIC_BIND_IP not set; loopback tests still cover epoll delivery")
 	}
 	var bindIP [4]byte
 	if _, err := fmt.Sscanf(bindIPStr, "%d.%d.%d.%d", &bindIP[0], &bindIP[1], &bindIP[2], &bindIP[3]); err != nil {
 		t.Fatalf("REAL_NIC_BIND_IP parse: %v", err)
 	}
 
-	// Record the NIC metadata in the.log header ().
 	iface := os.Getenv("REAL_NIC_IFACE")
 	if iface == "" {
 		iface = "unknown"
@@ -662,12 +531,12 @@ func TestEBPFEpollIngress_RealNIC(t *testing.T) {
 	if ethtoolL == "" {
 		ethtoolL = "not captured"
 	}
-	t.Logf("=== GAP-2 REAL-NIC RUN ===")
-	t.Logf(" bind IP: %s", bindIPStr)
-	t.Logf(" interface: %s", iface)
-	t.Logf(" ethtool -l: %s", ethtoolL)
-	t.Logf(" nproc: %d", runtime.NumCPU())
-	t.Logf(" GOMAXPROCS: %d", runtime.GOMAXPROCS(0))
+	t.Logf("real-NIC delivery run")
+	t.Logf("  bind IP        : %s", bindIPStr)
+	t.Logf("  interface      : %s", iface)
+	t.Logf("  ethtool -l     : %s", ethtoolL)
+	t.Logf("  nproc          : %d", runtime.NumCPU())
+	t.Logf("  GOMAXPROCS     : %d", runtime.GOMAXPROCS(0))
 
 	const numSockets = 32
 	const nFrames = 1000
@@ -697,7 +566,7 @@ func TestEBPFEpollIngress_RealNIC(t *testing.T) {
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	// Send frames to the REAL NIC IP (not loopback).
+	// Send frames to the real NIC IP (not loopback).
 	dstIP := net.IPv4(bindIP[0], bindIP[1], bindIP[2], bindIP[3])
 	for i := 0; i < nFrames; i++ {
 		sendFrame(t, dstIP, port, frame)
@@ -716,7 +585,7 @@ func TestEBPFEpollIngress_RealNIC(t *testing.T) {
 	wg.Wait()
 
 	if delivered != uint64(nFrames) {
-		t.Fatalf("RealNIC FAIL: expected Frames()=%d, got %d (lost frames on real NIC)", nFrames, delivered)
+		t.Fatalf("real-NIC delivery: want %d frames, got %d", nFrames, delivered)
 	}
-	t.Logf(" REAL-NIC STICKINESS: %d frames sent to %s -> EpollIngress.Frames()=%d (0 mis-routes on real NIC). SILICON-PROVEN.", nFrames, bindIPStr, delivered)
+	t.Logf("real-NIC delivery: sent %d frames to %s; delivered=%d", nFrames, bindIPStr, delivered)
 }

@@ -4,31 +4,11 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package sync — crdt_capnp_wire is the production CRDTDeltaEvent marshal seam.
+// Package sync encodes CRDTDeltaEvent frames for the mesh transport.
 //
-// This file is the FIRST non-test producer of the capnp CRDTDeltaEvent wire that
-// pkg/receive.Receiver.HandleFrame consumes (crdt_apply.go:113
-// ApplyCRDTDeltaEvent → capnp.Unmarshal → ReconstructEntry). Before this file
-// the ONLY builder for the wire shape was the test-local
-// encodeEntryToCRDTDeltaEvent helper (pkg/sync/crdt_capnp_roundtrip_test.go:156),
-// and crdt_apply.go:216 explicitly escalated "no production capnp marshal seam
-// exists". This file is that seam.
-//
-// frozen-substrate discipline: this file is a CALLER of the generated capnp
-// schema (capnp_schema.NewRootCRDTDeltaEvent, the Set* accessors) and the
-// compiled-in version const CRDTDeltaEventWireVersion. It edits NO frozen file:
-// it imports the frozen schema.capnp(.go) the same way crdt_apply.go does and
-// produces a byte-identical wire shape to the roundtrip test's builder, so the
-// production sink (ReconstructEntryWithSkewBound) decodes it without any schema
-// edit (the C5/C6 guards fire on this wire exactly as they fire on the test
-// wire).
-//
-// Design note (no transport here): this file is codec-only. It produces the
-// innerWire []byte the signed-envelope seam signs and length-prefixes in the
-// mesh transport (pkg/mesh). Keeping the codec in pkg/sync means the mesh is a
-// pure CALLER of engine + codec + identity + envelope; the engine owns the
-// Join/Apply sink, this file owns the marshal sink's inverse, and they share
-// exactly the frozen generated schema as their wire contract.
+// BuildCRDTDeltaEvent uses the same generated Cap'n Proto schema and wire
+// version as the receive path. The mesh signs and length-prefixes the returned
+// bytes; transport framing and delivery remain outside this package.
 package sync
 
 import (
@@ -38,37 +18,28 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// BuildCRDTDeltaEvent marshals a single (entityID, payload, CRDTEntry) triple
-// into the canonical capnp CRDTDeltaEvent wire that ApplyCRDTDeltaEvent
-// consumes. It is byte-faithful to the test-local
-// encodeEntryToCRDTDeltaEvent (crdt_capnp_roundtrip_test.go:156) whose
-// roundtrip the suite proves against ReconstructEntry — promoted so
-// the production gossip path produces the SAME wire the production apply path
-// decodes, with zero schema edit.
+// BuildCRDTDeltaEvent marshals an entity ID, payload, and CRDTEntry into a
+// CRDTDeltaEvent frame accepted by ApplyCRDTDeltaEvent.
 //
-// Field mapping onto CRDTDeltaEvent (the 12 contract fields + 1 version tag,
-// identical to the roundtrip builder):
+// The frame contains the version tag and all twelve CRDT contract fields:
 //
-//	version <- CRDTDeltaEventWireVersion (forward-compat tag, crdt_apply.go:67)
-//	payloadDigest <- entry.PayloadDigest ([32]byte -> Data)
-//	originNodeID <- entry.OriginNodeID ([16]byte -> Data)
-//	dotNodeID <- entry.DotNodeID ([16]byte -> Data)
-//	dotCounter <- entry.DotCounter (uint64 -> UInt64)
-//	h3Index <- entry.H3Index (uint64 -> UInt64)
-//	systemTime <- entry.SystemTime
+//	version        <- CRDTDeltaEventWireVersion (forward-compat tag)
+//	payloadDigest  <- entry.PayloadDigest  ([32]byte -> Data)
+//	originNodeID   <- entry.OriginNodeID   ([16]byte -> Data)
+//	dotNodeID      <- entry.DotNodeID      ([16]byte -> Data)
+//	dotCounter     <- entry.DotCounter     (uint64 -> UInt64)
+//	h3Index        <- entry.H3Index        (uint64 -> UInt64)
+//	systemTime     <- entry.SystemTime
 //	validTimeStart <- entry.ValidTimeStart
-//	validTimeEnd <- entry.ValidTimeEnd
-//	assertionTime <- entry.AssertionTime
-//	decisionTime <- entry.DecisionTime
-//	entityId <- entityID string (C6: NOT entityIDHash[:16])
-//	payload <- payload string (C6: bytes, NOT the digest)
+//	validTimeEnd   <- entry.ValidTimeEnd
+//	assertionTime  <- entry.AssertionTime
+//	decisionTime   <- entry.DecisionTime
+//	entityId       <- entityID string      (not entityIDHash[:16])
+//	payload        <- payload string       (bytes, not the digest)
 //
-// The receiver cross-validates PayloadDigest == SHA-256(payload) in
-// ReconstructEntry (crdt_reconstruct.go:346), so payload and PayloadDigest MUST
-// be consistent — the caller (pkg/mesh) constructs the entry via
-// InsertLocal's returned CRDTEntry, then passes the matching payload string
-// here. A mismatch is an HONEST DropVerify on the receive side, never a silent
-// accept.
+// The receiver requires PayloadDigest to equal SHA-256(payload), so callers
+// must pass the payload corresponding to entry.PayloadDigest. Inconsistent
+// input is rejected during reconstruction rather than joined.
 func BuildCRDTDeltaEvent(entityID, payload string, entry CRDTEntry) ([]byte, error) {
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
 	if err != nil {

@@ -4,55 +4,51 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Command mesh-bootstrap mints the FULL mesh-bootstrap for the
-// 100-node 3-region silicon gate: a dev CA, 100 per-node leaf certs, 100
-// unique Ed25519 signing identities (seed + derived nodeID + pubkey), the
-// shared 100-line --peer-dir config, and a manifest a deployment tool consumes
+// Command mesh-bootstrap mints the mesh-bootstrap artifacts for the
+// 100-node, 3-region convergence gate: a dev CA, 100 per-node leaf certs,
+// 100 unique Ed25519 signing identities (seed, derived nodeID, pubkey), the
+// shared 100-line --peer-dir config, and a manifest the orchestrator consumes
 // to scp each per-node bundle to its host.
 //
-// WHY THIS EXISTS — a real N-node mesh needs two things a quick harness tends
-// to stub out: a --peer-dir (so each receiver's Directory.Lookup resolves the
-// peer's pubkey — without it the deltas are DROPPED LOUD at the verify gate)
-// and a UNIQUE signing identity per node (a shared identity means every node
-// signs under ONE key — a single-identity "mesh" that is NOT N nodes). This
-// helper mints both, plus the CA and the per-node leaf certs, so a deployment
-// tool can launch a real mesh. ADR-0041 disclosed the gap as the
-// "inject-batch-CLI / peer-dir-bootstrap" work; this is that, built.
+// Without bootstrap configuration (peer-dir, CA and leaf certificates, and
+// distinct per-node identities), nodes cannot form an authenticated gossip mesh
+// (missing peer-dir causes directory lookup misses; a shared identity collapses
+// the mesh into a single identity). This helper generates the necessary mesh
+// wiring and per-node certificates required for multi-node deployments.
 //
-// THE DERIVATION (must match the binary EXACTLY):
+// Derivation (must match the binary):
 //
-//	seed_i = sha256("mesh-node-" + i) (32 bytes)
-//	nodeID_i = ed25519.NewKeyFromSeed(seed_i).Public()[:16] (16 bytes)
-//	pubkey_i = ed25519.NewKeyFromSeed(seed_i).Public() (32 bytes)
+//	seed_i    = sha256("mesh-node-" + i)                        (32 bytes)
+//	nodeID_i  = ed25519.NewKeyFromSeed(seed_i).Public()[:16]     (16 bytes)
+//	pubkey_i  = ed25519.NewKeyFromSeed(seed_i).Public()          (32 bytes)
 //
-// The binary's buildNodeIdentity (cmd/sovereign-node/main.go) derives
-// the SAME nodeID from --identity-seed + fatalf's if it != --node-id, so the
-// deployment MUST pass --identity-seed <seed_hex> AND --node-id <nodeID_hex>
-// (both from this manifest). The peer-dir line for node i is:
+// The binary's buildNodeIdentity derives the same nodeID from
+// --identity-seed and aborts if it differs from --node-id, so the
+// orchestrator must pass --identity-seed <seed_hex> and --node-id
+// <nodeID_hex> (both from this manifest). The peer-dir line for node i is:
 //
 //	<addr> <nodeID_hex> <pubkey_hex> - <region>
 //
 // where <addr> = <host_public_ip>:<mesh_port> (the mesh port = MESH_PORT_BASE +
-// the per-region LOCAL index; cross-region peers dial the public IP — the SG
+// the per-region local index; cross-region peers dial the public IP — the SG
 // opens the mesh port 0.0.0.0/0 for the run, tightened post-launch).
 //
-// USAGE (run LOCALLY on the operator's machine — it needs the Go crypto deps):
+// USAGE (run locally — it needs the Go crypto deps):
 //
 //	mesh-bootstrap -out-dir /tmp/mesh-bootstrap \
-//
-// -regions us-east-1=192.0.2.10,eu-west-1=198.51.100.20,ap-southeast-2=203.0.113.30 \
-// -split 34,33,33 -mesh-port-base 7373
+//	    -regions us-east-1=192.0.2.10,eu-west-1=192.0.2.20,ap-southeast-2=192.0.2.30 \
+//	    -split 34,33,33 -mesh-port-base 7373
 //
 // OUTPUTS (under -out-dir):
 //
-//	ca.pem — the shared trust anchor (every host gets this)
-//	peerdir — the 100-line --peer-dir config (every host gets this)
-//	manifest — one line per node: i region ip mesh_port seed_hex nodeID_hex cert key
-//	node-<i>/seed.hex — the --identity-seed value
-//	node-<i>/nodeid.hex — the --node-id value
-//	node-<i>/cert.pem — the --tls-cert value (certgen.go IssueLeafWithIP → WritePEM writes cert.pem)
-//	node-<i>/key.pem — the --tls-key value (WritePEM writes key.pem)
-//	node-<i>/meta — i region ip mesh_port (the deployment tool's scp + launch key)
+//	ca.pem                 — the shared trust anchor (every host gets this)
+//	peerdir                — the 100-line --peer-dir config (every host gets this)
+//	manifest               — one line per node: i region ip mesh_port seed_hex nodeID_hex cert key
+//	node-<i>/seed.hex      — the --identity-seed value
+//	node-<i>/nodeid.hex    — the --node-id value
+//	node-<i>/cert.pem     — the --tls-cert value (certgen.go IssueLeafWithIP → WritePEM writes cert.pem)
+//	node-<i>/key.pem      — the --tls-key value (WritePEM writes key.pem)
+//	node-<i>/meta          — i region ip mesh_port (the orchestrator's scp + launch key)
 package main
 
 import (
@@ -73,9 +69,18 @@ import (
 func main() {
 	outDir := flag.String("out-dir", "", "output directory (required)")
 	regionsCSV := flag.String("regions", "", "region=ip,region=ip,region=ip (required, in NODES_CSV order)")
-	splitCSV := flag.String("split", "34,33,33", "per-region node counts (must sum to -require-n for the silicon run; a local smoke test passes e.g. 1,1,1 with -require-n 3)")
+	splitCSV := flag.String("split", "34,33,33", "per-region node counts (must sum to -require-n for a multi-node cluster run; a local smoke test passes e.g. 1,1,1 with -require-n 3)")
 	meshPortBase := flag.Int("mesh-port-base", 7373, "the mesh port base; node i binds mesh-port-base + (per-region local index)")
-	requireN := flag.Int("require-n", 100, "the total node count the split MUST sum to (100 for the silicon gate; 3 for a local smoke test)")
+	requireN := flag.Int("require-n", 100, "total node count the split must sum to (100 for a full cluster run; 3 for a local smoke test)")
+	// The -region-ips flag carries the per-region instance IPs:
+	// region=ip1,ip2,... (comma-separated). When set, a region's nodes fill
+	// its instances sequentially (instance j takes the next quota_j nodes;
+	// quota = the split share spread as evenly as arithmetically possible)
+	// and the manifest and port indexes are per-instance (node k of instance j
+	// binds base+k, so every port range fits the fleet SG's 34-wide windows).
+	// Unset = the one-ip-per-region shape (the manifest's ip = the region's
+	// single ip and the port index = the per-region local index).
+	regionIPsCSV := flag.String("region-ips", "", "the 30-instance placement: region=ip1,ip2,... per region; unset = the one-ip-per-region shape")
 	flag.Parse()
 
 	if *outDir == "" || *regionsCSV == "" {
@@ -117,6 +122,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mesh-bootstrap: split sums to %d, want %d (-require-n)\n", total, *requireN)
 		os.Exit(2)
 	}
+	// Parse -region-ips (unset => empty => the one-ip-per-region shape).
+	regionIPs := make([][]string, len(regions))
+	if *regionIPsCSV != "" {
+		for _, pair := range strings.Split(*regionIPsCSV, ",") {
+			kv := strings.SplitN(pair, "=", 2)
+			if len(kv) != 2 {
+				fmt.Fprintf(os.Stderr, "mesh-bootstrap: bad -region-ips pair %q (want region=ip1:ip2|ip1,ip2...)\n", pair)
+				os.Exit(2)
+			}
+			for ri, r := range regions {
+				if r.name == kv[0] {
+					regionIPs[ri] = strings.Split(kv[1], ":")
+					break
+				}
+			}
+		}
+		for ri, r := range regions {
+			if len(regionIPs[ri]) == 0 {
+				fmt.Fprintf(os.Stderr, "mesh-bootstrap: -region-ips missing region %q\n", r.name)
+				os.Exit(2)
+			}
+		}
+	}
 
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mesh-bootstrap: mkdir out-dir: %v\n", err)
@@ -137,12 +165,12 @@ func main() {
 	// WriteCAPEM writes ca.pem inside outDir; the returned path is the full path.
 	_ = caPath
 
-	// ── 1b. Mint ONE client leaf (signed by the SAME CA) for the gate client. ──
-	// The gate client (cmd/convergence-gate) presents this leaf to each node's mTLS
+	// ── 1b. Mint a client leaf (signed by the same CA) for the gate client. ──
+	// The gate client presents this leaf to each node's mTLS
 	// control port (--control-addr, RequireAndVerifyClientCert). The client CN
 	// is distinct from every node CN (the "client" suffix) so the per-node
-	// nodeID-dedup in parsePeerDir is irrelevant (the client is NOT a peer; it
-	// is an SDK consumer of the control port). One client leaf dials ALL 100
+	// nodeID-dedup in parsePeerDir is irrelevant (the client is not a peer; it
+	// is an SDK consumer of the control port). One client leaf dials all 100
 	// nodes (the CA is the trust anchor; the client cert is the credential).
 	clientDir := filepath.Join(*outDir, "client")
 	if err := os.MkdirAll(clientDir, 0o755); err != nil {
@@ -161,13 +189,39 @@ func main() {
 
 	// ── 2. Derive the 100 identities + mint 100 leafs, building the peer-dir. ─
 	// Global node index → (region, per-region local index) via the split, the
-	// SAME mapping the deployment tooling must reproduce.
+	// same mapping the orchestrator's node_region() uses.
 	var peerDirLines []string
 	var manifestLines []string
 	var allAddrs []string // every node's mesh addr; each node's --peers = allAddrs minus its own
 	globalIdx := 0
 	for ridx, r := range regions {
 		for localIdx := 0; localIdx < split[ridx]; localIdx++ {
+			// The 30-instance placement — (nodeIP, portIdx) per node. Unset
+			// -region-ips => the one-ip-per-region shape (the region's single
+			// ip, the per-region port index), byte-identical.
+			nodeIP := r.ip
+			portIdx := localIdx
+			if len(regionIPs[ridx]) > 0 {
+				nips := len(regionIPs[ridx])
+				quota, rem := split[ridx]/nips, split[ridx]%nips
+				filled, j := 0, 0
+				for j < nips {
+					qj := quota
+					if j < rem {
+						qj++
+					}
+					if localIdx < filled+qj {
+						break
+					}
+					filled += qj
+					j++
+				}
+				if j >= nips {
+					j = nips - 1
+				}
+				nodeIP = regionIPs[ridx][j]
+				portIdx = localIdx - filled
+			}
 			// Deterministic per-node seed: sha256("mesh-node-<globalIdx>").
 			seed := sha256.Sum256([]byte("mesh-node-" + strconv.Itoa(globalIdx)))
 			ident, err := mesh.NewNodeIdentity(seed[:])
@@ -182,20 +236,20 @@ func main() {
 			// Mint the leaf cert (CN = nodeID hex; the handshake identifies the
 			// node by the leaf CN; --peer-auto-reconcile hex-decodes the CN). The
 			// leaf carries the host's IP in its IPAddresses SAN (IssueLeafWithIP)
-			// so the peer dial — which uses the peer addr's HOST as the TLS
-			// ServerName (the dial loop's splitHostPort) — verifies against the IP
-			// SAN, NOT a DNSName (the default IssueLeaf has IPAddresses=nil; that
-			// works ONLY for localhost-loopback dials, where ServerName=localhost
-			// matches the leaf's "localhost" DNSName). For silicon the peers dial
-			// the PUBLIC IP → the leaf MUST carry it. A nil/empty IP (parse fail)
-			// falls back to DNSNames-only — logged but NOT fatal (a localhost
-			// smoke test passes 127.0.0.1, which parses; a malformed IP is a
-			// deploy error the boot handshake surfaces as "no IP SAN").
+			// so the peer dial — which uses the peer addr's host as the TLS
+			// ServerName (splitHostPort) — verifies against the IP SAN, not a
+			// DNSName (the default IssueLeaf has IPAddresses=nil; that works only
+			// for localhost-loopback dials, where ServerName=localhost matches
+			// the leaf's "localhost" DNSName). For the convergence gate the peers
+			// dial the public IP, so the leaf must carry it. A nil or empty IP
+			// (parse failure) falls back to DNSNames-only — logged but not fatal
+			// (a localhost smoke test passes 127.0.0.1, which parses; a malformed
+			// IP is a deploy error the boot handshake surfaces as "no IP SAN").
 			var leafIPs []net.IP
-			if pip := net.ParseIP(r.ip); pip != nil {
+			if pip := net.ParseIP(nodeIP); pip != nil {
 				leafIPs = []net.IP{pip}
 			} else {
-				fmt.Fprintf(os.Stderr, "mesh-bootstrap: WARN: region %q ip %q is not a parseable IP — leaf minted DNSNames-only (peer dial by this addr's host will FAIL the TLS hostname check)\n", r.name, r.ip)
+				fmt.Fprintf(os.Stderr, "mesh-bootstrap: warn: region %q ip %q is not a parseable IP — leaf minted DNSNames-only (peer dial by this address host will fail the TLS hostname check)\n", r.name, nodeIP)
 			}
 			leaf, err := ca.IssueLeafWithIP(nodeIDHex, leafIPs)
 			if err != nil {
@@ -222,29 +276,29 @@ func main() {
 				fmt.Fprintf(os.Stderr, "mesh-bootstrap: write nodeid: %v\n", err)
 				os.Exit(1)
 			}
-			// meta: the deployment tool's scp + launch key (which node, which host, which port).
-			meta := fmt.Sprintf("%d %s %s %d\n", globalIdx, r.name, r.ip, *meshPortBase+localIdx)
+			// meta: the orchestrator's scp + launch key (which node, which host, which port).
+			meta := fmt.Sprintf("%d %s %s %d\n", globalIdx, r.name, nodeIP, *meshPortBase+portIdx)
 			if err := os.WriteFile(filepath.Join(nodeDir, "meta"), []byte(meta), 0o644); err != nil {
 				fmt.Fprintf(os.Stderr, "mesh-bootstrap: write meta: %v\n", err)
 				os.Exit(1)
 			}
 
 			// peer-dir line: <addr> <nodeID_hex> <pubkey_hex> - <region>
-			// addr = host public IP: mesh port (cross-region dial via public IP;
+			// addr = host public IP : mesh port (cross-region dial via public IP;
 			// the SG opens the mesh port for the run).
-			addr := fmt.Sprintf("%s:%d", r.ip, *meshPortBase+localIdx)
+			addr := fmt.Sprintf("%s:%d", nodeIP, *meshPortBase+portIdx)
 			allAddrs = append(allAddrs, addr)
-			// The peer-dir region column is a uint8 region TAG (0-255), NOT a
-			// region NAME — the binary's parsePeerDir ParseUint's it into a
-			// mesh.RegionTag (provisioning.go: a name like "us-east-1" is
-			// "invalid syntax" → boot fatalf). r.name is for the manifest (human
-			// reading); the peer-dir carries the INDEX (0/1/2 = the --self-region
-			// tag space, 0=RegionUnset=intra default; we use 1/2/3 to leave 0 as
+			// The peer-dir region column is a uint8 region tag (0-255), not a
+			// region name — the binary's parsePeerDir parses it into a
+			// mesh.RegionTag (a name like "us-east-1" is "invalid syntax" and
+			// causes a boot fatalf). r.name is for the manifest (human reading);
+			// the peer-dir carries the index (0/1/2 = the --self-region tag
+			// space, 0=RegionUnset=intra default; we use 1/2/3 to leave 0 as
 			// the explicit-Unset sentinel the engine reserves).
 			regionTag := ridx + 1
 			peerDirLines = append(peerDirLines, fmt.Sprintf("%s %s %s - %d", addr, nodeIDHex, pubkeyHex, regionTag))
 			manifestLines = append(manifestLines, fmt.Sprintf("%d %s %s %d %s %s %s %s",
-				globalIdx, r.name, r.ip, *meshPortBase+localIdx, seedHex, nodeIDHex,
+				globalIdx, r.name, nodeIP, *meshPortBase+portIdx, seedHex, nodeIDHex,
 				filepath.Join(filepath.Base(nodeDir), "cert.pem"),
 				filepath.Join(filepath.Base(nodeDir), "key.pem")))
 			globalIdx++
@@ -265,14 +319,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── 3b. Write each node's --peers list (all OTHER nodes' mesh addrs). ──
-	// The binary's dial loop keys off --peers (the dial list); --peer-dir
-	// only REGISTERS the peer's verification identity (the anchor). The
-	// boot WARNS "peer X in --peer-dir but NOT in --peers — never dialed — a
-	// silent one-way partition" if a peer-dir peer is missing from --peers. So
-	// a node MUST pass BOTH: --peer-dir (the shared config) AND --peers (every
-	// OTHER node's addr, comma-joined). Each node's peers.txt is allAddrs minus
-	// its OWN addr (a node does not dial itself).
+	// ── 3b. Write each node's --peers list (all other nodes' mesh addrs). ──
+	// The binary's dial loop keys off --peers; --peer-dir only registers the
+	// peer's verification identity. The boot warns "peer X in --peer-dir but
+	// not in --peers — never dialed — a silent one-way partition" if a peer-dir
+	// peer is missing from --peers. So a node must pass both: --peer-dir (the
+	// shared config) and --peers (every other node's addr, comma-joined). Each
+	// node's peers.txt is allAddrs minus its own addr (a node does not dial
+	// itself).
 	for i := range allAddrs {
 		var others []string
 		for j, a := range allAddrs {
@@ -288,25 +342,24 @@ func main() {
 		}
 	}
 
-	// ── 4. Self-verify: re-derive nodeID from a random seed file + confirm the ─
-	// peer-dir has 100 lines + every nodeID is unique (the FAILSAFE the ─
-	// binary's parsePeerDir enforces; a duplicate nodeID fatalf's the boot). ─
+	// ── 4. Self-verify: verify each peer-dir entry and reject duplicate nodeIDs
+	// before exit (matching parsePeerDir startup validation).
 	seen := make(map[string]bool)
 	for _, l := range peerDirLines {
 		fields := strings.Fields(l)
 		if len(fields) < 3 {
-			fmt.Fprintf(os.Stderr, "mesh-bootstrap: INTERNAL: bad peer-dir line %q\n", l)
+			fmt.Fprintf(os.Stderr, "mesh-bootstrap: internal: bad peer-dir line %q\n", l)
 			os.Exit(1)
 		}
 		if seen[fields[1]] {
-			fmt.Fprintf(os.Stderr, "mesh-bootstrap: INTERNAL: duplicate nodeID %s (the boot would fatalf)\n", fields[1])
+			fmt.Fprintf(os.Stderr, "mesh-bootstrap: internal: duplicate nodeID %s\n", fields[1])
 			os.Exit(1)
 		}
 		seen[fields[1]] = true
 	}
 
 	fmt.Printf("mesh-bootstrap: OK — %d nodes, CA + peer-dir + manifest + per-node bundles written to %s\n", globalIdx, *outDir)
-	fmt.Printf(" regions: %s\n", *regionsCSV)
-	fmt.Printf(" split: %s (sum=%d)\n", *splitCSV, total)
-	fmt.Printf(" outputs: ca.pem, peerdir (%d lines), manifest, node-<i>/{seed.hex,nodeid.hex,cert.pem,key.pem,meta}\n", len(peerDirLines))
+	fmt.Printf("  regions: %s\n", *regionsCSV)
+	fmt.Printf("  split:   %s (sum=%d)\n", *splitCSV, total)
+	fmt.Printf("  outputs: ca.pem, peerdir (%d lines), manifest, node-<i>/{seed.hex,nodeid.hex,cert.pem,key.pem,meta}\n", len(peerDirLines))
 }

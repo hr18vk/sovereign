@@ -6,34 +6,20 @@
 
 package mesh
 
-// query_test.go — READ-half guards (/v1/query over Resolver.AsOf). The durability tier
-// is round-trip-closed: write → checkpoint → query, AND write → checkpoint →
-// crash → bounded-recover → query-the-history.
+// These tests cover /v1/query over Resolver.AsOf and LocalFS, including writes,
+// checkpoints, crash recovery, concurrent reads, and a disabled query tier.
 //
-// The byte-identity invariant (verified before writing T1): the WRITE key prefix and
-// the READ key prefix are byte-identical.
-//   WRITE (memtable.go:144): h := sha256.Sum256(entityIDBytes); key[0:16] = h[:16].
-//   WRITE dir  (l0_flusher.go:224): hex(firstKey[:8])            — firstKey[:8] = h[:8]
-//                                    of the SMALLEST-hash entity in the SkipList.
-//   WRITE col0 (l0_flusher.go:147): entityHashBuilder.Append(entityHash)  — entityHash = key[0:16] = h[:16].
-//   READ hash  (query.go:119):       fullHash := sha256.Sum256(entityIDBytes); hashPrefix = fullHash[:16].
-//   READ dir   (query.go:125):       hex(hashPrefix[:8])         — hashPrefix[:8] = fullHash[:8] of the QUERIED entity.
-//   READ col0  (query.go:346):       bytes.Equal(rowHash, hashPrefix[:])  — hashPrefix = fullHash[:16].
-// For a SINGLE entity the smallest-hash entity IS that entity, so WRITE
-// `hex(sha256(eid)[:8])` == READ `hex(sha256(eid)[:8])` and the col0 16-byte hash
-// matches too — the round-trip closes. (Multi-entity flush files are keyed by
-// the smallest-hash entity; a per-entity query would not find them. That is a
-// pre-existing WRITE-path behavior; is READ-only. The guards use a
-// single entity so the round-trip closes; the residual is disclosed in ADR-0017.)
+// Memtable keys begin with sha256(entityID)[:16]. The L0 flusher stores that
+// prefix in column 0 and names the directory hex(firstKey[:8]); Resolver derives
+// the same values from the queried entity ID. For a single-entity flush, the
+// directory and column-0 hashes therefore match on the write and read paths.
+// Multi-entity flush files instead use the smallest entity hash for the directory;
+// that remaining lookup limitation is documented in ADR-0017, so these round
+// trips use one entity per harness.
 //
-// The guards PROVE that byte-identity by retrieving the persisted event. AsOf is
-// the READ half; the pre-fix RED was "no /v1/query route (404) AND no
-// Resolver-over-LocalFS E2E (the AsOf surface was unit-isolated to
-// internal/database with a mock S3 — wiring LocalFS as the real S3 is the new
-// seam)" (ADR-0017). The RED-control sub-stages cut the index-WRITE (enableIndex=
-// false) to make the failure observable WITHOUT needing to run the guard on the
-// pre-fix binary: with the Arrow index unwritten, AsOf returns ErrEntityNotFound
-// (no l0 files) — the honest signature that the Round-Trip needs the write half.
+// Disabling the Arrow index is the negative control. The recovery image is still
+// written, but with no l0 files AsOf returns ErrEntityNotFound and the handler
+// returns 404. The enabled case must return the persisted timestamp and digest.
 
 import (
 	"context"
@@ -56,63 +42,46 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// queryTestNodeID is a distinct 16-byte nodeID for the harness (kept
-// separate from the control tests' test503NodeID so a value collision in one
-// family never masks the other's root cause).
+// queryTestNodeID is a distinct 16-byte nodeID for the harness (kept separate
+// from the control tests' test503NodeID so a value collision in one family
+// never masks the other's root cause).
 var queryTestNodeID = [16]byte{0x12, 0x12, 0x0c, 0x0c, 0x00, 0xaa, 0xbb, 0xcc}
 
 // queryTestArenaSize matches pkg/sync + pkg/durability test convention (64 MiB).
 const queryTestArenaSize uintptr = 64 * 1024 * 1024
 
-// queryValidEndNs is a CONCRETE far-future ns sentinel that fits int64 (<
-// math.MaxInt64 ≈ 9.22e18) and exceeds every SystemTime these guards use (baseT
-// ≈ 1.7e18 + small offsets). It is the VALID-TIME-range OPEN END for queryTestEntry
-// so AsOf's Filter3 (validStart <= validTime < validEnd) accepts any validTime
-// >= SystemTime, reducing the tri-temporal dominance to "latest SystemTime <=
-// transactionTime" — the cleanest pin for the round-trip guards.
+// queryValidEndNs is an int64-safe open-end sentinel for these tests. It exceeds
+// every SystemTime used here, so AsOf's valid-time filter accepts the entry and
+// dominance selects the latest SystemTime at or before the transaction time.
 //
-// It DELIBERATELY does NOT use database.MaxValidTime.UnixNano (l0_flusher.go:20
-// — the documented "open-ended (year 9999)" sentinel). That var's UnixNano
-// OVERFLOWS int64: year-9999 is ~2.5e26 ns from epoch, beyond int64's 9.2e18
-// ceiling, so it wraps to -4,852,116,232,933,722,624 — a HUGE NEGATIVE. A row with
-// validEnd = that negative would fail Filter3's `validTimeNs >= validEnd` for
-// EVERY positive validTime → the entity becomes UNQUERYABLE. No production code
-// calls .UnixNano on MaxValidTime (verified: only the var's own definition
-// references it), so the read tier is NOT broken in prod; the overflow is a
-// latent WRITE-PATH-var landmine disclosed in ADR-0017 §6 (out of's
-// READ-only scope to fix). The guards sidestep it with this int64-safe sentinel.
+// database.MaxValidTime.UnixNano() cannot serve as this sentinel: year 9999 is
+// outside time.UnixNano's int64 range and wraps to a negative value. Such an end
+// would make the valid-time interval empty for the timestamps used in these
+// tests. ADR-0017 §3 records that limitation; production code does not call
+// UnixNano on MaxValidTime.
 const queryValidEndNs int64 = 9_000_000_000_000_000_000 // year ~2253; > baseT, < MaxInt64.
 
-// queryTestEntry builds a CRDTEntry with a KNOWN SystemTime and an OPEN-ENDED
-// valid-time range [SystemTime, queryValidEndNs). See queryValidEndNs for why
-// a concrete sentinel (NOT database.MaxValidTime.UnixNano, which overflows).
-// The shared helper stagedEntry leaves ValidTimeStart/End ZERO, which
-// makes AsOf's valid-time predicate (validStart <= v < validEnd) an EMPTY range
-// that never matches — fine for the recovery guards (they check MerkleRoot, not
-// the Arrow READ), but fatal here. sets its own range (this helper).
+// queryTestEntry gives an entry the valid-time range
+// [systemTime, queryValidEndNs). The shared stagedEntry helper leaves both
+// bounds zero, which is suitable for Merkle-root recovery tests but produces an
+// empty interval that AsOf cannot return.
 func queryTestEntry(systemTime int64) eng.CRDTEntry {
 	return eng.CRDTEntry{
 		SystemTime:     systemTime,
 		ValidTimeStart: systemTime,
-		ValidTimeEnd:   queryValidEndNs, // open-ended (int64-safe sentinel; NOT MaxValidTime.UnixNano — overflows)
+		ValidTimeEnd:   queryValidEndNs, // open-ended (int64-safe sentinel; not MaxValidTime.UnixNano — overflows)
 		AssertionTime:  systemTime,
 	}
 }
 
-// queryDigest returns the PayloadDigest bridge.PutLocal stamps (bridge.go:182
-// sha256(payload)) — the HONEST digest SnapshotToLSM emits into the Arrow row
-// with a SENTRY body (snapshot.go:445), and AsOf echoes verbatim. T1 asserts it
-// (NOT a fabricated payload value — the "digest-is-not-value" guard).
+// queryDigest computes the digest Bridge.PutLocal stores in the Arrow row.
+// AsOf returns this digest while the row's payload body remains SENTRY.
 func queryDigest(payload string) [32]byte { return sha256.Sum256([]byte(payload)) }
 
-// queryHarness builds a live Bridge bound to a fresh WAL over t.TempDir, a
-// LocalFS snapshot store over its own t.TempDir root, and — when enableIndex
-// — SetSnapshotter(lfs, true) so AppendCheckpoint writes the dot-bearing
-// recovery image + the Arrow query index (the seam). It mirrors
-// durability.newLiveBridge (eng.DataDir isolation — the frozen-ctor hazard) +
-// control_test.go's harness. t.Cleanup closes the live engine + WAL (the tests
-// that CRASH close them first; double-Close is the existing snapshot-test
-// pattern and is safe). Returns the lfs for the Resolver + recovery to share.
+// queryHarness builds a Bridge over a fresh WAL and a LocalFS snapshot store.
+// With enableIndex, AppendCheckpoint writes both the dot-bearing recovery image
+// and the l0 Arrow query index. Cleanup closes the engine and WAL; tests that
+// simulate a crash close them first, and their repeated Close calls are safe.
 func queryHarness(t *testing.T, enableIndex bool) (bridge *durability.Bridge, lfs *durability.LocalFS, walPath string) {
 	t.Helper()
 	eng.DataDir = t.TempDir()
@@ -135,14 +104,14 @@ func queryHarness(t *testing.T, enableIndex bool) (bridge *durability.Bridge, lf
 		t.Fatalf("NewLocalFS: %v", err)
 	}
 
-	bridge = durability.NewBridge(engine, wal, 0) // 0 = caller-driven checkpoints (the guards call AppendCheckpoint)
+	bridge = durability.NewBridge(engine, wal, 0) // 0 = caller-driven checkpoints; the test calls AppendCheckpoint
 	if enableIndex {
 		bridge.SetSnapshotter(lfs, true) // recovery image + Arrow query index
 	}
 	return bridge, lfs, walPath
 }
 
-// newQueryResolver constructs the Resolver over the SAME lfs the snapshotter
+// newQueryResolver constructs the Resolver over the same lfs the snapshotter
 // writes l0/*.arrow to (S3Lister + S3Downloader both backed by LocalFS; bucket
 // ignored by LocalFS — "local" is cosmetic). Mirrors cmd/sovereign-node's
 // construction. queryAlloc is the off-heap read-buffer allocator; it is a
@@ -174,27 +143,16 @@ func queryGet(t *testing.T, srv *httptest.Server, key string, validTime, txTime 
 }
 
 // queryNanosInRFC3339Nano round-trip-checks a ns timestamp can be formatted +
-// re-parsed to the same ns (the handler's parseQueryTime path). Used to STAMP
+// re-parsed to the same ns (the handler's parseQueryTime path). Used to stamp
 // the open-ended valid queries so the txTime the handler reconstructs is the
 // exact ns the guard asserts against.
 func queryNanosInRFC3339Nano(ns int64) time.Time { return time.Unix(0, ns).UTC() }
 
-// ────────────────────────────────────────────────────────────────────────
-// T1 — the headline. write → checkpoint → query persists SystemTime + digest.
-// ────────────────────────────────────────────────────────────────────────
-
-// TestQuery_RoundTrip_WritesThenQueriesPersistedHistory is T1. A
-// single-entity PutLocal + AppendCheckpoint writes l0/{sha256(eid)[:8]}/{T}.arrow
-// with the REAL digest + a SENTRY body; a Resolver over the same lfs returns
-// the persisted TriTemporalEvent — SystemTime + PayloadDigest verbatim. The guard
-// ALSO drives the /v1/query handler (the wired surface, not just the Resolver
-// seam) so the headline (the surface) is the proof, not a unit green.
-//
-// RED-control sub-stage: enableIndex=false → AppendCheckpoint writes the recovery
-// image ONLY (no l0/*.arrow) → AsOf returns ErrEntityNotFound → the handler
-// returns 404 (the persistent "not found" sentinel). This is the honest A/B
-// toggle: the 200 path needs the index-WRITE; cutting it makes AsOf
-// observable-fail (not a constructed green for the READ wire).
+// TestQuery_RoundTrip_WritesThenQueriesPersistedHistory writes one entity,
+// checkpoints it, and retrieves it through both Resolver.AsOf and /v1/query.
+// SystemTime and PayloadDigest must match the write. With enableIndex=false, the
+// same write produces only a recovery image; AsOf must return ErrEntityNotFound
+// and the HTTP handler must return 404.
 func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 	const alpha = "alpha"
 	const payload = "alpha-payload"
@@ -205,7 +163,7 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 	wantDigest := queryDigest(payload)
 
 	// ── Positive control: the index is written; AsOf retrieves the persisted event ──
-	t.Run("GREEN_bitemporal_roundtrip", func(t *testing.T) {
+	t.Run("bitemporal_roundtrip", func(t *testing.T) {
 		bridge, lfs, _ := queryHarness(t, true) // enableIndex=true → l0/*.arrow written
 		if _, err := bridge.PutLocal(alpha, payload, queryTestEntry(T_alpha)); err != nil {
 			t.Fatalf("PutLocal: %v", err)
@@ -228,8 +186,8 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 		}
 		assertPersistedEvent(t, got, alpha, T_alpha, wantDigest)
 
-		// (2) The /v1/query SURFACE ('s headline). One AsOf + one JSON
-		// encode (mirror /v1/get's discipline), reading the PERSISTED index.
+		// (2) The /v1/query surface (the headline). One AsOf + one JSON encode
+		// (mirror /v1/get's discipline), reading the persisted index.
 		if got.EntityID != alpha {
 			t.Fatalf("AsOf EntityID = %q, want %q", got.EntityID, alpha)
 		}
@@ -257,24 +215,21 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 			t.Fatalf("query system_time_ns = %d, want %d (the WRITE's SystemTime, retrieved verbatim)", qr.SystemTimeNs, T_alpha)
 		}
 		if qr.PayloadDigestHex != hex.EncodeToString(wantDigest[:]) {
-			t.Fatalf("query payload_digest_hex = %q, want %q (the WRITE's real digest, echoed verbatim — NOT recomputed)",
+			t.Fatalf("query payload_digest_hex = %q, want %q (the WRITE's real digest, echoed verbatim, not recomputed)",
 				qr.PayloadDigestHex, hex.EncodeToString(wantDigest[:]))
 		}
-		// guard: the body carries NO payload field (the index has a SENTRY
-		// body, so a payload field would be the fabrication).
+		// The index stores a SENTRY body, so the response contains the digest
+		// but cannot contain the original payload.
 		if hasPayloadField(body) {
-			t.Fatalf("queryResponse must NOT carry a payload field (the index stores a SENTRY body; reporting one is fabrication): %s", body)
+			t.Fatalf("queryResponse contains a payload field despite the SENTRY-bodied index: %s", body)
 		}
 	})
 
-	// ── negative control: cut the index-WRITE → AsOf returns ErrEntityNotFound ──
-	// (pre-fix RED, by code-reading: at HEAD no /v1/query route → 404. This RED
-	// control makes the SAME observable AFTER the fix by cutting the write half:
-	// the recovery image is written but the l0/*.arrow index is NOT, so AsOf
-	// finds no keys → ErrEntityNotFound. Proves the 200 is not a constructed
-	// green for the read wire — it depends on the index-WRITE.)
-	t.Run("RED_no_index_written_returns_404", func(t *testing.T) {
-		bridge, lfs, _ := queryHarness(t, false) // enableIndex=false → recovery image only, NO l0/*.arrow
+	// Without the Arrow index, AsOf has no l0 objects to read and must return
+	// ErrEntityNotFound. This distinguishes the index's contribution from the
+	// recovery image, which is still written in this subtest.
+	t.Run("no_index_written_returns_404", func(t *testing.T) {
+		bridge, lfs, _ := queryHarness(t, false) // enableIndex=false → recovery image only, no l0/*.arrow
 		if _, err := bridge.PutLocal(alpha, payload, queryTestEntry(T_alpha)); err != nil {
 			t.Fatalf("PutLocal: %v", err)
 		}
@@ -284,7 +239,7 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 
 		resolver := newQueryResolver(lfs)
 
-		// The Resolver seam: no l0 files → ErrEntityNotFound (NOT a prefix
+		// The Resolver seam: no l0 files means ErrEntityNotFound (not a prefix
 		// mismatch — the keys are byte-identical; the index was simply never
 		// written).
 		_, err := resolver.AsOf(
@@ -293,13 +248,13 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 			queryNanosInRFC3339Nano(T_alpha+1),
 		)
 		if err == nil {
-			t.Fatalf("AsOf returned nil error with the Arrow index UNWRITTEN — want ErrEntityNotFound (the honest round-trip failure)")
+			t.Fatalf("AsOf returned nil error with the Arrow index unwritten — want ErrEntityNotFound (the round-trip failure)")
 		}
 		if !isErrEntityNotFound(err) {
 			t.Fatalf("AsOf err = %v, want a wrap of database.ErrEntityNotFound (no l0 files when the index is off)", err)
 		}
 
-		// The surface: ErrEntityNotFound → handler returns the honest 404 body.
+		// The surface: ErrEntityNotFound maps to the 404 body.
 		cs := NewControlServer(nil, queryTestNodeID, nil, nil)
 		cs.SetResolver(resolver)
 		srv := httptest.NewServer(cs.Handler())
@@ -319,42 +274,33 @@ func TestQuery_RoundTrip_WritesThenQueriesPersistedHistory(t *testing.T) {
 	})
 }
 
-// assertPersistedEvent checks the AsOf-returned event round-trips the WRITE's
-// SystemTime + PayloadDigest verbatim (the SystemTime InsertLocal PRESERVES —
-// crdt.go:949-951 override ONLY the dot fields; SnapshotToLSM reads it back into
-// the Arrow row; AsOf echoes it). Payload body is a SENTRY (nil) — we assert the
-// DIGEST, not a payload value (the honesty guard).
+// assertPersistedEvent checks that AsOf preserves the written SystemTime and
+// PayloadDigest. InsertLocal changes only dot fields; SnapshotToLSM persists the
+// remaining entry fields. The Arrow payload body is SENTRY, so the digest is the
+// available payload identity (ADR-0011 §5, §9).
 func assertPersistedEvent(t *testing.T, got *database.TriTemporalEvent, wantEntityID string, wantSystemTime int64, wantDigest [32]byte) {
 	t.Helper()
 	if got == nil {
-		t.Fatalf("AsOf returned nil event — want the persisted event (ErrEntityNotFound would have been a key-prefix mismatch; the index is byte-identical, so this is a real miss)")
+		t.Fatalf("AsOf returned a nil event, want the persisted event")
 	}
 	if got.EntityID != wantEntityID {
 		t.Fatalf("AsOf EntityID = %q, want %q", got.EntityID, wantEntityID)
 	}
 	if got.SystemTime != wantSystemTime {
-		t.Fatalf("AsOf SystemTime = %d, want %d (round-trip: write → checkpoint → query → persisted SystemTime retrieved verbatim)",
+		t.Fatalf("AsOf SystemTime = %d, want the persisted value %d",
 			got.SystemTime, wantSystemTime)
 	}
 	if got.PayloadDigest != wantDigest {
-		t.Fatalf("AsOf PayloadDigest = %x, want %x (the WRITE's real sha256(payload); HONEST digest, NOT recomputed)",
+		t.Fatalf("AsOf PayloadDigest = %x, want sha256(payload) = %x",
 			got.PayloadDigest, wantDigest)
 	}
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// T2 — crash → bounded-recover → query-the-history (round-trip across a crash).
-// ────────────────────────────────────────────────────────────────────────
-
-// TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash is T2.
-// PutLocal(alpha@T1) + AppendCheckpoint (→ ckpt image #1 + l0 arrow #1); PutLocal
-// (alpha@T2) + AppendCheckpoint (→ ckpt image #2 + l0 arrow #2); CRASH
-// (WAL+engine Close). RecoverEngineWithSnapshot loads the latest dot-bearing
-// image + replays only the post-checkpoint tail (witness.Bounded); a Resolver
-// over the SAME lfs then returns the persisted event @ T2 (the l0/*.arrow files
-// survived the crash on disk — they are a QUERY tier, independent of the
-// recovered HAMT). Plus the L0 file list shows BOTH T1 and T2 files (the
-// unbounded-growth residue — one fresh file per checkpoint, no merge).
+// TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash checkpoints two
+// versions of one entity, closes the engine and WAL, and recovers from the latest
+// dot-bearing image plus the post-checkpoint WAL tail. The two Arrow files remain
+// on disk independently of the recovered HAMT. Queries at each transaction-time
+// horizon must return the corresponding SystemTime and digest.
 func TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash(t *testing.T) {
 	const alpha = "alpha"
 	const p1, p2 = "alpha@T1", "alpha@T2"
@@ -395,15 +341,14 @@ func TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash(t *testing.T) 
 	t.Cleanup(func() { _ = recEngine.Close() })
 	t.Cleanup(func() { _ = recWAL.Close() })
 
-	// (a) the bounded path loaded the snapshot (NOT full replay).
+	// Bounded recovery must load the latest dot-bearing image rather than
+	// replaying the entire WAL.
 	if !witness.Bounded {
-		t.Fatalf("witness.Bounded=false, want true (the latest dot-bearing image should load; full replay would not bound the tail)")
+		t.Fatalf("witness.Bounded=false, want true after loading the latest dot-bearing image")
 	}
 
-	// (b) the post-recover AsOf returns the persisted event @ T2 (history
-	// survives the crash + the bound — the durability tier is round-trip-closed
-	// across a crash). validTime/txTime = "now"-ish (>= T2) lands in the latest
-	// open-ended range; dominance picks max SystemTime = T2.
+	// A query at T2's valid and transaction times must select the later event
+	// from the Arrow files that survived the engine and WAL close.
 	resolver := newQueryResolver(lfs)
 	got, err := resolver.AsOf(
 		context.Background(), alpha,
@@ -411,19 +356,17 @@ func TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash(t *testing.T) 
 		queryNanosInRFC3339Nano(T2+1),
 	)
 	if err != nil {
-		t.Fatalf("post-recover AsOf: %v (the l0/*.arrow files survived the crash; a miss would mean the WRITE→READ key-prefix diverged — Law II)", err)
+		t.Fatalf("post-recovery AsOf at T2: %v", err)
 	}
 	if got.SystemTime != T2 {
-		t.Fatalf("post-recover AsOf SystemTime = %d, want %d (the persisted event @ T2 — history survives the crash + bound)", got.SystemTime, T2)
+		t.Fatalf("post-recovery AsOf SystemTime = %d, want %d", got.SystemTime, T2)
 	}
 	if got.PayloadDigest != d2 {
-		t.Fatalf("post-recover AsOf PayloadDigest = %x, want %x (T2's real digest)", got.PayloadDigest, d2)
+		t.Fatalf("post-recovery AsOf PayloadDigest = %x, want %x", got.PayloadDigest, d2)
 	}
 
-	// (c) BOTH checkpoint files are on disk under l0/ — the unbounded-growth
-	// witness (one fresh l0/*.arrow per checkpoint, no merge). The earlier T1
-	// event is ALSO queryable (the index retained it, not overwrote it — a
-	// DIFFERENT file per checkpoint, appended not merged).
+	// Each checkpoint leaves a separate Arrow file. The earlier T1 event must
+	// remain queryable at its own transaction-time horizon.
 	files, err := lfs.ListObjects(context.Background(), "local", "l0/", 0)
 	if err != nil {
 		t.Fatalf("ListObjects l0/: %v", err)
@@ -432,53 +375,38 @@ func TestQuery_ResilientAfterBoundedRecovery_HistorySurvivesCrash(t *testing.T) 
 		t.Fatalf("L0 file count = %d, want 2 (one fresh l0/*.arrow per checkpoint — the unbounded-growth witness); files=%v",
 			len(files), files)
 	}
-	// T1 history is retrievable too (the index did NOT overwrite T1 — it is a
-	// separate file; dominance at validTime/txTime >= T1 picks T2, but a query
-	// scoped to T1's horizon returns T1 — the persisted history is queryable).
+	// A horizon between T1 and T2 excludes the later SystemTime and must return
+	// the earlier checkpoint's event rather than overwriting its history.
 	gotT1, err := resolver.AsOf(
 		context.Background(), alpha,
 		queryNanosInRFC3339Nano(T1),
-		queryNanosInRFC3339Nano(T1+1), // txTime horizon BETWEEN T1 and T2 → dominance picks T1 (T2 > txTime excluded)
+		queryNanosInRFC3339Nano(T1+1),
 	)
 	if err != nil {
-		t.Fatalf("post-recover AsOf @T1 horizon: %v", err)
+		t.Fatalf("post-recovery AsOf at T1 horizon: %v", err)
 	}
 	if gotT1.SystemTime != T1 || gotT1.PayloadDigest != d1 {
-		t.Fatalf("post-recover AsOf @T1 horizon = (sys=%d dgst=%x), want (sys=%d dgst=%x) — the T1 history must be queryable (the index retained it, not overwrote it)",
+		t.Fatalf("post-recovery AsOf at T1 horizon = (sys=%d digest=%x), want (sys=%d digest=%x)",
 			gotT1.SystemTime, gotT1.PayloadDigest, T1, d1)
 	}
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// T3 — -race: concurrent PutLocal + AppendCheckpoint + AsOf (no torn-read FP).
-// ────────────────────────────────────────────────────────────────────────
-
-// TestQuery_RaceClean_ConcurrentQueryAndCheckpoint is T3 (the -race leg). A
-// writer PutLocal-s alpha at monotonically increasing SystemTime; a checker
-// AppendCheckpoint-s continuously; a queryer runs AsOf concurrently. -race must
-// flag NO data race (LocalFS.ListObjects/Download + the off-heap Arrow reads are
-// concurrent-safe — ADR-0017 §3). At quiescence AsOf == the latest checkpoint's
-// value (a query concurrent with a checkpoint may list a file mid-Upload — the
-// scanFile continue-on-error mitigation query.go:233 refuses the torn bytes and
-// keeps an earlier valid event; the latest checkpoint is fully on disk once the
-// checker stops, so the final AsOf is exact — no torn-read false-positive).
+// TestQuery_RaceClean_ConcurrentQueryAndCheckpoint runs one writer, repeated
+// checkpoints, and concurrent AsOf calls. LocalFS listing/download and off-heap
+// Arrow reads must be race-free (ADR-0017 §3). A reader may encounter an
+// incomplete upload; scanFile skips it and retains an earlier valid event. Once
+// the writer stops and the final checkpoint finishes, AsOf must return the last
+// written SystemTime.
 //
 // Run with: go test -race -count=5 -run TestQuery_RaceClean ./pkg/mesh/
 func TestQuery_RaceClean_ConcurrentQueryAndCheckpoint(t *testing.T) {
 	bridge, lfs, _ := queryHarness(t, true)
 	resolver := newQueryResolver(lfs)
 
-	// SINGLE sequential writer: SystemTime = baseT + writeIndex in WRITE order,
-	// which == DOT order (NextCounter is monotonic), so the latest-DOT alpha at
-	// quiescence is exactly alpha@(baseT + totalWrites-1) — DETERMINISTIC.
-	// (A fleet of racing writers would assign the last counter's SystemTime
-	// nondeterministically; AsOf dominance is on max SystemTime across
-	// checkpoint files, and only the file captured while @max was the latest-dot
-	// holds it — not guaranteed under write-write concurrency. Sequential writer
-	// restores the pin WITHOUT weakening the race: the CHECKER + QUERYER still
-	// run concurrently with the writer + each other + the LocalFS — that is the
-	// torn-read race T3 exists to stress; write-write concurrency is the
-	// engine's own CAS, tested elsewhere.)
+	// One sequential writer keeps SystemTime and dot order aligned, making the
+	// final checkpoint's expected value deterministic. Checkpointing and querying
+	// still run concurrently with the writer and with each other; write-write
+	// contention is covered by the engine's own tests.
 	const totalWrites = 80
 	const baseT = int64(1_700_000_000_000_000_000)
 	const alpha = "alpha"
@@ -519,9 +447,9 @@ func TestQuery_RaceClean_ConcurrentQueryAndCheckpoint(t *testing.T) {
 		}
 	}()
 
-	// Queryer: AsOf concurrently. validTime=now/txTime=now → lands in every
-	// open-ended range → dominance picks the latest SystemTime <= now. A torn
-	// file mid-Upload is continue-on-error'd; no race, no crash.
+	// Concurrent queries use the current valid and transaction times. A file
+	// observed during upload is skipped; a later complete checkpoint remains
+	// available. ErrEntityNotFound is valid before the first index file lands.
 	queryerDone := make(chan struct{})
 	go func() {
 		defer close(queryerDone)
@@ -540,17 +468,14 @@ func TestQuery_RaceClean_ConcurrentQueryAndCheckpoint(t *testing.T) {
 		}
 	}()
 
-	wg.Wait()   // writer done — all totalWrites on disk
-	close(stop) // stop checker (after its final ckpt) + queryer
+	wg.Wait()   // Wait for all writes.
+	close(stop) // Stop querying and request one final checkpoint.
 	<-checkerDone
 	<-queryerDone
 
-	// Quiescence: the final AppendCheckpoint (last action in checker's stop
-	// branch) wrote the latest alpha@sysMax. AsOf now returns it exact. The
-	// txTime/sysMax pins: the latest-dot alpha has SystemTime = baseT+(N-1)
-	// (sequential writer → dot order == SystemTime order); the final checkpoint
-	// captured it; a query with validTime/txTime >= sysMax returns it via max-
-	// SystemTime dominance. A torn-read false-positive would miss (FP err).
+	// Sequential writes keep dot and SystemTime order aligned. The final
+	// checkpoint therefore contains alpha at baseT+totalWrites-1, and AsOf at
+	// that valid time and the following transaction time must return it.
 	sysMax := baseT + totalWrites - 1 // the highest SystemTime written (latest-dot alpha)
 	got, err := resolver.AsOf(context.Background(), alpha,
 		queryNanosInRFC3339Nano(sysMax), queryNanosInRFC3339Nano(sysMax+1))
@@ -565,23 +490,13 @@ func TestQuery_RaceClean_ConcurrentQueryAndCheckpoint(t *testing.T) {
 	}
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// T4 — disabled when no --lsm-root: honest 503, NOT a silent 404.
-// ────────────────────────────────────────────────────────────────────────
-
-// TestQuery_DisabledWhenNoLSMRoot_Honest503 is T4. A ControlServer with
-// NO resolver wired (a research/in-memory node, or --lsm-root absent) MUST
-// return 503 + {"error":"query-tier disabled (no --lsm-root)"} for /v1/query —
-// NOT 404. A route-absent 404 is indistinguishable to a client from "entity not
-// found", so a disabled tier that 404'd would be a silent lie (the
-// honest-no-availability precedent — ADR-0017 §3).
-//
-// RED-before-fix (recorded): at HEAD the Handler mux registered no /v1/query
-// route, so GET /v1/query → ServeMux's default 404 — exactly the misread-able
-// behavior. The fix registers the route + the nil-resolver 503 guard.
+// TestQuery_DisabledWhenNoLSMRoot_Honest503 requires /v1/query to return 503
+// with "query-tier disabled (no --lsm-root)" when no Resolver is configured.
+// A 404 would incorrectly suggest that the entity, rather than the query tier,
+// is absent. The availability check precedes parameter validation (ADR-0017 §3).
 func TestQuery_DisabledWhenNoLSMRoot_Honest503(t *testing.T) {
 	t.Run("nil_resolver_returns_503_not_404", func(t *testing.T) {
-		// NewControlServer unmodified (4-arg); SetResolver NEVER called → resolver stays nil.
+		// NewControlServer unmodified (4-arg); SetResolver never called → resolver stays nil.
 		cs := NewControlServer(nil, queryTestNodeID, nil, nil)
 		srv := httptest.NewServer(cs.Handler())
 		t.Cleanup(srv.Close)
@@ -591,7 +506,7 @@ func TestQuery_DisabledWhenNoLSMRoot_Honest503(t *testing.T) {
 			queryNanosInRFC3339Nano(1_700_000_000_000_000_002))
 
 		if status != http.StatusServiceUnavailable {
-			t.Fatalf("disabled /v1/query returned %d, want 503 (honest no-availability; a 404 would be indistinguishable from 'not found' — the silent-lie class): %s",
+			t.Fatalf("disabled /v1/query returned %d, want 503 to distinguish an unavailable tier from a missing entity: %s",
 				status, body)
 		}
 		var d queryDisabledBody
@@ -599,12 +514,12 @@ func TestQuery_DisabledWhenNoLSMRoot_Honest503(t *testing.T) {
 			t.Fatalf("decode 503 body: %v (body=%s)", err, body)
 		}
 		if d.Error != "query-tier disabled (no --lsm-root)" {
-			t.Fatalf("503 body error = %q, want the honest disclosure %q", d.Error, "query-tier disabled (no --lsm-root)")
+			t.Fatalf("503 body error = %q, want the disclosure %q", d.Error, "query-tier disabled (no --lsm-root)")
 		}
 	})
 
 	t.Run("missing_params_return_400_even_when_disabled", func(t *testing.T) {
-		// The 503-disabled check runs BEFORE param validation (the tier is OFF;
+		// The 503-disabled check runs before param validation (the tier is off;
 		// a malformed query to a disabled tier is still "unavailable", not
 		// "bad request"). This pins the order so a future refactor doesn't 400
 		// a request that should be 503 (hiding the disabled state behind a 400).
@@ -620,35 +535,26 @@ func TestQuery_DisabledWhenNoLSMRoot_Honest503(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("empty disabled /v1/query returned %d, want 503 (the 503-disabled guard runs BEFORE param validation)", resp.StatusCode)
+			t.Fatalf("empty disabled /v1/query returned %d, want 503 (the 503-disabled guard runs before param validation)", resp.StatusCode)
 		}
 	})
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// — the honest debt: N files after N checkpoints, NOT fixed.
-// ────────────────────────────────────────────────────────────────────────
-
-// TestQuery_L0FileGrowthDisclosed is the honest-negative
-// guard. It makes the L0 unbounded-growth debt OBSERVABLE in CI: each
-// AppendCheckpoint writes a FRESH l0/*.arrow (no merge), so N checkpoints → N
-// files. This guard DISCLOSES the debt; it does NOT fix it.
-//
-// It MUST assert fileCount == N (the debt's existence) and NEVER assert
-// fileCount < N (that would be a false-fix fabricated green). The disclosure is
-// LOGGED (t.Logf), not assert-failed. Per ADR-0017 §5 + the honest-negative
-// culture: "L0 unbounded growth disclosed: N files after N checkpoints;
-// level-overwrite compaction is future work; the epoch tombstone compactor is
-// DEAD-TO-DEAD (no production DELETE operator) and is NOT the fix for this debt."
-func TestQuery_L0FileGrowthDisclosed(t *testing.T) {
+// TestQueryL0FileGrowthDisclosed records the current L0 growth behavior: each
+// AppendCheckpoint writes a fresh l0/*.arrow file without merging earlier files,
+// so N checkpoints produce N files. The test asserts that count rather than
+// claiming compaction has been implemented (ADR-0017 §5). The epoch tombstone
+// compactor does not address this growth because production has no DELETE
+// operator that creates dead-to-dead rows.
+func TestQueryL0FileGrowthDisclosed(t *testing.T) {
 	const N = 50
 	const alpha = "alpha"
 	const baseT = int64(1_700_000_000_000_000_000)
 
 	bridge, lfs, _ := queryHarness(t, true)
 
-	// N checkpoints, each with a DISTINCT SystemTime (so each flush's txTime
-	// differs → a NEW l0 file, no overwrite). Single entity → same prefix dir.
+	// N checkpoints, each with a distinct SystemTime (so each flush's txTime
+	// differs → a new l0 file, no overwrite). Single entity → same prefix dir.
 	for i := 0; i < N; i++ {
 		sys := baseT + int64(i) // distinct per checkpoint → distinct file txTime
 		if _, err := bridge.PutLocal(alpha, fmt.Sprintf("%s-%d", alpha, i), queryTestEntry(sys)); err != nil {
@@ -664,33 +570,28 @@ func TestQuery_L0FileGrowthDisclosed(t *testing.T) {
 		t.Fatalf("ListObjects l0/: %v", err)
 	}
 
-	// THE WITNESS — the debt's existence, asserted (NOT < N; exactly N: one
-	// fresh file per checkpoint, no merge, no compaction). This is the honest
-	// OBSERVABLE, not a fabricated improvement.
+	// Exactly one new file per checkpoint is the current behavior; no merge or
+	// compaction reduces the count.
 	if len(files) != N {
-		t.Fatalf("L0 file count = %d, want %d (one fresh l0/*.arrow per checkpoint — the disclosed debt); files=%v",
+		t.Fatalf("L0 file count = %d, want %d (one file per checkpoint); files=%v",
 			len(files), N, files)
 	}
 
-	// The disclosure (LOGGED — the honest-negative-culture discipline). The debt
-	// is OBSERVABLE in CI, not silently accrued. It is NOT fixed by this change.
-	t.Logf("L0 unbounded growth disclosed: %d files after %d checkpoints; level-overwrite compaction is a future fork; the epoch tombstone compactor is DEAD-TO-DEAD (no production DELETE operator) and is NOT the fix for this debt.", len(files), N)
+	t.Logf("L0 contains %d files after %d checkpoints", len(files), N)
 	t.Logf("files under l0/: %v", files)
 
-	// AsOf still functions over an UNBOUNDED L0 — correctness is preserved; the
-	// cost is O(L0-files) per query (the disclosed scope, NOT a target).
-	// This guards the honest contract: unbounded ≠ broken; it is bounded only by
-	// the ResolVerConfig.MaxL0Files cap (1000) — future work shrinks it.
+	// Queries remain correct across these files, with cost proportional to the
+	// number scanned and bounded by ResolverConfig.MaxL0Files.
 	resolver := newQueryResolver(lfs)
 	got, err := resolver.AsOf(context.Background(), alpha,
 		queryNanosInRFC3339Nano(baseT+int64(N-1)),
 		queryNanosInRFC3339Nano(baseT+int64(N)),
 	)
 	if err != nil {
-		t.Fatalf("AsOf over an unbounded L0 (N=%d): %v (correctness is preserved; the disclosed cost is O(L0-files), NOT a correctness bug)", N, err)
+		t.Fatalf("AsOf across %d L0 files: %v", N, err)
 	}
 	if got.SystemTime != baseT+int64(N-1) {
-		t.Fatalf("AsOf over unbounded L0 SystemTime = %d, want %d (dominance picks the latest checkpointed value)", got.SystemTime, baseT+int64(N-1))
+		t.Fatalf("AsOf across L0 files returned SystemTime = %d, want the latest checkpointed value %d", got.SystemTime, baseT+int64(N-1))
 	}
 }
 
@@ -698,10 +599,9 @@ func TestQuery_L0FileGrowthDisclosed(t *testing.T) {
 // helpers
 // ────────────────────────────────────────────────────────────────────────
 
-// isErrEntityNotFound reports whether err wraps database.ErrEntityNotFound (the
-// "no matching event" sentinel — query.go:417). AsOf returns it bare when no L0
-// keys are listed (query.go:143) or no dominant match (query.go:175); scan/cancel
-// errors wrap differently — the distinction is the 404 vs 500 boundary.
+// isErrEntityNotFound reports whether err is or wraps
+// database.ErrEntityNotFound. AsOf returns it when no L0 keys are listed or no
+// dominant row matches; scan and cancellation errors use the 500 path instead.
 func isErrEntityNotFound(err error) bool {
 	if err == nil {
 		return false
@@ -713,9 +613,9 @@ func isErrEntityNotFound(err error) bool {
 		strings.Contains(err.Error(), database.ErrEntityNotFound.Error())
 }
 
-// hasPayloadField reports whether the /v1/query JSON body carries a "payload"
-// key (which it must NOT — the index stores a SENTRY body; a payload field would
-// be the fabrication). Decodes into a map to check key presence.
+// hasPayloadField reports whether a query or range JSON body contains a
+// "payload" key. The index stores SENTRY bodies, so responses expose the payload
+// digest but not the original value (ADR-0011 §5, §9).
 func hasPayloadField(body []byte) bool {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {

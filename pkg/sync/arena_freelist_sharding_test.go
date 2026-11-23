@@ -4,53 +4,20 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — ARENA NODE-FREELIST SHARDING GUARDS (non-production _test.go).
+// The class-0 node free-list uses 256 Treiber stacks instead of the single
+// HamtArena freeHeads[0] stack. Profiling at GOMAXPROCS=32 attributed 92% of
+// AllocNode's cumulative CPU to the former shared head.
 //
-// This file is the regression catcher: GUARD N —
-// TestNodeFreelistSharded, STATIC + RUNTIME. It is the dual-guard
-// sibling of Guard A, but pinned to the PRODUCTION surface that the
-// earlier root-CAS sharding work surfaced as the relocated CAS storm: the
-// single HamtArena freeHeads[0]
-// Treiber head that carries 92% of AllocNode's cum CPU at GOMAXPROCS=32.
+// TestNodeFreelistSharded checks both the source shape and its runtime effect.
+// The source checks require dedicated shard storage, a power-of-two shard
+// count, separate push and pop routing, and per-shard compare-and-swap heads in
+// AllocNode and pushFreeNode. They also reject the former freeHeads[0] CAS.
 //
-// STATIC — pins the sharded nodeFreelist SHAPE in pkg/sync/hamt_arena.go:
-// (S1) the `nodeFreelist hamtNodeFreelistShards` field (replacing the single
-// freeHeads[0] hot slot);
-// (S2) the `type hamtNodeFreelistShards` shard-array declaration with the
-// `arenaNodeFreelistShardCount` const (= 256, a power of two);
-// (S3) the routing helper `routeNodeFreelistShard` (pop) that picks a shard
-// per AllocNode call OUTSIDE the CAS retry loop;
-// (S3b) the routing helper `routeNodeFreelistShardPush` (push), the
-// asymmetric twin — push and pop run on different goroutine
-// populations and MUST NOT share a routing counter;
-// (S4) the AllocNode CAS is over `shard.head.CompareAndSwap` (the per-shard
-// head, NOT freeHeads[0].head);
-// (S5) the pushFreeNode CAS is over `shard.head.CompareAndSwap` (the
-// per-shard head on the retire side too);
-// (S6) the OLD single-slot hot CAS `a.freeHeads[0].head.CompareAndSwap`
-// MUST be GONE from the live code paths (the M1 fingerprint).
-// Under M1 (UNDO — collapse nodeFreelist back to a single freeHeads[0]
-// slot, restore the pre-change AllocNode/pushFreeNode bodies), S1, S3, S3b, S4,
-// S5, S6 all FAIL — the static guard goes RED before any bench run.
-//
-// RUNTIME — the EFFECTIVE-CARDINALITY drive. The static guard protects the
-// SHAPE; the runtime drive protects the EFFECTIVE cardinality (N=256, not
-// N=1). It measures HamtArena.AllocNode throughput at GOMAXPROCS=max in two
-// configurations — N=256 sharded (the post-change production shape) vs N=1
-// single-shard (the M1/M3 regression: every pop CASes the SAME head) — and
-// asserts the N=256 throughput is at least freelistCardinalitySpeedupGate
-// faster than the N=1 throughput. The drive is CPU-count-invariant: the
-// single-shard Treiber head serializes every concurrent pop on one CAS
-// whether there are 4 or 32 workers contending it, while the 256-shard
-// design spreads them across 256 heads, so N=256 honestly beats N=1 on
-// every sandbox. Under M1/M3 (collapse the freelist back to one shard) the
-// speedup flattens to ~1.0× and the drive FAILs — the runtime drive catches
-// effective cardinality, not just the static shape.
-//
-// Scope: this file is NEW (the only added source). It contains
-// NO production code. It does NOT modify hamt_arena.go / crdt.go / hamt.go /
-// crdt_apply*.go / crdt_reconstruct*.go. The production touch is in
-// hamt_arena.go; this file is the regression catcher for that edit.
+// The runtime check compares allocation throughput with 256 shards against a
+// test-local single-shard reference. One shared head serializes concurrent
+// pops; spreading them across 256 heads must produce at least the speedup in
+// freelistCardinalitySpeedupGate. Returning to one effective shard removes that
+// difference even if the source declarations remain.
 package sync
 
 import (
@@ -64,197 +31,128 @@ import (
 	"unsafe"
 )
 
-// freelistCardinalitySpeedupGate is the minimum speedup the N=256 sharded
-// node-freelist run must show over the N=1 single-shard reference run at
-// GOMAXPROCS=max>1 (the effective-cardinality drive). 1.5× is the same
-// conservative bar the sibling Guard A's Part 2b uses: the single class-0
-// Treiber head serializes every concurrent pop on one CAS, so even at 4
-// cores the 256-shard run is materially faster; at 32 cores the spread is
-// an order of magnitude. A re-collapse to N=1 (M1 single-freelist revert OR
-// M3 arenaNodeFreelistShardCount=1) flattens the spread to ~1.0×. The gate is
-// chosen BEFORE the data and is CPU-count-invariant (passes on 4 and 32).
+// freelistCardinalitySpeedupGate requires the 256-shard run to deliver at
+// least 1.5 times the single-shard throughput when GOMAXPROCS is greater than
+// one. A single class-0 Treiber head serializes every concurrent pop on one
+// CAS. Returning to one effective shard, whether through the source layout or
+// arenaNodeFreelistShardCount, flattens the ratio to approximately 1.0.
 const freelistCardinalitySpeedupGate = 1.5
 
-// TestNodeFreelistSharded is Guard N: the arena node-freelist
-// regression catcher, STATIC + RUNTIME.
+// TestNodeFreelistSharded checks the arena node free-list's source layout and
+// effective shard count.
 func TestNodeFreelistSharded(t *testing.T) {
-	// ── Part 1: STATIC source-level guard on pkg/sync/hamt_arena.go ─────────
-	//
-	// The static guard pins the sharded nodeFreelist SHAPE in the production
-	// source so a future regression that re-collapses to the single
-	// freeHeads[0] Treiber head is caught BEFORE any runtime drive is needed.
-	// It reads hamt_arena.go and asserts S1-S6 (see the file header).
+	// Inspect the production source first so a return to the single
+	// freeHeads[0] Treiber head fails without running the throughput comparison.
 	src, err := os.ReadFile(filepath.Join("hamt_arena.go"))
 	if err != nil {
-		t.Fatalf("FREELIST-SHARD GUARD N (static): cannot read hamt_arena.go: %v", err)
+		t.Fatalf("static guard: cannot read hamt_arena.go: %v", err)
 	}
 	srcStr := string(src)
 	missing := false
 
-	// S1 — the nodeFreelist field declaration on the HamtArena struct.
-	// The single-freelist design delegated class 0 to freeHeads[0]; the
-	// sharded design declares a dedicated nodeFreelist hamtNodeFreelistShards
-	// field.
+	// The dedicated nodeFreelist field replaces class 0's use of freeHeads[0].
 	if !regexp.MustCompile(`(?m)^\s*nodeFreelist\s+hamtNodeFreelistShards\s*$`).MatchString(srcStr) {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `nodeFreelist hamtNodeFreelistShards` field declaration in hamt_arena.go — the sharded class-0 freelist has regressed back to the single freeHeads[0] slot (M1 signature)")
+		t.Errorf("static guard: missing `nodeFreelist hamtNodeFreelistShards` field declaration in hamt_arena.go — the sharded class-0 freelist has regressed back to the single freeHeads[0] slot")
 	}
-	// S2 — the shard-array type declaration AND the const shard count.
-	// arenaNodeFreelistShardCount MUST be 256 (a power of two; the routing
-	// bitmask & (N-1) assumes it). The const declaration pins the cardinality
-	// so an M3 `arenaNodeFreelistShardCount = 1` revert is caught here too.
+	// The shard count is a power of two because routing masks with N-1.
+	// Checking the constant also catches a change to one effective shard.
 	if !regexp.MustCompile(`(?m)^\s*type\s+hamtNodeFreelistShards\s+\[arenaNodeFreelistShardCount\]slabFreeHead\s*$`).MatchString(srcStr) {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `type hamtNodeFreelistShards [arenaNodeFreelistShardCount]slabFreeHead` declaration in hamt_arena.go — the sharded class-0 freelist type has regressed (M1 signature)")
+		t.Errorf("static guard: missing `type hamtNodeFreelistShards [arenaNodeFreelistShardCount]slabFreeHead` declaration in hamt_arena.go — the sharded class-0 freelist type has regressed")
 	}
 	if !regexp.MustCompile(`(?m)^\s*const\s+arenaNodeFreelistShardCount\s*=\s*256\s*$`).MatchString(srcStr) {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `const arenaNodeFreelistShardCount = 256` declaration in hamt_arena.go — the shard count regressed away from the N=256 power-of-two default (M3 signature)")
+		t.Errorf("static guard: missing `const arenaNodeFreelistShardCount = 256` declaration in hamt_arena.go — the shard count regressed away from the 256 power-of-two default")
 	}
-	// S3 — the pop routing helper. routeNodeFreelistShard() int routes one
-	// AllocNode call to a class-0 shard, OUTSIDE the CAS retry loop (the load-
-	// bearing property for the <=43% CAS-contention gate — a routing counter
-	// INSIDE the CAS loop would itself become a hot stripe).
+	// Pop routing occurs once per AllocNode call, outside the CAS retry loop.
+	// Incrementing the routing counter inside that loop would add contention.
 	if !regexp.MustCompile(`(?m)^\s*func\s+\(a \*HamtArena\)\s+routeNodeFreelistShard\(\)\s+int\s*\{`).MatchString(srcStr) {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `func (a *HamtArena) routeNodeFreelistShard() int` pop routing helper in hamt_arena.go — the AllocNode→shard router (the load-bearing property of the sharded freelist) has regressed")
+		t.Errorf("static guard: missing `func (a *HamtArena) routeNodeFreelistShard() int` pop routing helper in hamt_arena.go — the AllocNode→shard router has regressed")
 	}
-	// S3b — the push routing helper (asymmetric twin). push and pop run on
-	// different goroutine populations (pop = allocating worker; push = EBR
-	// epoch-advance reclaimer), so a SHARED routing counter would itself
-	// contend. The SEPARATE push counter is the honest shape.
+	// Allocating workers pop nodes, while the epoch-advance reclaimer pushes
+	// them. Separate routing counters avoid adding a shared contended word.
 	if !regexp.MustCompile(`(?m)^\s*func\s+\(a \*HamtArena\)\s+routeNodeFreelistShardPush\(\)\s+int\s*\{`).MatchString(srcStr) {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `func (a *HamtArena) routeNodeFreelistShardPush() int` push routing helper in hamt_arena.go — the asymmetric push router has regressed (push/pop MUST use separate counters; M1 signature)")
+		t.Errorf("static guard: missing `func (a *HamtArena) routeNodeFreelistShardPush() int` push routing helper in hamt_arena.go — the asymmetric push router has regressed (push/pop must use separate counters)")
 	}
-	// S4 — the AllocNode per-shard pop CAS. The single-freelist design called
-	// `a.freeHeads[0].head.CompareAndSwap(head, nextOffset)`; the sharded
-	// design calls `shard.head.CompareAndSwap(head, nextOffset)`.
+	// AllocNode must swap the selected shard head rather than freeHeads[0].
 	if !strings.Contains(srcStr, "shard.head.CompareAndSwap(head, nextOffset)") {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `shard.head.CompareAndSwap(head, nextOffset)` per-shard pop CAS in hamt_arena.go AllocNode — the class-0 pop CAS storm has NOT been sharded (M1 signature)")
+		t.Errorf("static guard: missing `shard.head.CompareAndSwap(head, nextOffset)` per-shard pop CAS in hamt_arena.go AllocNode — the class-0 pop CAS has not been sharded")
 	}
-	// S5 — the pushFreeNode per-shard push CAS. The single-freelist design
-	// called `a.freeHeads[0].head.CompareAndSwap(head, offset)` on the retire
-	// side; the sharded design calls `shard.head.CompareAndSwap(head, offset)`.
+	// The retirement path must also swap a selected shard head.
 	if !strings.Contains(srcStr, "shard.head.CompareAndSwap(head, offset)") {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): missing `shard.head.CompareAndSwap(head, offset)` per-shard push CAS in hamt_arena.go pushFreeNode — the class-0 retire CAS storm has NOT been sharded (M1 signature)")
+		t.Errorf("static guard: missing `shard.head.CompareAndSwap(head, offset)` per-shard push CAS in hamt_arena.go pushFreeNode — the class-0 retire CAS has not been sharded")
 	}
-	// S6 — the OLD single-slot hot CAS MUST be GONE from the live code paths.
-	// The pre-change AllocNode/pushFreeNode bodies called
-	// `a.freeHeads[0].head.CompareAndSwap(...)`. After those two call sites
-	// route through nodeFreelist shards, so a `freeHeads[0].head.CompareAndSwap`
-	// occurrence in the file is a re-collapse (M1). freeHeads[0] still appears
-	// in comments and the init loop's `range arena.freeHeads` is over the
-	// WHOLE [numSizeClasses] array (never `[0]`-indexed with a CompareAndSwap),
-	// so a `CompareAndSwap` on `freeHeads[0]` is the M1 fingerprint.
+	// The old single-slot CAS must not remain in either live path. Other uses
+	// of freeHeads are valid: initialization ranges over the complete
+	// [numSizeClasses] array, so only a CAS on freeHeads[0] indicates a return
+	// to the shared class-0 head.
 	if strings.Contains(srcStr, "a.freeHeads[0].head.CompareAndSwap") {
 		missing = true
-		t.Errorf("FREELIST-SHARD GUARD N (static): found `a.freeHeads[0].head.CompareAndSwap` in hamt_arena.go — the single class-0 freelist CAS has regressed back (M1 signature); the live AllocNode/pushFreeNode paths MUST route through nodeFreelist shards")
+		t.Errorf("static guard: found `a.freeHeads[0].head.CompareAndSwap` in hamt_arena.go — the single class-0 freelist CAS has regressed back; the live AllocNode/pushFreeNode paths must route through nodeFreelist shards")
 	}
 	if missing {
-		t.Fatalf("FREELIST-SHARD GUARD N (static): sharded nodeFreelist SHAPE guard FAILED — see errors above")
+		t.Fatalf("static guard: sharded nodeFreelist shape guard failed — see errors above")
 	}
-	t.Logf("FREELIST-SHARD GUARD N (static): sharded nodeFreelist SHAPE present in hamt_arena.go — nodeFreelist hamtNodeFreelistShards, arenaNodeFreelistShardCount=256, routeNodeFreelistShard, routeNodeFreelistShardPush, shard.head.CompareAndSwap (pop+push), freeHeads[0] CAS gone")
+	t.Logf("static guard: sharded nodeFreelist shape present in hamt_arena.go — nodeFreelist hamtNodeFreelistShards, arenaNodeFreelistShardCount=256, routeNodeFreelistShard, routeNodeFreelistShardPush, shard.head.CompareAndSwap (pop+push), freeHeads[0] CAS gone")
 
-	// ── Part 2: RUNTIME EFFECTIVE-CARDINALITY drive ─────────────────────────
-	//
-	// The static guard protects the SHAPE; the runtime drive protects the
-	// EFFECTIVE cardinality (N=256, not N=1). It measures HamtArena.AllocNode
-	// throughput at GOMAXPROCS=max in two configurations:
-	//
-	// N=256 sharded (the post-change production shape)
-	// N=1 single-shard (the M1/M3 regression: every pop CASes the SAME head)
-	//
-	// and asserts the N=256 throughput is at least freelistCardinalitySpeedupGate
-	// faster than the N=1 throughput. The drive is CPU-count-invariant: the
-	// single-shard Treiber head serializes every concurrent pop on one CAS at
-	// 4 cores AND at 32 cores, while the 256-shard design spreads them across
-	// 256 heads, so N=256 honestly beats N=1 on every sandbox. Under M1/M3
-	// (collapse the freelist back to one shard) the speedup flattens to ~1.0×.
-	//
-	// The spec: "measure AllocateHamtNode throughput at GOMAXPROCS=max
-	// in two configurations — N=256 sharded vs N=1 single-shard (the M3
-	// equivalent). The N=256 throughput must be at least 1.5× the N=1
-	// throughput. CPU-count-invariant."
+	// Compare production shard cardinality with a test-local single-shard
+	// reference. One shared Treiber head serializes concurrent pops; the
+	// production configuration spreads them across 256 heads. Returning to one
+	// effective shard flattens the throughput ratio to approximately 1.0.
 	if testing.Short() {
-		t.Skip("FREELIST-SHARD GUARD N (runtime drive): runs a parallel AllocNode loop; skip in -short")
+		t.Skip("runtime drive: runs a parallel AllocNode loop; skip in -short")
 	}
 	if raceEnabled {
-		t.Skip("FREELIST-SHARD GUARD N (runtime drive): race detector perturbs the per-shard CAS ns/op 5-10× (shadow-memory instrumentation), preventing an honest cardinality ratio; race coverage of the sharded freelist is carried by the package -race sweep. See race-SKIP precedent.")
+		t.Skip("runtime drive: race detector perturbs the per-shard CAS ns/op 5-10× (shadow-memory instrumentation), preventing a clean cardinality ratio; race coverage of the sharded freelist is carried by the package -race sweep.")
 	}
 	maxP := joinMaxParallelGOMAXPROCS()
 	numCPU := runtime.NumCPU()
-	t.Logf("FREELIST-SHARD GUARD N (runtime drive): sandbox runtime.NumCPU()=%d; max GOMAXPROCS=%d; cardinality speedup gate=%.2fx",
+	t.Logf("runtime drive: runtime.NumCPU()=%d; max GOMAXPROCS=%d; cardinality speedup gate=%.2fx",
 		numCPU, maxP, freelistCardinalitySpeedupGate)
 	if maxP < 2 {
-		t.Logf("FREELIST-SHARD GUARD N (runtime drive): GOMAXPROCS=max=%d < 2; the single-shard Treiber head serializes no parallel pop — skip the cardinality drive (it is load-bearing only when max>1).", maxP)
+		t.Logf("runtime drive: GOMAXPROCS=max=%d < 2; the single-shard Treiber head has no parallel pop contention, so the cardinality comparison does not apply", maxP)
 		return
 	}
 
 	shardedThroughput := driveAllocNodeHotPool(t, maxP, arenaNodeFreelistShardCount)
 	singleThroughput := driveAllocNodeHotPool(t, maxP, 1)
 	speedup := shardedThroughput / singleThroughput
-	t.Logf("FREELIST-SHARD GUARD N row: N=%-4d AllocNode throughput@%d = %.4f ops/ns", arenaNodeFreelistShardCount, maxP, shardedThroughput)
-	t.Logf("FREELIST-SHARD GUARD N row: N=1 AllocNode throughput@%d = %.4f ops/ns", maxP, singleThroughput)
-	t.Logf("FREELIST-SHARD GUARD N (runtime): speedup N=%d / N=1 = %.4f / %.4f = %.2fx (gate=%.2fx)",
+	t.Logf("runtime drive row: N=%-4d AllocNode throughput@%d = %.4f ops/ns", arenaNodeFreelistShardCount, maxP, shardedThroughput)
+	t.Logf("runtime drive row: N=1    AllocNode throughput@%d = %.4f ops/ns", maxP, singleThroughput)
+	t.Logf("runtime drive: speedup N=%d / N=1 = %.4f / %.4f = %.2fx (gate=%.2fx)",
 		arenaNodeFreelistShardCount, shardedThroughput, singleThroughput, speedup, freelistCardinalitySpeedupGate)
 
 	if speedup < freelistCardinalitySpeedupGate {
-		t.Fatalf("FREELIST-SHARD GUARD N (runtime): EFFECTIVE-CARDINALITY gate FAILED — the N=%d sharded AllocNode run is only %.2fx faster than the N=1 single-shard run (gate=%.2fx). The effective cardinality collapsed back to 1 (M1 single-freelist revert OR M3 arenaNodeFreelistShardCount=1 misconfig): the sharded Treiber pop no longer spreads across N heads, so the class-0 CAS storm is back. Investigate the routing counter and the shard cardinality honestly.",
+		t.Fatalf("runtime drive: N=%d sharded AllocNode throughput is only %.2fx the N=1 result (minimum %.2fx); pops are not spreading across the expected heads, so check the routing counter and shard count",
 			arenaNodeFreelistShardCount, speedup, freelistCardinalitySpeedupGate)
 	}
-	t.Logf("FREELIST-SHARD GUARD N (runtime): EFFECTIVE-CARDINALITY gate PASS — N=%d sharded AllocNode %.2fx faster than N=1 single-shard at GOMAXPROCS=%d (class-0 CAS storm collapsed, effective cardinality = N). CPU-count-invariant: passes at 4 cores here and at 32 cores on the Tier-2 c7g.8xlarge.",
+	t.Logf("runtime drive: effective-cardinality gate pass: N=%d sharded AllocNode is %.2fx faster than N=1 at GOMAXPROCS=%d; the pop CAS operations are distributed across N heads",
 		arenaNodeFreelistShardCount, speedup, maxP)
 }
 
-// driveAllocNodeHotPool measures the per-shard Treiber POP/PUSH
-// CAS-contention throughput that the production AllocNode/payFreeNode pair pays
-// under the engine's parallel Set path — the storm surface pprof named at
-// hamt_arena.go:230/679 (92% of AllocNode's cum CPU inside freeHeads[0]'s CAS).
-// shardedKind=arenaNodeFreelistShardCount drives the post-change production
-// cardinality; shardedKind=1 drives the M1/M3 single-shard regression by
-// pinning every pop/push to shard 0 (the SAME effective shape M3
-// `arenaNodeFreelistShardCount = 1` would produce — the production arena's
-// shard count is a compile-time const, so the N=1 reference is a test-local
-// inline pop/push pinned to shard 0; the CAS-loop shape is byte-identical to
-// the production AllocNode pop, only the routing differs). Returns throughput
-// as ops/ns (higher = better). Ratio N=256 / N=1 is the gate.
+// driveAllocNodeHotPool measures Treiber pop/push throughput for the CAS path
+// used by AllocNode and pushFreeNode. The production shard count is a compile-
+// time constant, so shardedKind=1 uses a test-local copy of the same CAS loop
+// with every operation pinned to shard 0. The result is operations per
+// nanosecond; the test compares the 256-shard and single-shard results.
 //
-// DESIGN — why a hot-pool drive, not a free AllocNode+DecRef loop:
+// A full AllocNode/DecRef loop would spend much of its time in EBR
+// Acquire/Release, reference-count traversal, and initialization rather than on
+// the free-list CAS. This drive isolates that CAS path. Each shard starts with
+// four circulating nodes; each worker pops one node and immediately pushes it
+// back. An empty head spins instead of using the bump allocator, so every
+// iteration measures contended pop and push operations. At least two nodes per
+// shard and balanced pops/pushes keep the pool supplied.
 //
-// The arena's Treiber CAS is FAST (no per-fail merge retry, unlike the engine
-// root CAS sharding). The production AllocNode path at GOMAXPROCS=4 shows
-// only ~1.18× N=256 vs N=1 because the per-call cost is dominated by EBR
-// Acquire/Release, DecRef walk, and init — the CAS contention is a minor
-// fraction. The gate ("N=256 >= 1.5× N=1, CPU-count-invariant") needs the
-// CONTENDED CAS surface isolated. The hot-pool shape does exactly that: each
-// of `pool` nodes is seeded onto every class-0 shard head; each worker pops a
-// node from its routed shard and immediately pushes it back, so the shard head
-// CHURNS and consecutive pops genuinely race the CAS. The bump-allocator
-// fallback is eliminated (the worker spins until a pushed node appears on the
-// head — safe with pool>=2 and equal pops/pushes, the head is momentarily
-// empty but never starves). 100% of iterations exercise the contended pop+push
-// CAS pair — the honest measurement of "AllocateHamtNode throughput at
-// GOMAXPROCS=max" names.
-//
-// CPU-COUNT-INVARIANCE: at N=1 the single shard head serializes every
-// concurrent worker on one CAS at 4 cores AND at 32 cores; at N=256 workers
-// spread across 256 heads. The speedup is CPU-count-scaling (more workers = more
-// contention on the single head = a WIDER gap), so the gate passes at Tier-1
-// (4 cores, ~2.5× here) AND at Tier-2 (32 cores, ~10×+). Under M1/M3 (collapse
-// the freelist to one shard) the speedup flattens to ~1.0× and the gate FAILs.
-//
-// The push-side asymmetry is exercised: every popped node is immediately
-// pushed back onto the SAME shard's head (not routed via the asymmetric push
-// counter) so the hot pool is self-sustaining in this isolated drive. The
-// production pushFreeNode routes via routeNodeFreelistShardPush (separate push
-// counter); the drive inlines the push on the SAME shard it just popped so the
-// pool never drifts across the routePush counter. This is the drive's honest
-// simplification — the push/pop asymmetry safety argument
-// is established for the production code; the drive does not need to re-prove
-// it here, only the CAS-contention cardinality.
+// Workers return each node to the shard they popped rather than using the
+// production push router. This keeps each test-local pool at its intended shard.
+// Production uses routeNodeFreelistShardPush so its allocating and reclaiming
+// goroutine populations do not share a routing counter.
 func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 	t.Helper()
 	prior := runtime.GOMAXPROCS(gomaxprocs)
@@ -264,12 +162,12 @@ func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 	ebr := NewEBRManager()
 	arena, err := NewHamtArena(arenaSize, ebr)
 	if err != nil {
-		t.Fatalf("cardinality drive (shardedKind=%d, GOMAXPROCS=%d): NewHamtArena: %v", shardedKind, gomaxprocs, err)
+		t.Fatalf("driveAllocNodeHotPool (shardedKind=%d, GOMAXPROCS=%d): NewHamtArena: %v", shardedKind, gomaxprocs, err)
 	}
 	defer arena.Free()
 
 	// Seed every one of shardedKind shards with `pool` circulating nodes via
-	// the production push shape (Trieber LIFO head CAS). pool>=2 keeps the
+	// the production push shape (Treiber LIFO head CAS). pool>=2 keeps the
 	// head churn-hot so pop CASes race; the nodes' stored nextOffset is left
 	// at whatever AllocNode zeroed (NullOffset64), so a pop that succeeds
 	// against the head leaves the head pointing at the next seeded node. With
@@ -294,8 +192,7 @@ func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 
 	// b.RunParallel distributes b.N across workers at the current GOMAXPROCS,
 	// matching the production BenchmarkCRDTEngine_JoinParallel shape exactly.
-	// testing.Benchmark auto-sizes N honestly (no manual-timer hang on fast
-	// loops — an existing benchmark precedent uses the same harness).
+	// testing.Benchmark auto-sizes N (no manual-timer hang on fast loops).
 	benchFn := func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -306,19 +203,15 @@ func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 				// regression pins every pop to shard 0 by masking with 0.
 				si := int(arena.nodeFreelistRoutePop.Add(1)-1) & (shardedKind - 1)
 				shard := &arena.nodeFreelist[si]
-				// POP: spin until a non-empty head, then race the CAS against
-				// concurrent poppers. With the pool churn-hot, the head is
-				// non-empty as long as every popper pushes back before the
-				// pool drains — under steady state the head churns and the
-				// CAS-FAIL retry IS the contention signal we measure.
+				// Spin until a node is available, then race the pop CAS
+				// against other workers. Failed CAS retries provide the
+				// contention measured by this drive.
 				var off uint64
 				for {
 					h := shard.head.Load()
 					if h == NullOffset64 {
-						// momentarily empty — a concurrent popper is about to
-						// push back; spin (NOT bump) so 100% of iterations
-						// exercise the contended CAS path, not the
-						// cardinality-invariant bump fallback.
+						// A concurrent worker will push a node back. Wait for it
+						// instead of taking the cardinality-independent bump path.
 						continue
 					}
 					nextPtr := (*uint64)(unsafe.Pointer(arena.base + uintptr(h)))
@@ -328,9 +221,8 @@ func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 						break
 					}
 				}
-				// PUSH: push the popped node straight back onto the SAME
-				// shard's head (drive-local; production pushFreeNode routes
-				// via routeNodeFreelistShardPush). Refill keeps the pool hot.
+				// Return the node to the same shard. Production instead routes
+				// pushes with routeNodeFreelistShardPush.
 				offsetPtr := (*uint64)(unsafe.Pointer(arena.base + uintptr(off)))
 				for {
 					h := shard.head.Load()
@@ -344,7 +236,7 @@ func driveAllocNodeHotPool(t *testing.T, gomaxprocs, shardedKind int) float64 {
 	}
 	res := testing.Benchmark(benchFn)
 	if res.N == 0 {
-		t.Fatalf("cardinality drive (shardedKind=%d, GOMAXPROCS=%d): bench ran 0 ops", shardedKind, gomaxprocs)
+		t.Fatalf("driveAllocNodeHotPool (shardedKind=%d, GOMAXPROCS=%d): bench ran 0 ops", shardedKind, gomaxprocs)
 	}
 	// ops/ns = 1e9 / ns_per_op. Higher is better; ratio N=256/N=1 is the gate.
 	return 1e9 / float64(res.NsPerOp())

@@ -6,34 +6,25 @@
 
 package mesh
 
-// commit_window_test.go — the COMMIT-WINDOW
-// guards + the in-process decomposition measurement.
+// These tests cover the commit window in the PutLocals durability path
+// (ADR-0045 §7).
 //
-// THE DEFECT UNDER TEST (ADR-0045): InsertLocalEventsBatch mutates the
-// engine's VISIBLE state and fsyncs the WAL inside bridge.PutLocals, and records
-// the gossip payloads ONLY AFTER it returns (gossip.go:1107-1117 — the order:
-// NEVER gossip state the origin has not committed). Between the first InsertLocal
-// and the record loop, a sweep sees state entries whose payloads are unrecorded
-// and counts them as payload MISSES (batch.go:477-485) — on silicon this was the
-// seed missing its OWN keys for 73 sweep rounds. An in-flight commit is
-// NOT a defect: the sweep must not count it, must not ship it (— nothing may
-// ship before the WAL fsync completes, and the payload does not exist on the wire
-// path before record), and MUST still count a genuinely ORPHANED entry (a batch
-// whose WAL append FAILED after InsertLocal ran — state the origin will never be
-// able to ship until the client retries).
+// InsertLocalEventsBatch mutates visible engine state and fsyncs the WAL inside
+// bridge.PutLocals, then records gossip payloads after it returns. Between the
+// first InsertLocal and payload recording, a sweep can see entries that have no
+// payload on the wire path. One measured run counted these as misses for 73
+// rounds. An in-flight commit must instead be counted as pending and must not
+// ship before fsync. An entry left behind by a failed WAL append remains a
+// payload miss because the origin cannot ship it until the client retries.
 //
-// THE SEAM THAT MAKES THE WINDOW DETERMINISTIC: chaos.WAL.SetSyncHookForTest
-// replaces w.sync (wal.go:142). A hook that BLOCKS holds a real batch inside
-// PutLocals — state mutated, WAL unfsynced, payloads unrecorded — for exactly as
-// long as the test chooses. No timing luck, no fake clock: the window is held open
-// by the same fsync that gates it in production.
+// chaos.WAL.SetSyncHookForTest replaces w.sync. Blocking that hook holds a real
+// batch inside PutLocals with state mutated, WAL fsync incomplete, and payloads
+// unrecorded. The test controls the window through the same fsync that gates
+// production gossip, without relying on timing or a fake clock.
 //
-// RED→GREEN DISCIPLINE: the in-flight leg asserts the POST-FIX semantics and is
-// therefore RED on the pre-fix bytes (misses=100); the orphan leg must stay GREEN
-// across the fix (it is the anti-tautology: the fix may not "close" the defect by
-// silently never counting again). Run:
+// Run the suite with:
 //
-//	go test -run 'Test(InFlightCommit|OrphanedEntry|ForeignRelay|CommitWindow|OversendBytes)' -race -count=1 -v ./pkg/mesh/
+//	go test -run 'TestInFlightCommitIsNotAPayloadMiss|TestOrphanedEntryStillCountsAsMiss|TestForeignRelayUnaffectedByCommitWindow|TestCommitWindowMeasure|TestOversendBytes' -race -count=1 -v ./pkg/mesh/
 
 import (
 	"context"
@@ -54,10 +45,10 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// newCommitWindowMesh builds the 2-node loopback TLS mesh (the batchMesh fixture:
-// real transport, real receiver, real Publish) and binds A to a REAL WAL via the
-// production SetBridge seam, so A's InsertLocalEventsBatch takes the durable
-// PutLocals path (the silicon path) with the test's sync hook on the fsync.
+// newCommitWindowMesh builds a two-node loopback TLS batchMesh with the real
+// transport, receiver, and Publish path. It binds A to a real WAL through
+// SetBridge, so InsertLocalEventsBatch uses durable PutLocals and the test can
+// control fsync with the WAL sync hook.
 func newCommitWindowMesh(t *testing.T) (*batchMesh, *chaos.WAL) {
 	t.Helper()
 	seedA := make([]byte, 32)
@@ -75,7 +66,7 @@ func newCommitWindowMesh(t *testing.T) (*batchMesh, *chaos.WAL) {
 		t.Fatalf("NewNodeIdentity B: %v", err)
 	}
 	m := newBatchMesh(t, 100, identA, identB)
-	wal, err := chaos.OpenWAL(filepath.Join(t.TempDir(), "commit-window-a.wal"))
+	wal, err := chaos.OpenWAL(filepath.Join(t.TempDir(), "commitwindow-a.wal"))
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
@@ -96,10 +87,10 @@ func commitWindowItems(prefix string, n int) []BatchItem {
 	return items
 }
 
-// TestInFlightCommitIsNotAPayloadMiss is the LOAD-BEARING guard.
-// It holds a 100-key batch inside PutLocals (fsync blocked) and sweeps: the
-// sweep must ship NOTHING and count NOTHING (an in-flight commit is not a
-// defect). It then releases the fsync: the next sweep must ship all 100 (no loss).
+// TestInFlightCommitIsNotAPayloadMiss holds a 100-key batch inside PutLocals
+// with fsync blocked. A sweep must ship none of those entries, report 100 as
+// pending, and count none as misses. After fsync is released, the next sweep
+// must ship the entire batch.
 func TestInFlightCommitIsNotAPayloadMiss(t *testing.T) {
 	m, wal := newCommitWindowMesh(t)
 	defer m.close()
@@ -116,22 +107,22 @@ func TestInFlightCommitIsNotAPayloadMiss(t *testing.T) {
 	const N = 100
 	batchDone := make(chan error, 1)
 	go func() {
-		_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commit-window-inflight", N))
+		_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commitwindow-inflight", N))
 		batchDone <- err
 	}()
-	<-entered // DETERMINISTIC WINDOW: 100 InsertLocal'd in state, WAL mid-fsync, payloadCache empty for these keys
+	<-entered // State has 100 entries; fsync is blocked and their payloads are not cached.
 
 	stWindow := m.gA.AntiEntropySweep(context.Background())
 	if stWindow.shippedEnvelopes != 0 {
-		t.Fatalf(" VIOLATION: the sweep shipped %d envelope(s) while the batch's WAL fsync was BLOCKED — gossiping state the origin has not committed is the forbidden fix (ADR-0045)", stWindow.shippedEnvelopes)
+		t.Fatalf("durability violation: the sweep shipped %d envelope(s) while the batch's WAL fsync was blocked — gossiping state the origin has not committed is forbidden (ADR-0045 §4)", stWindow.shippedEnvelopes)
 	}
 	if stWindow.payloadMisses != 0 {
-		t.Fatalf("STARTING-LINE DEFECT (ADR-0045 step 2): the sweep counted %d payload misses for an IN-FLIGHT COMMIT — on silicon this is the seed missing its OWN keys for 73 rounds (the run: 20,259 capped log lines, 277.5/round ≈ 35 peers × missLogCap 8). An in-flight commit is not a defect: the sweep must classify it as pending, not as a miss. (st=%+v)", stWindow.payloadMisses, stWindow)
+		t.Fatalf("in-flight commit counted as %d payload misses; want pending classification with zero misses (ADR-0045 §7): %+v", stWindow.payloadMisses, stWindow)
 	}
 	if stWindow.payloadPending != N {
-		t.Fatalf("CLASSIFICATION MISSING: the sweep must still WALK the in-flight entries and count them as pending (%d), got pending=%d — a 'fix' that drops them from the walk (or never classifies) is invisible to this counter and forbidden (st=%+v)", N, stWindow.payloadPending, stWindow)
+		t.Fatalf("classification missing: the sweep must still walk the in-flight entries and count them as pending (%d), got pending=%d — a 'fix' that drops them from the walk (or never classifies) is invisible to this counter and forbidden (st=%+v)", N, stWindow.payloadPending, stWindow)
 	}
-	t.Logf("WINDOW SWEEP: misses=%d shipped_env=%d entries_shipped=%d (the in-flight batch was invisible to the wire, by construction —: entries counts PUBLISHED entries, so 0 here)",
+	t.Logf("window sweep: misses=%d shipped_env=%d entries_shipped=%d (the in-flight batch was invisible to the wire, by construction — entries counts published entries, so 0 here)",
 		stWindow.payloadMisses, stWindow.shippedEnvelopes, stWindow.shippedEntries)
 
 	close(release)
@@ -140,66 +131,61 @@ func TestInFlightCommitIsNotAPayloadMiss(t *testing.T) {
 	}
 
 	stAfter := m.gA.AntiEntropySweep(context.Background())
-	// NOTE on shippedEntries (updated by ADR-0045): the
-	// entries counter is PUBLISHED-ONLY now — the walk-top `entries++` that
-	// double-counted every shipped entry (N walked + N shipped = 2N) is
-	// deleted, because it made the gate identity "entries + pending ==
-	// deliverable set" a tautology. A full ship of N keys reads EXACTLY N, and
-	// entries + pending == N is the identity with guards: a walked self entry
-	// that is neither shipped, pending, nor orphan-missed breaks the sum.
+	// shippedEntries counts published entries only (ADR-0045 §7), not
+	// entries merely visited by the walk. A full ship of N keys therefore
+	// reports N. Any visited self entry that is neither shipped, pending, nor
+	// counted as an orphan miss breaks the accounting identity.
 	if stAfter.shippedEnvelopes != 1 || stAfter.shippedEntries != N || stAfter.payloadMisses != 0 {
-		t.Fatalf("POST-COMMIT SHIP BROKEN: after the fsync landed, the next sweep must ship the whole batch — got shipped_env=%d entries=%d (want 1 envelope, entries=%d published) misses=%d. The fix may not trade the false-miss for a lost ship.",
+		t.Fatalf("post-commit ship broken: after the fsync landed, the next sweep must ship the whole batch — got shipped_env=%d entries=%d (want 1 envelope, entries=%d published) misses=%d. The fix may not trade the false-miss for a lost ship.",
 			stAfter.shippedEnvelopes, stAfter.shippedEntries, N, stAfter.payloadMisses)
 	}
-	t.Logf("GREEN (post-commit): released batch shipped whole — shipped_env=%d entries=%d misses=%d",
+	t.Logf("post-commit: released batch shipped whole — shipped_env=%d entries=%d misses=%d",
 		stAfter.shippedEnvelopes, stAfter.shippedEntries, stAfter.payloadMisses)
 }
 
-// TestOrphanedEntryStillCountsAsMiss is the ANTI-TAUTOLOGY leg: a batch
-// whose WAL fsync FAILS leaves InsertLocal'd entries in state that were never
-// recorded and never will be (the client got a 503 and must retry). The sweep MUST
-// keep counting those as payload misses — the fix classifies IN-FLIGHT as
-// non-defect; it may not reclassify ORPHANED the same way.
+// TestOrphanedEntryStillCountsAsMiss fails a batch fsync after InsertLocal has
+// changed engine state. Those entries have no recorded payload and cannot ship
+// until the client retries after its 503 response. Unlike in-flight entries,
+// they must remain payload misses.
 func TestOrphanedEntryStillCountsAsMiss(t *testing.T) {
 	m, wal := newCommitWindowMesh(t)
 	defer m.close()
 
-	wal.SetSyncHookForTest(func() error { return errors.New("injected fsync failure") })
+	wal.SetSyncHookForTest(func() error { return errors.New("commitwindow injected fsync failure") })
 
 	const N = 100
-	_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commit-window-orphan", N))
+	_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commitwindow-orphan", N))
 	if err == nil {
 		t.Fatalf("premise broken: the batch must FAIL (its fsync was injected-failed) so the caller 503s and nothing is recorded")
 	}
 
 	st := m.gA.AntiEntropySweep(context.Background())
 	if st.payloadMisses != N {
-		t.Fatalf("DEFECT COUNTER REGRESSED: %d orphaned entries (InsertLocal ran, WAL append FAILED, no record is ever coming) must count as %d payload misses, got %d. misses is the only steady-state desync signal the sweep has — a fix that silences it converts a loud defect into silent divergence.",
+		t.Fatalf("defect counter regressed: %d orphaned entries (InsertLocal ran, WAL append failed, no record is ever coming) must count as %d payload misses, got %d. misses is the only steady-state desync signal the sweep has — a fix that silences it converts a loud defect into silent divergence.",
 			N, N, st.payloadMisses)
 	}
 	if st.relayMisses != 0 {
-		t.Fatalf(" split violation: ORPHANED SELF entries must count on misses ONLY — relay_misses=%d moved for a shape with zero foreign entries", st.relayMisses)
+		t.Fatalf("split violation: orphaned self entries must count on misses only — relay_misses=%d moved for a shape with zero foreign entries", st.relayMisses)
 	}
 	if st.shippedEnvelopes != 0 {
-		t.Fatalf(" VIOLATION: shipped %d envelopes for entries whose WAL write FAILED", st.shippedEnvelopes)
+		t.Fatalf("durability violation: shipped %d envelopes for entries whose WAL write failed", st.shippedEnvelopes)
 	}
-	t.Logf("GREEN (anti-tautology): %d orphaned entries still count as %d payload misses — the defect counter survives the fix", N, st.payloadMisses)
+	t.Logf("orphan check: %d orphaned entries counted as %d payload misses", N, st.payloadMisses)
 }
 
-// TestForeignRelayUnaffectedByCommitWindow is the FOREIGN-branch
-// no-regression guard: while a SELF commit is in flight (blocked fsync), a FOREIGN
-// entry with a retained batch must STILL relay — the pending classification lives
-// in the SELF branch only, and a fix that swallowed foreign relays behind the
-// commit window would re-open the one-hop-relay defect (foreign deltas stuck at one hop).
+// TestForeignRelayUnaffectedByCommitWindow blocks fsync for a local batch while
+// A holds a retained batch from B. The sweep must classify A's entries as
+// pending without suppressing relay of B's entries; pending classification
+// applies only to the local branch.
 func TestForeignRelayUnaffectedByCommitWindow(t *testing.T) {
 	m, wal := newCommitWindowMesh(t)
 	defer m.close()
-	m.gB.SetBatchSize(100)       // B ships BATCHES, so A retains via the batch path
-	m.gA.WireRelayHooks(m.recvA) // the production wiring seam
+	m.gB.SetBatchSize(100)       // B ships batches, so A retains via the batch path
+	m.gA.WireRelayHooks(m.recvA) // the production wiring seam (batch retainer wiring)
 
 	// B originates 5 keys and ships them to A for real (B→A sweep).
 	for i := 0; i < 5; i++ {
-		m.gB.InsertLocalEvents(fmt.Sprintf("commit-window-foreign-%d", i), "v",
+		m.gB.InsertLocalEvents(fmt.Sprintf("commitwindow-foreign-%d", i), "v",
 			eng.CRDTEntry{SystemTime: int64(1_700_300_000 + i), H3Index: uint64(i)})
 	}
 	m.gB.AntiEntropySweep(context.Background())
@@ -208,9 +194,9 @@ func TestForeignRelayUnaffectedByCommitWindow(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		n := 0
-		st := m.engineA.State()
+		// PointGet avoids rebuilding the merged view on every poll.
 		for i := 0; i < 5; i++ {
-			if len(st.Get(fmt.Sprintf("commit-window-foreign-%d", i))) > 0 {
+			if len(m.engineA.PointGet(fmt.Sprintf("commitwindow-foreign-%d", i))) > 0 {
 				n++
 			}
 		}
@@ -223,7 +209,7 @@ func TestForeignRelayUnaffectedByCommitWindow(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Open A's commit window: 100 SELF keys inside PutLocals, fsync blocked.
+	// Open A's commit window: 100 self keys inside PutLocals, fsync blocked.
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -234,45 +220,45 @@ func TestForeignRelayUnaffectedByCommitWindow(t *testing.T) {
 	})
 	batchDone := make(chan error, 1)
 	go func() {
-		_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commit-window-self-during-relay", 100))
+		_, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems("commitwindow-self-during-relay", 100))
 		batchDone <- err
 	}()
 	<-entered
 
 	st := m.gA.AntiEntropySweep(context.Background())
 	if st.payloadMisses != 0 {
-		t.Fatalf("orphan misses during a commit window: got %d, want 0 (the window must classify SELF entries as pending)", st.payloadMisses)
+		t.Fatalf("orphan misses during a commit window: got %d, want 0 (the window must classify self entries as pending)", st.payloadMisses)
 	}
 	if st.payloadPending != 100 {
-		t.Fatalf("pending classification wrong: got %d, want 100 (the in-flight SELF batch)", st.payloadPending)
+		t.Fatalf("pending classification wrong: got %d, want 100 (the in-flight self batch)", st.payloadPending)
 	}
 	if st.shippedEnvelopes != 1 {
-		t.Fatalf("FOREIGN RELAY REGRESSION: during A's commit window the retained FOREIGN batch must STILL relay (1 envelope re-published byte-identical) — got shipped_env=%d. The pending classification must not swallow the foreign branch (Root-2 stays closed).",
+		t.Fatalf("foreign relay during A's commit window: got shipped_env=%d, want 1 byte-identical envelope; pending local entries must not suppress the foreign branch",
 			st.shippedEnvelopes)
 	}
 	close(release)
 	if err := <-batchDone; err != nil {
 		t.Fatalf("InsertLocalEventsBatch: %v", err)
 	}
-	t.Logf("GREEN (foreign relay): during a 100-key in-flight SELF commit, the sweep relayed the retained FOREIGN batch (shipped_env=%d) while classifying the self entries pending=%d, misses=%d",
+	t.Logf("foreign relay: during a 100-key in-flight local commit, the sweep relayed the retained foreign batch (shipped_env=%d) with local pending=%d and misses=%d",
 		st.shippedEnvelopes, st.payloadPending, st.payloadMisses)
 }
 
-// TestCommitWindowMeasure is the (b)/(c)/(d) MEASUREMENT (reports,
-// not gates): the in-flight miss population vs concurrency, the tail after the last
-// batch ACK, the straggler shape (the silicon starting-line in miniature), and the
-// sweep ON/OFF ingest cost. Artifact: the -v output.
+// TestCommitWindowMeasure reports, without asserting performance thresholds,
+// the observed pending population, the tail after the last batch acknowledgment,
+// a slow-commit straggler, and ingest cost with sweeps enabled and disabled.
+// The measurements appear in verbose test output.
 func TestCommitWindowMeasure(t *testing.T) {
-	// ──: population tracks the in-flight window ──────────────────────
+	// Population tracks the in-flight window.
 	// A 25ms injected fsync emulates the loaded-NVMe commit latency so ~all 10
-	// workers are mid-batch at any instant (the silicon shape); the sweep sampler
-	// records the misses population it observes.
+	// workers are mid-batch at any instant; the sweep sampler records the misses
+	// population it observes.
 	m, wal := newCommitWindowMesh(t)
 	defer m.close()
 	const commitLat = 25 * time.Millisecond
 	wal.SetSyncHookForTest(func() error { time.Sleep(commitLat); return nil })
 
-	const workers, batchesPerWorker, batchSize = 10, 10, 100 // the gate's shape (10 × 100-key batches), 10,000 keys
+	const workers, batchesPerWorker, batchSize = 10, 10, 100 // 10 workers each write 10 batches of 100 keys
 	type sweepSample struct {
 		at      time.Duration
 		misses  int
@@ -311,7 +297,7 @@ func TestCommitWindowMeasure(t *testing.T) {
 			defer injectWG.Done()
 			for b := 0; b < batchesPerWorker; b++ {
 				t0 := time.Now()
-				if _, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems(fmt.Sprintf("commit-window-measure-w%d-b%d", w, b), batchSize)); err != nil {
+				if _, _, err := m.gA.InsertLocalEventsBatch(commitWindowItems(fmt.Sprintf("commitwindow-measure-w%d-b%d", w, b), batchSize)); err != nil {
 					t.Errorf("batch w%d b%d: %v", w, b, err)
 					return
 				}
@@ -323,17 +309,14 @@ func TestCommitWindowMeasure(t *testing.T) {
 	}
 	injectWG.Wait()
 	lastACK := time.Since(start)
-	// Stop the sampler BEFORE the tail loop: AntiEntropySweep is single-goroutine
-	// (the SweepLoop discipline — the memo has no synchronization), so
-	// the tail's sweeps must not overlap the sampler's. (An early draft of this
-	// test overlapped them and ate a "concurrent map read and map write" fatal —
-	// a HARNESS race, not a production one.)
+	// AntiEntropySweep is single-goroutine, and its memo is not synchronized.
+	// Stop the sampler before the tail loop so its sweeps cannot overlap the
+	// tail's sweeps and race on that state.
 	close(stop)
 	sweepWG.Wait()
 
-	// The tail: sweep until the first sweep with NOTHING unshippable (no orphan
-	// misses AND nothing pending), measuring from the LAST batch ACK (the
-	// gate's convStart anchor pre-).
+	// The tail: sweep until the first sweep with nothing unshippable (no orphan
+	// misses and nothing pending), measuring from the last batch ACK.
 	for {
 		st := m.gA.AntiEntropySweep(context.Background())
 		if st.payloadMisses == 0 && st.payloadPending == 0 {
@@ -360,16 +343,14 @@ func TestCommitWindowMeasure(t *testing.T) {
 	}
 	samplesMu.Unlock()
 	p50, p99, wmax := commitWindowPercentiles(walls)
-	t.Logf("V2-MEASURE step1 (commitLat=%s, %d workers x %d x %d keys):", commitLat, workers, batchesPerWorker, batchSize)
+	t.Logf("population measurement (commitLat=%s, %d workers x %d x %d keys):", commitLat, workers, batchesPerWorker, batchSize)
 	t.Logf("  per-batch wall: p50=%s p99=%s max=%s (n=%d)", p50, p99, wmax, len(walls))
 	t.Logf("  sweep sampler: %d sweeps, %d with misses>0, %d with pending>0, max misses=%d, max pending=%d (predicted in-flight population ~= workers x batchSize = %d)", len(samples), nonzeroSweeps, pendingSweeps, maxMiss, maxPend, workers*batchSize)
-	t.Logf("  inject wall (last ACK) = %s; TAIL (last ACK -> first clean sweep) = %s", lastACK, tail)
+	t.Logf("  inject wall (last ACK) = %s; tail (last ACK -> first clean sweep) = %s", lastACK, tail)
 
-	// ──: the straggler — the silicon starting line in miniature ──────
-	// One batch whose fsync takes 2s while every other call has returned: the
-	// driver's clock stops (injectWG.Wait's analog) with the straggler still
-	// inside PutLocals. The sweeps in between observe the misses the silicon
-	// gate measured as its "convergence SLO".
+	// Hold one batch in fsync for two seconds after the other calls return.
+	// Sweeps during that interval show what a convergence measurement would
+	// observe if its clock stopped while this commit remained outstanding.
 	m2, wal2 := newCommitWindowMesh(t)
 	defer m2.close()
 	slow := make(chan struct{})
@@ -380,11 +361,11 @@ func TestCommitWindowMeasure(t *testing.T) {
 	})
 	stragglerDone := make(chan struct{})
 	go func() {
-		_, _, _ = m2.gA.InsertLocalEventsBatch(commitWindowItems("commit-window-straggler", batchSize))
+		_, _, _ = m2.gA.InsertLocalEventsBatch(commitWindowItems("commitwindow-straggler", batchSize))
 		close(stragglerDone)
 	}()
 	<-slow
-	clockStop := time.Now() // the gate would print "injected ..." and start convStart HERE
+	clockStop := time.Now() // Model a convergence clock started after the other batches returned.
 	missesWhileStraggler := 0
 	pendingWhileStraggler := 0
 	sweepsWhileStraggler := 0
@@ -402,18 +383,18 @@ func TestCommitWindowMeasure(t *testing.T) {
 stragglerLanded:
 	stragglerTail := time.Since(clockStop)
 	stFinal := m2.gA.AntiEntropySweep(context.Background())
-	t.Logf("V2-MEASURE step2 (straggler): clock stopped at last-return; straggler committed %s LATER;", stragglerTail)
-	t.Logf("  sweeps during the window: %d, misses observed: %d, pending observed: %d (the SLO-clock defect — those sweeps are the gate's 'convergence' window)", sweepsWhileStraggler, missesWhileStraggler, pendingWhileStraggler)
+	t.Logf("straggler measurement: clock stopped at last return; straggler committed %s later", stragglerTail)
+	t.Logf("  sweeps during the window: %d, misses observed: %d, pending observed: %d (these observations fall inside the convergence interval)", sweepsWhileStraggler, missesWhileStraggler, pendingWhileStraggler)
 	t.Logf("  first post-commit sweep: misses=%d pending=%d shipped_env=%d entries=%d", stFinal.payloadMisses, stFinal.payloadPending, stFinal.shippedEnvelopes, stFinal.shippedEntries)
 
-	// ── ingest with the sweep ON vs OFF (the seed node) ───────────────
+	// Ingest with the sweep on vs off.
 	for _, on := range []bool{false, true} {
 		mX, _ := newCommitWindowMesh(t)
 		defer mX.close()
-		// real fsync (no hook): the local-disk commit window
+		// Use real fsync with no hook to measure the local-disk commit window.
 		var wgX sync.WaitGroup
 		stopX := make(chan struct{})
-		var ends []time.Duration // per-batch completion times — the ingest CURVE
+		var ends []time.Duration // per-batch completion times for the ingest-rate curve
 		var endsMu sync.Mutex
 		var sweepWG2 sync.WaitGroup
 		sweepWG2.Add(1)
@@ -438,7 +419,7 @@ stragglerLanded:
 			go func(w int) {
 				defer wgX.Done()
 				for b := 0; b < batchesPerWorker; b++ {
-					_, _, _ = mX.gA.InsertLocalEventsBatch(commitWindowItems(fmt.Sprintf("commit-window-onoff-%v-w%d-b%d", on, w, b), batchSize))
+					_, _, _ = mX.gA.InsertLocalEventsBatch(commitWindowItems(fmt.Sprintf("commitwindow-onoff-%v-w%d-b%d", on, w, b), batchSize))
 					endsMu.Lock()
 					ends = append(ends, time.Since(startX))
 					endsMu.Unlock()
@@ -449,34 +430,32 @@ stragglerLanded:
 		close(stopX)
 		sweepWG2.Wait()
 		wall := time.Since(startX)
-		t.Logf("V2-MEASURE step3: ingest 10,000 keys (10x10x100) sweep ON=%v: wall=%s (%.0f keys/s) [4-core box, tmpfs+ext4 mix — RELATIVE number, not the gate]",
+		t.Logf("ingest comparison: 10,000 keys (10x10x100), sweep enabled=%v: wall=%s (%.0f keys/s) [four-core host, tmpfs and ext4; relative measurement]",
 			on, wall, float64(workers*batchesPerWorker*batchSize)/wall.Seconds())
-		t.Logf("V2-MEASURE step3 curve ON=%v (decile keys/s): %s", on, commitWindowCurve(ends, batchSize))
+		t.Logf("ingest-rate curve, sweep enabled=%v (decile keys/s): %s", on, commitWindowCurve(ends, batchSize))
 	}
 }
 
-// TestOversendBytes measures the sweep's wire cost in BYTES — the
-// post-cost is TRANSMISSION, not compute: at the silicon shape (35
-// peers × 100 batches of 100 entries), the sweep ships every key to every peer
-// every round, FOREVER, including at converged steady state (B.4). This guard
-// measures the per-envelope wire bytes exactly (build a real 100-entry batch,
-// marshal the real envelope) and states the multiplication — no "entries"
-// hand-waving.
+// TestOversendBytes measures the sweep's transmission cost with a real
+// 100-entry batch and a signed, length-prefixed envelope. At the measured
+// shape of 35 peers and 100 batches per peer, the sweep repeatedly ships every
+// key, including after convergence. The test reports the resulting bytes per
+// node and per 34-node host for each round.
 func TestOversendBytes(t *testing.T) {
 	m, _ := newCommitWindowMesh(t)
 	defer m.close()
 
-	// 100 real entries on A (the silicon batch size).
+	// 100 real entries on A (the measured batch size).
 	const N = 100
 	var keys []string
 	for i := 0; i < N; i++ {
-		k := fmt.Sprintf("commit-window-oversend-%d", i)
+		k := fmt.Sprintf("commitwindow-oversend-%d", i)
 		m.gA.InsertLocalEvents(k, fmt.Sprintf("payload-%010d", i), eng.CRDTEntry{SystemTime: int64(1_700_600_000 + i), H3Index: uint64(i)})
 		keys = append(keys, k)
 	}
 	events := make([]BuiltEvent, 0, N)
 	for _, k := range keys {
-		ents := m.engineA.State().Get(k)
+		ents := m.engineA.PointGet(k) // Avoid rebuilding the merged State view for each key.
 		e := ents[0]
 		payload, ok := m.gA.cache.lookup(k, eng.CausalDot{NodeID: e.DotNodeID, Counter: e.DotCounter})
 		if !ok {
@@ -498,19 +477,19 @@ func TestOversendBytes(t *testing.T) {
 	env := attribution.MarshalBatchEnvelope(m.gA.owner.NodeID, sigArr, 1, 1, batchWire)
 	prefixed := receive.LengthPrefixFrame(env)
 
-	const peers, batchesPerPeer, nodesPerHost = 35, 100, 34 // the silicon shape
+	const peers, batchesPerPeer, nodesPerHost = 35, 100, 34 // the measured shape (run 10)
 	perEnv := len(prefixed)
 	perRoundNode := peers * batchesPerPeer * perEnv
 	perRoundHost := perRoundNode * nodesPerHost
-	t.Logf("V4 OVERSEND BYTES: payload≈%dB/key; batchWire(100 entries)=%dB; envelope(prefixed)=%dB ⇒ %.1f B/entry on the wire",
+	t.Logf("oversend bytes: payload≈%dB/key; batchWire(100 entries)=%dB; envelope(prefixed)=%dB ⇒ %.1f B/entry on the wire",
 		len("payload-0000000000"), len(batchWire), perEnv, float64(perEnv)/N)
-	t.Logf("V4 OVERSEND BYTES: %d peers × %d batches × %dB = %.1f MB/round/node; × %d nodes/host = %.1f MB/round/host of TLS writes — FOREVER, including at converged steady state (the correct steady-state answer is ~0)",
+	t.Logf("oversend bytes: %d peers × %d batches × %dB = %.1f MB/round/node; × %d nodes/host = %.1f MB/round/host of TLS writes — forever, including at converged steady state (the correct steady-state answer is ~0)",
 		peers, batchesPerPeer, perEnv, float64(perRoundNode)/1e6, nodesPerHost, float64(perRoundHost)/1e6)
 }
 
-// commitWindowCurve renders the ingest RATE OVER TIME (not an average): sort the
-// per-batch completion times, then for each decile of completions report
-// keys/s within that decile. A collapse shows up as a falling tail.
+// commitWindowCurve sorts per-batch completion times and reports keys per
+// second within each decile of completions, exposing changes over time that a
+// single average would hide.
 func commitWindowCurve(ends []time.Duration, batchSize int) string {
 	if len(ends) < 10 {
 		return "n/a"

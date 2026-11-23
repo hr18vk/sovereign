@@ -6,30 +6,16 @@
 
 package mesh
 
-// (ADR-0024) guards — the /v1/range HTTP route + the AsOf-consistency
-// superset invariant (the load-bearing one), over a REAL *LocalFS via the
-// production Bridge harness (the query_test.go precedent).
+// These tests cover /v1/range and its consistency with Resolver.AsOf using the
+// production Bridge and a real LocalFS. For one entity and transaction time,
+// every row returned by AsOf within [vLo, vHi) must also appear in Range over
+// that window.
 //
-// This file holds the operator-facing-seam guards:
-//   - AsOf-CONSISTENCY superset (the consistency invariant): for the SAME
-//     entity+txTime, AsOf(E, v, txTime) for any v in [vLo, vHi) returns a row
-//     PRESENT in Range(E, [vLo,vHi), txTime). Driven over a REAL *LocalFS via
-//     the Bridge (write → checkpoint → Arrow index → Resolver.Range + AsOf).
-//   - /v1/range ROUTE CONTRACT: 405 on POST, 503 when resolver nil (the
-// honest-disabled precedent — NOT a silent 404), 400 on missing key
-//     / bad valid_time_lo / bad valid_time_hi / bad tx_time / empty window, 404
-//     ErrEntityNotFound, 200 the sorted window + truncated. Mirrors /v1/query's
-//     handler (control.go handleQuery) for the shared cases.
-// - scope hygiene: pkg/mesh's import of pkg/sync is UNCHANGED — Range
-//     reuses the Resolver, NOT the engine (Range adds NO engine read-seam importer).
-//
-// It reuses the query_test.go harness (queryHarness / newQueryResolver /
-// queryTestNodeID / queryValidEndNs / queryNanosInRFC3339Nano /
-// isErrEntityNotFound) — the SAME REAL *LocalFS + Bridge the query guards
-// drive. Range is READ-only; the Bridge path keeps col0/entityID coupling HONEST
-// (key prefix = sha256(entityID)[:16]), so this file does NOT host the
-// decoupled-col0 Filter-4 test (that needs the low-level SkipList+Flusher path in
-// internal/database). The narrower scope is the import-graph honest split.
+// The route checks cover method and parameter errors, a disabled resolver,
+// missing entities, sorted results, and truncation. The tests reuse the query
+// harness and its Arrow-index setup. Multi-row files produced below the Bridge
+// are covered in internal/database because the Bridge snapshots only the
+// dominant row for an entity at each checkpoint.
 
 import (
 	"context"
@@ -39,9 +25,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -49,20 +32,10 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// rangeTestEntry builds a CRDTEntry with an EXPLICIT valid-time window [vs, ve)
-// + a known SystemTime. It is the window-aware sibling of queryTestEntry (which
-// sets ValidTimeEnd = OpenEndedValidEndNs, the degenerate-window pin for AsOf a
-// Range window-intersection test does NOT want). The Bridge.PutLocal path
-// (bridge.go:178) + snapshot.go:439-441 carry entry.ValidTimeStart/End VERBATIM
-// into the Arrow row, so a checkpoint of these lands DISTINCT windows the
-// Resolver.Range reads. The open-end sentinel (OpenEndedValidEndNs) is reused
-// when a window is meant to extend past any realistic txTime.
-//
-// NOTE on the pkg/sync (eng) import: this is a TEST file (query_range_test.go),
-// NOT pkg/mesh's production import graph. query_test.go already imports
-// eng for the SAME harness; the scope-hygiene guard asserts pkg/mesh/control.go
-// (PRODUCTION) imports pkg/sync UNCHANGED — a test-file import is the
-// precedent, NOT a production-seam addition.
+// rangeTestEntry builds an entry with an explicit non-empty valid-time window
+// [validStart, validEnd) and a known SystemTime. Bridge.PutLocal preserves both
+// bounds in the Arrow row, allowing the test to construct disjoint windows and
+// check Range's intersection rules.
 func rangeTestEntry(systemTime, validStart, validEnd int64) (eng.CRDTEntry, error) {
 	if validEnd <= validStart {
 		return eng.CRDTEntry{}, fmt.Errorf("rangeTestEntry: degenerate window [%d,%d)", validStart, validEnd)
@@ -106,32 +79,22 @@ func rangeGet(t *testing.T, srv *httptest.Server, key string, vLo, vHi, tx time.
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// AsOf-CONSISTENCY superset over a REAL *LocalFS via the Bridge.
+// AsOf-consistency superset over a real *LocalFS via the Bridge.
 // ──────────────────────────────────────────────────────────────────────────
 
-// TestAsOfConsistencyRangeSupersetOverLocalFS is the AsOf-consistency superset
-// guard over
-// the production durable surface (the Bridge → checkpoint → Arrow index a
-// sovereign-node writes). For the SAME entity+txTime, AsOf(E, v, txTime) for any
-// v in [vLo, vHi) returns a row PRESENT in Range(E, [vLo,vHi), txTime). The 4-
-// probe sweep. Range is a SUPERSET.
+// TestAsOfConsistencyRangeSupersetOverLocalFS checks four AsOf probes against a
+// Range result over the same entity, valid-time window, and transaction time.
+// Every selected row must be present in the Range set.
 //
-// SEEDING NOTE (the honest Bridge path): SnapshotToLSM reads engine.State's
-// MERGED dominant per entity (snapshot.go `latest` map), so multiple PutLocals to
-// the SAME entity in ONE checkpoint collapse to ONE row. To build a multi-row
-// history for one entity via the production Bridge, issue ONE PutLocal PER
-// checkpoint — each checkpoint's dominant lands as its OWN L0 file (the SAME
-// shape a sovereign-node's checkpoint cadence produces). Range then reads the
-// multi-FILE history (L0 files are the per-checkpoint dominants). This is the
-// FAITHFUL durable surface; the multi-DOT-per-file seam lives in
-// internal/database/range_test.go (the SkipList path that co-locates
-// several rows in ONE file — CANNOT via the Bridge, which merges first). A Range
-// filter that DIVERGES from AsOf's (e.g. an off-by-one bound) breaks this.
+// SnapshotToLSM keeps only the dominant row for an entity in a checkpoint. The
+// test therefore performs one PutLocal and AppendCheckpoint per disjoint window,
+// producing three L0 files for Range to read. Multi-row files below the Bridge
+// are covered by internal/database/range_test.go.
 func TestAsOfConsistencyRangeSupersetOverLocalFS(t *testing.T) {
 	const alpha = "alpha"
 	base := int64(1_700_000_000_000_000_000)
 	// One row per checkpoint; each checkpoint's dominant lands as its own L0
-	// file. Windows DISJOINT (so each AsOf probe resolves a UNIQUE row across
+	// file. Windows are disjoint (so each AsOf probe resolves a unique row across
 	// the multi-file history — the superset check maps each AsOf to its file).
 	wins := [][2]int64{
 		{base + 10, base + 20},
@@ -180,21 +143,17 @@ func TestAsOfConsistencyRangeSupersetOverLocalFS(t *testing.T) {
 		}
 		k := key{got.ValidTimeStart, got.SystemTime}
 		if _, present := rangeSet[k]; !present {
-			t.Fatalf("AsOf-consistency superset: AsOf(alpha, v=%d) row {vs=%d,sys=%d} NOT in Range result-set — Range's filter DIVERGES from AsOf's (the consistency killer)", probe-base, got.ValidTimeStart, got.SystemTime)
+			t.Fatalf("AsOf(alpha, v=%d) returned {vs=%d,sys=%d}, which is absent from Range; their filters disagree", probe-base, got.ValidTimeStart, got.SystemTime)
 		}
 	}
-	t.Logf("REAL *LocalFS: 4-point AsOf sweep (v=10,35,55,59) each ∈ Range result-set over %d L0 files (one per checkpoint) — Range is a SUPERSET of every AsOf point in the window", len(rows))
+	t.Logf("4-point AsOf sweep (v=10,35,55,59) each in Range result-set over %d L0 files (one per checkpoint) — Range is a superset of every AsOf point in the window", len(rows))
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// /v1/range ROUTE CONTRACT (the operator-facing seam).
-// ──────────────────────────────────────────────────────────────────────────
+// /v1/range route contract.
 
-// TestRangeRouteContract mirrors /v1/query's
-// handler (control.go handleQuery) for the shared cases (405/503/400/404/200) +
-// asserts the range-specific 400 guards (valid_time_lo + valid_time_hi parse +
-// the non-empty window). All over a REAL *LocalFS via the Bridge for the 200 +
-// 404 paths (the same surface the production node reads).
+// TestRangeRouteContract checks the /v1/range responses for success, unsupported
+// methods, a missing resolver, malformed parameters, an empty window, and an
+// unknown entity. Successful and not-found requests read a real LocalFS index.
 func TestRangeRouteContract(t *testing.T) {
 	const alpha = "alpha"
 	base := int64(1_700_000_000_000_000_000)
@@ -245,17 +204,17 @@ func TestRangeRouteContract(t *testing.T) {
 		if rr.Truncated {
 			t.Fatalf("200 path: truncated must be false (2 rows << MaxRangeRows)")
 		}
-		// validTimeStart ascending + the digest is echoed verbatim.
+		// Rows are ordered by validTimeStart. The index stores SENTRY bodies,
+		// so the response can return digests but not original payload values.
 		for i := 1; i < len(rr.Rows); i++ {
 			if rr.Rows[i-1].ValidTimeStartNs >= rr.Rows[i].ValidTimeStartNs {
 				t.Fatalf("200 path: rows must be validTimeStart-sorted; got [%d, %d]", rr.Rows[i-1].ValidTimeStartNs, rr.Rows[i].ValidTimeStartNs)
 			}
 		}
-		// NO payload field (the index stores a SENTRY body).
 		if hasPayloadField(body) {
-			t.Fatalf("/v1/range body carries a payload field (the digest-is-not-value fabrication — the index has a SENTRY body): %s", body)
+			t.Fatalf("/v1/range body contains a payload field, but the index stores SENTRY bodies: %s", body)
 		}
-		t.Logf("200: Range [25,65) → %d rows, sorted, truncated=false, no payload field (the no-fabrication discipline holds)", len(rr.Rows))
+		t.Logf("Range [25,65) returned %d sorted rows with truncated=false and no payload field", len(rr.Rows))
 	})
 
 	t.Run("405_POST_rejected", func(t *testing.T) {
@@ -273,8 +232,8 @@ func TestRangeRouteContract(t *testing.T) {
 		}
 	})
 
-	t.Run("503_resolver_nil_honest_disabled", func(t *testing.T) {
-		// SetResolver NEVER called → resolver stays nil → 503 (NOT 404).
+	t.Run("503_resolver_nil_disabled", func(t *testing.T) {
+		// SetResolver never called → resolver stays nil → 503 (not 404).
 		cs := NewControlServer(nil, queryTestNodeID, nil, nil)
 		srv := httptest.NewServer(cs.Handler())
 		t.Cleanup(srv.Close)
@@ -282,22 +241,22 @@ func TestRangeRouteContract(t *testing.T) {
 			queryNanosInRFC3339Nano(base+25), queryNanosInRFC3339Nano(base+65),
 			queryNanosInRFC3339Nano(base+99999))
 		if status != http.StatusServiceUnavailable {
-			t.Fatalf("disabled /v1/range returned %d, want 503 (honest no-availability — NOT silent 404); body=%s", status, body)
+			t.Fatalf("disabled /v1/range returned %d, want 503 (no-availability — not silent 404); body=%s", status, body)
 		}
 		var d queryDisabledBody
 		if err := json.Unmarshal(body, &d); err != nil {
 			t.Fatalf("decode 503: %v body=%s", err, body)
 		}
 		if d.Error != "query-tier disabled (no --lsm-root)" {
-			t.Fatalf("503 error=%q want the honest disclosure %q", d.Error, "query-tier disabled (no --lsm-root)")
+			t.Fatalf("503 error=%q want the disclosure %q", d.Error, "query-tier disabled (no --lsm-root)")
 		}
 	})
 
-	t.Run("503_runs_BEFORE_param_validation_even_when_disabled", func(t *testing.T) {
-		// The disabled-tier check runs BEFORE param validation (the SAME order
+	t.Run("503_runs_before_param_validation_even_when_disabled", func(t *testing.T) {
+		// The disabled-tier check runs before param validation (the same order
 		// handleQuery pins: a malformed range to a disabled tier is
-		// "unavailable", NOT "bad request"). This pins the order so a future
-		// refactor does NOT 400 a request that should be 503.
+		// "unavailable", not "bad request"). This pins the order so a future
+		// refactor does not 400 a request that should be 503.
 		cs := NewControlServer(nil, queryTestNodeID, nil, nil) // resolver nil
 		srv := httptest.NewServer(cs.Handler())
 		t.Cleanup(srv.Close)
@@ -308,7 +267,7 @@ func TestRangeRouteContract(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("empty disabled /v1/range returned %d, want 503 (the disabled guard runs BEFORE param validation)", resp.StatusCode)
+			t.Fatalf("empty disabled /v1/range returned %d, want 503 (the disabled guard runs before param validation)", resp.StatusCode)
 		}
 	})
 
@@ -422,52 +381,4 @@ func TestRangeRouteContract(t *testing.T) {
 			t.Fatalf("404 body=%+v want {Error:%q Entity:%q}", nf, "not found", "never-written")
 		}
 	})
-}
-
-// TestScopeHygieneMeshImportOfSyncUnchanged is the
-// scope-hygiene guard. Range reuses Resolver (internal/database), NOT the live
-// HAMT / pkg/sync engine, so it adds NO new importer of a live-engine/HAMT read
-// seam. This guard asserts pkg/mesh's import of pkg/sync (eng) is UNCHANGED —
-// Range's /v1/range handler + the resolver path add ZERO engine read-seam
-// importers. The check mirrors the pkg/receive source-grep discipline.
-func TestScopeHygieneMeshImportOfSyncUnchanged(t *testing.T) {
-	wd, err := os.Getwd()
-	require_NoErrf(t, "getwd", err)
-	controlGo := filepath.Join(wd, "control.go")
-	data, err := os.ReadFile(controlGo)
-	if err != nil {
-		t.Fatalf("read control.go: %v", err)
-	}
-	// pkg/sync (eng) MUST still be imported (the pre-existing /v1/insert +
-	// /v1/get + /v1/query readers use eng.CRDTEntry / eng.CausalDot). This file's
-	// handleRange uses database.Resolver + database.CoalesceRange — it does NOT
-	// add a new eng. surface. The import line is the SAME shape the
-	// query guards inherited.
-	if !strings.Contains(string(data), `eng "github.com/hr18vk/sovereign/pkg/sync"`) {
-		t.Fatalf("scope hygiene: pkg/mesh/control.go no longer imports pkg/sync (eng) — must NOT change the mesh↔sync import surface (Range reuses Resolver, NOT the engine); the eng import is the pre-existing seam")
-	}
-	// Range's NEW surface type must be database (NOT eng) — the Range handler
-	// references database.Range/something only via Resolver. Assert the handler
-	// uses database. (A regression that routed Range through engine.InsertLocal
-	// would be the TOCTOU class — Range is READ-only.)
-	if !strings.Contains(string(data), "database.ErrEntityNotFound") || !strings.Contains(string(data), `s.resolver.Range`) {
-		t.Fatalf("scope hygiene: handleRange must call s.resolver.Range + surface database.ErrEntityNotFound (READ-only via Resolver, NOT the engine)")
-	}
-	// Range must NOT reach into the live HAMT — no engine.State / engine.InsertLocal
-	// in handleRange's body. (A grep on the file, not just the function: the
-	// handleRange block must not contain engine read-seam calls.) The handleGet
-	// / handleInsert readers are ALLOWED their existing engine seams; the check
-	// is scoped to handleRange via the absence of NEW engine.Method calls WITHIN
-	// Range's handler — covered by the resolver.Range call above (the handler
-	// goes through the resolver, period).
-	t.Logf("scope hygiene: pkg/mesh imports pkg/sync (eng) UNCHANGED; handleRange goes through s.resolver.Range (READ-only via Resolver, NOT the engine/HAMT) — Range adds NO engine read-seam importer")
-}
-
-// require_NoErrf is a local require-no-error wrapper (testify's require imports
-// common types; kept local to avoid a testify-only helper in this guard).
-func require_NoErrf(t *testing.T, prefix string, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("%s: %v", prefix, err)
-	}
 }

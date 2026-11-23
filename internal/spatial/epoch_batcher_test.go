@@ -95,7 +95,7 @@ func TestEpochBatcher_TimeoutRecovery(t *testing.T) {
 
 	batcher := NewEpochBatcher(ring, 2)
 
-	// event with NO consumer (will timeout).
+	// Stage an event with no consumer running (will timeout).
 	if err := batcher.Stage(10.0, 76.0); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}

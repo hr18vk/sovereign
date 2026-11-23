@@ -6,28 +6,18 @@
 
 package durability
 
-// B2 — THE ARMED ORACLE (ADR-0045; the BINDING §15.16
-// Revision 1, §11.5-§11.9).
+// Recovery fingerprint tests. A Merkle root covers only DotNodeID and
+// DotCounter, and the post-tail root comparison runs only for a final
+// checkpoint. Neither can detect changed entry bytes in an image with a WAL
+// tail. The fingerprinted 0x05 checkpoint and the image header's CutSeq and root
+// binding close that gap.
 //
-// THE DEFECT: recovery.go's ONLY integrity check (the root assertion) is
-// (a) BLIND to everything but (DotNodeID, DotCounter) — "same dots, wrong
-// bytes" is undetectable, and
-// (b) gated on `checkpointFinal`, which is FALSE whenever a post-checkpoint
-// mutation tail exists — the crash-mid-inject shape the silicon gate
-// exists to test. On that shape the check NEVER arms: the crash-leg
-// PASS was taken with the integrity check switched OFF.
-//
-// The fix: the 0x05 record carries the state fingerprint; the
-// image header carries the anchor's CutSeq+root (the BINDING); the pre-tail
-// check compares root AND fingerprint immediately after the image Join (where
-// the rebuilt state IS the image), armed only when the binding matched, the
-// anchor carries a fingerprint, and the image Join skipped nothing; a binding
-// mismatch DISARMS + falls back to exact-WAL replay (NEVER fatal); an armed
-// mismatch IS fatal.
-//
-// T-C2: one corrupted non-dot byte, final checkpoint ⇒ boot REFUSED, and the
-// root check provably stays blind. T-C3: the crash-mid-inject shape — the
-// check arms WITH a tail.
+// After the image Join, recovery compares both root and fingerprint when the
+// binding matches, the anchor has a fingerprint, and no image records were
+// skipped. A binding mismatch falls back to exact-WAL replay; a mismatch in an
+// armed integrity check refuses the boot. These tests cover non-dot corruption,
+// a post-checkpoint tail, writer/reader fingerprint agreement, and legacy or
+// truncated checkpoint lengths.
 
 import (
 	"context"
@@ -42,13 +32,12 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// b2BuildMidInject writes `pre` mutations, takes a snapshotter-backed
-// checkpoint, writes `tail` post-checkpoint mutations, and crashes (per-record
-// fsyncs only). Returns the WAL path, the checkpoint's image key watermark,
-// and the FINAL live root.
-func b2BuildMidInject(t *testing.T, lfs *LocalFS, pre, tail int) (walPath string, wm uint64, liveRoot [32]byte) {
+// buildCheckpointTail writes pre-checkpoint mutations, takes a snapshotter-
+// backed checkpoint, appends a mutation tail, and closes the live engine and
+// WAL. It returns the WAL path, image-key watermark, and final live root.
+func buildCheckpointTail(t *testing.T, lfs *LocalFS, pre, tail int) (walPath string, wm uint64, liveRoot [32]byte) {
 	t.Helper()
-	walPath = filepath.Join(t.TempDir(), "b2.wal")
+	walPath = filepath.Join(t.TempDir(), "checkpoint-tail.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, true)
 	for i := 0; i < pre; i++ {
@@ -82,11 +71,10 @@ func b2BuildMidInject(t *testing.T, lfs *LocalFS, pre, tail int) (walPath string
 	return walPath, rep.FinalCheckpt.LamportHigh, liveRoot
 }
 
-// b2CorruptFirstRecordByte flips ONE byte of the first image record's
-// ValidTimeEnd field (entry offset 88) on disk. The flip is dot-invisible:
-// the Merkle root folds only DotNodeID+DotCounter, so the corrupted image
-// produces the SAME root — only a payload-folding check can see it.
-func b2CorruptFirstRecordByte(t *testing.T, lfs *LocalFS, wm uint64) {
+// corruptFirstImageValidTimeEnd flips a ValidTimeEnd byte in the first image
+// record. The Merkle root folds only DotNodeID and DotCounter, so this change
+// leaves the root intact while altering the state fingerprint.
+func corruptFirstImageValidTimeEnd(t *testing.T, lfs *LocalFS, wm uint64) {
 	t.Helper()
 	key := filepath.Join(lfs.Root(), "ckpt", strconv.FormatUint(wm, 10))
 	data, err := os.ReadFile(key)
@@ -102,16 +90,11 @@ func b2CorruptFirstRecordByte(t *testing.T, lfs *LocalFS, wm uint64) {
 	case 2:
 		hdr = 61
 	case 3:
-		// (C3): the production image is now v3 (whole-image CRC32C
-		// trailer). A v3 byte-flip is caught by the CRC at DECODE (that is T4's
-		// guard) and never reaches the fingerprint check. THIS guard's premise is
-		// that the corruption STILL DECODES so the FINGERPRINT — the "same dots,
-		// wrong bytes" check — is the one that fires. To preserve that premise we
-		// downgrade the image to the legacy v2 form (strip the 4-byte CRC trailer,
-		// set version=2): v2 has no checksum, so the corruption decodes and the
-		// fingerprint remains the EXERCISED defense on the unprotected format.
-		// The header (LamportHigh/CutSeq/MerkleRoot) is untouched, so the anchor
-		// binding still holds; only the CRC trailer + version byte change.
+		// A v3 byte flip is rejected by its CRC before fingerprint handling.
+		// These tests need the fingerprint to handle the corruption, so they use
+		// the legacy v2 encoding without a checksum. Removing the trailer and
+		// changing the version byte leaves LamportHigh, CutSeq, MerkleRoot, and
+		// the record layout untouched, preserving the anchor binding.
 		hdr = 61
 		data = append([]byte(nil), data[:len(data)-4]...) // strip the CRC trailer
 		data[4] = 2
@@ -133,10 +116,9 @@ func b2CorruptFirstRecordByte(t *testing.T, lfs *LocalFS, wm uint64) {
 	t.Logf("corrupted one byte at offset %d (record 0 ValidTimeEnd) of %s", off, key)
 }
 
-// b2RootFromImage joins a (possibly corrupted) image into a probe engine and
-// returns its Merkle root — the proof that a non-dot corruption is INVISIBLE
-// to the root check.
-func b2RootFromImage(t *testing.T, img *SnapshotImage) [32]byte {
+// merkleRootFromImage joins an image into a probe engine and returns its root,
+// providing an independent comparison with the checkpoint anchor.
+func merkleRootFromImage(t *testing.T, img *SnapshotImage) [32]byte {
 	t.Helper()
 	eng.DataDir = t.TempDir()
 	e, err := eng.NewDeltaCRDTEngine(testNodeID(), 1, testArenaSize)
@@ -148,24 +130,17 @@ func b2RootFromImage(t *testing.T, img *SnapshotImage) [32]byte {
 	return e.MerkleRootFromShards()
 }
 
-// TestNonDotCorruptionBootRefused is T-C2 — the load-bearing Blocker-2
-// guard. Persist a checkpoint, corrupt exactly ONE non-dot byte of the image
-// on disk (ValidTimeEnd), recover. The check MUST REFUSE the boot. The second
-// half is the whole point: the corruption is provably INVISIBLE to the Merkle
-// root (the corrupted image reproduces the anchor root exactly), so a boot that
-// succeeded would prove the root-only check structurally blind to "same dots,
-// wrong bytes".
-//
-// RED on the pre-fix tree: no fingerprint exists on disk and the root assertion
-// passes (dots unchanged), so recovery BOOTS — the assertion below fires.
-// GREEN post-fix: the armed fingerprint check fires ErrRecoveryFingerprintMismatch.
+// TestNonDotCorruptionBootRefused changes ValidTimeEnd in a final-checkpoint
+// image. The corrupted image must still reproduce the anchor root, proving the
+// corruption is outside the root's coverage, and recovery must reject it with
+// ErrRecoveryFingerprintMismatch rather than a decode or I/O error.
 func TestNonDotCorruptionBootRefused(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath, wm, _ := b2BuildMidInject(t, lfs, 6, 0) // final checkpoint, NO tail
-	b2CorruptFirstRecordByte(t, lfs, wm)
+	walPath, wm, _ := buildCheckpointTail(t, lfs, 6, 0) // final checkpoint with no tail
+	corruptFirstImageValidTimeEnd(t, lfs, wm)
 
-	// PREMISE (the root-check blindness, proven not claimed): the corrupted
-	// image must STILL decode and MUST reproduce the anchor root — i.e. the
+	// Premise (the root-oracle blindness, proven not claimed): the corrupted
+	// image must still decode and must reproduce the anchor root — i.e. the
 	// corruption is in bytes the root never folds.
 	rep, err := ReplayWAL(walPath)
 	if err != nil {
@@ -175,107 +150,82 @@ func TestNonDotCorruptionBootRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("corrupted image must still decode (structure intact): %v", err)
 	}
-	if got := b2RootFromImage(t, img); got != rep.FinalCheckpt.MerkleRoot {
-		t.Fatalf("PREMISE BROKEN: the corruption moved the root (%x != anchor %x) — it is NOT a non-dot corruption; pick a byte the root does not fold", got, rep.FinalCheckpt.MerkleRoot)
+	if got := merkleRootFromImage(t, img); got != rep.FinalCheckpt.MerkleRoot {
+		t.Fatalf("premise broken: the corruption moved the root (%x != anchor %x) — it is not a non-dot corruption; pick a byte the root does not fold", got, rep.FinalCheckpt.MerkleRoot)
 	}
 
-	// THE ASSERTION: recovery must REFUSE to boot on the corrupted image.
+	// The assertion: recovery must refuse to boot on the corrupted image.
 	engine, wal, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if err == nil {
 		_ = wal.Close()
 		_ = engine.Close()
-		t.Fatalf(`B2 RED — recovery BOOTED on a byte-corrupted image (witness=%+v).
- The image's ValidTimeEnd was flipped on disk; the root assertion cannot see it
- (roots match); NO fingerprint check exists on disk to fire. The boot succeeded
- on state the durable checkpoint never promised — the exact "same dots, wrong
- bytes" blindness Blocker 2 exists to close.`, witness)
+		t.Fatalf("recovery accepted a ValidTimeEnd-corrupted image with a matching root; want ErrRecoveryFingerprintMismatch (witness=%+v)", witness)
 	}
 
-	// THE TIGHTENED ASSERTION (no-test-lies): it is NOT enough that SOME error
-	// fired — a decode failure, an IO error, or the dot-only root check would
-	// also satisfy `err != nil` while the fingerprint check sat silent. The
-	// error MUST be the fingerprint sentinel. The premise above proved the
-	// corruption is dot-invisible, so the root check CANNOT have fired; the
-	// fingerprint sentinel is the only refusal that proves the "same dots,
-	// wrong bytes" check is live.
+	// Require the fingerprint sentinel: a decode failure, I/O error, or root
+	// mismatch would not demonstrate that non-dot corruption was detected. The
+	// independent root comparison above rules out the root-only check.
 	if !errors.Is(err, ErrRecoveryFingerprintMismatch) {
-		t.Fatalf("B2 T-C2: want ErrRecoveryFingerprintMismatch (the payload check must fire), got: %v", err)
+		t.Fatalf("want ErrRecoveryFingerprintMismatch for non-dot image corruption, got %v", err)
 	}
 	if errors.Is(err, ErrRecoveryRootMismatch) {
-		t.Fatalf("B2 T-C2: got ErrRecoveryRootMismatch — but the premise proved the corruption is dot-invisible, so the DOT check firing means the wrong check ran: %v", err)
+		t.Fatalf("got ErrRecoveryRootMismatch after proving the corrupted image root matches: %v", err)
 	}
-	t.Logf("B2 T-C2 GREEN: the fingerprint check (not the root check, not an incidental error) refused the boot: %v", err)
+	t.Logf("fingerprint check refused non-dot image corruption: %v", err)
 }
 
-// TestCrashMidInjectOracleArmed is T-C3 — the arming guard. The
-// crash-mid-inject shape (checkpoint, then a mutation tail, then crash) is the
-// shape the silicon gate exists to test — and pre-fix it is EXACTLY the shape
-// on which the root assertion NEVER arms (checkpointFinal == false). Corrupt
-// one image byte on that shape: pre-fix the boot SUCCEEDS (check disarmed);
-// post-fix the pre-tail check arms on the binding match and REFUSES. The clean
-// sibling subtest proves the same shape boots when the image is intact — the
-// check arms and PASSES, it does not merely refuse everything.
+// TestCrashMidInjectOracleArmed repeats the corruption with a WAL tail after
+// the checkpoint. The post-tail root comparison is not armed in this shape, so
+// the fingerprint must detect the corruption. Its clean sibling must boot with
+// IntegrityChecksArmed set and reproduce the live root.
 func TestCrashMidInjectOracleArmed(t *testing.T) {
-	t.Run("corrupt_image_with_tail_REFUSED", func(t *testing.T) {
+	t.Run("corrupt_image_with_tail", func(t *testing.T) {
 		lfs := newSnapshotStore(t)
-		walPath, wm, _ := b2BuildMidInject(t, lfs, 6, 3) // a 3-record tail after the checkpoint
-		b2CorruptFirstRecordByte(t, lfs, wm)
+		walPath, wm, _ := buildCheckpointTail(t, lfs, 6, 3) // a 3-record tail after the checkpoint
+		corruptFirstImageValidTimeEnd(t, lfs, wm)
 
 		engine, wal, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 		if err == nil {
 			_ = wal.Close()
 			_ = engine.Close()
-			t.Fatalf(`B2 RED — mid-inject crash with a corrupted image BOOTED (witness=%+v).
- checkpointFinal == false (the tail exists), so the ONLY integrity verification never armed —
- the exact disarmed-check shape on which the run's crash leg reported PASS.`, witness)
+			t.Fatalf("recovery accepted a corrupted image with a post-checkpoint tail; want ErrRecoveryFingerprintMismatch (witness=%+v)", witness)
 		}
-		// Tightened (no-test-lies): the refusal must be the fingerprint check
-		// arming on the mid-inject shape — not a decode/IO error and not the root
-		// check (the corruption is dot-invisible by construction).
+		// The refusal must come from the fingerprint check rather than an
+		// incidental decode, I/O, or dot-only root error.
 		if !errors.Is(err, ErrRecoveryFingerprintMismatch) {
-			t.Fatalf("B2 T-C3 corrupt: want ErrRecoveryFingerprintMismatch (check armed WITH a tail), got: %v", err)
+			t.Fatalf("want ErrRecoveryFingerprintMismatch with a post-checkpoint tail, got %v", err)
 		}
 		if errors.Is(err, ErrRecoveryRootMismatch) {
-			t.Fatalf("B2 T-C3 corrupt: got ErrRecoveryRootMismatch — the dot check cannot see this corruption: %v", err)
+			t.Fatalf("got ErrRecoveryRootMismatch for non-dot corruption with a tail: %v", err)
 		}
-		t.Logf("B2 T-C3 corrupt-armed GREEN: the fingerprint check armed WITH a tail and refused: %v", err)
+		t.Logf("fingerprint check refused corrupted image with a post-checkpoint tail: %v", err)
 	})
 
-	t.Run("clean_image_with_tail_BOOTS", func(t *testing.T) {
+	t.Run("clean_image_with_tail", func(t *testing.T) {
 		lfs := newSnapshotStore(t)
-		walPath, _, liveRoot := b2BuildMidInject(t, lfs, 6, 3)
+		walPath, _, liveRoot := buildCheckpointTail(t, lfs, 6, 3)
 		engine, witness := recoverBounded(t, walPath, lfs)
 		if !witness.Bounded {
 			t.Fatalf("clean mid-inject: witness.Bounded=false — the intact image must be used")
 		}
-		// THE ANTI-LIE ASSERTION: the check must have ARMED on this crash-mid-
-		// inject shape (a tail follows the checkpoint). Pre-fix, checkpointFinal
-		// was false here and the check silently never ran — so a "PASS" with the
-		// check OFF was exactly that lie. If IntegrityChecksArmed is false
-		// the clean boot proves nothing about the check.
+		// A clean boot demonstrates coverage only if the fingerprint check was
+		// armed despite the tail and then passed.
 		if !witness.IntegrityChecksArmed {
-			t.Fatalf("clean mid-inject: witness.IntegrityChecksArmed=false — the integrity verification must ARM on the crash-mid-inject shape; a disarmed PASS is the lie Blocker 2 exists to kill (the run's check-OFF pass)")
+			t.Fatalf("clean image with a tail booted with IntegrityChecksArmed=false")
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("clean mid-inject: recovered root %x != live %x — the intact image + tail must rebuild the live state", got, liveRoot)
+			t.Fatalf("clean image and tail recovered root %x, want live root %x", got, liveRoot)
 		}
 	})
 }
 
-// TestFingerprintWriterReaderAgreement is T-C4 — the fold-agreement guard.
-// The checkpoint's fingerprint is produced by TWO different code paths that MUST
-// agree on the same logical state: the WRITER (fingerprintRecords over the
-// captured image records, bridge.go) and the READER (StateFingerprint walking
-// the live engine's shards). If they disagreed, EVERY clean boot would
-// false-positive a fingerprint mismatch and refuse a healthy node. The B2 clean
-// boot proves this end-to-end; this test proves it DIRECTLY, isolating the fold
-// from the WAL/image machinery so a regression localizes to the fold itself.
+// TestFingerprintWriterReaderAgreement compares fingerprintRecords over image
+// records with StateFingerprint over the same records joined into an engine.
+// These writer and reader paths must agree or clean recovery would report a
+// false mismatch.
 //
-// The drop-one control is the fold's FALSIFIABILITY guard: removing one entry
-// MUST change the fingerprint. A fold that returned a constant (or were
-// insensitive to a dropped entry) would "agree" vacuously and detect no
-// corruption — an agreement assertion without this control can pass on a
-// do-nothing fold.
+// Removing one entry must change the result. That comparison prevents two
+// constant or content-insensitive folds from passing the agreement check.
 func TestFingerprintWriterReaderAgreement(t *testing.T) {
 	nodeID := testNodeID()
 	const n = 64
@@ -284,45 +234,30 @@ func TestFingerprintWriterReaderAgreement(t *testing.T) {
 		recs = append(recs, exactRec(utf8EntityID(i), nodeID, uint64(i+2), stagedDigest(i)))
 	}
 
-	// WRITER: fold the image records directly (the checkpoint-path fold).
+	// Writer: fold the image records directly (the checkpoint-path fold).
 	writerFP := fingerprintRecords(recs)
-	// READER: fold the SAME records joined into a live engine (the boot-path fold).
+	// Reader: fold the same records joined into a live engine (the boot-path fold).
 	readerFP := StateFingerprint(engineWith(t, nodeID, 1, recs...))
 	if writerFP != readerFP {
-		t.Fatalf("writer/reader fold DISAGREE: fingerprintRecords=%x StateFingerprint=%x — every clean boot would false-positive a fingerprint mismatch", writerFP, readerFP)
+		t.Fatalf("writer and reader fingerprints differ: fingerprintRecords=%x StateFingerprint=%x", writerFP, readerFP)
 	}
 
-	// DROP-ONE CONTROL: a state missing ONE entry MUST fingerprint differently.
 	droppedFP := StateFingerprint(engineWith(t, nodeID, 1, recs[:n-1]...))
 	if droppedFP == readerFP {
-		t.Fatalf("DROP-ONE CONTROL FAILED: dropping one entry left the fingerprint unchanged (%x) — the fold is not content-sensitive and would detect no corruption", droppedFP)
+		t.Fatalf("dropping one entry left fingerprint unchanged at %x; the fold is not content-sensitive", droppedFP)
 	}
 }
 
-// TestLegacyAndTruncatedCheckpoint is T-C5 — the 0x05 length-discrimination
-// guard. The 0x05 record is variable-length: 48 bytes (legacy, pre-—
-// root‖LamportHigh‖CutSeq, no ClockHigh, no Fingerprint), 56 (ClockHigh, no
-// Fingerprint), 88 (Fingerprint). Two contracts, both about the decoder NEVER
-// silently misparsing length:
+// TestLegacyAndTruncatedCheckpoint covers 0x05 checkpoint length handling.
+// Valid lengths are 48 bytes for root, LamportHigh, and CutSeq; 56 bytes with
+// ClockHigh; and 88 bytes with a state fingerprint.
 //
-//	(a) LEGACY 48-byte: boots FINE — the fingerprint check DISARMS (there is
-//
-// no fingerprint to compare) and the witness DISCLOSES the degradation
-// (LegacyCheckpoint=true, IntegrityChecksArmed=false) rather than crashing
-// or silently arming. This is the "old log on a new binary" contract.
-//
-//	(b) TRUNCATED 40-byte: below the 48-byte 0x05 minimum — ReplayWAL must
-//
-// HARD-ERROR, never parse a short record as if it were whole.
-//
-// RED (bug-inject): (a) if the decoder set HasFingerprint on a 48-byte record,
-// the boot would compare against a zero fingerprint and FALSE-REFUSE — the
-// LegacyCheckpoint/IntegrityChecksArmed assertions catch it; (b) if the decoder
-// dropped its `len < 48` guard, ReplayWAL would parse the 40-byte record and the
-// hard-error assertion would fire.
+// A legacy 48-byte record must boot with LegacyCheckpoint set and fingerprint
+// checks disarmed because it carries no fingerprint. A 40-byte record is below
+// the minimum and ReplayWAL must reject it rather than parse partial fields.
 func TestLegacyAndTruncatedCheckpoint(t *testing.T) {
 	t.Run("Legacy48_Boots_FingerprintDisarmed", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "b5legacy.wal")
+		walPath := filepath.Join(t.TempDir(), "legacy-checkpoint.wal")
 		// Two real mutations via the live path so the boot rebuilds real state.
 		live := newLiveBridge(t, walPath, 0)
 		for i := 0; i < 2; i++ {
@@ -330,9 +265,8 @@ func TestLegacyAndTruncatedCheckpoint(t *testing.T) {
 				t.Fatalf("PutLocal %d: %v", i, err)
 			}
 		}
-		// The legacy 48-byte 0x05 must carry the REAL rebuilt root, or the
-		// post-tail root assertion (which arms on a final checkpoint with no
-		// advances) would refuse the boot for the WRONG reason.
+		// Carry the real rebuilt root so the post-tail comparison cannot refuse
+		// this legacy-checkpoint boot for an unrelated reason.
 		liveRoot := live.Engine().MerkleRootFromShards()
 		payload := make([]byte, 48)
 		copy(payload[0:32], liveRoot[:])
@@ -351,15 +285,15 @@ func TestLegacyAndTruncatedCheckpoint(t *testing.T) {
 		engine, witness := recoverFull(t, walPath) // nil store → full replay
 		_ = engine.Close()
 		if !witness.LegacyCheckpoint {
-			t.Fatalf("legacy 48-byte 0x05 must set witness.LegacyCheckpoint (the fingerprint check had nothing to compare); got %+v", witness)
+			t.Fatalf("legacy 48-byte checkpoint did not set LegacyCheckpoint; witness=%+v", witness)
 		}
 		if witness.IntegrityChecksArmed {
-			t.Fatalf("legacy 48-byte 0x05 must leave the fingerprint check DISARMED (no fingerprint to compare) — IntegrityChecksArmed=true would mean a comparison against a zero fingerprint, a false-refuse waiting to happen")
+			t.Fatalf("legacy checkpoint without a fingerprint armed IntegrityChecksArmed")
 		}
 	})
 
 	t.Run("Truncated40_HardReject", func(t *testing.T) {
-		walPath := filepath.Join(t.TempDir(), "b5trunc.wal")
+		walPath := filepath.Join(t.TempDir(), "truncated-checkpoint.wal")
 		w, err := OpenWAL(walPath)
 		if err != nil {
 			t.Fatalf("OpenWAL: %v", err)
@@ -373,7 +307,7 @@ func TestLegacyAndTruncatedCheckpoint(t *testing.T) {
 			t.Fatalf("close: %v", err)
 		}
 		if _, err := ReplayWAL(walPath); err == nil {
-			t.Fatalf("a truncated 40-byte 0x05 must HARD-ERROR at replay (the no-silent-misparse contract), not replay")
+			t.Fatalf("ReplayWAL accepted a truncated 40-byte 0x05 checkpoint")
 		} else if !strings.Contains(err.Error(), "short V2 checkpoint") {
 			t.Fatalf("error = %v, want the short-V2-checkpoint refusal", err)
 		}

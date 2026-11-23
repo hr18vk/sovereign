@@ -18,31 +18,15 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// seed_corpus_test.go is TWO non-fuzz guards that gate the corpus itself
-// (NOT the fuzz runs):
-//
-// 1. TestSeedCorpusIsValid — asserts every
-//      committed testdata/fuzz/FuzzX/*.txt seed runs through the matching
-//      unmarshaler / DispatchFrame in corpus-only mode (NO mutation) WITHOUT
-//      PANICKING. A malformed seed that returns an error is EXPECTED (the
-//      adversarial seeds are malformed by design — the corpus's POINT); only a
-// PANIC fails the guard (a committed seed that crashes the unmarshaler is a
-// corpus DEFECT, not a coverage shape — reproducibility).
-//
-// 2. TestBugInjectControlProof — the Law 5
-// / mold: PROVES the harness is NOT a
-//      tautology by demonstrating a deliberately-injected panic IS catchable on
-//      a real input shape (the contrast: the REAL UnmarshalIBLT returns an error
-//      on the length-bomb seed; a BUG-INJECTED copy that skips the bounds guard
-//      PANICS with an out-of-bounds slice index; the test recovers the panic and
-//      asserts it fired). A fuzz that could not catch an injected panic is a
-// no-op runner (the KEM-CLASSICAL-CONTROL refutation class).
-//
-// Both guards are GREEN in `go test ./pkg/security/fuzz/` (no -fuzz flag needed).
+// The corpus tests run without fuzz mutation. TestSeedCorpusIsValid parses each
+// committed seed and calls the matching default target directly; malformed input
+// may return an error, but a panic fails the test. TestSeedCorpusMatchesBuilders
+// separately compares file counts, numeric indices, and bytes with the builders
+// used by each target's f.Add calls.
 
-// fuzzTargetNames is the canonical list of fuzz targets this package ships. It
-// is the telemetry counter the corpus guard iterates (a default target whose testdata/ dir is
-// missing fails the guard — a coverage hole, not a silent skip).
+// fuzzTargetNames lists every target with a committed corpus. A missing
+// directory fails for the six default targets rather than silently reducing
+// coverage. The fault-injection corpus is optional in the default build.
 var fuzzTargetNames = []string{
 	"FuzzDispatchFrame",
 	"FuzzUnmarshalRelayEnvelope",
@@ -53,10 +37,8 @@ var fuzzTargetNames = []string{
 	"FuzzBugInjectControl", // the build-tagged fault-injection target (corpus optional in default build)
 }
 
-// runSeedNoPanic runs the seed through the matching target's call shape in
-// corpus-only mode (NO mutation) and returns nil if the call returned (with OR
-// without an error — a malformed seed returning an error is EXPECTED) or a
-// non-nil error if the call PANICKED (a committed seed that crashes is a defect).
+// runSeedNoPanic calls the selected target once without mutation. Ordinary
+// parse errors are ignored; a recovered panic becomes the returned error.
 func runSeedNoPanic(target string, seed []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -77,19 +59,16 @@ func runSeedNoPanic(target string, seed []byte) (err error) {
 	case "FuzzUnmarshalIBLT":
 		_, _ = eng.UnmarshalIBLT(seed)
 	case "FuzzBugInjectControl":
-		// The fault-injection corpus seeds are operator-only (the build-tagged target
-		// consumes them); the default-build guard does NOT parse them (the
-		// TestBugInjectControlProof guard covers the inject proof directly).
+		// The fault-injected implementation is deliberately not called here.
+		// TestBugInjectControlProof exercises it under fuzzbuginject; the outer
+		// corpus test still parses these files in either build.
 	}
 	return nil
 }
 
-// corpusPanicError wraps a recovered panic so the guard reports it as a failure.
-// Field order packs the 16B iface (val) before the 16B string header (target)
-// so the struct is 24B not 32B (fieldalignment-clean — the gate is
-// NET-NEUTRAL; this is a test-only struct, never on a hot path, but the gate
-// counts new debt so the reorder is required). See memory
-// fieldalignment_fix_is_destructive — manual reorder, NEVER `fieldalignment -fix`.
+// corpusPanicError identifies the target and value from a recovered panic.
+// Placing val before target groups the pointer-bearing words first and leaves
+// the string length in the final word, reducing the GC pointer-scanning prefix.
 type corpusPanicError struct {
 	val    any
 	target string
@@ -109,27 +88,22 @@ func sprintAny(v any) string {
 	return "<non-string panic value>"
 }
 
-// TestSeedCorpusIsValid is the corpus-validity guard. It walks every
-// testdata/fuzz/FuzzX/ corpus dir, reads each committed seed, and runs it
-// through the matching target in corpus-only mode (NO mutation). The guard
-// asserts NO committed seed PANICS (a seed that crashes is a corpus defect).
-// A malformed seed returning an error is EXPECTED (the adversarial
-// seeds are malformed by design). It counts the seeds per target so the
-// corpus COUNT is a NUMBER, not "enough".
+// TestSeedCorpusIsValid reads every committed seed and calls its matching
+// default target once without mutation. A malformed seed may return an error;
+// a panic fails the test. Per-target logs record the number of files checked.
 func TestSeedCorpusIsValid(t *testing.T) {
 	totalSeeds := 0
 	for _, target := range fuzzTargetNames {
 		dir := filepath.Join("testdata", "fuzz", target)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			// FuzzBugInjectControl's corpus is optional in the default build
-			// (the target is build-tagged); a missing dir for it is fine. For
-			// the 6 default targets the corpus MUST exist (— committed).
+			// The fault-injection target is absent from the default build, so
+			// its directory is optional. All six default targets require one.
 			if target == "FuzzBugInjectControl" {
-				t.Logf("seed-corpus: %s corpus dir absent (build-tagged target, default-skipped) — OK", dir)
+				t.Logf("seed-corpus: %s is absent; skipping the build-tagged target", dir)
 				continue
 			}
-			t.Fatalf("seed-corpus: missing corpus dir %s (M4 — the seed corpus is COMMITTED, not git-ignored): %v", dir, err)
+			t.Fatalf("seed-corpus: read required corpus directory %s: %v", dir, err)
 		}
 		count := 0
 		for _, e := range entries {
@@ -141,37 +115,26 @@ func TestSeedCorpusIsValid(t *testing.T) {
 				t.Fatalf("seed-corpus: read seed %s/%s: %v", target, e.Name(), derr)
 			}
 			if perr := runSeedNoPanic(target, seed); perr != nil {
-				t.Fatalf("seed-corpus: seed %s/%s PANICKED the target (a committed seed that crashes is a corpus DEFECT, Law II): %v", target, e.Name(), perr)
+				t.Fatalf("seed-corpus: committed seed %s/%s panicked: %v", target, e.Name(), perr)
 			}
 			count++
 		}
 		totalSeeds += count
 		if target == "FuzzBugInjectControl" {
-			// The fault-injection target's corpus is present (the build-tagged target
-			// consumes it under -tags fuzzbuginject); the DEFAULT build does NOT
-			// run its seeds through a real unmarshaler (runSeedNoPanic's
-			// FuzzBugInjectControl case is a no-op — the bug copy is behind the
-			// build tag). The guard asserts the corpus is PRESENT + PARSEABLE (the
-			// readSeedFile call above already validated the file format); the
-			// no-panic proof is TestBugInjectControlProof under the build tag.
-			t.Logf("seed-corpus: %s — %d committed seeds present + parseable (the no-panic proof is TestBugInjectControlProof under -tags fuzzbuginject)", target, count)
+			// The reads above establish presence and format. The tagged control
+			// checks the fault-injected call's behavior separately.
+			t.Logf("seed-corpus: %s has %d committed seeds with valid corpus syntax", target, count)
 			continue
 		}
-		t.Logf("seed-corpus: %s — %d committed seeds run cleanly (no panic)", target, count)
+		t.Logf("seed-corpus: %s ran %d committed seeds without a panic", target, count)
 	}
-	t.Logf("seed-corpus: TOTAL committed corpus seeds across all default targets = %d", totalSeeds)
+	t.Logf("seed-corpus: checked %d committed seeds in total", totalSeeds)
 }
 
-// seedBuilderFor returns the SINGLE-SOURCE-OF-TRUTH seed list for a target — the
-// same []byte slice the target's f.Add(...) calls AND the on-disk corpus files
-// both derive from (the desync discipline seeds_test.go's top-doc names). The
-// byte-equality guard TestSeedCorpusMatchesBuilders re-derives the corpus from
-// these lists + asserts the on-disk files match byte-for-byte, so a hand-broken
-// seed OR a builder mutated without regenerating the corpus fails the guard
-// . Returns nil for
-// FuzzBugInjectControl in the DEFAULT build (its builder bugInjectSeeds is
-// behind the fuzzbuginject build tag; the byte-equality check for it runs ONLY
-// under -tags fuzzbuginject — the same opt-in discipline as the no-panic proof).
+// seedBuilderFor returns the same seed list used by the selected target's f.Add
+// calls. TestSeedCorpusMatchesBuilders compares this list with the on-disk
+// corpus. The fault-injection builder is behind fuzzbuginject, so its default-
+// build stub returns nil and the comparison is skipped.
 func seedBuilderFor(target string) [][]byte {
 	switch target {
 	case "FuzzDispatchFrame":
@@ -192,59 +155,30 @@ func seedBuilderFor(target string) [][]byte {
 	return nil
 }
 
-// TestSeedCorpusMatchesBuilders is the desync
-// discipline ENFORCEMENT (the finding: the
-// TestSeedCorpusIsValid guard only enforces no-panic, NOT builder↔corpus
-// byte-equality, despite seeds_test.go's docstring claiming it did). This guard
-// closes that enforcement gap: for each target it re-derives the seed list from
-// the builder aggregator (seedBuilderFor — the SAME list the target's f.Add
-// consumes), reads the on-disk testdata/fuzz/FuzzX/*.txt corpus files in lexical
-// (= index) order, and asserts:
+// TestSeedCorpusMatchesBuilders compares each target's builder list with its
+// committed files. The counts must match, filenames must have contiguous numeric
+// indices starting at zero, and each file's decoded bytes must equal the builder
+// seed at that index. Numeric ordering matters because lexical order places
+// seed-10.txt before seed-2.txt.
 //
-//   - COUNT match (the builder list length == the on-disk file count) — a
-//     builder seed not materialized OR a corpus file not in the builder is a
-//     desync.
-//   - BYTE-EQUALITY per index (the Nth builder seed == the Nth on-disk file's
-//     parsed bytes) — a hand-edited corpus file OR a builder mutated without
-//     regenerating the corpus is a desync.
-//
-// The byte-equality is the load-bearing check: it proves the committed corpus is
-// BYTE-FAITHFUL to the builders (a fuzz finding reproduced from the corpus is
-// reproducible from the builders, and vice versa —). The order matters:
-// the corpus generator wrote seed-0.txt..seed-N.txt in builder-list order, so a
-// reordered corpus (same set, different order) fails the per-index byte-equality
-// (a reordered corpus would still pass a set-equality check but is a desync — the
-// per-index check is the stronger invariant).
-//
-// FuzzBugInjectControl is build-tagged: its builder (bugInjectSeeds) exists ONLY
-// under -tags fuzzbuginject, so in the DEFAULT build seedBuilderFor returns nil
-// for it + this guard SKIPS it with an honest log (the byte-equality check for it
-// runs under the build tag — the same opt-in discipline as the no-panic proof).
+// The default build skips FuzzBugInjectControl because its builder is behind
+// fuzzbuginject. A tagged run applies the same comparison to that corpus.
 func TestSeedCorpusMatchesBuilders(t *testing.T) {
 	totalMatched := 0
 	for _, target := range fuzzTargetNames {
 		builder := seedBuilderFor(target)
 		if builder == nil {
-			// FuzzBugInjectControl in the default build: the builder is behind the
-			// fuzzbuginject tag. The byte-equality check for it runs under the tag;
-			// the default build skips it (the corpus is still PRESENT + PARSEABLE —
-			// TestSeedCorpusIsValid covers that).
-			t.Logf("corpus-byte-identity: %s — builder absent in default build (build-tagged); byte-equality enforced under -tags fuzzbuginject", target)
+			// Only the fault-injection target has a nil default-build builder.
+			t.Logf("corpus-byte-identity: %s has no builder in the default build; comparison requires -tags fuzzbuginject", target)
 			continue
 		}
 		dir := filepath.Join("testdata", "fuzz", target)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("corpus-byte-identity: missing corpus dir %s: %v", dir, err)
+			t.Fatalf("corpus-byte-identity: read corpus directory %s: %v", dir, err)
 		}
-		// Collect the seed files in NUMERIC-index order. The generator wrote
-		// seed-0.txt, seed-1.txt, … seed-10.txt. LEXICAL sort of the bare names
-		// would put "seed-10.txt" BEFORE "seed-2.txt" (because '1' < '2') — WRONG
-		// for a target with >=11 seeds (Dispatch has 11). The per-index
-		// byte-equality requires the Nth file to match the Nth builder seed, so the
-		// files MUST be ordered by the integer in the filename (seed-N.txt → N),
-		// NOT lexically. A corpus file whose name does not match seed-<int>.txt is a
-		// corrupt corpus (fails the parse below).
+		// Sort by the numeric filename index so seed-10.txt follows seed-9.txt.
+		// Any other filename shape is rejected.
 		type seedFile struct {
 			name  string
 			index int
@@ -256,35 +190,34 @@ func TestSeedCorpusMatchesBuilders(t *testing.T) {
 			}
 			idx, ok := parseSeedIndex(e.Name())
 			if !ok {
-				t.Fatalf("corpus-byte-identity: %s — corpus file %q does not match seed-<int>.txt (a corrupt corpus): %v", target, e.Name(), err)
+				t.Fatalf("corpus-byte-identity: %s has corpus file %q; want seed-<int>.txt: %v", target, e.Name(), err)
 			}
 			files = append(files, seedFile{name: e.Name(), index: idx})
 		}
 		sort.Slice(files, func(i, j int) bool { return files[i].index < files[j].index })
 		if len(files) != len(builder) {
-			t.Fatalf("corpus-byte-identity: %s — COUNT desync (builder=%d seeds, corpus=%d files); a builder seed not materialized OR a corpus file not in the builder is a desync (Law II)", target, len(builder), len(files))
+			t.Fatalf("corpus-byte-identity: %s has %d builder seeds but %d corpus files", target, len(builder), len(files))
 		}
 		for i, sf := range files {
 			if sf.index != i {
-				t.Fatalf("corpus-byte-identity: %s — corpus index GAP at position %d (file %s has index %d, expected %d); a missing seed-N.txt file is a desync (Law II)", target, i, sf.name, sf.index, i)
+				t.Fatalf("corpus-byte-identity: %s has index gap at position %d: file %s has index %d, want %d", target, i, sf.name, sf.index, i)
 			}
 			diskSeed, derr := readSeedFile(filepath.Join(dir, sf.name))
 			if derr != nil {
-				t.Fatalf("corpus-byte-identity: %s — read seed %s: %v", target, sf.name, derr)
+				t.Fatalf("corpus-byte-identity: %s: read seed %s: %v", target, sf.name, derr)
 			}
 			if !bytesEqual(diskSeed, builder[i]) {
-				t.Fatalf("corpus-byte-identity: %s — BYTE desync at index %d (%s): builder=%d bytes (magic %x…) vs corpus=%d bytes (magic %x…); a hand-edited corpus file OR a builder mutated without regenerating the corpus is a desync (Law II)", target, i, sf.name, len(builder[i]), magicPrefix(builder[i]), len(diskSeed), magicPrefix(diskSeed))
+				t.Fatalf("corpus-byte-identity: %s differs at index %d (%s): builder=%d bytes (magic %x…), corpus=%d bytes (magic %x…)", target, i, sf.name, len(builder[i]), magicPrefix(builder[i]), len(diskSeed), magicPrefix(diskSeed))
 			}
 		}
 		totalMatched += len(builder)
-		t.Logf("corpus-byte-identity: %s — %d builder seeds byte-match the %d committed corpus files (byte-faithful, no desync)", target, len(builder), len(files))
+		t.Logf("corpus-byte-identity: %s matched %d builder seeds to %d committed files", target, len(builder), len(files))
 	}
-	t.Logf("corpus-byte-identity: TOTAL builder↔corpus byte-matched seeds = %d", totalMatched)
+	t.Logf("corpus-byte-identity: matched %d seeds in total", totalMatched)
 }
 
-// bytesEqual is a nil-safe byte slice equality (bytes.Equal panics on nil vs
-// empty in older Go; this is explicit so a 0-byte builder seed {} matches a
-// 0-byte corpus seed []byte("")).
+// bytesEqual compares length and contents, treating nil and empty slices as
+// equal so an empty builder seed matches an empty corpus entry.
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -297,9 +230,8 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// magicPrefix returns the first min(4, len(b)) bytes of b as a hex prefix for
-// the desync error message (the magic is the diagnostic — a desync on the magic
-// is the most likely failure mode + the most actionable).
+// magicPrefix packs up to the first four bytes into the integer printed by the
+// mismatch diagnostic. Short inputs produce a correspondingly shorter prefix.
 func magicPrefix(b []byte) uint32 {
 	n := len(b)
 	if n > 4 {
@@ -312,11 +244,8 @@ func magicPrefix(b []byte) uint32 {
 	return p
 }
 
-// parseSeedIndex extracts the integer index from a seed-N.txt filename. Returns
-// (idx, true) for "seed-0.txt".."seed-999.txt" + (0, false) for any other shape
-// (a corrupt corpus file the guard rejects). The numeric index is the sort key
-// for the per-index byte-equality (lexical sort mis-orders seed-10.txt before
-// seed-2.txt — the trap the FIRST guard draft fell into).
+// parseSeedIndex extracts the decimal index from seed-N.txt. It rejects missing
+// or non-numeric indices and filenames without the required prefix and suffix.
 func parseSeedIndex(name string) (int, bool) {
 	const prefix = "seed-"
 	const suffix = ".txt"
@@ -337,15 +266,12 @@ func parseSeedIndex(name string) (int, bool) {
 	return idx, true
 }
 
-// readSeedFile parses the go-fuzz on-disk corpus file format:
+// readSeedFile reads a Go fuzz corpus entry and decodes its []byte value:
 //
 //	go test fuzz v1
 //	[]byte("...")
 //
-// (an optional trailing newline is tolerated). The body is a Go string literal
-// (the seed bytes encoded as a quoted Go string). It is the EXACT format
-// `go test -fuzz` writes when it finds a crashing input, so a corpus file this
-// guard reads is byte-identical to what the fuzzer re-loads.
+// An optional trailing newline is tolerated.
 func readSeedFile(path string) ([]byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -354,10 +280,9 @@ func readSeedFile(path string) ([]byte, error) {
 	return parseGofuzzCorpusEntry(raw)
 }
 
-// parseGofuzzCorpusEntry extracts the []byte seed from a go-fuzz corpus file's
-// raw bytes. The format is a header line ("go test fuzz v1") + a body line of
-// the form `[]byte("...")`. The string literal is unquoted with Go's own strconv
-// rules (handles escapes) so binary seeds round-trip faithfully.
+// parseGofuzzCorpusEntry skips the first line, extracts the literal between
+// the []byte("...") wrapper, and applies Go's unquoting rules to recover the
+// original bytes.
 func parseGofuzzCorpusEntry(raw []byte) ([]byte, error) {
 	s := string(raw)
 	// Strip the header line.

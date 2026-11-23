@@ -4,6 +4,6 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package crypto will host the Zero-GC PII masking hot path.
-// Stub placed so go.mod can resolve; the real implementation is provided separately.
+// Package crypto implements the zero-GC PII masking hot path for the Sovereign
+// Engine ingestion pipeline.
 package crypto

@@ -15,54 +15,31 @@ import (
 )
 
 // ──────────────────────────────────────────────────────────────────────────
-// ADR-0036: the hybrid (Ed25519 + ML-DSA-65) verify guards.
+// Hybrid verify tests (ADR-0036): the Ed25519 + ML-DSA-65 verification gate.
 //
-// The hybrid verify (hybrid_verify.go VerifyCRDTFrame_Hybrid) is the
-// defense-in-depth BOTH-signatures-required gate. The guards:
+// VerifyCRDTFrame_Hybrid requires both a valid Ed25519 signature and a valid
+// ML-DSA-65 signature. The cases cover acceptance and each rejection mode:
 //
-//	TestPQ_HybridVerifyDual — a frame signed under BOTH Ed25519 +
-// ML-DSA-65 VERIFIES under the hybrid gate
-// (the BOTH-required accept path).
-//	TestPQ_HybridClassicalReject — a frame whose Ed25519 sig is CORRUPTED
-// is REJECTED (the classical break does NOT
-// pass the hybrid gate — defense-in-depth).
-//	TestPQ_HybridPQReject — a frame whose ML-DSA-65 sig is CORRUPTED
-// is REJECTED (the PQ break does NOT pass).
-//	TestPQ_HybridNilPQReject — a frame with a nil PQ pubkey (the honest
-// NOT-YET — the Directory does not yet carry
-// the peer's ML-DSA-65 key) is REJECTED
-// (the STRICT mode: a hybrid verifier NEVER
-// accepts a classical-only frame).
-//	TestPQ_HybridEitherOrControl — the bug-inject control: an EITHER-or
-// gate (return pqOK || edOK) would ACCEPT a
-// frame whose classical sig is corrupt but
-// PQ is valid — PROVES the BOTH gate is
-// load-bearing (the EITHER-or is the
-// defense-in-depth INVERSION the BOTH gate
-// forbids).
-//	TestPQ_HybridLenMismatch — a msg whose length is NOT 120 is
-// REJECTED (the PQ seam takes a [120]byte;
-// the hybrid honors the STRICTER of the
-// two seams — the classical tolerates any
-// length, the PQ does not).
-//
-// The guards reuse the EXISTING SignCRDTFrame (classical) +
-// SignCRDTFrame_PostQuantum (PQ) sign seams + the hybrid verify. The hybrid
-// SIGN (a frame carries BOTH sigs) is a future change — these guards sign under
-// BOTH in-process (the test owns the dual-sign), NOT via a production wire
-// shape (which does not exist yet — disclosed ADR-0036 §6).
+//	TestPQ_HybridVerifyDual       — both signatures valid -> accept.
+//	TestPQ_HybridClassicalReject  — corrupt Ed25519 signature -> reject.
+//	TestPQ_HybridPQReject         — corrupt ML-DSA-65 signature -> reject.
+//	TestPQ_HybridNilPQReject      — nil ML-DSA-65 public key -> reject.
+//	TestPQ_HybridEitherOrControl  — control showing an either-or gate would
+//	                                accept a corrupt-classical / valid-PQ
+//	                                frame that VerifyCRDTFrame_Hybrid rejects.
+//	TestPQ_HybridLenMismatch      — non-120-byte message -> reject.
 // ──────────────────────────────────────────────────────────────────────────
 
-// hybridTestSeed is a 32-byte Ed25519 seed for the hybrid guards (deterministic;
-// the SAME seed the SignCRDTFrame seam takes). NOT a secret — the guards are
-// reproducibility tests, not key-management.
+// hybridTestSeed is a 32-byte Ed25519 seed for the hybrid tests (deterministic;
+// the same seed the SignCRDTFrame path uses). It is not a secret — these are
+// reproducibility tests, not key management.
 var hybridTestSeed = bytes.Repeat([]byte{0x31}, ed25519.SeedSize) // 32 bytes of '1'
 
-// hybridMintKeys derives an Ed25519 seed→pubkey + an ML-DSA-65 keypair for the
-// hybrid guards. The Ed25519 pub is derived via the SAME path SignCRDTFrame uses
+// hybridMintKeys derives an Ed25519 seed→pubkey and an ML-DSA-65 keypair for the
+// hybrid tests. The Ed25519 pub is derived via the same path SignCRDTFrame uses
 // (ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)); the ML-DSA-65
-// keypair is minted via GeneratePreviewKey65 (the production PQ key minter).
-// Returns edSeed, edPub, pqPriv, pqPub.
+// keypair is minted via GeneratePreviewKey65 (the production PQ key minter,
+// promoted from the pq_preview tag). Returns edSeed, edPub, pqPriv, pqPub.
 func hybridMintKeys(t *testing.T) (edSeed []byte, edPub ed25519.PublicKey, pqPriv *mldsa.PrivateKey, pqPub *mldsa.PublicKey) {
 	t.Helper()
 	edSeed = hybridTestSeed
@@ -77,10 +54,8 @@ func hybridMintKeys(t *testing.T) (edSeed []byte, edPub ed25519.PublicKey, pqPri
 	return edSeed, edPub, pqPriv, pqPub
 }
 
-// TestPQ_HybridVerifyDual proves a frame signed under
-// BOTH Ed25519 + ML-DSA-65 VERIFIES under the hybrid gate (the BOTH-required
-// accept path). The guard signs a 120-byte frame under BOTH seams + asserts
-// VerifyCRDTFrame_Hybrid returns true.
+// TestPQ_HybridVerifyDual verifies that a frame signed under both Ed25519 and
+// ML-DSA-65 passes VerifyCRDTFrame_Hybrid.
 func TestPQ_HybridVerifyDual(t *testing.T) {
 	edSeed, edPub, pqPriv, pqPub := hybridMintKeys(t)
 	frame := makeFrame120(t, 42)
@@ -95,15 +70,13 @@ func TestPQ_HybridVerifyDual(t *testing.T) {
 		t.Fatalf("SignCRDTFrame_PostQuantum (PQ): %v", err)
 	}
 	if !VerifyCRDTFrame_Hybrid(edPub, pqPub, frame, edSig, pqSig, "") {
-		t.Fatalf("VerifyCRDTFrame_Hybrid=false on a frame signed under BOTH Ed25519 + ML-DSA-65, want true (the BOTH-required accept path)")
+		t.Fatalf("hybrid verify dual: VerifyCRDTFrame_Hybrid=false on dual-signed frame, want true")
 	}
-	t.Logf("PASS: a frame signed under BOTH Ed25519 + ML-DSA-65 VERIFIES under the hybrid gate (the BOTH-required accept path)")
+	t.Logf("hybrid verify dual: dual-signed frame accepted by VerifyCRDTFrame_Hybrid")
 }
 
-// TestPQ_HybridClassicalReject proves a frame
-// whose Ed25519 sig is CORRUPTED is REJECTED by the hybrid gate (the classical
-// break does NOT pass — defense-in-depth). The guard signs under BOTH, then
-// flips a byte in the Ed25519 sig + asserts the hybrid verify returns false.
+// TestPQ_HybridClassicalReject verifies that corrupting the Ed25519 signature
+// causes VerifyCRDTFrame_Hybrid to reject even when the ML-DSA-65 signature is valid.
 func TestPQ_HybridClassicalReject(t *testing.T) {
 	edSeed, edPub, pqPriv, pqPub := hybridMintKeys(t)
 	frame := makeFrame120(t, 7)
@@ -122,13 +95,13 @@ func TestPQ_HybridClassicalReject(t *testing.T) {
 	copy(edSigCorrupt, edSig)
 	edSigCorrupt[0] ^= 0xFF
 	if VerifyCRDTFrame_Hybrid(edPub, pqPub, frame, edSigCorrupt, pqSig, "") {
-		t.Fatalf("VerifyCRDTFrame_Hybrid=true on a frame whose Ed25519 sig is CORRUPTED, want false (a classical break MUST NOT pass the hybrid gate — defense-in-depth)")
+		t.Fatalf("hybrid classical reject: VerifyCRDTFrame_Hybrid=true with corrupt Ed25519 signature, want false")
 	}
-	t.Logf("PASS: a frame whose Ed25519 sig is CORRUPTED is REJECTED by the hybrid gate (the classical break does NOT pass — defense-in-depth)")
+	t.Logf("hybrid classical reject: corrupt Ed25519 signature rejected")
 }
 
-// TestPQ_HybridPQReject proves a frame whose ML-DSA-65
-// sig is CORRUPTED is REJECTED by the hybrid gate (the PQ break does NOT pass).
+// TestPQ_HybridPQReject verifies that corrupting the ML-DSA-65 signature causes
+// VerifyCRDTFrame_Hybrid to reject even when the Ed25519 signature is valid.
 func TestPQ_HybridPQReject(t *testing.T) {
 	edSeed, edPub, pqPriv, pqPub := hybridMintKeys(t)
 	frame := makeFrame120(t, 99)
@@ -142,23 +115,17 @@ func TestPQ_HybridPQReject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignCRDTFrame_PostQuantum: %v", err)
 	}
-	// Corrupt the PQ sig (flip a mid-sig byte — the first byte may be a header
-	// the verify tolerates; a mid-sig byte is the safe corruption).
+	// Corrupt a byte in the middle of the ML-DSA-65 signature.
 	pqSigCorrupt := make([]byte, len(pqSig))
 	copy(pqSigCorrupt, pqSig)
 	pqSigCorrupt[len(pqSigCorrupt)/2] ^= 0xFF
 	if VerifyCRDTFrame_Hybrid(edPub, pqPub, frame, edSig, pqSigCorrupt, "") {
-		t.Fatalf("VerifyCRDTFrame_Hybrid=true on a frame whose ML-DSA-65 sig is CORRUPTED, want false (a PQ break MUST NOT pass the hybrid gate — defense-in-depth)")
+		t.Fatalf("hybrid pq reject: VerifyCRDTFrame_Hybrid=true with corrupt ML-DSA-65 signature, want false")
 	}
-	t.Logf("PASS: a frame whose ML-DSA-65 sig is CORRUPTED is REJECTED by the hybrid gate (the PQ break does NOT pass — defense-in-depth)")
+	t.Logf("hybrid pq reject: corrupt ML-DSA-65 signature rejected")
 }
 
-// TestPQ_HybridNilPQReject proves a frame with a
-// nil PQ pubkey (the honest NOT-YET — the Directory does not yet carry the
-// peer's ML-DSA-65 key) is REJECTED (the STRICT mode: a hybrid verifier NEVER
-// accepts a classical-only frame; BOTH is the contract). This is the
-// receive-path posture under --hybrid-verify today (the v1 envelope carries no
-// PQ sig + the Directory carries no PQ pubkey → the hybrid verify rejects).
+// TestPQ_HybridNilPQReject verifies that a nil ML-DSA-65 public key is rejected.
 func TestPQ_HybridNilPQReject(t *testing.T) {
 	edSeed, edPub, _, _ := hybridMintKeys(t)
 	frame := makeFrame120(t, 13)
@@ -166,21 +133,16 @@ func TestPQ_HybridNilPQReject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignCRDTFrame: %v", err)
 	}
-	// nil PQ pubkey + nil PQ sig — the STRICT mode (the honest NOT-YET).
 	if VerifyCRDTFrame_Hybrid(edPub, nil, frame, edSig, nil, "") {
-		t.Fatalf("VerifyCRDTFrame_Hybrid=true on a frame with a nil PQ pubkey, want false (the STRICT mode — a hybrid verifier NEVER accepts a classical-only frame; BOTH is the contract; the honest NOT-YET under --hybrid-verify today)")
+		t.Fatalf("hybrid nil pq reject: VerifyCRDTFrame_Hybrid=true with nil PQ pubkey, want false")
 	}
-	t.Logf("PASS: a frame with a nil PQ pubkey is REJECTED (the STRICT mode — a hybrid verifier NEVER accepts a classical-only frame; the honest NOT-YET under --hybrid-verify today)")
+	t.Logf("hybrid nil pq reject: nil PQ pubkey rejected")
 }
 
-// TestPQ_HybridLenMismatch proves a msg whose length
-// is NOT 120 is REJECTED (the PQ seam takes a [120]byte; the hybrid honors the
-// STRICTER of the two seams — the classical tolerates any length, the PQ does
-// not). The guard signs a 200-byte frame under the classical seam (which
-// accepts any length) + asserts the hybrid verify rejects (the len != 120 guard).
+// TestPQ_HybridLenMismatch verifies that a message length other than 120 bytes
+// is rejected even when the Ed25519 signature alone would verify.
 func TestPQ_HybridLenMismatch(t *testing.T) {
 	edSeed, edPub, _, pqPub := hybridMintKeys(t)
-	// A 200-byte frame (NOT the 120-byte CRDT-frame delta the PQ seam signs).
 	frame := make([]byte, 200)
 	for i := range frame {
 		frame[i] = byte(i)
@@ -189,26 +151,18 @@ func TestPQ_HybridLenMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignCRDTFrame: %v", err)
 	}
-	// The classical verify PASSES on a 200-byte frame (the classical seam
-	// tolerates any length) — prove the classical alone accepts it.
 	if !VerifyCRDTFrame(edPub, frame, edSig) {
-		t.Fatalf("pre-condition failed — VerifyCRDTFrame (classical) rejected the 200-byte frame, want accept (the classical seam tolerates any length; the len-mismatch is the hybrid's STRICTER guard)")
+		t.Fatalf("hybrid len mismatch: precondition failed — VerifyCRDTFrame rejected 200-byte frame, want accept")
 	}
-	// The hybrid verify REJECTS the 200-byte frame (the PQ seam takes a
-	// [120]byte; the len != 120 guard rejects before the PQ verify).
 	if VerifyCRDTFrame_Hybrid(edPub, pqPub, frame, edSig, nil, "") {
-		t.Fatalf("VerifyCRDTFrame_Hybrid=true on a 200-byte frame, want false (the hybrid honors the STRICTER of the two seams — the PQ seam takes a [120]byte; a len != 120 is a frame-shape mismatch the hybrid rejects)")
+		t.Fatalf("hybrid len mismatch: VerifyCRDTFrame_Hybrid=true on 200-byte frame, want false")
 	}
-	t.Logf("PASS: a 200-byte frame (len != 120) is REJECTED by the hybrid gate (the hybrid honors the STRICTER of the two seams — the classical tolerates any length, the PQ does not)")
+	t.Logf("hybrid len mismatch: 200-byte frame rejected (requires 120 bytes)")
 }
 
-// TestPQ_HybridEitherOrControl is the BUG-INJECT
-// control that PROVES the BOTH gate is load-bearing: an EITHER-or gate (return
-// pqOK || edOK) would ACCEPT a frame whose classical sig is corrupt but PQ is
-// valid. The guard constructs the EITHER-or result explicitly + asserts it
-// DIFFERS from the BOTH gate (the BOTH gate rejects; the EITHER-or accepts).
-// The false headline (EITHER-or) is PROVEN to invert the defense-in-depth the
-// BOTH gate enforces.
+// TestPQ_HybridEitherOrControl contrasts VerifyCRDTFrame_Hybrid against an
+// either-or policy (edOK || pqOK) on a frame with a corrupted Ed25519 signature
+// and valid ML-DSA-65 signature.
 func TestPQ_HybridEitherOrControl(t *testing.T) {
 	edSeed, edPub, pqPriv, pqPub := hybridMintKeys(t)
 	frame := makeFrame120(t, 250)
@@ -222,41 +176,31 @@ func TestPQ_HybridEitherOrControl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignCRDTFrame_PostQuantum: %v", err)
 	}
-	// Corrupt the Ed25519 sig (classical break). The PQ sig stays VALID.
 	edSigCorrupt := make([]byte, len(edSig))
 	copy(edSigCorrupt, edSig)
 	edSigCorrupt[0] ^= 0xFF
-	// The BOTH gate (the hybrid verify) MUST reject (classical corrupt → false).
 	bothGate := VerifyCRDTFrame_Hybrid(edPub, pqPub, frame, edSigCorrupt, pqSig, "")
 	if bothGate {
-		t.Fatalf("the BOTH gate ACCEPTED a frame with a corrupt classical sig, want reject (the BOTH gate is the defense-in-depth gate — a classical break MUST NOT pass)")
+		t.Fatalf("hybrid either-or control: both-required gate accepted corrupt classical signature, want reject")
 	}
-	// The EITHER-or gate (the BUG-INJECT inversion) would ACCEPT: classical is
-	// corrupt (false) BUT PQ is valid (true) → pqOK || edOK == true. Compute it
-	// explicitly to PROVE the inversion (the EITHER-or is the false headline).
-	edOK := VerifyCRDTFrame(edPub, frame, edSigCorrupt) // false (corrupt)
+	edOK := VerifyCRDTFrame(edPub, frame, edSigCorrupt)
 	var pqFrame [120]byte
 	copy(pqFrame[:], frame)
-	pqOK := VerifyCRDTFrame_PostQuantum(pqPub, pqFrame, pqSig, "") == nil // true (valid)
+	pqOK := VerifyCRDTFrame_PostQuantum(pqPub, pqFrame, pqSig, "") == nil
 	eitherOr := edOK || pqOK
 	if !eitherOr {
-		t.Fatalf("pre-condition failed — the EITHER-or gate REJECTED (edOK=%v pqOK=%v), want ACCEPT (the PQ sig is valid; the EITHER-or must accept a frame with a valid PQ sig even when classical is corrupt — the inversion)", edOK, pqOK)
+		t.Fatalf("hybrid either-or control: precondition failed — either-or rejected (edOK=%v pqOK=%v), want accept", edOK, pqOK)
 	}
-	// The load-bearing assertion: the BOTH gate rejects (bothGate=false) AND
-	// the EITHER-or accepts (eitherOr=true) — they DIFFER. The BOTH gate is
-	// load-bearing (NOT a tautology; the EITHER-or is the inversion it forbids).
 	if bothGate == eitherOr {
-		t.Fatalf("the BOTH gate (=%v) == the EITHER-or gate (=%v) — the BOTH gate is NOT load-bearing (a tautology); want BOTH=false AND EITHER-or=true (the BOTH gate forbids the EITHER-or inversion)", bothGate, eitherOr)
+		t.Fatalf("hybrid either-or control: bothGate (=%v) matched eitherOr (=%v), want false vs true", bothGate, eitherOr)
 	}
-	t.Logf("PASS: the BOTH gate rejects (=%v) a classical-corrupt+PQ-valid frame; the EITHER-or gate would accept (=%v) — they DIFFER, PROVING the BOTH gate is load-bearing (the EITHER-or is the defense-in-depth inversion the BOTH gate forbids)", bothGate, eitherOr)
+	t.Logf("hybrid either-or control: both-required=%v while either-or=%v on corrupt-classical/valid-PQ frame", bothGate, eitherOr)
 }
 
 // ─── helpers ───
 
-// makeFrame120 mints a deterministic 120-byte frame (the ADR-10 CRDTEntry
-// shape the PQ seam signs) seeded by tag. It fills the frame with a mix of
-// high-entropy + monotone fields (NOT 120 zeros, which would misrepresent the
-// real payload the sig covers).
+// makeFrame120 builds a deterministic 120-byte test payload (ADR-0010 CRDTEntry
+// size) seeded by tag.
 func makeFrame120(t *testing.T, tag byte) []byte {
 	t.Helper()
 	frame := make([]byte, 120)

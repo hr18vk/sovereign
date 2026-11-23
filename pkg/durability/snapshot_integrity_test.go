@@ -6,21 +6,15 @@
 
 package durability
 
-// ═══════════════════════════════════════════════════════════════════════════
-// (register) — snapshot image CRC32C integrity guards.
+// Snapshot image integrity tests (ADR-0053).
 //
-// The recovery image is now v3: the SAME 61-byte header + record stream, PLUS a
-// trailing whole-image CRC32C (Castagnoli). These guards prove the checksum FAILS
-// LOUD on content corruption (T4), preserves v2 backward-compat + round-trip
-// byte-exactness (T5), and — critically — that the CRC does NOT retire the
-// fingerprint check (T-C4: a CRC-VALID but content-SWAPPED image still
-// trips the fingerprint). Every guard is bug-injection-proven ([VACUOUS]==FAIL).
+// Version 3 appends a Castagnoli CRC32C over the header and record stream. These
+// tests cover corruption detection, v2 compatibility, byte-exact round trips,
+// and the separate fingerprint check for a CRC-valid image with altered content.
 //
-// THE FAIL-LOUD SPLIT (the fork's crux): a corrupt SNAPSHOT is a DERIVED-CACHE
-// rot → the LOUD exact-WAL fallback (the WAL is the truth), NEVER a boot-refusal
-// and NEVER a silent use of rotten bytes. (Contrast the WAL: corruption there is
-// a boot-REFUSAL, proven in internal/chaos/wal_crc_integrity_test.go.)
-// ═══════════════════════════════════════════════════════════════════════════
+// A corrupt snapshot is a derived-cache failure: recovery reports an exact-WAL
+// fallback rather than refusing to boot. A corrupt WAL instead refuses the boot
+// because there is no remaining authoritative source from which to rebuild.
 
 import (
 	"bytes"
@@ -33,8 +27,8 @@ import (
 	"testing"
 )
 
-// f19Image builds a small populated snapshot image for the unit-level guards.
-func f19Image() *SnapshotImage {
+// testSnapshotImage builds a small populated snapshot image for the unit tests.
+func testSnapshotImage() *SnapshotImage {
 	var root [32]byte
 	for i := range root {
 		root[i] = byte(0xB0 + i)
@@ -51,78 +45,73 @@ func f19Image() *SnapshotImage {
 	}
 }
 
-// TestSnapshotCorruptDetect is the core snapshot guard: a v3 image with
-// a flipped body byte is REJECTED with ErrSnapshotCorrupt. The bug-injection half
-// (snapshotCRC32Skip) compiles out the CRC compare → the SAME bytes decode
-// SILENTLY — proving the compare is load-bearing.
+// TestSnapshotCorruptDetect checks that changing a body or root byte in a v3
+// image returns ErrSnapshotCorrupt. With snapshotCRC32Skip set, the same altered
+// body decodes, demonstrating that rejection comes from the CRC comparison.
 func TestSnapshotCorruptDetect(t *testing.T) {
 	t.Run("BodyByteCorrupt_Detects", func(t *testing.T) {
-		buf, err := encodeSnapshotImage(f19Image())
+		buf, err := encodeSnapshotImage(testSnapshotImage())
 		if err != nil {
 			t.Fatalf("encodeSnapshotImage: %v", err)
 		}
 		if buf[4] != snapshotVersionV3 {
 			t.Fatalf("apparatus: encode must emit v3, got version %d", buf[4])
 		}
-		// Corrupt the LAST content byte (the final record's H3Index high byte) —
-		// inside the CRC-covered body, NOT the 4-byte CRC trailer.
+		// Corrupt the last content byte (the final record's H3Index high byte) —
+		// inside the CRC-covered body, not the 4-byte CRC trailer.
 		buf[len(buf)-5] ^= 0xFF
 		if _, err := decodeSnapshotImage(buf); !errors.Is(err, ErrSnapshotCorrupt) {
-			t.Fatalf("T4: want ErrSnapshotCorrupt for a corrupted v3 image, got %v", err)
+			t.Fatalf("decodeSnapshotImage returned %v for a corrupted v3 body, want ErrSnapshotCorrupt", err)
 		}
-		// BUG-INJECT: compile out the CRC compare → the SAME corrupted image decodes
-		// SILENTLY. This is the load-bearing proof (the pre-fix fail-silent gap).
+		// Skipping only the comparison lets the same corrupted bytes decode.
 		snapshotCRC32Skip.Store(true)
 		defer snapshotCRC32Skip.Store(false)
 		dec, err := decodeSnapshotImage(buf)
 		if err != nil {
-			t.Fatalf("T4 BUG-INJECT: with the CRC compare removed the corrupted image must decode SILENTLY, got %v", err)
+			t.Fatalf("decode with CRC comparison skipped failed: %v", err)
 		}
 		if len(dec.Records) != 3 {
-			t.Fatalf("T4 BUG-INJECT: the corrupted image must decode %d records silently, got %d", 3, len(dec.Records))
+			t.Fatalf("with CRC comparison skipped, want %d records, got %d", 3, len(dec.Records))
 		}
 	})
 
 	t.Run("MerkleRootCorrupt_Detects", func(t *testing.T) {
-		buf, err := encodeSnapshotImage(f19Image())
+		buf, err := encodeSnapshotImage(testSnapshotImage())
 		if err != nil {
 			t.Fatalf("encodeSnapshotImage: %v", err)
 		}
-		// Corrupt a MerkleRoot HEADER byte (root is at [29:61]) — the security-
+		// Corrupt a MerkleRoot header byte (root is at [29:61]) — a security-
 		// critical field. The whole-image CRC covers the header too.
 		buf[30] ^= 0xFF
 		if _, err := decodeSnapshotImage(buf); !errors.Is(err, ErrSnapshotCorrupt) {
-			t.Fatalf("T4: want ErrSnapshotCorrupt for a header (MerkleRoot) corruption, got %v", err)
+			t.Fatalf("decodeSnapshotImage returned %v for a corrupted MerkleRoot, want ErrSnapshotCorrupt", err)
 		}
 	})
 
 	t.Run("ShortCRCTrailer_Detects", func(t *testing.T) {
-		buf, err := encodeSnapshotImage(f19Image())
+		buf, err := encodeSnapshotImage(testSnapshotImage())
 		if err != nil {
 			t.Fatalf("encodeSnapshotImage: %v", err)
 		}
-		// A v3 image missing its CRC trailer (truncated by 4) is corruption, NOT a
+		// A v3 image missing its CRC trailer (truncated by 4) is corruption, not a
 		// torn tail (a snapshot is written whole — it has no torn-tail concept).
 		trunc := buf[:len(buf)-4]
 		trunc[4] = snapshotVersionV3 // still claims v3
 		if _, err := decodeSnapshotImage(trunc); !errors.Is(err, ErrSnapshotCorrupt) {
-			t.Fatalf("T4: want ErrSnapshotCorrupt for a v3 image missing its CRC trailer, got %v", err)
+			t.Fatalf("decodeSnapshotImage returned %v for a short CRC trailer, want ErrSnapshotCorrupt", err)
 		}
 	})
 }
 
-// TestRecoveryExactWALFallback is the FAIL-LOUD contract at the
-// recovery layer: a CRC-corrupt v3 image must NOT brick the node (the WAL is the
-// truth) and must NOT be silently used. RecoverEngineWithSnapshot must take the
-// LOUD exact-WAL fallback (recovery.go: the suspect image is DISCARDED, state is
-// rebuilt from the WAL, and the fallback is surfaced on the witness). All three
-// halves are asserted: boot-succeeds-from-WAL, image-not-used, fallback-signaled.
+// TestRecoveryExactWALFallback corrupts a stored v3 image and verifies that
+// recovery discards it, reports ExactWALFallback, and rebuilds the live state
+// from the WAL. The corrupt image must neither prevent boot nor be used.
 func TestRecoveryExactWALFallback(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath, wm, liveRoot := b2BuildMidInject(t, lfs, 6, 3) // 6 pre-checkpoint + 3 tail
+	walPath, wm, liveRoot := buildCheckpointTail(t, lfs, 6, 3) // 6 pre-checkpoint + 3 tail
 
-	// Corrupt a body byte of the v3 image IN PLACE (it stays v3; the CRC trailer is
-	// now stale). This is the "rot" the CRC exists to catch at DECODE.
+	// Corrupt a body byte of the v3 image in place (it stays v3; the CRC trailer is
+	// now stale). This is the corruption the CRC exists to catch at decode.
 	key := filepath.Join(lfs.Root(), "ckpt", strconv.FormatUint(wm, 10))
 	data, err := os.ReadFile(key)
 	if err != nil {
@@ -131,7 +120,7 @@ func TestRecoveryExactWALFallback(t *testing.T) {
 	if data[4] != snapshotVersionV3 {
 		t.Fatalf("apparatus: want a v3 image on disk, got version %d", data[4])
 	}
-	// Flip a byte in record 0's entry body (CRC-covered region, NOT the trailer).
+	// Flip a byte in record 0's entry body (CRC-covered region, not the trailer).
 	hdr := snapshotHeaderSize
 	eidLen := int(binary.BigEndian.Uint16(data[hdr : hdr+2]))
 	bodyByte := hdr + 2 + eidLen + 90 // a temporal field inside record 0's entry
@@ -143,34 +132,30 @@ func TestRecoveryExactWALFallback(t *testing.T) {
 		t.Fatalf("write corrupted image: %v", err)
 	}
 
-	// RECOVER. The corrupt image must trigger the exact-WAL fallback, NOT a refusal.
+	// RECOVER. The corrupt image must trigger the exact-WAL fallback, not a refusal.
 	engine, wal, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if err != nil {
-		t.Fatalf("T4 RECOVERY: a corrupt snapshot must NOT brick the node (the WAL is the truth) — got a boot-refusal: %v", err)
+		t.Fatalf("recovery with a corrupt snapshot failed: %v", err)
 	}
 	defer func() { _ = wal.Close(); _ = engine.Close() }()
 	if witness == nil {
-		t.Fatalf("T4 RECOVERY: nil witness on a successful boot")
+		t.Fatalf("recovery returned a nil witness")
 	}
-	// (a) fallback SIGNALED: the witness records the exact-WAL fallback.
 	if !witness.ExactWALFallback {
-		t.Fatalf("T4 RECOVERY: witness.ExactWALFallback=false — a CRC-corrupt image must force the exact-WAL fallback (witness=%+v)", witness)
+		t.Fatalf("ExactWALFallback is false after CRC corruption: %+v", witness)
 	}
-	// (b) image NOT used: the bounded path must be OFF (the suspect image discarded).
 	if witness.Bounded {
-		t.Fatalf("T4 RECOVERY: witness.Bounded=true — the rotten image must NOT be used (witness=%+v)", witness)
+		t.Fatalf("bounded recovery used the corrupt image: %+v", witness)
 	}
-	// (c) boot SUCCEEDS from the WAL: the recovered state equals the live state
-	// (all 9 local mutations replayed from the WAL; the fallback is lossless here).
 	if got := engine.State().MerkleRoot(); got != liveRoot {
-		t.Fatalf("T4 RECOVERY: recovered root %x != live %x — the exact-WAL fallback must rebuild the full state from the WAL", got, liveRoot)
+		t.Fatalf("recovered root %x differs from live root %x", got, liveRoot)
 	}
-	t.Logf("T4 RECOVERY GREEN: CRC-corrupt v3 image → loud exact-WAL fallback (not a refusal, not a silent use); state rebuilt from WAL, root re-equals live (%x)", liveRoot[:8])
+	t.Logf("corrupt snapshot triggered exact-WAL fallback and restored root %x", liveRoot[:8])
 }
 
-// encodeV2ImageForTest produces the LEGACY v2 image (no CRC trailer) by encoding
-// as v3 and stripping the trailer + resetting the version byte — so the v2 body
-// is byte-identical to what a pre-binary wrote (no duplicated layout).
+// encodeV2ImageForTest constructs the legacy representation by removing the v3
+// checksum and changing the version byte. The remaining bytes share the current
+// encoder's layout.
 func encodeV2ImageForTest(t *testing.T, image *SnapshotImage) []byte {
 	t.Helper()
 	v3, err := encodeSnapshotImage(image)
@@ -182,38 +167,37 @@ func encodeV2ImageForTest(t *testing.T, image *SnapshotImage) []byte {
 	return v2
 }
 
-// TestSnapshotBackwardCompat proves the format evolution never breaks
-// an existing on-disk image: a legacy v2 image (no CRC) still decodes
-// (disclosed-UNPROTECTED), a v3 image with a good CRC decodes, and a populated
-// image round-trips byte-exact.
+// TestSnapshotBackwardCompat checks that v2 images still decode without a
+// checksum, valid v3 images decode, and re-encoding a decoded image produces
+// identical bytes and preserves its content.
 func TestSnapshotBackwardCompat(t *testing.T) {
 	t.Run("V2LegacyDecodes_Unprotected", func(t *testing.T) {
-		img := f19Image()
+		img := testSnapshotImage()
 		v2 := encodeV2ImageForTest(t, img)
 		if v2[4] != snapshotVersionV2 {
 			t.Fatalf("apparatus: want a v2 image, got version %d", v2[4])
 		}
 		dec, err := decodeSnapshotImage(v2)
 		if err != nil {
-			t.Fatalf("T5: a legacy v2 image must still decode (backward-compat), got %v", err)
+			t.Fatalf("decoding legacy v2 image failed: %v", err)
 		}
 		if len(dec.Records) != len(img.Records) || dec.LamportHigh != img.LamportHigh || dec.CutSeq != img.CutSeq {
-			t.Fatalf("T5: v2 decode lost content: %d records (want %d), lh=%d cut=%d", len(dec.Records), len(img.Records), dec.LamportHigh, dec.CutSeq)
+			t.Fatalf("v2 decode returned %d records (want %d), LamportHigh %d, CutSeq %d", len(dec.Records), len(img.Records), dec.LamportHigh, dec.CutSeq)
 		}
 	})
 
 	t.Run("V3GoodCRCDecodes", func(t *testing.T) {
-		buf, err := encodeSnapshotImage(f19Image())
+		buf, err := encodeSnapshotImage(testSnapshotImage())
 		if err != nil {
 			t.Fatalf("encodeSnapshotImage: %v", err)
 		}
 		if _, err := decodeSnapshotImage(buf); err != nil {
-			t.Fatalf("T5: a v3 image with a good CRC must decode, got %v", err)
+			t.Fatalf("decoding v3 image with a valid CRC failed: %v", err)
 		}
 	})
 
 	t.Run("RoundTripByteExact", func(t *testing.T) {
-		img := f19Image()
+		img := testSnapshotImage()
 		buf1, err := encodeSnapshotImage(img)
 		if err != nil {
 			t.Fatalf("encode 1: %v", err)
@@ -223,37 +207,28 @@ func TestSnapshotBackwardCompat(t *testing.T) {
 			t.Fatalf("decode: %v", err)
 		}
 		// Re-encode the decoded image: canonical (sorted) + deterministic CRC, so a
-		// faithful round-trip is BYTE-EXACT.
+		// faithful round-trip is byte-exact.
 		buf2, err := encodeSnapshotImage(dec)
 		if err != nil {
 			t.Fatalf("encode 2: %v", err)
 		}
 		if !bytes.Equal(buf1, buf2) {
-			t.Fatalf("T5: round-trip NOT byte-exact (%d vs %d bytes)", len(buf1), len(buf2))
+			t.Fatalf("round-trip encodings differ: %d bytes before, %d after", len(buf1), len(buf2))
 		}
-		// And the decoded CONTENT matches the original (field-exact).
 		if len(dec.Records) != len(img.Records) || dec.MerkleRoot != img.MerkleRoot {
-			t.Fatalf("T5: decoded content diverged from the original image")
+			t.Fatalf("decoded image content differs from the original")
 		}
 	})
 }
 
-// TestValidCRCSwapStillCaughtByFingerprint is the LAYERING guard
-// (the C3 resolution): it proves the snapshot CRC and the fingerprint
-// check are COMPLEMENTARY, not redundant.
-//
-// - The CRC catches on-disk ROT: bytes that fail to decode (T4). Cheap, at decode.
-// - The fingerprint catches a VALID-BUT-WRONG image: a well-formed image (passes
-// the CRC) whose decoded bytes do not match the checkpoint's recorded state.
-//
-// This guard builds the latter: corrupt a dot-invisible byte (ValidTimeEnd), then
-// RECOMPUTE the CRC so the image is CRC-VALID but content-SWAPPED. The CRC passes
-// (it is honestly valid for the swapped bytes); the fingerprint check MUST STILL
-// fire at recovery. If the CRC had silently retired the fingerprint, this boot
-// would succeed — the exact regression the layering must prevent.
+// TestValidCRCSwapStillCaughtByFingerprint changes ValidTimeEnd and recomputes
+// the checksum. The resulting image passes its CRC but differs from the state
+// recorded by the checkpoint. The Merkle root cannot detect this because the
+// dots are unchanged; recovery must return ErrRecoveryFingerprintMismatch
+// instead (ADR-0045 §4).
 func TestValidCRCSwapStillCaughtByFingerprint(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath, wm, _ := b2BuildMidInject(t, lfs, 6, 0) // final checkpoint, fingerprinted, no tail
+	walPath, wm, _ := buildCheckpointTail(t, lfs, 6, 0) // final checkpoint, fingerprinted, no tail
 
 	key := filepath.Join(lfs.Root(), "ckpt", strconv.FormatUint(wm, 10))
 	data, err := os.ReadFile(key)
@@ -263,7 +238,7 @@ func TestValidCRCSwapStillCaughtByFingerprint(t *testing.T) {
 	if data[4] != snapshotVersionV3 {
 		t.Fatalf("apparatus: want a v3 image, got version %d", data[4])
 	}
-	// Corrupt a DOT-INVISIBLE byte: record 0's ValidTimeEnd (entry[88:96]). The
+	// Corrupt a dot-invisible byte: record 0's ValidTimeEnd (entry[88:96]). The
 	// Merkle root folds only (DotNodeID,DotCounter), so the root is unchanged; the
 	// header (and its binding root/CutSeq) is untouched; only the fingerprint —
 	// which folds the full 120-byte entry — can see it.
@@ -274,41 +249,37 @@ func TestValidCRCSwapStillCaughtByFingerprint(t *testing.T) {
 		t.Fatalf("apparatus: corruption offset %d past the CRC trailer (len %d)", vteOff, len(data))
 	}
 	data[vteOff] ^= 0xFF
-	// THE SWAP: recompute the CRC over the corrupted body so the image is
-	// CRC-VALID but content-WRONG. The CRC now honestly vouches for rotten bytes.
+	// The swap: recompute the CRC over the corrupted body so the image is
+	// CRC-valid but content-wrong. The CRC now vouches for corrupted bytes.
 	binary.BigEndian.PutUint32(data[len(data)-4:], crc32.Checksum(data[:len(data)-4], snapshotCastagnoliTable))
 	if err := os.WriteFile(key, data, 0o640); err != nil {
 		t.Fatalf("write swapped image: %v", err)
 	}
 
-	// RECOVER. The CRC must PASS (valid), and the FINGERPRINT must fire.
+	// The recomputed checksum is valid, so the fingerprint must detect the
+	// changed temporal bytes rather than ErrSnapshotCorrupt.
 	_, wal, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if wal != nil {
 		defer func() { _ = wal.Close() }()
 	}
-	// NOT the CRC (the image is CRC-valid — the CRC did its job and found nothing).
 	if errors.Is(err, ErrSnapshotCorrupt) {
-		t.Fatalf("T-C4: got ErrSnapshotCorrupt, but the image is CRC-VALID (a swap, not rot) — the CRC should NOT fire here; the fingerprint should: %v", err)
+		t.Fatalf("CRC-valid image returned ErrSnapshotCorrupt: %v", err)
 	}
-	// The fingerprint check MUST fire (the "same dots, wrong bytes" detector).
 	if !errors.Is(err, ErrRecoveryFingerprintMismatch) {
-		t.Fatalf("T-C4: want ErrRecoveryFingerprintMismatch for a CRC-valid-but-swapped image (the fingerprint must NOT be retired by the CRC), got %v (witness=%+v)", err, witness)
+		t.Fatalf("error = %v, want ErrRecoveryFingerprintMismatch (witness=%+v)", err, witness)
 	}
-	t.Logf("T-C4 GREEN: a CRC-valid-but-content-swapped v3 image passed the CRC and was caught by the FINGERPRINT check — the CRC did NOT retire the fingerprint (rot vs swap layering holds): %v", err)
+	t.Logf("fingerprint detected altered temporal bytes after the CRC passed: %v", err)
 }
 
-// TestWALCorruptBootRefused is the OTHER half of the fail-LOUD split
-// (the contrast to T4's snapshot fallback): a corrupt WAL record is the
-// AUTHORITATIVE-truth corruption with NO fallback — it must REFUSE the boot
-// (ErrWALCorrupt propagates out of ReplayWAL → RecoverEngineWithSnapshot), never
-// a silent boot and never an exact-WAL "fallback" (there is nothing to fall back
-// TO; the WAL is the floor). This is the boot-REFUSAL behavior the snapshot path
-// deliberately does NOT take.
+// TestWALCorruptBootRefused flips a content byte in a checksummed WAL record.
+// ReplayWAL must propagate ErrWALCorrupt through RecoverEngineWithSnapshot and
+// refuse the boot. Unlike a corrupt derived snapshot, a corrupt WAL has no
+// alternate authoritative source for exact replay.
 func TestWALCorruptBootRefused(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath, _, _ := b2BuildMidInject(t, lfs, 6, 3)
+	walPath, _, _ := buildCheckpointTail(t, lfs, 6, 3)
 
-	// Corrupt a content byte in the FIRST WAL record's innerPayload (the record is
+	// Corrupt a content byte in the first WAL record's innerPayload (the record is
 	// a 0x06 frame: header(13) at offset 8, then innerType(1) ‖ innerPayload ‖
 	// crc(4)). Flip the last content byte so the framing stays intact but the
 	// content no longer matches the CRC.
@@ -326,7 +297,7 @@ func TestWALCorruptBootRefused(t *testing.T) {
 		t.Fatalf("write corrupted WAL: %v", err)
 	}
 
-	// RECOVER. The corrupt WAL must REFUSE the boot.
+	// Corrupting the authoritative WAL must refuse recovery.
 	engine, wal, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if engine != nil {
 		_ = engine.Close()
@@ -335,7 +306,7 @@ func TestWALCorruptBootRefused(t *testing.T) {
 		_ = wal.Close()
 	}
 	if !errors.Is(err, ErrWALCorrupt) {
-		t.Fatalf("WAL corruption must REFUSE the boot with ErrWALCorrupt (the WAL is the truth, no fallback), got err=%v witness=%+v", err, witness)
+		t.Fatalf("WAL corruption must refuse the boot with ErrWALCorrupt (the WAL is the truth, no fallback), got err=%v witness=%+v", err, witness)
 	}
-	t.Logf("WAL fail-LOUD GREEN: a corrupt WAL record REFUSED the boot with ErrWALCorrupt (no fallback, no silent boot): %v", err)
+	t.Logf("corrupt WAL record refused boot with ErrWALCorrupt: %v", err)
 }

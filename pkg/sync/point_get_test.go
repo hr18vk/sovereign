@@ -29,41 +29,16 @@ func canonicalDotSet(entries []CRDTEntry) []string {
 	return out
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// (register) — the production read-path OOM.
-//
-// ROOT CAUSE (physics, one sentence): engine.State() (crdt.go:1457) rebuilds the
-// FULL merged HAMT on EVERY call, and Set's functional path-copying (hamt.go:199)
-// allocates O(log N) new path nodes + a wrapper per Set while NEVER retiring the
-// intermediate roots — the retired view's DecRef frees only the subtree reachable
-// from the FINAL root — so each State() call leaks O(N·log N) arena bytes
-// MONOTONICALLY, independent of the EBR grace window, until the 64 MiB arena OOMs
-// as an allocation PANIC (the /verify crash-harness hit it at ~2000 sequential
-// /v1/gets).
-//
-// THE FIX: a per-shard point-Get — PointGet (point_get.go) — that reads ONLY the
-// one shard the entityID routes to (routeShard is deterministic, crdt.go:561), a
-// pure O(log N) read that allocates NOTHING in the arena. The production
-// point-reads (handleGet control.go:532, engineHAMTAdapter.LiveRead main.go:2535,
-// LatestPayload gossip.go:1166) are routed to it. State() is frozen and untouched.
-//
-// THE GUARDS:
-// T1 TestPointGet_StateLeakNegativeControl — the DEFECT PROOF + negative control.
-// State()-in-a-loop GROWS the arena high-water. It PASSES on the leaking tree
-// (State is frozen, so it still leaks post-fix) and its positive growth PROVES
-// the detector works — so T2's "flat" assertion is not vacuous.
-// T2 TestPointGet_ArenaStaysFlat — the FIX guard: N PointGet calls leave the arena
-// high-water EXACTLY flat (a pure read allocates nothing in the arena).
-// T3 TestPointGet_MatchesStateGet — correctness: PointGet(k) returns the SAME dot
-// set as State().Get(k) for every seeded entity (routeShard determinism means
-// all of an entity's entries live in ONE shard). Bug-injection-proven: routing
-// PointGet at the WRONG shard makes this guard FAIL.
-// ═══════════════════════════════════════════════════════════════════════════
+// State constructs a merged HAMT, and its path copies can grow the arena
+// high-water mark. The first test measures that growth as a negative control.
+// The second requires repeated PointGet calls, including misses, to leave the
+// same mark unchanged. The third compares PointGet and State().Get dot sets for
+// single- and multi-dot entities and checks an absent key.
 
-// T1 — the RED / defect proof. Seeds N entities, warms the arena free-lists to
-// steady state, then asserts the high-water GROWS across further State() calls.
-// This is the $0 falsification of on the leaking tree the growth is
-// strictly positive. It remains as the permanent negative control for T2.
+// TestPointGet_StateLeakNegativeControl seeds 512 entities, warms the arena
+// free lists, and requires further State calls to increase the high-water
+// mark. That growth demonstrates that the gauge used by the PointGet test can
+// detect arena consumption.
 func TestPointGet_StateLeakNegativeControl(t *testing.T) {
 	engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, 256*1024*1024)
 	if err != nil {
@@ -78,8 +53,8 @@ func TestPointGet_StateLeakNegativeControl(t *testing.T) {
 		engine.InsertLocal(seedEntityID(i), CRDTEntry{H3Index: uint64(i)})
 	}
 
-	// Warm the arena free-lists to steady state so the growth we then measure
-	// is the per-call LEAK, not first-touch free-list priming.
+	// Prime the free lists so the measured growth comes from State's path copies
+	// rather than first-touch allocation.
 	const warmup = 16
 	for i := 0; i < warmup; i++ {
 		_ = engine.State()
@@ -93,18 +68,16 @@ func TestPointGet_StateLeakNegativeControl(t *testing.T) {
 	hw1 := engine.Arena().HighWater()
 
 	growth := hw1 - hw0
-	t.Logf(" leak probe: %d State() calls over %d entities grew arena high-water %d -> %d (+%d bytes, ~%d bytes/call)",
+	t.Logf("State allocation control: %d calls over %d entities grew the arena high-water from %d to %d bytes (+%d, approximately %d bytes/call)",
 		leakCalls, seedN, hw0, hw1, growth, growth/leakCalls)
 	if growth == 0 {
-		t.Fatalf(" NOT reproduced: State() left the arena high-water FLAT across %d calls — the O(N·log N)-per-call leak is absent, so this negative control cannot validate the T2 fix guard", leakCalls)
+		t.Fatalf("State() left the arena high-water unchanged across %d calls; the negative control cannot validate PointGet's no-growth assertion", leakCalls)
 	}
 }
 
-// T2 — the FIX guard. N PointGet calls must leave the arena high-water EXACTLY
-// flat: PointGet is a pure read (HAMT.Get path-copies NOTHING) and copies the
-// result to caller-owned Go heap, so it allocates ZERO arena bytes. The negative
-// control is T1 (State() grows the same gauge), which proves this "flat"
-// assertion is a real leak detector, not a tautology.
+// TestPointGet_ArenaStaysFlat performs 20,000 hit-and-miss pairs after warming
+// the participant pool. PointGet copies results to the Go heap, so none of these
+// reads may advance the arena high-water mark.
 func TestPointGet_ArenaStaysFlat(t *testing.T) {
 	engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, 256*1024*1024)
 	if err != nil {
@@ -117,7 +90,7 @@ func TestPointGet_ArenaStaysFlat(t *testing.T) {
 		engine.InsertLocal(seedEntityID(i), CRDTEntry{H3Index: uint64(i)})
 	}
 
-	// Warm up (prime the EBR participant pool) so we measure steady-state reads.
+	// Prime the EBR participant pool before measuring steady-state reads.
 	for i := 0; i < 16; i++ {
 		_ = engine.PointGet(seedEntityID(i % seedN))
 	}
@@ -125,22 +98,20 @@ func TestPointGet_ArenaStaysFlat(t *testing.T) {
 	hw0 := engine.Arena().HighWater()
 	const reads = 20000
 	for i := 0; i < reads; i++ {
-		_ = engine.PointGet(seedEntityID(i % seedN))                 // rotate across ALL shards
+		_ = engine.PointGet(seedEntityID(i % seedN))                 // rotate across all shards
 		_ = engine.PointGet("pointget-absent-" + strconv.Itoa(i%64)) // absent keys too
 	}
 	hw1 := engine.Arena().HighWater()
 
 	if hw1 != hw0 {
-		t.Fatalf(" regression: %d PointGet reads grew the arena high-water %d -> %d (+%d bytes); a pure read must allocate ZERO arena bytes", 2*reads, hw0, hw1, hw1-hw0)
+		t.Fatalf("%d PointGet reads grew the arena high-water from %d to %d bytes (+%d); point reads must not allocate arena storage", 2*reads, hw0, hw1, hw1-hw0)
 	}
-	t.Logf("PointGet flat: %d reads over %d entities left the arena high-water EXACTLY flat at %d bytes", 2*reads, seedN, hw1)
+	t.Logf("PointGet flat: %d reads over %d entities left the arena high-water exactly flat at %d bytes", 2*reads, seedN, hw1)
 }
 
-// T3 — CORRECTNESS. For every seeded entity (some carrying multiple dots),
-// PointGet(k) must return the SAME dot set as State().Get(k): routeShard is
-// deterministic, so all of an entity's entries live in ONE shard and the
-// single-shard read equals the merged-view read. Bug-injection proof: route
-// PointGet at the WRONG shard (routeShard+1) and this guard FAILS.
+// TestPointGet_MatchesStateGet compares sorted dot sets for every seeded
+// entity. Multiple dots per entity ensure the comparison covers complete entry
+// slices, while an absent key must return no entries from either read path.
 func TestPointGet_MatchesStateGet(t *testing.T) {
 	engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, 256*1024*1024)
 	if err != nil {
@@ -148,8 +119,8 @@ func TestPointGet_MatchesStateGet(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = engine.Close() })
 
-	// Seed 256 entities; entity i carries (i%3)+1 dots so multi-dot entities are
-	// exercised (the dot SET, not a single dot, must match).
+	// Seed 256 entities with one to three dots each so complete dot sets are
+	// compared rather than only the first entry.
 	const seedN = 256
 	for i := 0; i < seedN; i++ {
 		dots := (i % 3) + 1

@@ -5,36 +5,24 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §3 — Chaos orchestrator: the partition plan + anti-entropy loop.
+// Chaos orchestrator: partition scheduling and anti-entropy loop.
 // ---------------------------------------------------------------------------
 //
-// blueprint's "central chaos orchestrator generates [events] dispatched to the
-// virtual nodes with randomized latency, forced packet duplication, and
-// simulated routing blackholes." The orchestrator's job is to (1) GENERATE the
-// civic events, (2) SHIP them to virtual nodes via the Chaos VirtualNet, (3)
-// INDUCE and later HEAL network partitions at chosen times, and (4) ASSERT
+// The orchestrator generates events dispatched to virtual nodes with randomized
+// latency, forced packet duplication, and simulated routing blackholes. It
+// (1) generates test events, (2) ships them to virtual nodes via VirtualNet,
+// (3) induces and heals network partitions at chosen times, and (4) asserts
 // Merkle-root convergence across all nodes after the partition heals.
 //
-// HONESTY ON THE MATH: convergence is the §3 load-bearing claim. the design doc
-// says "once all nodes eventually receive all deltas, their final state
-// matrices must perfectly converge." This is exactly the lattice-join property
-// proven by (commutativity / associativity / idempotence). The
-// orchestrator does NOT prove the math again — it proves the math SURVIVES a
-// realistic, lossy, partitioned transport under an anti-entropy gossip loop. A
-// failure here means EITHER a bug in the engine's delta/Join OR a transport that
-// dropped a message permanently after healing (a VirtualNet contract violation
-// the gate distinguishes from a CRDT math violation).
+// Lattice-join commutativity, associativity, and idempotence guarantee that
+// once all nodes receive all deltas, their state converges. The orchestrator
+// exercises the engine's delta generation and Join over a lossy, partitioned
+// transport under an anti-entropy gossip loop.
 //
-// WHY override InsertLocal's lamport instead of letting gossip mint dots:
-//
-//	In a real cluster each NODE mints its own dots from its OWN lamport counter;
-//	cross-node deltas JOIN with the receiver applying the SENDER's DotCounter.
-//	The orchestrator reproduces that here: events are InsertLocal'd at the
-//	SOURCE node (minting dots from that node's counter), then anti-entropied to
-//	every other node via GenerateDelta + Join, exactly as the engine's real
-//	anti-entropy daemon would. This is NOT a virtualization of the dot
-//	semantics — it IS the dot semantics, over the real engine, on a virtual
-//	transport.
+// Events are inserted locally via InsertLocal at each source node (minting
+// dots from that node's Lamport counter), then propagated to every other node
+// via GenerateDelta + Join, matching the dot semantics of a live cluster over
+// a virtual transport.
 package chaos
 
 import (
@@ -49,7 +37,7 @@ import (
 	engsync "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// Orchestrator drives a §3 partition + anti-entropy scenario over a
+// Orchestrator drives a partition + anti-entropy scenario over a
 // VirtualNet + a set of real DeltaCRDTEngine instances.
 type Orchestrator struct {
 	mu      sync.Mutex
@@ -57,7 +45,7 @@ type Orchestrator struct {
 	engines map[[16]byte]*engsync.DeltaCRDTEngine
 
 	// rxLog records, per receiving node, the sequence of NetMessages actually
-	// delivered to its Receive callback. The gate inspects this to PROVE the net
+	// delivered to its Receive callback. The gate inspects this to prove the net
 	// really did deliver (no permanent post-heal loss) and to count duplicates.
 	rxLogMu sync.Mutex
 	rxLog   map[[16]byte][]NetMessage
@@ -68,7 +56,7 @@ type Orchestrator struct {
 	dedupOn bool
 }
 
-// OrchestratorConfig tunes a §3 run.
+// OrchestratorConfig tunes a partition scenario run.
 type OrchestratorConfig struct {
 	Net     *VirtualNet
 	Engines map[[16]byte]*engsync.DeltaCRDTEngine
@@ -79,7 +67,7 @@ type OrchestratorConfig struct {
 }
 
 // NewOrchestrator constructs a seeded orchestrator. The engines map keys must
-// exactly match the NetNode IDs added to the net; the orchestrator does NOT
+// exactly match the NetNode IDs added to the net; the orchestrator does not
 // add nodes itself — the caller wires the engines to the net.Walk it owns so
 // the test keeps control of phase ordering.
 func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
@@ -107,8 +95,8 @@ func NewOrchestrator(cfg OrchestratorConfig) (*Orchestrator, error) {
 }
 
 // BindNodes wires each engine's Receive callback so incoming NetMessages from
-// the fabric are DECODED and JOIN'd into the local engine. The caller invokes
-// this AFTER AddNode on the net so the Receiver closures capture the right
+// the fabric are decoded and joined into the local engine. The caller invokes
+// this after AddNode on the net so the Receiver closures capture the right
 // engine by ID. The payload encoding is the orchestrator's own compact format
 // (entityIDLen(4) + entityID + CRDTEntry(120)) wrapped in a SeqNo prefix only
 // for the dedup path; GossipDelta below emits this format.
@@ -132,10 +120,8 @@ func (o *Orchestrator) recordRx(to [16]byte, msg NetMessage) {
 }
 
 // applyDelta decodes the message and joins it into the receiver's engine. With
-// dedup enabled it skips SeqNos already applied on that edge (the design doc's
-// "aggressively duplicated by retries" path); with dedup disabled it relies
-// ENTIRELY on CRDT Join's idempotence (the design doc's "duplicate packet
-// delivery will corrupt the state" property check).
+// dedup enabled it skips SeqNos already applied on that edge; with dedup
+// disabled it relies on CRDT Join idempotence under duplicate packet delivery.
 func (o *Orchestrator) applyDelta(to [16]byte, e *engsync.DeltaCRDTEngine, msg NetMessage) {
 	if o.dedupOn {
 		key := edgeKey(msg.From, to)
@@ -149,9 +135,8 @@ func (o *Orchestrator) applyDelta(to [16]byte, e *engsync.DeltaCRDTEngine, msg N
 	// Decode (entityID + entry).
 	entry, entityID, ok := decodeDeltagram(msg.Bytes)
 	if !ok {
-		// A malformed deltagram from a peer — this is itself an orchestrator
-		// bug (the format is internal); scream loudly rather than silently
-		// dropping state.
+		// Malformed deltagrams indicate an internal encoding bug; panic rather
+		// than silently dropping state.
 		panic(fmt.Errorf("chaos/partition: malformed deltagram from %x seq=%d", msg.From, msg.SeqNo))
 	}
 	delta := engsync.CRDTDelta{
@@ -173,17 +158,12 @@ func edgeKey(from, to [16]byte) uint64 {
 	return binary.LittleEndian.Uint64(h[:8])
 }
 
-// GenerateEvents distributes N civic events across the source nodes: for event
-// k it picks a source node (round-robin) and InsertLocal's the event AT that
-// source (minting a dot from the SOURCE's lamport counter, just like a real
-// cluster where each node mints its own dots). Events are stored in-memory as
-// CRDTEntries and recorded so the gate can cross-check post-convergence state
-// contains every (nodeID, counter) dot.
+// GenerateEvents distributes n events round-robin across source nodes via
+// InsertLocal (minting a dot from each source's Lamport counter) and records
+// the entries so post-convergence checks can verify origin dot lineage.
 //
-// The event payloads imitate the design doc's "geospatial jurisdiction boundaries
-// mapped to Uber H3 hex cells" via the H3Index CRDTEntry field seeded from k.
-// We do NOT synthesize actual H3 cells (that requires the H3 library); we reuse
-// the field as a deterministic correlation id for the test.
+// The H3Index field is populated deterministically from k as a synthetic
+// correlation identifier for tests.
 func (o *Orchestrator) GenerateEvents(ctx context.Context, n int) (events []engsync.CRDTEntry, err error) {
 	ids := o.sortedIDs()
 	if len(ids) == 0 {
@@ -202,19 +182,18 @@ func (o *Orchestrator) GenerateEvents(ctx context.Context, n int) (events []engs
 	return events, nil
 }
 
-// GossipOnce runs ONE full anti-entropy sweep: for every (i→j) pair, computes
+// GossipOnce runs one full anti-entropy sweep: for every (i→j) pair, computes
 // i's delta to j and ships it. The receiver closes the loop by Join'ing it via
 // the BindNodes Receive callback when the (possibly delayed) delivery arrives.
 //
-// IMPORTANT honesty point: this computes deltas OVER THE SAME IN-PROCESS ENGINES
-// the real daemon would. The transport is virtual; the deltas are real
-// DeltaCRDTEngine.GenerateDelta output. So anything this gate proves about delta
-// determinism / Merkle equality is a fact about the engine, not a property of
-// the virtual net.
+// This computes deltas over the same in-process engines the real daemon would.
+// The transport is virtual; the deltas are real DeltaCRDTEngine.GenerateDelta
+// output. So anything this test proves about delta determinism / Merkle
+// equality is a fact about the engine, not a property of the virtual net.
 func (o *Orchestrator) GossipOnce(ctx context.Context) (shipped int, err error) {
 	return o.net.RunGossipRound(ctx, func(ctx context.Context, from, to [16]byte) ([]byte, error) {
 		// Generate a delta of (from) for (to). We use the engine's GenerateDelta
-		// against the target's CURRENT digest. Note: the receiver's digest is
+		// against the target's current digest. Note: the receiver's digest is
 		// sampled at delta-generation time; if the receiver mutates between then
 		// and delivery, the delta may be a superset (the CRDT Join is idempotent
 		// so this is correct, just occasionally redundant). This is the standard
@@ -225,12 +204,11 @@ func (o *Orchestrator) GossipOnce(ctx context.Context) (shipped int, err error) 
 			return nil, fmt.Errorf("chaos/partition: missing engine for from=%x to=%x", from, to)
 		}
 		dstDigest := dstEng.GenerateDigest() // IBLT over dst's current state
-		defer dstDigest.Release()            // the arena-backed digest must be released;
-		// on the heap the leak was hidden; the bounded arena surfaces it.
+		defer dstDigest.Release()            // arena-backed digest must be released
 		delta := srcEng.GenerateDelta(dstDigest)
 		defer delta.Release()
 		// Serialize every entry in the delta into the compact format
-		// (entityIDLen+entityID+CRDTEntry). Since we are NOT encoding a full
+		// (entityIDLen+entityID+CRDTEntry). Since we are not encoding a full
 		// CRDTDelta struct but a flat list of (entityID, entry) pairs, the
 		// receiver re-encodes each pair back via Join's push iterator.
 		var buf []byte
@@ -243,7 +221,7 @@ func (o *Orchestrator) GossipOnce(ctx context.Context) (shipped int, err error) 
 }
 
 // MerkleRoots returns each node's MerkleRoot plus a flag for whether all match.
-// The §3 gate asserts "Node[i].MerkleRoot() == Node[j].MerkleRoot()" after the
+// The partition gate asserts "Node[i].MerkleRoot() == Node[j].MerkleRoot()" after the
 // partition heals.
 func (o *Orchestrator) MerkleRoots() (roots map[[16]byte][32]byte, converged bool) {
 	o.mu.Lock()
@@ -257,7 +235,8 @@ func (o *Orchestrator) MerkleRoots() (roots map[[16]byte][32]byte, converged boo
 	var haveRef bool
 	for _, id := range ids {
 		eng := o.engines[id]
-		r := eng.State().MerkleRoot()
+		// MerkleRootFromShards computes the root without allocating arena snapshots.
+		r := eng.MerkleRootFromShards()
 		roots[id] = r
 		if !haveRef {
 			ref = r
@@ -313,7 +292,7 @@ func appendDeltagram(buf []byte, entityID string, entry engsync.CRDTEntry) []byt
 	return buf
 }
 
-// decodeDeltagram decodes ONE (entityID, entry) pair from p. Returns ok=false
+// decodeDeltagram decodes one (entityID, entry) pair from p. Returns ok=false
 // if the buffer is too short.
 func decodeDeltagram(p []byte) (entry engsync.CRDTEntry, entityID string, ok bool) {
 	if len(p) < 4 {
@@ -329,9 +308,9 @@ func decodeDeltagram(p []byte) (entry engsync.CRDTEntry, entityID string, ok boo
 	return entry, entityID, true
 }
 
-// stagedEventEntry builds a deterministic event for index k from source node
-// src. Mirrors wal_test.go's stagedEntry shape but stamped with the SOURCE
-// node id so Join sees the right OriginNodeID lineage.
+// stagedEventEntry builds a deterministic test entry for index k from source node
+// src. Matches wal_test.go's stagedEntry shape, stamped with the source node ID
+// so Join sees the expected OriginNodeID lineage.
 func stagedEventEntry(k int, src [16]byte) engsync.CRDTEntry {
 	h := sha256.Sum256([]byte(fmt.Sprintf("civic/%d/%x", k, src)))
 	var payload [32]byte

@@ -29,7 +29,7 @@ static inline void je_sdallocx(void* ptr, size_t size) {
 // je_malloc_usable_size_raw returns the actual number of usable bytes jemalloc
 // granted for a block allocated with mallocx/rallocx. jemalloc rounds every
 // request up to the nearest size class, so the usable size is ALWAYS >= the
-// requested size. We track and free against THIS size, never the
+// requested size. M1/M2 FIX: we track and free against THIS size, never the
 // caller-furnished requested size, so BytesAllocated() reflects true off-heap
 // RSS and sdallocx receives exactly the size jemalloc recorded for the block
 // (eliminating the size-class mismatch that risked jemalloc's size assertion
@@ -63,8 +63,8 @@ func NewJemallocAllocator() *JemallocAllocator {
 }
 
 // Allocate returns a byte slice of the given size backed by jemalloc memory.
-// The returned slice is NOT tracked by the Go GC.
-// CRITICAL: The caller MUST call Free() when done, or memory will leak.
+// The returned slice is not tracked by the Go GC.
+// The caller must call Free() when done, or memory will leak.
 func (a *JemallocAllocator) Allocate(size int) []byte {
 	if size <= 0 {
 		return nil
@@ -76,22 +76,14 @@ func (a *JemallocAllocator) Allocate(size int) []byte {
 		panic("jemalloc: out of memory")
 	}
 
-	// Account for the size-class-rounded USABLE size. The returned
-	// slice has len = usableSize so:
-	//   1. BytesAllocated equals true off-heap RSS jemalloc will release, so the
-	//      MemTable 256MB ceiling is enforced against reality (not a systematic
-	//      under-estimate that lets the engine blow through it after up-rounding).
-	//   2. Free(b) passes len(b) = usableSize to sdallocx, which is exactly the
-	//      size jemalloc recorded for the block — no size-class drift, no radix
-	//      tree corruption.
-	// usableSize is always >= size, so callers indexing [0:size) and the
-	// transport reassembly buffer [0:bufCap] with bufCap <= usableSize stay in
-	// bounds.
+	// Account for the size-class-rounded usable size so BytesAllocated reflects
+	// true off-heap RSS and Free(b) passes usableSize to sdallocx even when a
+	// caller reslices within [0:usableSize].
 	usableSize := int(C.je_malloc_usable_size_raw(ptr))
 	a.bytesAllocated.Add(int64(usableSize))
 
 	if jemallocAuditOn {
-		auditAllocHook(ptr, usableSize) // heap-audit diagnostic (call-site gated)
+		auditAllocHook(ptr, usableSize) // diagnostic (call-site gated)
 	}
 
 	// Create a Go slice header pointing at the jemalloc memory.
@@ -119,23 +111,20 @@ func (a *JemallocAllocator) Reallocate(size int, b []byte) []byte {
 		panic("jemalloc: out of memory on realloc")
 	}
 
-	// rallocx may relocate the block (cross-size-class growth) and
-	// ALWAYS grants a size-class-rounded usable size >= the new request. Account
-	// for the delta between the OLD usable size (len(b)) and the NEW usable size
-	// so BytesAllocated tracks the true RSS delta. The returned slice len matches
-	// the size Free will release via sdallocx.
+	// rallocx may relocate the block and grants a size-class-rounded usable size
+	// >= the new request; update BytesAllocated by the usable delta.
 	newUsable := int(C.je_malloc_usable_size_raw(newPtr))
 	a.bytesAllocated.Add(int64(newUsable - oldSize))
 
 	if jemallocAuditOn {
-		auditReallocHook(ptr, newPtr, newUsable) // heap-audit diagnostic (call-site gated)
+		auditReallocHook(ptr, newPtr, newUsable) // diagnostic (call-site gated)
 	}
 
 	return unsafe.Slice((*byte)(newPtr), newUsable)
 }
 
-// Free releases jemalloc-backed memory. After this call, the byte slice MUST
-// NOT be accessed — it is undefined behavior.
+// Free releases jemalloc-backed memory. After this call, the byte slice must
+// not be accessed — it is undefined behavior.
 func (a *JemallocAllocator) Free(b []byte) {
 	if len(b) == 0 {
 		return
@@ -143,30 +132,16 @@ func (a *JemallocAllocator) Free(b []byte) {
 
 	ptr := unsafe.Pointer(&b[0])
 
-	// Heap-audit diagnostic (no-op unless SUPREMUM_JEMALLOC_AUDIT is set): detect a
-	// double/invalid free via the registry BEFORE we touch the block — calling
+	// Diagnostic (no-op unless SUPREMUM_JEMALLOC_AUDIT is set): detect a
+	// double/invalid free via the registry before we touch the block — calling
 	// malloc_usable_size on an already-freed pointer is UB, so this must precede
 	// the usable-size read below. Also flags a resliced (wrong-size) free call.
 	if jemallocAuditOn {
 		auditFreeHook(ptr, len(b))
 	}
 
-	// The sized-free contract is enforced against jemalloc's
-	// ground truth, NOT the caller's slice length. sdallocx(ptr, size) requires
-	// size == the usable size jemalloc recorded for the block; a caller that frees
-	// a RESLICED buffer (buf[:n]) hands sdallocx a smaller size, so jemalloc
-	// returns the block to the WRONG size class and corrupts the heap metadata —
-	// the intermittent SIGSEGV (a 32768-byte block freed as 3266 bytes, later
-	// detonating at a 64KB flush alloc/free, addr=0x30). malloc_usable_size is
-	// the only trustworthy source of the recorded size.
-	//
-	// Cost: one radix lookup per free. This RETIRES Override 10.3's "trust the
-	// caller's size to skip the lookup" optimization — that optimization is
-	// precisely the footgun that made a caller's reslice a silent heap corruption.
-	// The lookup is negligible here because JemallocAllocator serves the
-	// LSM/durability/transport paths, NOT the per-op CRDT hot path (pkg/sync uses
-	// its own arena). The bytesAllocated accounting now subtracts the true usable
-	// size, so a resliced free can no longer silently drift the 256MB ceiling.
+	// Size free against jemalloc's recorded usable size rather than len(b) so
+	// resliced buffers (buf[:n]) cannot return blocks to the wrong size class.
 	usable := int(C.je_malloc_usable_size_raw(ptr))
 
 	C.je_sdallocx(ptr, C.size_t(usable))

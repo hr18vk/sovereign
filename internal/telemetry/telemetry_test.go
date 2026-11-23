@@ -13,9 +13,8 @@ import (
 	"unsafe"
 )
 
-// TestStripeSize_CacheLineAligned asserts the MESI false-sharing defeat: each
-// stripe occupies exactly one 64-byte Graviton line, so two counters'
-// atomics never cohabit a line.
+// TestStripeSize_CacheLineAligned asserts each stripe occupies one 64-byte
+// cache line so adjacent counters never false-share.
 func TestStripeSize_CacheLineAligned(t *testing.T) {
 	if sz := unsafe.Sizeof(counterStripe{}); sz != cacheLineBytes {
 		t.Fatalf("counterStripe size = %d, want %d (one cache line)", sz, cacheLineBytes)
@@ -35,8 +34,8 @@ func TestInc_AggregatesExact(t *testing.T) {
 	}
 }
 
-// TestAdd_FloatExact verifies fractional deltas sum without loss across
-// stripes (the CAS-loop decode-add-encode confined to one line).
+// TestAdd_FloatExact verifies that fractional deltas sum to within 1e-6 of
+// 1000 across the stripes.
 func TestAdd_FloatExact(t *testing.T) {
 	c := &Counter{stripes: make([]counterStripe, numStripes), mode: modeCounter}
 	const n = 1_000_000
@@ -61,9 +60,8 @@ func TestGauge_SetAndGet(t *testing.T) {
 	}
 }
 
-// TestInc_ConcurrentLinearizability hammers Inc from many goroutines and
-// confirms the final aggregate equals the number of increments (the lock-free
-// LongAdder correctness contract).
+// TestInc_ConcurrentLinearizability runs Inc from many goroutines and checks
+// that the final aggregate equals the number of increments.
 func TestInc_ConcurrentLinearizability(t *testing.T) {
 	c := &Counter{stripes: make([]counterStripe, numStripes), mode: modeCounter}
 	const goroutines = 32
@@ -86,11 +84,10 @@ func TestInc_ConcurrentLinearizability(t *testing.T) {
 	}
 }
 
-// TestNoMutexOnHotPath is a source-presence sanity check: the telemetry hot
-// path must never import sync.Mutex/RWMutex. This guards against regressions
-// where a future edit reintroduces a futex on the data plane.
+// TestNoMutexOnHotPath retains the atomic-operation smoke check. Its field
+// lookup is a stub and does not inspect Counter for mutex fields.
 func TestNoMutexOnHotPath(t *testing.T) {
-	// The Counter value type carries no mutex field; verify by structural probe.
+	// The current helper cannot inspect the Counter value's fields.
 	var c Counter
 	if field, ok := getField(&c, "mu"); ok {
 		t.Fatalf("unexpected mutex-like field on Counter: %v", field)
@@ -98,10 +95,9 @@ func TestNoMutexOnHotPath(t *testing.T) {
 	atomic.AddUint64(new(uint64), 1) // link atomic to keep import intent explicit
 }
 
-// getField reflects on a struct's named field without surfacing reflect on the
-// hot path; used only in this test.
+// getField is a placeholder retained by the existing smoke test. It always
+// reports that the requested field is absent.
 func getField(p *Counter, name string) (any, bool) {
-	// Counter has no mu field by construction; we confirm via a marker instead.
 	_ = p
 	_ = name
 	return nil, false
@@ -134,11 +130,8 @@ func BenchmarkCounterSet(b *testing.B) {
 	}
 }
 
-// BenchmarkCounterInc_Parallel measures the cross-core scalability of the
-// LongAdder hot path on the recorded 32-core silicon. This is the witness
-// that the cache-line padded stripes defeat MESI false-sharing: throughput
-// should scale near-linearly with cores (the whole point of LongAdder over a
-// single atomic).
+// BenchmarkCounterInc_Parallel measures concurrent increments on the striped
+// counter. Cache-line padding prevents false sharing between stripe values.
 func BenchmarkCounterInc_Parallel(b *testing.B) {
 	c := &Counter{stripes: make([]counterStripe, numStripes), mode: modeCounter}
 	b.ReportAllocs()
@@ -150,7 +143,7 @@ func BenchmarkCounterInc_Parallel(b *testing.B) {
 	})
 }
 
-// BenchmarkCounterAdd_Parallel is the float-delta variant of the above.
+// BenchmarkCounterAdd_Parallel measures concurrent floating-point increments.
 func BenchmarkCounterAdd_Parallel(b *testing.B) {
 	c := &Counter{stripes: make([]counterStripe, numStripes), mode: modeCounter}
 	b.ReportAllocs()

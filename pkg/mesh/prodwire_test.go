@@ -6,33 +6,20 @@
 
 package mesh
 
-// prodwire_test.go — (ADR-0045): the in-process
-// falsification guards for the production-relay wiring and the fan-out rotation.
+// These tests exercise production relay wiring and fan-out seed rotation
+// (ADR-0045).
 //
-// WHY THIS FILE EXISTS — THE CLASS, NOT THE INSTANCE.
-// `TestRelayChainLoadBearing` has long reported GREEN
-// while the BATCH relay was DEAD IN PRODUCTION for two silicon runs. It lied by
-// omission: it installs the retention hooks IN-TEST
-// (`recv.SetRelayRetainer(...)` + `recv.SetRelayRetainerBatch(...)`,
-// asymmetric_dial_test.go:514-515) and therefore proves the SEAM works while proving NOTHING about
-// whether the BINARY installs it. Production installed only the per-frame hook
-// (`main.go:1075`), so at `--batch-size=100` every relayCache batch layer stayed
-// empty. Two docstrings asserted the wiring existed (gossip.go:541,
-// topology.go:122); both were false.
+// The relay chain installs hooks through Gossiper.WireRelayHooks, the same entry
+// point used by cmd/sovereign-node. A test that installed hooks directly could
+// pass while the node left the batch retainer unwired. The negative control uses
+// only the per-frame retainer: with batched gossip, B then has no batch envelope
+// to relay to C. The production-wiring case must converge on the same topology.
 //
-// This guard closes that class: it drives the SAME function `main.go` calls —
-// `Gossiper.WireRelayHooks` — so a future hook that main.go forgets is a hook this
-// guard never installs either, and the chain goes RED. Adding a third relay hook
-// later means adding it inside WireRelayHooks, which this guard already exercises.
+// The seed tests separately check the sweep call site and the selector. The
+// sweep must stamp round ^ LittleEndian.Uint64(nodeID[:8]); the selector must
+// rotate remote peers while remaining deterministic for a given round and node.
 //
-// RED EVIDENCE (captured before the fix, per the in-process-falsification rule):
-// `wireRelayHooksLegacy` below is a byte-faithful replica of TODAY's main.go —
-// per-frame hook ONLY. TestProdWireNegativeControl drives the chain through
-// it and asserts C stays root-zero AND that B's relay-miss counter fires. That is
-// the silicon signature (373,504-377,776 `relay miss` lines per colocated receiver
-// on a silicon run) reproduced at 3 nodes in-process.
-//
-// RUN: go test -run 'TestProdWire' -race -count=1 ./pkg/mesh/
+// Run with: go test -run 'TestProdWire|TestSweepStampsSeed|TestFanoutRotation' -race -count=1 ./pkg/mesh/
 
 import (
 	"context"
@@ -56,15 +43,12 @@ import (
 	"github.com/hr18vk/sovereign/pkg/transport"
 )
 
-// wireRelayHooksLegacy replicates cmd/sovereign-node/main.go:1075 AS IT WAS before
-// — the per-frame retainer ONLY. It is the RED-control arm: the guard runs
-// the identical A→B→C chain through this wiring and through the real
-// WireRelayHooks, and the two outcomes must DIFFER. If they ever stop differing,
-// either the batch path is no longer load-bearing or the guard has gone vacuous.
+// wireRelayHooksLegacy installs only the per-frame retainer. Running the same
+// A→B→C chain through this function and WireRelayHooks must produce different
+// outcomes: without the batch retainer, the relay-only chain cannot converge.
 func wireRelayHooksLegacy(g *Gossiper, r relayHookSink) {
 	r.SetRelayRetainer(g.RetainForeign)
-	// DELIBERATELY MISSING: r.SetRelayRetainerBatch(g.RetainForeignBatch).
-	// This omission IS the bug that cost silicon runs #6 and #6b.
+	// Do not install SetRelayRetainerBatch in this negative control.
 }
 
 // prodWireNode is one real-TCP node in the relay chain.
@@ -79,28 +63,19 @@ type prodWireNode struct {
 	addr  string
 }
 
-// seedForTest reads the seed currently stamped on the TopologyManager, under the
-// same lock Select uses. In-package access (the asyncWait / peerLiveForTest
-// precedent) — there is no exported accessor and this guard must observe what
-// PRODUCTION stamped, not what the test stamped.
+// seedForTest reads the seed stamped by AntiEntropySweep under the same lock
+// Select uses. The test must observe the production call rather than setting the
+// seed itself.
 func (t *TopologyManager) seedForTest() uint64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.seed
 }
 
-// TestSweepStampsSeed is the CALL-SITE guard — the one that closes the
-// same in-test-wiring class closes.
-//
-// TestFanoutRotation below validates the seed MODEL, but it calls SetSeed
-// itself, so it would stay GREEN even if AntiEntropySweep never stamped a seed —
-// which is precisely the failure mode that let `SetSeed has zero production
-// callers` survive two silicon runs behind a docstring claiming "The SweepLoop
-// calls this before each Select". This guard asserts on the PRODUCTION path: run
-// AntiEntropySweep and observe that the topology's seed actually CHANGED, and that
-// it equals the documented per-node-per-round value.
-//
-// RED on pre-bytes: the seed stays 0 forever (no production caller).
+// TestSweepStampsSeed checks the production call site rather than calling
+// SetSeed from the test. After each AntiEntropySweep, the topology seed must
+// equal round ^ LittleEndian.Uint64(owner.NodeID[:8]). Without that call, a zero
+// seed keeps selecting the same inter-region peers.
 func TestSweepStampsSeed(t *testing.T) {
 	dir := identity.NewDirectory()
 	seedBytes := make([]byte, ed25519.SeedSize)
@@ -124,7 +99,7 @@ func TestSweepStampsSeed(t *testing.T) {
 	g.SetRegionAware(true)
 
 	if got := topo.seedForTest(); got != 0 {
-		t.Fatalf("Seed call-site guard premise: the topology seed is %d before any sweep, want 0", got)
+		t.Fatalf("topology seed is %d before any sweep, want 0", got)
 	}
 	ctx := context.Background()
 	for round := uint64(1); round <= 3; round++ {
@@ -132,25 +107,22 @@ func TestSweepStampsSeed(t *testing.T) {
 		want := round ^ w2SeedNodeTerm(owner.NodeID)
 		got := topo.seedForTest()
 		if got != want {
-			t.Fatalf("Seed NOT STAMPED BY THE SWEEP: after sweep %d the topology seed is %d, want %d (= round ^ LittleEndian.Uint64(owner.NodeID[:8])). This is the exact defect that survived two silicon runs: SetSeed had ZERO production callers while topology.go:122 claimed 'The SweepLoop calls this before each Select'. A seed that never changes freezes the inter-region fan-out onto the same peers every sweep (the affected run: same 1 eu + 1 ap peer, 64/66 remotes never selected).", round, got, want)
+			t.Fatalf("after sweep %d topology seed is %d, want %d (round ^ nodeID term)", round, got, want)
 		}
 	}
-	t.Logf("GREEN (seed call site) — AntiEntropySweep STAMPS the fan-out seed on the production path: after each of 3 sweeps the topology seed equals round ^ LittleEndian.Uint64(owner.NodeID[:8]) exactly. The seed is no longer frozen at 0, and the lying topology.go:122 docstring is now true.")
+	t.Logf("three sweeps stamped the expected per-round, per-node seeds")
 }
 
-// w2SeedNodeTerm is the per-node half of the fan-out seed —
-// LittleEndian.Uint64(nodeID[:8]) — kept in ONE place so the guard and
-// AntiEntropySweep (gossip.go, the SetSeed stamp) cannot drift apart in how they
-// derive it. If the production term ever changes shape, this guard changes with it
-// and the rotation/determinism assertions stay meaningful.
+// w2SeedNodeTerm is the node-specific half of the fan-out seed. Keeping the
+// derivation here and in AntiEntropySweep aligned makes the rotation assertions
+// check the intended value.
 func w2SeedNodeTerm(nodeID [16]byte) uint64 {
 	return binary.LittleEndian.Uint64(nodeID[:8])
 }
 
-// buildProdWireChain mints a 3-node A→B→C chain over REAL TCP+TLS with NO A↔C edge,
-// batch path armed (--batch-size=100, the production default), and installs the
-// relay hooks through the caller-supplied wiring function. That injection point is
-// the whole design: prod wiring vs legacy wiring is the ONLY variable.
+// buildProdWireChain constructs three TCP+TLS nodes with no direct A↔C edge.
+// DefaultBatchSize selects the batched relay path. The supplied function is the
+// only difference between the negative control and production-wiring cases.
 func buildProdWireChain(t *testing.T, wire func(*Gossiper, relayHookSink)) []*prodWireNode {
 	t.Helper()
 	dir := t.TempDir()
@@ -194,7 +166,7 @@ func buildProdWireChain(t *testing.T, wire func(*Gossiper, relayHookSink)) []*pr
 		recv := receive.NewReceiver(admission.NewPeerBucket(), clock.NewIngressHLCScalarCap(clock.NewSystemClock(), engN), clock.NewSystemClock(), d, engN, 50_000_000)
 		ps := NewPeerSet(tr, recv, id, engN)
 		g := NewGossiper(ps, id, engN, d)
-		// THE ONLY VARIABLE: which wiring function installs the hooks.
+		// The only variable: which wiring function installs the hooks.
 		wire(g, recv)
 		g.SetBatchSize(DefaultBatchSize) // the production --batch-size=100 path
 		nodes[i] = &prodWireNode{ident: id, eng: engN, recv: recv, ps: ps, g: g, tr: tr}
@@ -211,7 +183,7 @@ func buildProdWireChain(t *testing.T, wire func(*Gossiper, relayHookSink)) []*pr
 	return nodes
 }
 
-// runProdWireChain brings the chain up (A, then B dials A, then C dials B — NO A↔C
+// runProdWireChain brings the chain up (A, then B dials A, then C dials B — no A↔C
 // edge), injects `keys` events at A only, sweeps all three, and reports whether all
 // three Merkle roots converged within the SLO.
 func runProdWireChain(t *testing.T, nodes []*prodWireNode, keys int, slo time.Duration) (converged bool, rootA, rootC [32]byte, relayMisses int) {
@@ -237,7 +209,7 @@ func runProdWireChain(t *testing.T, nodes []*prodWireNode, keys int, slo time.Du
 		}
 		wg.Wait()
 	})
-	// B dials A; C dials B. C NEVER dials A — the relay-only topology.
+	// B dials A; C dials B. C never dials A — the relay-only topology.
 	if err := nodes[1].ps.Dial(ctx, nodes[0].addr, "localhost", nodes[0].ident.NodeID); err != nil {
 		t.Fatalf("dial B->A: %v", err)
 	}
@@ -247,7 +219,7 @@ func runProdWireChain(t *testing.T, nodes []*prodWireNode, keys int, slo time.Du
 	time.Sleep(150 * time.Millisecond) // let the inbound registrations settle
 
 	for i := 0; i < keys; i++ {
-		nodes[0].g.InsertLocalEvents(fmt.Sprintf("relay-chain-key-%d", i), fmt.Sprintf("v-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_000_000 + i), H3Index: uint64(i)})
+		nodes[0].g.InsertLocalEvents(fmt.Sprintf("prodwire-key-%d", i), fmt.Sprintf("v-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_000_000 + i), H3Index: uint64(i)})
 	}
 	for i := range nodes {
 		go nodes[i].g.SweepLoop(ctx, 20*time.Millisecond)
@@ -255,26 +227,22 @@ func runProdWireChain(t *testing.T, nodes []*prodWireNode, keys int, slo time.Du
 	deadline := time.Now().Add(slo)
 	for time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
-		rootA = nodes[0].eng.State().MerkleRoot()
-		rb := nodes[1].eng.State().MerkleRoot()
-		rootC = nodes[2].eng.State().MerkleRoot()
+		rootA = nodes[0].eng.MerkleRootFromShards()
+		rb := nodes[1].eng.MerkleRootFromShards()
+		rootC = nodes[2].eng.MerkleRootFromShards()
 		if rootA == rb && rb == rootC && rootA != ([32]byte{}) {
 			return true, rootA, rootC, relayMisses
 		}
 	}
-	rootA = nodes[0].eng.State().MerkleRoot()
-	rootC = nodes[2].eng.State().MerkleRoot()
+	rootA = nodes[0].eng.MerkleRootFromShards()
+	rootC = nodes[2].eng.MerkleRootFromShards()
 	return false, rootA, rootC, relayMisses
 }
 
-// TestProdWireNegativeControl is the RED half: driving the chain through the
-// LEGACY wiring (per-frame hook only — byte-faithful to main.go before)
-// must FAIL to converge, because B has no retained batch to relay onward. This
-// reproduces the silicon signature at 3 nodes in-process.
-//
-// If this control ever goes GREEN, the proof below is vacuous: it
-// would mean the batch relay is not load-bearing on this topology and the guard
-// cannot distinguish wired from unwired.
+// TestProdWireNegativeControl installs only the per-frame retainer. B can join
+// A's batch but cannot retain the batch envelope needed by shipBatchedDelta's
+// foreign branch, so the A→B→C chain must not converge. Convergence here would
+// mean the topology no longer distinguishes wired from unwired batch retention.
 func TestProdWireNegativeControl(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-TCP relay-chain test (binds loopback ports)")
@@ -282,51 +250,35 @@ func TestProdWireNegativeControl(t *testing.T) {
 	nodes := buildProdWireChain(t, wireRelayHooksLegacy)
 	converged, ra, rc, _ := runProdWireChain(t, nodes, 25, 6*time.Second)
 	if converged {
-		t.Fatalf("RED CONTROL BROKEN: the chain CONVERGED under the LEGACY wiring (per-frame retainer only, byte-faithful to main.go:1075 pre-). C must stay root-zero: with --batch-size=100 the sweep routes through shipBatchedDelta, whose foreign branch consults relayCache.lookupBatch — a cache only SetRelayRetainerBatch populates. If this converges, either the batch path is no longer exercised (check SetBatchSize/DefaultBatchSize) or C reached A another way (check that C never dials A) — either way this production-wire guard proves nothing.")
+		t.Fatalf("chain converged with only the per-frame retainer; check that DefaultBatchSize uses shipBatchedDelta and that C has no direct path to A")
 	}
 	if rc != ([32]byte{}) {
-		t.Logf("NOTE: C's root is non-zero (%x) but did not equal A's (%x) — partial propagation; the convergence assertion is what matters.", rc, ra)
+		t.Logf("C received partial state without converging (rootC=%x rootA=%x)", rc, ra)
 	}
-	t.Logf("RED CONTROL PASS — LEGACY wiring (per-frame hook ONLY, exactly main.go:1075 before): the A→B→C chain did NOT converge (rootA=%x rootC=%x). B Joined A's batch but retained NO batch envelope, so shipBatchedDelta's foreign branch relay-missed every entry and C never received A's data. THIS IS THE SILICON RUN-#6b SIGNATURE (373,504-377,776 `relay miss` lines per colocated receiver; zero cross-region frames), reproduced at 3 nodes for $0.", ra, rc)
+	t.Logf("per-frame-only wiring did not converge (rootA=%x rootC=%x)", ra, rc)
 }
 
-// TestProdWireLoadBearing is the GREEN half AND the class elimination:
-// the chain is wired through `Gossiper.WireRelayHooks` — the EXACT function
-// cmd/sovereign-node/main.go calls — and must converge.
-//
-// This is the guard that did not exist before. Every prior relay guard
-// installed the hooks itself, so no test observed the production wiring path.
+// TestProdWireLoadBearing installs retainers through Gossiper.WireRelayHooks,
+// the same method called by cmd/sovereign-node. The relay-only chain must
+// converge, covering both RetainForeign and RetainForeignBatch registration.
 func TestProdWireLoadBearing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-TCP relay-chain test (binds loopback ports)")
 	}
 	nodes := buildProdWireChain(t, func(g *Gossiper, r relayHookSink) {
-		// THE PRODUCTION CALL — identical to main.go's `gossiper.WireRelayHooks(recv)`.
 		g.WireRelayHooks(r)
 	})
 	converged, ra, rc, _ := runProdWireChain(t, nodes, 25, 10*time.Second)
 	if !converged {
-		t.Fatalf("PRODUCTION WIRING BROKEN: the A→B→C chain did NOT converge (rootA=%x rootC=%x) even though the hooks were installed via Gossiper.WireRelayHooks — the same call cmd/sovereign-node/main.go makes. Either WireRelayHooks fails to install BOTH hooks (it must install RetainForeign AND RetainForeignBatch) or the batch relay seam itself regressed. This is the production path: if this is RED, the binary is broken.", ra, rc)
+		t.Fatalf("chain did not converge through Gossiper.WireRelayHooks (rootA=%x rootC=%x); check RetainForeign and RetainForeignBatch registration", ra, rc)
 	}
-	t.Logf("GREEN (wiring class elimination) — the A→B→C chain (NO A↔C edge, --batch-size=%d) CONVERGED (root=%x) with the hooks installed ONLY via Gossiper.WireRelayHooks — the exact function cmd/sovereign-node/main.go calls. A test now CONSUMES the production wiring path, so a hook main.go forgets is a hook this guard never installs either: the drift class that killed silicon runs #6 and #6b is closed.", DefaultBatchSize, ra)
+	t.Logf("chain converged through production relay wiring with batch size %d (root=%x)", DefaultBatchSize, ra)
 }
 
-// TestFanoutRotation is the guard: a frozen seed selects the SAME
-// inter-region peers every round; the per-node-per-round seed rotates them.
-//
-// RED on pre-bytes: production never called SetSeed, so the seed stayed 0 and
-// two consecutive rounds' inter-region picks were IDENTICAL — which is why a silicon
-// run shipped cross-region to the SAME 1 eu + 1 ap peer every sweep and 64 of
-// 66 remote nodes were NEVER selected.
-//
-// The guard asserts BOTH halves of the contract:
-//   - ROTATION: across R rounds the distinct inter-region peers reached per remote
-//     region is >= min(K, 6) — coverage, not a single frozen pick.
-//   - DETERMINISM PRESERVED: the same (round, nodeID) reproduces the same output
-//
-// (the contract must not regress — introduces a
-//
-//	ROTATION, not randomness).
+// TestFanoutRotation checks four properties of the fan-out seed: an unstamped
+// seed repeats its selection; per-round seeds reach at least min(K, 6) peers in
+// each remote region over R rounds; identical round and node IDs reproduce the
+// selection; and different node IDs decorrelate colocated peers' selections.
 func TestFanoutRotation(t *testing.T) {
 	const (
 		regions   = 3
@@ -352,7 +304,7 @@ func TestFanoutRotation(t *testing.T) {
 	selfNodeID[0] = 0xA5
 	selfNodeID[1] = 0x5A
 
-	// (a) frozen SEED (the pre-production behavior): never call SetSeed.
+	// Without SetSeed, consecutive selections provide the fixed baseline.
 	frozen := mk()
 	first := frozen.Select(ctx)
 	second := frozen.Select(ctx)
@@ -366,12 +318,11 @@ func TestFanoutRotation(t *testing.T) {
 		}
 	}
 	if !identical {
-		t.Fatalf("Seed guard premise BROKEN: with NO SetSeed call, two consecutive Select() results DIFFER — the frozen-seed behavior this guard is built to detect is not reproducible, so the rotation assertion below proves nothing. first=%x second=%x", first, second)
+		t.Fatalf("two Select calls without SetSeed returned different peer sets (first=%x second=%x), want identical results", first, second)
 	}
-	t.Logf("RED baseline confirmed: with the seed never stamped (production, before the seed-stamping fix), two consecutive Select() calls return the IDENTICAL peer set — the frozen fan-out that left 64/66 remote nodes never selected on the affected silicon run.")
+	t.Logf("two Select calls without SetSeed returned the same peer set")
 
-	// (b) POST-: stamp `round ^ LittleEndian(nodeID[:8])` each round, exactly as
-	// AntiEntropySweep now does, and count distinct inter-region peers reached.
+	// Stamp the same per-round seed as AntiEntropySweep and count coverage.
 	rotated := mk()
 	seen := map[RegionTag]map[[16]byte]bool{}
 	for round := uint64(1); round <= rounds; round++ {
@@ -379,7 +330,7 @@ func TestFanoutRotation(t *testing.T) {
 		for _, p := range rotated.Select(ctx) {
 			reg := RegionTag(p[0])
 			if reg == selfRegion {
-				continue // intra-region full-mesh is not the fan-out under test
+				continue // Intra-region full-mesh is not the fan-out under test.
 			}
 			if seen[reg] == nil {
 				seen[reg] = map[[16]byte]bool{}
@@ -397,30 +348,28 @@ func TestFanoutRotation(t *testing.T) {
 		}
 		got := len(seen[r])
 		if got < want {
-			t.Fatalf("SEED ROTATION INSUFFICIENT: over %d rounds the fan-out reached only %d distinct peers in remote region %d (want >= %d of %d). A frozen or weakly-mixed seed starves most remote peers — the silicon run-#6b failure (same 1 eu + 1 ap peer every sweep, 64/66 remotes never selected). Check that AntiEntropySweep stamps SetSeed(round ^ LittleEndian.Uint64(owner.NodeID[:8])) BEFORE Select.", rounds, got, r, want, perRegion)
+			t.Fatalf("over %d rounds fan-out reached %d distinct peers in region %d, want at least %d of %d", rounds, got, r, want, perRegion)
 		}
-		t.Logf("GREEN (seed rotation) — remote region %d: %d distinct peers reached across %d rounds (>= %d required).", r, got, rounds, want)
+		t.Logf("region %d reached %d distinct peers across %d rounds (minimum %d)", r, got, rounds, want)
 	}
 
-	// (c) DETERMINISM PRESERVED — the contract. Same (round, nodeID) → same
-	// output. is a rotation, NOT randomness.
+	// Equal round and node inputs must reproduce the selection exactly.
 	d1 := mk()
 	d2 := mk()
 	d1.SetSeed(7 ^ w2SeedNodeTerm(selfNodeID))
 	d2.SetSeed(7 ^ w2SeedNodeTerm(selfNodeID))
 	o1, o2 := d1.Select(ctx), d2.Select(ctx)
 	if len(o1) != len(o2) {
-		t.Fatalf("SEED DETERMINISM REGRESSED: same (round=7, nodeID) produced different-length selections (%d vs %d) — the topology-determinism contract is broken", len(o1), len(o2))
+		t.Fatalf("equal round and node ID produced selection lengths %d and %d", len(o1), len(o2))
 	}
 	for i := range o1 {
 		if o1[i] != o2[i] {
-			t.Fatalf("SEED DETERMINISM REGRESSED: same (round=7, nodeID) produced different selections at index %d (%x vs %x) — the seed must be a deterministic ROTATION, not randomness", i, o1[i], o2[i])
+			t.Fatalf("equal round and node ID produced different peers at index %d (%x vs %x)", i, o1[i], o2[i])
 		}
 	}
-	t.Logf("GREEN (seed determinism) — the same (round, nodeID) reproduces the identical selection: the rotation is deterministic, so the topology-determinism contract holds.")
+	t.Logf("equal round and node ID reproduced the same selection")
 
-	// (d) PER-NODE DE-CORRELATION — two DIFFERENT nodes in the SAME round must not
-	// pile onto the identical remote peers (the 34-colocated-nodes-per-host case).
+	// The node ID term must decorrelate colocated nodes in the same round.
 	var otherNode [16]byte
 	otherNode[0] = 0x11
 	otherNode[1] = 0x22
@@ -438,7 +387,7 @@ func TestFanoutRotation(t *testing.T) {
 		}
 	}
 	if same {
-		t.Fatalf("SEED NODE-TERM INEFFECTIVE: two DIFFERENT nodeIDs in the SAME round (3) selected the IDENTICAL peer set. The nodeID term must de-correlate colocated nodes, or 34 nodes on one host all fan out to the same remote peer in the same round. Check the XOR uses owner.NodeID[:8].")
+		t.Fatalf("different node IDs selected the same peer set in round 3; check the nodeID XOR term")
 	}
-	t.Logf("GREEN (seed per-node de-correlation) — two distinct nodeIDs in the same round select DIFFERENT peer sets: colocated nodes spread across remote peers instead of piling onto one.")
+	t.Logf("different node IDs selected different peer sets in the same round")
 }

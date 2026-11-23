@@ -4,42 +4,44 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package receive — batch_bench_test.go is the amortization bench:
-// the HONEST physics center of the day. It measures the full receive-side batch
-// path (Lookup + Verify + ApplyCRDTDeltaBatch — exactly what HandleBatchFrame
+// Package receive — batch_bench_test.go is the amortization benchmark for
+// batched verification. It measures the full receive-side batch path
+// (Lookup + Verify + ApplyCRDTDeltaBatch — exactly what HandleBatchFrame
 // runs after the O(1) header parse) for N in {1, 10, 100, 256} and reports
-// ns/DELTA = ns/op / N. The verify (one Ed25519 over the batch wire) amortizes
-// from 60.19 us/delta (the per-frame ceiling, BenchmarkVerifyCRDTFrame_32c) to
-// 60.19/N us/delta; the floor then moves to (batch-wire decode + N applies),
-// each sub-microsecond per delta on the PROVEN 32c apply number (~36 ns/entry).
+// ns/delta = ns/op / N. The verify (one Ed25519 over the batch wire) amortizes
+// from 60.19 µs/delta (the per-frame ceiling, BenchmarkVerifyCRDTFrame_32c) to
+// 60.19/N µs/delta; the floor then moves to (batch-wire decode + N applies),
+// each sub-microsecond per delta on the established 32c apply number (~36 ns/entry).
 //
-// THE HONEST GATE: ns/delta MUST fall ~linearly with N up to the apply
-// floor. A NEGATIVE (batch-wire serialization or capnp decode dominates so
-// batching is SLOWER per delta than per-frame) is RECORDED VERBATIM as
-// ACCEPTED-with-NEGATIVE-perf, NOT hidden. The bench is the ONLY gate that may
-// be NEGATIVE without failing the day; it may NOT be POSITIVE-FABRICATED.
+// The acceptance gate: ns/delta must fall roughly linearly with N up to the
+// apply floor. A negative result (batch-wire serialization or capnp decode
+// dominates so batching is slower per delta than per-frame) is recorded
+// verbatim as accepted-with-negative-perf, not hidden. This benchmark is the
+// only gate that may be negative without failing; it must not be
+// positive-fabricated.
 //
-// GEAR TAG (HONEST): this runs on the benchmark box (GOMAXPROCS=4, gear-light),
-// NOT on 32c/96c silicon. The per-frame anchor (60.19 us @ 32c) is CITED from
-// BenchmarkVerifyCRDTFrame_32c (pkg/identity/bench_test.go), NOT re-measured
-// here (this box is not 32c). The 32c/96c re-bite is a conditional
-// (SCISSORS — the silicon gate is deferred). Do NOT relabel a 4c ns/delta as a
-// 32c number. The bench reports the AMORTIZATION SHAPE (ns/delta as a function
-// of N) on this box; the absolute silicon number is.
+// This benchmark runs on a 4-core box (GOMAXPROCS=4), not on 32c/96c
+// silicon. The per-frame anchor (60.19 µs @ 32c) is cited from
+// BenchmarkVerifyCRDTFrame_32c (pkg/identity/bench_test.go), not re-measured
+// here. The 32c/96c re-measurement is a separate conditional step. Do not
+// relabel a 4c ns/delta as a 32c number. The benchmark reports the
+// amortization shape (ns/delta as a function of N) on this box; the absolute
+// silicon number is measured separately.
 //
-// WHY THE APPLY IS AN IDEMPOTENT RE-JOIN (a conservative no-op, NOT a real
-// insert): the bench warms the engine with ONE real apply of the N-delta batch
-// (a real insert), then the timed loop RE-APPLIES the same frame every op. The
-// CRDT Join is idempotent — re-joining the same deltas changes nothing — so the
-// timed apply is a no-op. This bounds the engine to N entries (the arena never
-// exhausts across b.N ops) and measures the VERIFY AMORTIZATION honestly: the
-// verify (the ~60us @ 32c target) runs FULLY every op (never cached), so ns/delta
-// falls ~linearly with N as 60us/N. The apply floor (~36 ns/entry @ 32c) is CITED
-// from the PROVEN per-entry number, NOT measured here (measuring it would
-// require unbounded real inserts, which exhausts the fixed-size arena — a
-// bench-construction artifact, not physics). A no-op apply is CHEAPER than a real
-// insert, so the measured ns/delta is a LOWER BOUND on the real per-delta cost —
-// it can never fabricate a win the engine does not have.
+// Why the apply is an idempotent re-join (a conservative no-op, not a real
+// insert): the benchmark warms the engine with one real apply of the N-delta
+// batch (a real insert), then the timed loop re-applies the same frame every
+// op. The CRDT Join is idempotent — re-joining the same deltas changes nothing
+// — so the timed apply is a no-op. This bounds the engine to N entries (the
+// arena never exhausts across b.N ops) and measures the verify amortization:
+// the verify (the ~60 µs @ 32c target) runs fully every op (never cached), so
+// ns/delta falls roughly linearly with N as 60 µs/N. The apply floor (~36
+// ns/entry @ 32c) is cited from the established per-entry number, not measured
+// here (measuring it would require unbounded real inserts, which exhausts the
+// fixed-size arena — a bench-construction artifact, not a physical constraint). A no-op apply
+// is cheaper than a real insert, so the measured ns/delta is a lower bound on
+// the real per-delta cost — it can never fabricate a win the engine does not
+// have.
 package receive
 
 import (
@@ -63,7 +65,7 @@ import (
 // pkg/mesh/batch.go (the SEND-side builder) but is re-derived here so pkg/receive
 // does not import pkg/mesh (the bench measures the RECEIVE path in isolation).
 // Each event stamps the 12 contract fields + the version tag exactly as the
-// production builder does, so the wire is a faithful CRDTDeltaBatch the frozen
+// production builder does, so the wire is a faithful CRDTDeltaBatch the
 // ApplyCRDTDeltaBatch accepts.
 func buildBenchBatchWire(b *testing.B, n int, baseDot uint64, tag int) []byte {
 	b.Helper()
@@ -123,20 +125,20 @@ func buildBenchBatchWire(b *testing.B, n int, baseDot uint64, tag int) []byte {
 	return data
 }
 
-// BenchmarkBatchedVerify is the amortization bench. For each N in
+// BenchmarkBatchedVerify is the amortization benchmark for batched verification. For each N in
 // {1, 10, 100, 256} it pre-builds a pool of distinct signed batch frames, then
 // measures the full receive path (HandleBatchFrame = Lookup + Verify +
-// ApplyCRDTDeltaBatch) per op and reports ns/DELTA = ns/op / N. The verify
-// amortizes 60.19 us/delta -> 60.19/N us/delta; the floor is the decode + N
+// ApplyCRDTDeltaBatch) per op and reports ns/delta = ns/op / N. The verify
+// amortizes 60.19 µs/delta -> 60.19/N µs/delta; the floor is the decode + N
 // applies. Compare ns/delta at N=1 vs N=100: the ratio is the amortization.
 //
-// RUN: go test -bench=BenchmarkBatchedVerify -benchmem -run=^$./pkg/receive/
+// RUN: go test -bench=BenchmarkBatchedVerify -benchmem -run=^$ ./pkg/receive/
 //
-// SCISSORS: in-process, GOMAXPROCS=4 benchmark box (gear-light). NOT 32c silicon.
-// The 32c/96c re-bite is conditional.
+// In-process, GOMAXPROCS=4 on a 4-core box. Not 32c silicon.
+// The 32c/96c re-measurement is a separate conditional step.
 func BenchmarkBatchedVerify(b *testing.B) {
 	// The origin keypair: the seed signs each batch; the pub is Directory-registered
-	// (GAP-3) so HandleBatchFrame's Lookup resolves it. Fresh per bench run.
+	// so HandleBatchFrame's Lookup resolves it. Fresh per bench run.
 	originPub, originPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		b.Fatalf("ed25519.GenerateKey: %v", err)
@@ -167,10 +169,10 @@ func BenchmarkBatchedVerify(b *testing.B) {
 
 	for _, N := range []int{1, 10, 100, 256} {
 		b.Run(fmt.Sprintf("N=%d", N), func(b *testing.B) {
-			// Pre-build ONE signed batch frame OUTSIDE the timer. The sign is
-			// the ONE Ed25519 per batch (the amortization); it is NOT in the
+			// Pre-build one signed batch frame outside the timer. The sign is
+			// the one Ed25519 per batch (the amortization); it is not in the
 			// timed loop. The frame's N events have distinct entityIDs + a
-			// monotonic dotCounter so the FIRST apply is a real insert.
+			// monotonic dotCounter so the first apply is a real insert.
 			batchWire := buildBenchBatchWire(b, N, 1, 0)
 			sig, err := identity.SignCRDTFrame(originSeed, batchWire)
 			if err != nil {
@@ -180,24 +182,24 @@ func BenchmarkBatchedVerify(b *testing.B) {
 			copy(sigArr[:], sig)
 			frame := attribution.MarshalBatchEnvelope(rcvOriginNodeID, sigArr, 1, uint16(N), batchWire)
 
-			// Warm the engine with ONE real apply (a real insert of all N
+			// Warm the engine with one real apply (a real insert of all N
 			// deltas) so the engine holds the state the timed loop re-joins.
 			// This bounds the engine to N entries for the whole timed loop (the
-			// arena never exhausts) and makes every timed op an IDEMPOTENT
+			// arena never exhausts) and makes every timed op an idempotent
 			// re-join (the CRDT Join is idempotent — re-joining the same deltas
 			// changes nothing).
 			//
-			// THE HONEST CONSEQUENCE: the timed apply is a NO-OP after the warm
-			// (an idempotent re-join does not insert). This UNDERSTATES the apply
+			// The consequence: the timed apply is a no-op after the warm
+			// (an idempotent re-join does not insert). This understates the apply
 			// cost — the conservative direction. The verify (the amortization
-			// TARGET, ~60us @ 32c) runs FULLY every op (it is never cached), so
-			// the bench measures the VERIFY AMORTIZATION honestly (ns/delta
-			// falls ~linearly with N as 60us/N). The apply floor (~36 ns/entry
-			// @ 32c) is CITED from the PROVEN per-entry number, NOT measured
+			// target, ~60 µs @ 32c) runs fully every op (it is never cached), so
+			// the benchmark measures the verify amortization (ns/delta
+			// falls roughly linearly with N as 60 µs/N). The apply floor (~36 ns/entry
+			// @ 32c) is cited from the established per-entry number, not measured
 			// here (measuring it would require unbounded real inserts, which
-			// exhausts the arena — a bench-construction artifact, not physics).
-			// A no-op apply is CHEAPER than a real insert, so the measured
-			// ns/delta is a LOWER BOUND on the real per-delta cost — it can
+			// exhausts the arena — a bench-construction artifact, not a physical constraint).
+			// A no-op apply is cheaper than a real insert, so the measured
+			// ns/delta is a lower bound on the real per-delta cost — it can
 			// never fabricate a win the engine does not have.
 			warm := recv.HandleBatchFrame(frame)
 			if warm.Verdict != Accept {
@@ -214,9 +216,9 @@ func BenchmarkBatchedVerify(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			// ns/DELTA = ns/op / N. Report it as a custom metric so the bench
-			// table shows BOTH ns/op (per batch) and ns/delta (the amortized
-			// per-delta cost — the honest center of the report).
+			// ns/delta = ns/op / N. Report it as a custom metric so the bench
+			// table shows both ns/op (per batch) and ns/delta (the amortized
+			// per-delta cost — the center of the report).
 			nsPerOp := b.Elapsed().Nanoseconds() / int64(b.N)
 			nsPerDelta := nsPerOp / int64(N)
 			b.ReportMetric(float64(nsPerDelta), "ns/delta")

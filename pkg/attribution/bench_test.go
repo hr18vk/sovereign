@@ -13,27 +13,20 @@ import (
 	ed25519 "github.com/cloudflare/circl/sign/ed25519"
 )
 
-// BenchmarkEnvelope_HopBoundCheck_32c measures the O(1) hop-count check
-// ns/op (read hop count, compare to bound) — the reject-before-Verify
-// defense that runs BEFORE any crypto, before 3.0's clock cap is even
-// relevant on the depth axis. It MUST be sub-us and 0-alloc: it is a single
-// integer compare (len(hops) > maxHops) that returns ErrHopBoundExceeded
-// without touching Ed25519.
+// BenchmarkEnvelope_HopBoundCheck_32c measures the hop-count rejection path.
+// Open compares len(hops) with maxHops and returns ErrHopBoundExceeded before
+// signature verification, so the benchmark reports the cost of that integer
+// comparison and its allocations.
 //
-// GEAR TAG (HONEST): GOMAXPROCS=4, CPU part 0xd40 (Cortex-A76-class,
-// Graviton3-era). This is NOT c8g.8xlarge at 32c. The function name retains
-// the _32c suffix per the roadmap's naming convention (the TARGET
-// gear for the published bar); the HONEST gear tag is this comment and the
-// commit message. Do NOT relabel a 4c number as a 32c number.
+// The _32c suffix names the 32-core c8g.8xlarge baseline used for comparison.
+// Results on other hosts describe the host running the benchmark.
 //
-// The bench builds a 1000-hop envelope (the §1.D3.E attacker shape) and
-// sets the bound to 15 (MaxHopsForBudget(1ms)), so every Open hits the
-// depth-exceed branch and returns instantly — zero Verify calls. The
-// reported ns/op is the O(1) depth-check cost; it must be orders of
-// magnitude below the 60.2 us per-Verify cost (c8g 32c sweep).
+// The 1000-hop envelope exceeds the 15-hop bound derived from a 1 ms budget.
+// Every iteration therefore returns before Verify. For scale, the measured
+// Ed25519 verification cost on the 32-core baseline is about 60.2 us.
 func BenchmarkEnvelope_HopBoundCheck_32c(b *testing.B) {
 	inner := fakeInnerWire()
-	// 1000 garbage hops — the depth check rejects before any Verify.
+	// The depth check rejects these invalid hop records before verification.
 	garbageHops := make([]Hop, 1000)
 	env := NewRelayEnvelope(inner, garbageHops)
 	maxHops := MaxHopsForBudget(1 * time.Millisecond) // 15
@@ -48,19 +41,11 @@ func BenchmarkEnvelope_HopBoundCheck_32c(b *testing.B) {
 	}
 }
 
-// BenchmarkEnvelope_Open_3Hops_32c measures the full A->B->C->D open: 3
-// outer relay Verifies + the O(1) depth check. The inner origin Verify is
-// the caller's job and is NOT included here, so this bench
-// measures 3 Verifies ~= 3 x 60.2 us @ 32c (the ALREADY-PROVEN 32c
-// per-Verify cost from the sweep). On this 4c box the per-Verify
-// cost differs from the 32c number; the bench is tagged 4c honestly and
-// the 60.2 us figure is the PROVEN 32c publication number, not a 4c
-// re-measurement.
-//
-// GEAR TAG (HONEST): 4c (GOMAXPROCS=4, CPU part 0xd40). Do NOT relabel 4c
-// as 32c. The 60.2 us per-Verify is the PROVEN 32c number (sweep,
-// committed artifact); 3.2's hop-count bound is sized against it, not a 4c
-// re-measurement.
+// BenchmarkEnvelope_Open_3Hops_32c measures three outer relay verifications
+// and the hop-count check for an A->B->C->D chain. The caller's inner origin
+// verification is not included. On the 32-core c8g.8xlarge baseline, the three
+// outer verifications cost approximately 3 x 60.2 us; other hosts measure
+// their own verification cost. MaxHopsForBudget uses the baseline cost.
 func BenchmarkEnvelope_Open_3Hops_32c(b *testing.B) {
 	inner := fakeInnerWire()
 	// Build a fresh 3-hop relay chain once (keygen is expensive and not
@@ -78,10 +63,9 @@ func BenchmarkEnvelope_Open_3Hops_32c(b *testing.B) {
 	}
 }
 
-// buildRelayChainBench is the bench-package variant of buildRelayChain that
-// takes a testing.TB (so it can call genKey from a benchmark) and returns
-// only the envelope (the bench does not need the relay pubkeys). It builds
-// an N-hop relay chain with fresh keys.
+// buildRelayChainBench builds an N-hop chain with fresh keys. It accepts a
+// testing.TB so benchmarks can share genKey, and omits the relay public keys
+// because the benchmarks do not use them.
 func buildRelayChainBench(b testing.TB, innerWire []byte, nHops int) *RelayEnvelope {
 	relayPubs := make([]ed25519.PublicKey, nHops)
 	relayPrivs := make([]ed25519.PrivateKey, nHops)

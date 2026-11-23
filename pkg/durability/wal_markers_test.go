@@ -6,12 +6,9 @@
 
 package durability
 
-//wal_markers_test.go — the MARKER guards (ADR-0045): T5, T9,
-// T13. These reference the NEW witness fields (ExactWALFallback,
-// LocalPhantomsRejected, CheckpointSeq) and the new restoreEntry behavior, so
-// they cannot compile against HEAD — their RED artifacts are BUG-INJECTS: a
-// one-line neutralization of the mechanism under test, reverted immediately
-// after the RED is captured. Each guard's doc comment names the exact inject.
+// Tests for recovery witness fields and entry restoration (ADR-0045 §5).
+// They cover phantom local dots, sequence-based tail selection, fallback when
+// an image is unavailable, and preservation of local and foreign origins.
 
 import (
 	"context"
@@ -21,32 +18,16 @@ import (
 	"testing"
 )
 
-// ---------------------------------------------------------------------------
-// T5 — unlogged snapshot phantom: image DISCARDED, fallback marker observable
-// ---------------------------------------------------------------------------
-
-// TestUnloggedSnapshotPhantomDiscardsImage guards the unlogged-snapshot phantom
-// discard. A local dot in the image with NO durable WAL identity means the image was
-// taken from a state the log cannot justify (torn write, compromised store).
-// The ruled response: discard the IMAGE (not just the entry), fall back to
-// exact-WAL full replay, and leave the marker observable.
+// TestUnloggedSnapshotPhantomDiscardsImage verifies rejection of a local dot in
+// an image when that dot has no durable WAL identity. Such an image describes
+// state the log cannot justify, so recovery discards the entire image and
+// replays the WAL.
 //
-// The phantom is injected INTO THE STORED IMAGE (not the live engine), so the
-// WAL, the checkpoint anchor, and the live root are all clean — the ONLY
-// suspect artifact is the image. Recovery must then succeed from the WAL alone
-// and the witness must say why.
-//
-// A post-checkpoint TAIL put is deliberate: it makes the checkpoint non-final,
-// which disarms the root-equality anchor — so is the SOLE guard between a
-// compromised image and silent corruption. (Without the tail, neutralizing
-// still fails recovery via ErrRecoveryRootMismatch and the guard would be
-// testing the anchor, not the phantom gate.)
-//
-// RED (bug-inject): force the check inert (`phantoms > 0` → `false` at
-// recovery.go:~237) → the phantom image is USED: both markers stay zero, the
-// recovered dot count absorbs the phantom (5 vs live 4), the clock jumps to
-// the phantom's 777, and the root diverges — recovery SUCCEEDS on corrupt
-// state. Four assertions fire.
+// Only the stored image is modified; the WAL and live root remain valid. The
+// post-checkpoint mutation makes the checkpoint non-final, preventing the root
+// comparison from masking a failure of the phantom check. If that check were
+// disabled, the phantom would increase the dot count, advance the clock to 777,
+// and change the recovered root.
 func TestUnloggedSnapshotPhantomDiscardsImage(t *testing.T) {
 	nodeID := testNodeID()
 	lfs := newSnapshotStore(t)
@@ -63,7 +44,7 @@ func TestUnloggedSnapshotPhantomDiscardsImage(t *testing.T) {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
 	ckptLamport := live.Engine().LamportCounter() // quiescent: watermark == clock
-	// The non-final-making tail: one durable mutation ABOVE the checkpoint.
+	// The non-final-making tail: one durable mutation above the checkpoint.
 	if _, err := live.PutLocal(utf8EntityID(3), stagedPayload(3), stagedEntry(3)); err != nil {
 		t.Fatalf("PutLocal tail: %v", err)
 	}
@@ -76,7 +57,7 @@ func TestUnloggedSnapshotPhantomDiscardsImage(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// Inject the phantom: a LOCAL dot (counter 777) with no WAL identity, added
+	// Inject the phantom: a local dot (counter 777) with no WAL identity, added
 	// to the stored image after the fact — the compromised-store shape.
 	img, err := lfs.LoadSnapshotImage(context.Background(), ckptLamport)
 	if err != nil {
@@ -89,54 +70,41 @@ func TestUnloggedSnapshotPhantomDiscardsImage(t *testing.T) {
 
 	rec, witness := recoverBounded(t, walPath, lfs)
 
-	// THE MARKERS (the guard's point — not the absence of a crash).
+	// The witness must disclose both the rejected phantom and the fallback.
 	if !witness.ExactWALFallback {
-		t.Errorf("MARKER: ExactWALFallback=false — the phantom image was used SILENTLY (R5 violated)")
+		t.Errorf("ExactWALFallback is false after rejecting a phantom image")
 	}
 	if witness.LocalPhantomsRejected != 1 {
-		t.Errorf("MARKER: LocalPhantomsRejected=%d, want 1", witness.LocalPhantomsRejected)
+		t.Errorf("LocalPhantomsRejected = %d, want 1", witness.LocalPhantomsRejected)
 	}
 	if witness.Bounded {
-		t.Errorf("MARKER: Bounded=true after a phantom discard — the witness claims a bounded recovery that did not happen")
+		t.Errorf("Bounded is true after the phantom image was discarded")
 	}
-	// THE STATE: rebuilt from the WAL alone — the phantom is gone, the durable
-	// mutations (3 pre-checkpoint + 1 tail) are all present.
+	// The three pre-checkpoint mutations and the tail mutation must remain;
+	// the injected counter 777 must not appear in either state or clock.
 	if got := countDots(t, rec); got != 4 {
-		t.Errorf("DOT COUNT: recovered %d != 4 — the phantom was absorbed or durable state was lost", got)
+		t.Errorf("recovered dot count = %d, want 4", got)
 	}
 	if witness.ReplayedRecords != 4 {
-		t.Errorf("WITNESS: ReplayedRecords=%d, want 4 (full exact-WAL replay of every durable mutation)", witness.ReplayedRecords)
+		t.Errorf("ReplayedRecords = %d, want 4 from the full WAL", witness.ReplayedRecords)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x", got, liveRoot)
+		t.Errorf("recovered root %x differs from live root %x", got, liveRoot)
 	}
 	if got := rec.LamportCounter(); got != liveClock {
-		t.Errorf("CLOCK: recovered %d != live %d — the phantom's counter 777 leaked into the clock", got, liveClock)
+		t.Errorf("recovered clock = %d, want live clock %d", got, liveClock)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// T9 — sequence-cut partition; ambiguity errs toward replaying MORE
-// ---------------------------------------------------------------------------
-
-// TestSequenceCutPartition guards the sequence-cut partition. The tail cut is the
-// on-disk RECORD SEQUENCE, never a scalar counter. This guard pins the
-// partition byte-exactly:
+// TestSequenceCutPartition verifies that the replay tail is selected by WAL
+// record sequence rather than a scalar counter. CheckpointSeq is read from the
+// file independently of ReplayWAL. The three records after the cut must be
+// replayed, and the image and tail together must reproduce every dot and the
+// live root.
 //
-// - the witness's CheckpointSeq equals the checkpoint record's RAW on-disk
-// seq (parsed from the bytes — ReplayWAL is the code under test, so the
-// check is the file itself);
-// - exactly the post-cut records are replayed (ReplayedRecords == 3);
-// - every pre-cut dot is present via the image, every post-cut dot via the
-// exact-dot replay, and the recovered root equals the live root;
-// - C1 idempotency: replaying the below-cut records ANYWAY (the full path on
-// the same WAL) lands on the SAME root — the cut is a conservative
-// optimization, not a correctness dependency.
-//
-// RED (bug-inject): make the cut swallow the tail (skip every record when
-// useSnapshot) → the recovered state has only the image's {2,3,4} → the
-// dot-count and root assertions fire. Mirror inject (skip the image Join)
-// leaves only {5,6,7} — same assertions fire from the other side.
+// Full replay also processes the records below the cut. It must reach the same
+// root, showing that exact-dot restoration is idempotent and that the cut
+// reduces work without changing state.
 func TestSequenceCutPartition(t *testing.T) {
 	nodeID := testNodeID()
 	lfs := newSnapshotStore(t)
@@ -166,7 +134,7 @@ func TestSequenceCutPartition(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// The raw-byte check: 6 mutations + 1 checkpoint, checkpoint at index 3.
+	// Read the sequence numbers directly from six mutations and one checkpoint.
 	seqs := readWALRecordSeqs(t, walPath)
 	if len(seqs) != 7 {
 		t.Fatalf("raw WAL holds %d records, want 7 (6 mutations + 1 checkpoint)", len(seqs))
@@ -175,16 +143,16 @@ func TestSequenceCutPartition(t *testing.T) {
 
 	rec, witness := recoverBounded(t, walPath, lfs)
 	if !witness.Bounded {
-		t.Fatalf("witness.Bounded=false — the bounded path did not engage")
+		t.Fatalf("bounded recovery was not used")
 	}
 	if witness.CheckpointSeq != ckptSeq {
-		t.Errorf("CUT: witness.CheckpointSeq=%d != the checkpoint record's on-disk seq %d", witness.CheckpointSeq, ckptSeq)
+		t.Errorf("CheckpointSeq = %d, want on-disk checkpoint sequence %d", witness.CheckpointSeq, ckptSeq)
 	}
 	if witness.ReplayedRecords != 3 {
-		t.Errorf("CUT: ReplayedRecords=%d != 3 (exactly the post-cut records)", witness.ReplayedRecords)
+		t.Errorf("ReplayedRecords = %d, want the 3 post-cut records", witness.ReplayedRecords)
 	}
 	if got := countDots(t, rec); got != 6 {
-		t.Errorf("DOT COUNT: recovered %d != 6", got)
+		t.Errorf("recovered dot count = %d, want 6", got)
 	}
 	for i := 0; i < 6; i++ {
 		ents := collectEntries(t, rec)[utf8EntityID(i)]
@@ -193,35 +161,27 @@ func TestSequenceCutPartition(t *testing.T) {
 		}
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x", got, liveRoot)
+		t.Errorf("recovered root %x differs from live root %x", got, liveRoot)
 	}
 	if got := rec.LamportCounter(); got != liveClock {
-		t.Errorf("CLOCK: recovered %d != live %d", got, liveClock)
+		t.Errorf("recovered clock = %d, want live clock %d", got, liveClock)
 	}
 
-	// C1 IDEMPOTENCY: the full path replays the below-cut records too — and
-	// MUST land on the same root (exact-dot restore makes re-application a
-	// no-op). If the cut were load-bearing for CORRECTNESS (not just cost),
-	// these roots would differ.
+	// Full replay re-applies the records below the cut. Exact-dot restoration
+	// makes that idempotent, so its root must equal the bounded and live roots.
 	full, fullWitness := recoverFull(t, walPath)
 	if got := full.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("C1: full-replay root %x != live %x — re-applying below-cut records changed the state", got, liveRoot)
+		t.Errorf("full-replay root %x differs from live root %x", got, liveRoot)
 	}
 	if fullWitness.ReplayedRecords != 6 {
-		t.Errorf("C1: full path ReplayedRecords=%d, want 6 (replayed EVERYTHING — and still converged)", fullWitness.ReplayedRecords)
+		t.Errorf("full ReplayedRecords = %d, want all 6 mutations", fullWitness.ReplayedRecords)
 	}
 }
 
-// TestAmbiguousCutReplaysMore is the second half of T9: when the image
-// cannot be bound to the log (here: deleted from the store), the cut is
-// meaningless and recovery MUST err toward replaying MORE — the whole log —
-// with the fallback marker set. Replaying more is always safe (C1); replaying
-// less loses data.
-//
-// RED (bug-inject): suppress the marker in the missing-image branch
-// (`exactWALFallback = true` removed at recovery.go:~187) → recovery still
-// succeeds from the full log but the witness CLAIMS a bounded recovery — the
-// marker assertions fire.
+// TestAmbiguousCutReplaysMore removes the image named by a checkpoint. Without
+// a bound image, recovery must replay the whole WAL and set ExactWALFallback.
+// Replaying already absorbed records is idempotent; omitting durable records
+// would lose state.
 func TestAmbiguousCutReplaysMore(t *testing.T) {
 	lfs := newSnapshotStore(t)
 	walPath := filepath.Join(t.TempDir(), "t9b.wal")
@@ -250,7 +210,7 @@ func TestAmbiguousCutReplaysMore(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// The ambiguous case: the image the checkpoint points at is GONE.
+	// The ambiguous case: the image the checkpoint points at is gone.
 	imgPath := filepath.Join(lfs.Root(), "ckpt", strconv.FormatUint(ckptLamport, 10))
 	if err := os.Remove(imgPath); err != nil {
 		t.Fatalf("remove image %s: %v", imgPath, err)
@@ -258,44 +218,30 @@ func TestAmbiguousCutReplaysMore(t *testing.T) {
 
 	rec, witness := recoverBounded(t, walPath, lfs)
 	if !witness.ExactWALFallback {
-		t.Errorf("MARKER: ExactWALFallback=false on a missing image — the fallback was SILENT (R5 violated)")
+		t.Errorf("ExactWALFallback is false with the checkpoint image missing")
 	}
 	if witness.Bounded {
-		t.Errorf("MARKER: Bounded=true with no image — the witness claims a bounded recovery that did not happen")
+		t.Errorf("Bounded is true without a snapshot image")
 	}
 	if witness.ReplayedRecords != 6 {
-		t.Errorf("ERR-DIRECTION: ReplayedRecords=%d, want 6 — an ambiguous cut must replay MORE (the whole log), never less", witness.ReplayedRecords)
+		t.Errorf("ReplayedRecords = %d, want all 6 mutations after an ambiguous cut", witness.ReplayedRecords)
 	}
 	if got := countDots(t, rec); got != 6 {
-		t.Errorf("DOT COUNT: recovered %d != 6", got)
+		t.Errorf("recovered dot count = %d, want 6", got)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x", got, liveRoot)
+		t.Errorf("recovered root %x differs from live root %x", got, liveRoot)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// T13 — origin classification survives recovery (the B.15 guard)
-// ---------------------------------------------------------------------------
-
-// TestOriginClassificationSurvivesRecovery guards origin classification across recovery.
-// shipDelta's SELF predicate (pkg/mesh/gossip.go:1766) is
-// `entry.OriginNodeID == nodeID`: SELF entries are served from the
-// payloadCache, FOREIGN ones from the relayCache. The WAL's 80-byte entry
-// carries OriginNodeID == ZERO in production (the-BLOCKER: bridge.go builds
-// the WALEntry from the caller's pre-insert struct), so restoreEntry MUST
-// synthesize the origin from the dot (every WAL mutation is local-origin).
-// If it ever passed the WAL's zero origin through, every tail-restored entry
-// would classify FOREIGN — the relaunched node would miss its own pre-crash
-// payloads on every sweep (run-#11's B.15).
+// TestOriginClassificationSurvivesRecovery checks the origin used by shipDelta
+// to select payloadCache for local entries and relayCache for foreign entries.
+// Legacy WAL records have no origin field, so restoreEntry synthesizes the local
+// origin from their dots. Without that step, local entries recovered from the
+// tail would be treated as foreign and their cached payloads would be missed.
 //
-// Both directions are asserted: tail-restored LOCAL dots classify SELF, and
-// image-restored FOREIGN dots classify FOREIGN (recovery must not re-origin
-// what it did not mint).
-//
-// RED (bug-inject): restoreEntry with `OriginNodeID: [16]byte{}` (the
-// pass-the-zero-through regression) → both tail-restored local entries
-// misclassify FOREIGN and the SELF assertion fires naming them.
+// Image-restored foreign entries must retain their original node ID. The test
+// checks both directions as well as the recovered root.
 func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 	nodeID := testNodeID()
 	lfs := newSnapshotStore(t)
@@ -303,7 +249,7 @@ func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
-	// 3 local puts BELOW the checkpoint (restored from the image).
+	// 3 local puts below the checkpoint (restored from the image).
 	for i := 0; i < 3; i++ {
 		if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal pre %d: %v", i, err)
@@ -314,8 +260,8 @@ func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 	if err := live.AppendCheckpoint(); err != nil {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
-	// 2 local puts ABOVE the checkpoint (restored from the WAL tail via
-	// restoreEntry — the code path whose origin synthesis this guard pins).
+	// 2 local puts above the checkpoint (restored from the WAL tail via
+	// restoreEntry — the code path whose origin synthesis this test pins).
 	for i := 3; i < 5; i++ {
 		if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal post %d: %v", i, err)
@@ -335,8 +281,8 @@ func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 	}
 	entries := collectEntries(t, rec)
 
-	// SELF direction: every local-origin entry (image-restored AND
-	// tail-restored) must satisfy shipDelta's SELF predicate.
+	// Self direction: every local-origin entry (image-restored and
+	// tail-restored) must satisfy shipDelta's self predicate.
 	for i := 0; i < 5; i++ {
 		id := utf8EntityID(i)
 		ents := entries[id]
@@ -344,10 +290,10 @@ func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 			t.Fatalf("local entity %s carries %d dots, want 1", id, len(ents))
 		}
 		if ents[0].OriginNodeID != nodeID {
-			t.Errorf("CLASSIFICATION: local entry %s has OriginNodeID=%x — shipDelta (gossip.go:1766) classifies it FOREIGN and it will never be served from the payloadCache (B.15)", id, ents[0].OriginNodeID)
+			t.Errorf("local entry %s has OriginNodeID %x; shipDelta will select relayCache instead of payloadCache", id, ents[0].OriginNodeID)
 		}
 	}
-	// FOREIGN direction: the image-restored foreign dots must NOT be re-origined.
+	// Foreign direction: the image-restored foreign dots must not be re-origined.
 	for i := 0; i < 2; i++ {
 		id := utf8EntityID(5000 + i)
 		ents := entries[id]
@@ -355,10 +301,10 @@ func TestOriginClassificationSurvivesRecovery(t *testing.T) {
 			t.Fatalf("foreign entity %s carries %d dots, want 1", id, len(ents))
 		}
 		if ents[0].OriginNodeID != foreignNodeID() {
-			t.Errorf("CLASSIFICATION: foreign entry %s re-origined to %x (want %x) — recovery must not claim what it did not mint", id, ents[0].OriginNodeID, foreignNodeID())
+			t.Errorf("foreign entry %s has OriginNodeID %x, want %x", id, ents[0].OriginNodeID, foreignNodeID())
 		}
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
-		t.Errorf("ROOT: recovered %x != live %x", got, liveRoot)
+		t.Errorf("recovered root %x differs from live root %x", got, liveRoot)
 	}
 }

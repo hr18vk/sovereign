@@ -1,12 +1,6 @@
-# Copyright 2026 Harsh Rawat
-#
-# Use of this software is governed by the Business Source License 1.1,
-# which can be found in the LICENSE file. Production use requires a written
-# grant from the Licensor until the Change Date (2029-08-15).
-
 # Cap'n Proto schema for the Sovereign Engine ingestion wire format.
 #
-# PHYSICS (see "Go High-Performance Architecture Research", §DOMAIN 3):
+# the physical invariant:
 #   - Absolute 8-byte alignment is the physical invariant. Every field here
 #     is either a fixed 8-byte primitive (Float64 / UInt64) or a pointer
 #     (Text) so that the struct's data section is a contiguous run of 8-byte
@@ -42,23 +36,23 @@ struct TriTemporalEvent {
 # (mutually-authenticated peers, CRDT delta contract). Their senders, receivers,
 # trust boundaries, and lifecycles differ; their field sets are disjoint except
 # for the assertionTime dimension. Folding one into the other would re-entrench
-# the defect class where a schema that does not fit gets bypassed instead of
-# extended.
+# the bypassed-schema defect class: a schema that does not fit the data is
+# circumvented rather than extended.
 #
-# PHYSICS: the data section is a contiguous run of 8-byte slots with zero
+# the physical constraint: the data section is a contiguous run of 8-byte slots with zero
 # internal padding. The two [16]byte node IDs and the [32]byte digest are
 # carried as fixed-size Data (capnp pads Data to 8-byte granularity
 # automatically) so the receiver decodes them sliceless. The two Text pointer
-# fields (entityId, payload) carry the payload and its digest -- the payload
-# bytes MUST cross the wire, never only PayloadDigest; this is never allowed
-# to regress.
+# fields (entityId, payload) carry the entityId and payload pair -- the payload
+# bytes must cross the wire, never only PayloadDigest; the CRDT reconstruction
+# integrity checks (ADR-0045) never allow that regression.
 #
-# version is the single forward-compat surface (@0:UInt16). Semantics: the
+# version is the single forward-compat surface (@0 :UInt16). Semantics: the
 # encoder stamps the version of the schema it serialized against; the decoder
 # compares the on-wire tag against its own compiled-in schema version and, on
 # mismatch, fails explicitly (never silent fall-through to zero-received
-# fields -- that is exactly how a silent bypass hides). Minimum forward-compat
-# machinery: no
+# fields -- that is how the bypassed-schema defect hid). Minimum
+# forward-compat machinery: no
 # unknown-field bags, no bitmasks.
 struct CRDTDeltaEvent {
     version         @0 :UInt16;
@@ -76,23 +70,28 @@ struct CRDTDeltaEvent {
     payload         @12 :Text;
 }
 
-# CRRTDeltaBatch is the batched wrapper around CRRTDeltaEvent. It carries
-# a List(CRRTDeltaEvent) so that one decode + one Join can move N CRRT-entries
-# through the ReconstructEntry seam atomically (reconstruct-all-then-join-
-# once). It is a DISTINCT struct from CRRTDeltaEvent; CRRTDeltaEvent's
-# wire surface (13 fields, TypeID 0xa90774c0daa3fdc7) stays byte-identical — the
-# batch is a new wrapper, not a modification of the single-event schema.
+# CRDTDeltaBatch is the batched wrapper for the causal dot attribution checks
+# (ADR-0045) around CRDTDeltaEvent. It carries a List(CRDTDeltaEvent) so that
+# one decode + one Join can move N CRDT-entries through the ReconstructEntry
+# seam atomically (reconstruct-all-then-join-once). It is a distinct struct
+# from CRDTDeltaEvent; CRDTDeltaEvent's CRDT reconstruction integrity checks
+# (ADR-0045) wire surface (13 fields, TypeID 0xa90774c0daa3fdc7) stays
+# byte-identical — the batch is a new wrapper, not a modification of the
+# single-event schema.
 #
-# PHYSICS: the struct's single field is a pointer to a List(CRRTDeltaEvent)
+# the physical constraint: the struct's single field is a pointer to a List(CRDTDeltaEvent)
 # (composite list, 8-byte-aligned element stride). The decoder overlays the
 # list onto the raw buffer and yields per-element views that share the parent
-# arena; the production entry point (pkg/sync ApplyCRRTDeltaBatch) Releases the
-# single *Message at function scope, exactly as the single-event path
-# does — there is exactly one arena per batch frame, not one per element.
+# arena; the production entry point (pkg/sync ApplyCRDTDeltaBatch) Releases the
+# single *Message at function scope, exactly as the delta batch integrity checks
+# (ADR-0045) single-event path does — there is exactly one arena per batch
+# frame, not one per element.
 #
-# SCOPE: length-prefix framing, gzip/Snappy, and a real network transport are
-# carry-forwards gated on real traffic.
-# This schema is the batch shape only; the transport concerns are out of scope.
+# Scope (the causal dot attribution checks (ADR-0045), and only that):
+# length-prefix framing, gzip/Snappy, and a real network transport are
+# carry-forwards gated on the Ed25519 origin auth and transport work
+# (ADR-0036, ADR-0037) real traffic. This schema is the batch shape only; the
+# transport concerns are out of scope.
 struct CRDTDeltaBatch {
     events @0 :List(CRDTDeltaEvent);
 }

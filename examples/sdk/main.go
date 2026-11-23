@@ -6,8 +6,8 @@
 
 // Command sdk-example is the canonical "how to use the Sovereign Engine" file:
 // connect to a running mesh over mutual TLS and perform a state operation in
-// under 50 lines of Go, importing ONLY the sovereign SDK + stdlib.
-// Run: go run./examples/sdk -addr 127.0.0.1:7432 -cert c -key k -ca ca.pem
+// under 50 lines of Go, importing only the sovereign SDK + stdlib.
+// Run: go run ./examples/sdk -addr 127.0.0.1:7432 -cert c -key k -ca ca.pem
 package main
 
 import (

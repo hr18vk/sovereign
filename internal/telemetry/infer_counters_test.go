@@ -6,21 +6,13 @@
 
 package telemetry
 
-// The auto-inference counter guards (ADR-0027).
+// infer_counters_test.go tests registry membership and OpenTelemetry export for
+// the three pruning-horizon inference metrics (QueryTxTimeHighWaterMark,
+// PruningHorizonEffective, PruningHorizonRetreatRefused; ADR-0027).
 //
-// The 3 new inferrer counters are in allCounters() (0 dups, all registered
-// under the real Meter after a subprocess Init). The bridge
-// (pkg/metrics/telemetry_bridge.go) enumerates them WITHOUT a bridge edit (the
-// slice auto-surface property — a sister guard in pkg/metrics scrapes /metrics
-// and asserts the 3 new names appear). This in-package guard asserts the
-// allCounters() slice carries the 3 new distinct counters + the subprocess-Init
-// fill discipline (a counter missing from rebuildCounters() silently drops to
-// nil under --otel — not reopened for the 3 new counters; the
-// construction-vs-distinct trap disarmed).
-//
-// The subprocess Init guard asserts the 3 new counters are NON-nil post-Init
-// (the rebuildCounters fill held for the inferrer counters — the omission
-// landmine stays closed for the 3 new ones).
+// All 25 metrics live in allCounters() and are reconstructed in
+// rebuildCounters(), so Init(meter) preserves them and TelemetryBridge can
+// enumerate them automatically.
 
 import (
 	"context"
@@ -35,26 +27,18 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 )
 
-// inferSubprocessMarker is the env var the subprocess guards set when they
-// re-invoke the test binary for a fresh process (the Init once-per-process
-// guard makes a second Init a rejected no-op in-process).
+// inferSubprocessMarker selects the subprocess entry point. Init accepts only
+// its first call, so the test uses a fresh process for a real Meter.
 const inferSubprocessMarker = "SUPREMUM_INFER_SUBPROC"
 
-// TestInferCountersInRegistry asserts the 3 new inferrer counters are in
-// allCounters() (the counter slice), carry their distinct names, and that the
-// slice grew to include them (the honest growth ADR-0027 discloses). The bridge
-// enumerates this slice automatically (verified by the sister guard in
-// pkg/metrics). The guard ALSO asserts the 3 new counters are registered under
-// a real Meter (a subprocess Init + ManualReader Collect surfaces the 3 new
-// instruments — the "OTel callback observes the new gauges automatically" claim
-// byte-verified).
+// TestInferCountersInRegistry asserts the three horizon-inference counters are
+// present in Counters() with unique names and expected cardinality.
 func TestInferCountersInRegistry(t *testing.T) {
 	cs := Counters()
-	const wantDistinct = 24 // distinct counters; grew across the ADR series as disclosure counters were added
+	const wantDistinct = 25
 	if len(cs) != wantDistinct {
-		t.Fatalf("infer-telemetry: len(Counters())=%d, want %d (grew the counter 21->22 — PQHandshakeNegotiated — the PQ-KEM disclosure; grew the counter 19->21 — TWO counters: CertRotationTriggered + CertRevokedRejected — the PKI leaf-rotation + revocation-reject disclosure; grew the counter 18->19; the stratified-anti-entropy fallback counter — StratifiedAntiEntropyFallback — grew the counter; the live-source — QueryLiveSourceReads — grew it; the manifest-skip — QueryManifestSkippedFirstSys — grew it; the download-skip — QueryDownloadSkippedFirstSys — grew it; the 3 inferrer counters grew it)", len(cs), wantDistinct)
+		t.Fatalf("len(Counters())=%d, want %d", len(cs), wantDistinct)
 	}
-	// The 3 new names MUST be present (the slice carries them).
 	wantNames := map[string]bool{
 		"supremum.query_txtime_high_water_mark_ns":            false,
 		"supremum.compaction.pruning_horizon_effective_ns":    false,
@@ -69,41 +53,33 @@ func TestInferCountersInRegistry(t *testing.T) {
 	}
 	for n, found := range wantNames {
 		if !found {
-			t.Errorf("infer-telemetry: the new counter %q is NOT in Counters() (the counter must carry it for the bridge to auto-surface)", n)
+			t.Errorf("counter %q missing from Counters()", n)
 		}
 	}
-	// 0 dups (the construction-vs-distinct trap — a dup would panic MustRegister
-	// at boot under the bridge).
 	dups := 0
 	for n, k := range seen {
 		if k > 1 {
 			dups++
-			t.Errorf("infer-telemetry: duplicate name in Counters(): %q x%d (MustRegister would PANIC at boot)", n, k)
+			t.Errorf("duplicate name in Counters(): %q x%d (MustRegister would panic at boot)", n, k)
 		}
 	}
 	if dups != 0 {
-		t.Fatalf("infer-telemetry: %d duplicate names — the construction-vs-distinct trap (MustRegister PANIC at boot)", dups)
+		t.Fatalf("%d duplicate names in Counters() (MustRegister would panic at boot)", dups)
 	}
 	if len(seen) != wantDistinct {
-		t.Fatalf("infer-telemetry: distinct names=%d, want %d", len(seen), wantDistinct)
+		t.Fatalf("distinct names=%d, want %d", len(seen), wantDistinct)
 	}
-	t.Logf("infer-telemetry PASS: Counters() carries %d DISTINCT (16->17; 15->16; 12->15), the 3 inferrer names present, 0 dups — the counter grew honestly; the bridge auto-surfaces the manifest-skip counter WITHOUT an edit (verified by the pkg/metrics sister guard)", len(cs))
+	t.Logf("Counters() carries %d distinct metrics including the three inferrer metrics with zero duplicates", len(cs))
 }
 
-// TestInferCountersNonNilPostInit_Subproc drives a REAL telemetry.Init
-// (testMeter) in a fresh subprocess + asserts the 3 new counters are NON-nil
-// post-Init (the rebuildCounters fill held for the inferrer counters — the
-// omission landmine stays closed for the 3 new ones; the
-// construction-vs-distinct trap disarmed). Negative control: a stale tree where
-// rebuildCounters OMITTED the 3 new fills would leave them nil post-Init (the
-// var the init() object was assigned to gets reassigned by rebuildCounters;
-// without the fill the new assignment is nil).
+// TestInferCountersNonNilPostInit_Subproc runs telemetry.Init in a fresh
+// subprocess and checks that all three inference metrics stay non-nil and
+// register with an OpenTelemetry ManualReader.
 func TestInferCountersNonNilPostInit_Subproc(t *testing.T) {
 	if os.Getenv(inferSubprocessMarker) == "newcounters" {
 		runInferNewCountersSubproc(t)
 		return
 	}
-	// Parent: re-invoke the test binary as a subprocess for a fresh process.
 	cmd := exec.Command(os.Args[0], "-test.run=^TestInferCountersNonNilPostInit_Subproc$")
 	cmd.Env = append(os.Environ(), inferSubprocessMarker+"=newcounters")
 	cmd.Args = append(cmd.Args, "-test.v")
@@ -111,17 +87,12 @@ func TestInferCountersNonNilPostInit_Subproc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("infer-new-counters subprocess failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "infer-new-counters PASS") {
+	if !strings.Contains(string(out), "infer-new-counters pass") {
 		t.Fatalf("infer-new-counters subprocess did not pass:\n%s", out)
 	}
-	t.Logf("infer-new-counters PASS (subprocess): the 3 inferrer counters are NON-nil post-Init — the rebuildCounters fill held for them (the omission landmine stays closed)")
+	t.Logf("inference-counter subprocess passed with all three metrics bound after Init")
 }
 
-// runInferNewCountersSubproc is the subprocess entry. It builds a ManualReader,
-// Init's the Meter against it, asserts the 3 new counters are NON-nil, drives
-// the retreat-refuse counter + the two gauges, Collects, and asserts the 3 new
-// instruments appear in the OTel Collect output (the "gauges observed
-// automatically" claim byte-verified — NO additional OTel wiring).
 func runInferNewCountersSubproc(t *testing.T) {
 	mr := sdkmetric.NewManualReader()
 	res, rerr := resource.Merge(
@@ -131,39 +102,31 @@ func runInferNewCountersSubproc(t *testing.T) {
 		),
 	)
 	if rerr != nil {
-		t.Fatalf("infer-new-counters: resource merge: %v", rerr)
+		t.Fatalf("resource merge: %v", rerr)
 	}
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithResource(res), sdkmetric.WithReader(mr))
 	defer mp.Shutdown(context.Background())
 	meter := mp.Meter("internal/telemetry")
 	Init(meter)
 
-	// (a) The 3 new counters are NON-nil post-Init (the rebuildCounters fill).
 	if QueryTxTimeHighWaterMark == nil {
-		t.Fatalf("infer-new-counters: QueryTxTimeHighWaterMark nil post-Init (the rebuildCounters fill is MISSING — the omission landmine reopened)")
+		t.Fatalf("QueryTxTimeHighWaterMark nil post-Init (missing from rebuildCounters)")
 	}
 	if PruningHorizonEffective == nil {
-		t.Fatalf("infer-new-counters: PruningHorizonEffective nil post-Init (the rebuildCounters fill is MISSING)")
+		t.Fatalf("PruningHorizonEffective nil post-Init (missing from rebuildCounters)")
 	}
 	if PruningHorizonRetreatRefused == nil {
-		t.Fatalf("infer-new-counters: PruningHorizonRetreatRefused nil post-Init (the rebuildCounters fill is MISSING)")
+		t.Fatalf("PruningHorizonRetreatRefused nil post-Init (missing from rebuildCounters)")
 	}
 
-	// (b) Drive the 2 gauges + the retreat-refuse counter, then Collect + assert
-	// the 3 new instruments appear in the OTel stream (the "gauges observed
-	// automatically" claim — the PeriodicReader/ManualReader observes modeGauge
-	// via Value() -> GaugeValue(); NO additional wiring).
 	QueryTxTimeHighWaterMark.Set(7_000_000)
 	PruningHorizonEffective.Set(6_500_000)
 	PruningHorizonRetreatRefused.Add(3)
 
 	var rm metricdata.ResourceMetrics
 	if cerr := mr.Collect(context.Background(), &rm); cerr != nil {
-		t.Fatalf("infer-new-counters: Collect: %v", cerr)
+		t.Fatalf("Collect: %v", cerr)
 	}
-	// The 3 new names MUST appear in the OTel Collect output (the gauges as a
-	// Gauge instrument; the counter as a Sum). The OTel callback observes them
-	// automatically.
 	foundGauges := map[string]bool{
 		"supremum.query_txtime_high_water_mark_ns":         false,
 		"supremum.compaction.pruning_horizon_effective_ns": false,
@@ -183,11 +146,11 @@ func runInferNewCountersSubproc(t *testing.T) {
 	}
 	for n, found := range foundGauges {
 		if !found {
-			t.Errorf("infer-new-counters: the gauge %q NOT found in the OTel Collect output (the auto-observe claim is FALSE — the observable callback did not register the gauge under the Meter)", n)
+			t.Errorf("gauge %q not found in OTel Collect output", n)
 		}
 	}
 	if !foundCounter {
-		t.Errorf("infer-new-counters: the counter 'supremum.compaction.pruning_horizon_retreat_refused' NOT found in the OTel Collect output (the observable callback did not register)")
+		t.Errorf("counter 'supremum.compaction.pruning_horizon_retreat_refused' not found in OTel Collect output")
 	}
-	t.Logf("infer-new-counters PASS: the 3 inferrer counters are NON-nil post-Init + observed by the OTel ManualReader Collect (the gauges via Value()->GaugeValue() at telemetry.go:230; the auto-observe claim byte-verified — NO additional OTel wiring)")
+	t.Logf("infer-new-counters pass: all three inference metrics are non-nil after Init and present in OpenTelemetry output")
 }

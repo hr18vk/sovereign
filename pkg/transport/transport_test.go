@@ -19,10 +19,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestTransmitHeapBuffer_BuildsHeapCopy () proves the copy is real and
-// exact: the returned heap slice is independent of the mmap source (mutating a
-// clone of the source does not change the heap copy), the length matches, and a
-// live *runtime.Pinner is returned.
+// TestTransmitHeapBuffer_BuildsHeapCopy checks the returned length and contents
+// and requires a non-nil Pinner. It also edits a clone of the source and checks
+// that the returned bytes do not change. Address independence is checked
+// separately by TestTransmitHeapBuffer_NeverPinsMmapRegion.
 func TestTransmitHeapBuffer_BuildsHeapCopy(t *testing.T) {
 	payload := make([]byte, 120)
 	for i := range payload {
@@ -44,26 +44,25 @@ func TestTransmitHeapBuffer_BuildsHeapCopy(t *testing.T) {
 	if !bytes.Equal(heap, payload) {
 		t.Fatal("heap copy != payload (copy was not exact)")
 	}
-	// The heap copy must be INDEPENDENT of the mmap source: mutate a clone of
-	// the source and confirm the heap copy is unchanged. This proves the copy
-	// was a real byte copy, not an alias of the source backing array.
+	// Edits to a source clone must not affect the returned bytes. The separate
+	// address check compares the source and destination starting addresses.
 	clone := make([]byte, len(payload))
 	copy(clone, payload)
 	clone[0] = 0xFF
 	clone[59] = 0xAA
 	clone[119] = 0x55
 	if heap[0] == 0xFF || heap[59] == 0xAA || heap[119] == 0x55 {
-		t.Fatal("heap copy mutated by source clone edit -> copy aliased the source, not a real copy")
+		t.Fatal("heap copy changed after edits to a source clone")
 	}
 	if !bytes.Equal(heap, payload) {
-		t.Fatal("heap copy diverged from original payload after source-clone mutation")
+		t.Fatal("heap copy differs from the original payload after source-clone edits")
 	}
-	// Release the pin we took; the test owns the Pinner.
+	// The test owns the Pinner and releases it here.
 	pin.Unpin()
 }
 
-// TestTransmitHeapBuffer_EmptyRejected () proves a zero-length mmap frame
-// is rejected with ErrEmptyPayload and returns no heap, no pin.
+// TestTransmitHeapBuffer_EmptyRejected checks nil and empty slices. Both must
+// return an empty-payload error and no heap slice or Pinner.
 func TestTransmitHeapBuffer_EmptyRejected(t *testing.T) {
 	for _, in := range [][]byte{nil, {}} {
 		heap, pin, err := TransmitHeapBuffer(in)
@@ -82,31 +81,26 @@ func TestTransmitHeapBuffer_EmptyRejected(t *testing.T) {
 	}
 }
 
-// TestTransmitHeapBuffer_HasHonestGearTag () is the gear-honesty guard.
-// This box is 4c (nproc=4, CPU part 0xd40, Graviton3-era). The 32c figure is
-// PROVEN publication number, NOT this gear. Re-using 32c for 2.0 OWN
-// benches is the mislabel class, detector-banned. The test asserts
-// the honest 4c count and skips (with rationale) if the box is willfully
-// reporting something else, rather than printing a false tag.
+// TestTransmitHeapBuffer_HasHonestGearTag reports the four-core host profile
+// used by this check. Other CPU or GOMAXPROCS counts skip the test rather than
+// applying the four-core tag to a different host.
 func TestTransmitHeapBuffer_HasHonestGearTag(t *testing.T) {
 	n := runtime.NumCPU()
 	gmp := runtime.GOMAXPROCS(0)
-	t.Logf("honest gear: NumCPU=%d GOMAXPROCS=%d (tag: _4c / GOMAXPROCS=4)", n, gmp)
+	t.Logf("host profile: NumCPU=%d GOMAXPROCS=%d (tag: _4c / GOMAXPROCS=4)", n, gmp)
 	if n != 4 {
-		t.Skipf("box reports NumCPU=%d, not the 4c gear this track targets; refusing to tag a false core count (no _32c on 2.0 OWN benches)", n)
+		t.Skipf("host reports NumCPU=%d, not the 4-core profile this test checks; skipping tag assertion", n)
 	}
 	if gmp != 4 {
-		t.Skipf("GOMAXPROCS=%d, not 4; refusing to tag a false core count", gmp)
+		t.Skipf("GOMAXPROCS=%d, not 4; skipping tag assertion", gmp)
 	}
 }
 
-// TestTransmitHeapBufferSend_AFUnixNoPanicNoRace (+ ) is the
-// egress sequence acceptance (roadmap line 48): copy -> Pin -> sendmsg(MSG_ZEROCOPY)
-// -> Unpin runs end-to-end on a real AF_UNIX socketpair with SO_ZEROCOPY set,
-// no panic, data integrity verified on the recv side. Kernel zero-copy is
-// conditionally-verified, NOT asserted (§1.6): the kernel may decline to arm
-// SO_ZEROCOPY (observed EOPNOTSUPP on this AF_UNIX build) and fall back to an
-// in-kernel copy; the send still carries the data intact.
+// TestTransmitHeapBufferSend_AFUnixNoPanicNoRace exercises copy, pin, sendmsg,
+// and Unpin over an AF_UNIX socketpair and checks the received payload. It can
+// be run with the race detector. SO_ZEROCOPY may be unsupported on AF_UNIX; a
+// setsockopt failure is logged and payload delivery is still checked. The test
+// does not establish whether the kernel used zero-copy.
 func TestTransmitHeapBufferSend_AFUnixNoPanicNoRace(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -116,14 +110,12 @@ func TestTransmitHeapBufferSend_AFUnixNoPanicNoRace(t *testing.T) {
 	defer unix.Close(fds[1])
 	sendFd, recvFd := fds[0], fds[1]
 
-	// Arm the send socket for zero-copy. Tolerate the kernel declining
-	// (EOPNOTSUPP/ENOPROTOOPT observed on this AF_UNIX build): log it and still
-	// run the send. The copy->Pin->sendmsg->Unpin sequence must not panic
-	// regardless; whether the kernel truly zero-copies is conditional.
+	// Set SO_ZEROCOPY when supported. A refusal does not prevent the send or
+	// change the payload assertions.
 	if serr := unix.SetsockoptInt(sendFd, unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1); serr != nil {
-		t.Logf("setsockopt SO_ZEROCOPY declined by kernel: %v (conditional zero-copy, not asserted; send proceeds)", serr)
+		t.Logf("setsockopt SO_ZEROCOPY: %v; continuing with payload-delivery check", serr)
 	} else {
-		t.Logf("setsockopt SO_ZEROCOPY armed (kernel may still fall back to copy)")
+		t.Logf("setsockopt SO_ZEROCOPY succeeded; the kernel may still copy")
 	}
 
 	payload := make([]byte, 120)
@@ -131,7 +123,7 @@ func TestTransmitHeapBufferSend_AFUnixNoPanicNoRace(t *testing.T) {
 		payload[i] = byte(i)
 	}
 
-	// The egress sequence: copy -> Pin -> sendmsg(MSG_ZEROCOPY) -> Unpin (defer).
+	// The helper owns copy, Pin, sendmsg, and the deferred Unpin.
 	sent, err := TransmitHeapBufferSend(sendFd, payload, nil)
 	if err != nil {
 		t.Fatalf("TransmitHeapBufferSend: %v", err)
@@ -140,8 +132,8 @@ func TestTransmitHeapBufferSend_AFUnixNoPanicNoRace(t *testing.T) {
 		t.Fatalf("sent = %d, want 120", sent)
 	}
 
-	// Recv loop until the full frame arrives or timeout. Asserts DATA INTEGRITY
-	// (the copy into the heap slice went on the wire), NOT zero-copy occurrence.
+	// Read until the full frame arrives or the deadline expires. These checks
+	// cover data delivery, not whether the kernel used zero-copy.
 	got := make([]byte, 0, 120)
 	buf := make([]byte, 256)
 	deadline := time.Now().Add(2 * time.Second)
@@ -164,20 +156,17 @@ func TestTransmitHeapBufferSend_AFUnixNoPanicNoRace(t *testing.T) {
 	}
 }
 
-// TestTransmitHeapBuffer_NeverPinsMmapRegion (+ ) is the
-// load-bearing -race structural proof. It proves the heap copy and the mmap
-// source are at DISTINCT addresses (the copy did not alias) and that -race over
-// 32 concurrent sends is clean. Combined with , this is the line-48
-// acceptance: Pin accepted for the heap pointer, explicitly NOT accepted for
-// the mmap pointer.
+// TestTransmitHeapBuffer_NeverPinsMmapRegion checks that the source and returned
+// heap copy start at different addresses, then issues 32 concurrent sends
+// through an AF_UNIX socketpair. Running the test with -race exercises the
+// concurrent send path. TestTransmitHeapBuffer_MmapPinIsNoOp_Physics covers Pin
+// behavior for a non-Go address.
 //
-// unsafe.Pointer is used ONLY here, in the test, for the address-distinctness
-// assertion (§6 exception). It is forbidden in transport.go ().
+// unsafe.Pointer is confined to this test's address comparison; transport.go
+// does not import unsafe.
 func TestTransmitHeapBuffer_NeverPinsMmapRegion(t *testing.T) {
-	// Represent the mmap source as a make slice. The 2.0 source-ban detector
-	// (TestTransmitHeapBuffer_SourceGuardViolated_FailsBuild) forbids Pin on
-	// this region in transport.go; here we only hand it to TransmitHeapBuffer,
-	// which copies it onto a fresh heap slice.
+	// Pass a byte slice to TransmitHeapBuffer. The helper must allocate a new
+	// destination rather than pinning its input directly.
 	source := make([]byte, 120)
 	for i := range source {
 		source[i] = byte(i)
@@ -186,19 +175,17 @@ func TestTransmitHeapBuffer_NeverPinsMmapRegion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TransmitHeapBuffer: %v", err)
 	}
-	// Distinct-address proof: the heap copy and the source must NOT share a
-	// backing array. If they did, the copy was an alias and Pin would be
-	// pinning the mmap region (the forbidden pattern).
+	// Equal starting addresses would mean that the returned slice aliases the
+	// input at its first byte.
 	heapAddr := uintptr(unsafe.Pointer(&heap[0]))
 	srcAddr := uintptr(unsafe.Pointer(&source[0]))
 	t.Logf("heap[0]=%#x source[0]=%#x distinct=%v", heapAddr, srcAddr, heapAddr != srcAddr)
 	if heapAddr == srcAddr {
-		t.Fatal("heap copy and mmap source share the same backing array -> copy aliased, Pin would target the mmap region")
+		t.Fatal("heap copy and source start at the same address")
 	}
 	pin.Unpin()
 
-	// 32 concurrent goroutines each doing copy->Pin->sendmsg->Unpin through an
-	// AF_UNIX pair, under -race. This is the race target.
+	// Thirty-two goroutines call the full send helper on a shared socket.
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
@@ -250,40 +237,19 @@ func TestTransmitHeapBuffer_NeverPinsMmapRegion(t *testing.T) {
 	<-recvDone
 }
 
-// TestTransmitHeapBuffer_MmapPinIsNoOp_Physics () is the empirical proof
-// that Pin on a non-Go (unix.Mmap) address is a documented no-op on THIS Go
-// 1.26.1 build. The roadmap acceptance (line 48) demands this proof; the specification
-// predicted the no-op would surface as an Unpin panic at pinner.go:173
-// ("tried to unpin non-Go pointer"). VERIFIED EMPIRICALLY: that panic
-// does NOT fire via the normal Pin->Unpin path on this build, because Pin never
-// records the non-Go pointer in the first place.
+// TestTransmitHeapBuffer_MmapPinIsNoOp_Physics checks Pin behavior for an
+// address returned by unix.Mmap. The Go 1.26.1 runtime records Go-heap pointers
+// in p.refs but ignores non-Go pointers. Pinning heap and mmap addresses on the
+// same Pinner therefore leaves only the heap pointer for Unpin to release.
+// Recording the mmap pointer instead would make Unpin panic in setPinned.
 //
-// The mechanism (runtime/pinner.go, this build):
-// - Pin -> pinnerGetPtr returns the address (no panic: it is a pointer kind)
-// -> setPinned(ptr, true): spanOfHeap(ptr)==nil -> returns false silently
-// (pinner.go:169-178, comment "nothing to do, silently ignore it")
-// -> the `if setPinned(ptr, true) { p.refs = append(...) }` guard is FALSE,
-// so the mmap pointer is NEVER appended to p.refs.
-// - Unpin -> pinner.unpin() iterates p.refs, which is EMPTY for the mmap pin,
-// so setPinned(_, false) is never called and the pinner.go:173 panic never
-// fires. (That panic only fires if a non-Go pointer is somehow present in
-// p.refs, which the standard Pin path prevents.)
-//
-// So the honest empirical proof of the no-op is NOT an Unpin panic; it is the
-// ASYMMETRY between a heap pin (effective: recorded in p.refs, cleanly unpinned)
-// and an mmap pin (no-op: not recorded, Unpin is a no-op). We prove it by
-// interleaving both on the SAME Pinner: Pin(heap) records the heap object;
-// Pin(mmap) is a silent no-op that does NOT corrupt the recorded heap pin;
-// Unpin then cleanly unpins ONLY the heap object with no panic. If Pin(mmap)
-// had recorded the mmap pointer, Unpin would panic at pinner.go:173 — its
-// absence is the proof the mmap pointer was never accepted.
-//
-// This test is the SOLE place the raw Pin(mmap) pattern is permitted; it lives in
-// the test package and the source guard scans transport.go (non-test) only.
+// The test distinguishes that no-op path from an Unpin failure and checks that
+// both buffers retain their contents. Raw Pin(mmap) is confined to this test;
+// the source guard scans transport.go rather than test files.
 func TestTransmitHeapBuffer_MmapPinIsNoOp_Physics(t *testing.T) {
 	buf, err := unix.Mmap(-1, 0, 4096, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {
-		t.Skipf("mmap unavailable on this box: %v", err)
+		t.Skipf("mmap unavailable: %v", err)
 	}
 	defer unix.Munmap(buf)
 	buf[0] = 0xAB
@@ -292,7 +258,7 @@ func TestTransmitHeapBuffer_MmapPinIsNoOp_Physics(t *testing.T) {
 	heap[0] = 0xCD
 
 	var p runtime.Pinner
-	// 1) Pin a REAL Go-heap object: effective, recorded in p.refs.
+	// Pin a Go-heap object so the runtime records it in p.refs.
 	pinPanicked := false
 	func() {
 		defer func() {
@@ -307,28 +273,25 @@ func TestTransmitHeapBuffer_MmapPinIsNoOp_Physics(t *testing.T) {
 		t.Fatal("Pin on a Go-heap object panicked; the build's Pin contract is broken")
 	}
 
-	// 2) Pin the non-Go (mmap) address on the SAME Pinner: documented no-op
-	// (pinner.go:48). Must NOT panic and must NOT corrupt the recorded heap
-	// pin. If this panicked, the build's no-op contract changed.
+	// Pin the mmap address on the same Pinner. This must not panic or disturb
+	// the recorded heap pin.
 	mmapPanicked := false
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				mmapPanicked = true
-				t.Errorf("Pin(mmap) panicked (unexpected; documented no-op per pinner.go:48): %v", r)
+				t.Errorf("Pin(mmap) panicked (unexpected; documented no-op per pinner documentation): %v", r)
 			}
 		}()
 		p.Pin(&buf[0])
 	}()
 	if mmapPanicked {
-		t.Fatal("Pin on a non-Go (mmap) pointer panicked; expected documented no-op (pinner.go:48)")
+		t.Fatal("Pin on a non-Go (mmap) pointer panicked; expected documented no-op (pinner documentation)")
 	}
 
-	// 3) Unpin the SAME Pinner. If Pin(mmap) had recorded the mmap pointer in
-	// p.refs, this Unpin would call setPinned(mmapPtr, false) and PANIC at
-	// pinner.go:173 ("tried to unpin non-Go pointer"). The absence of that
-	// panic is the empirical proof the mmap pointer was NEVER accepted by
-	// Pin — i.e. Pin(mmap) was a documented no-op on this build.
+	// Unpin the shared Pinner. If Pin(mmap) recorded the non-Go pointer,
+	// setPinned would panic while trying to release it. A clean return confirms
+	// that Unpin released only the recorded heap entry.
 	unpinPanicked := false
 	var unpinPanic any
 	func() {
@@ -341,9 +304,9 @@ func TestTransmitHeapBuffer_MmapPinIsNoOp_Physics(t *testing.T) {
 		p.Unpin()
 	}()
 	if unpinPanicked {
-		t.Fatalf("Unpin panicked after Pin(heap)+Pin(mmap): %v — Pin(mmap) recorded the non-Go pointer (the no-op contract regressed; pinner.go:173 fired)", unpinPanic)
+		t.Fatalf("Unpin panicked after Pin(heap) and Pin(mmap): %v; the mmap pointer was recorded", unpinPanic)
 	}
-	// heap and buf contents survive the no-op cycle (sanity).
+	// Check that both buffers retain their contents.
 	if heap[0] != 0xCD {
 		t.Errorf("heap[0] = %#x, want 0xCD (heap object disturbed by mmap no-op cycle)", heap[0])
 	}
@@ -352,57 +315,48 @@ func TestTransmitHeapBuffer_MmapPinIsNoOp_Physics(t *testing.T) {
 	}
 }
 
-// TestTransmitHeapBuffer_SourceGuardViolated_FailsBuild () is the negative
-// control for the source-ban detector. The detector scans transport.go (non-test
-// files) for any Pin whose argument is a sub-element of a non-heap []byte. The
-// ONLY permitted Pin is on &heap[0] where heap:= make([]byte,...).
-//
-// The negative control injects the forbidden pattern `p.Pin(&mmapPayload[0])`
-// into a TEMP COPY of the source and asserts the detector flags it. It does NOT
-// mutate the real transport.go (which would break the build and other tests);
-// the temp-copy injection proves the detector's pattern-matching is load-bearing.
+// TestTransmitHeapBuffer_SourceGuardViolated_FailsBuild is the negative control
+// for detectForbiddenPin. It checks transport.go, replaces the valid pin in a
+// temporary copy with p.Pin(&mmapPayload[0]), and requires the detector to
+// report that call. The original source file is not modified.
 func TestTransmitHeapBuffer_SourceGuardViolated_FailsBuild(t *testing.T) {
-	// First: the real transport.go must PASS the detector.
+	// The unmodified source must pass before testing the negative control.
 	realSrc, err := os.ReadFile("transport.go")
 	if err != nil {
 		t.Fatalf("read transport.go: %v", err)
 	}
 	if violations := detectForbiddenPin(string(realSrc)); len(violations) != 0 {
-		t.Fatalf("detector found forbidden Pin in real transport.go (source guard violated): %v", violations)
+		t.Fatalf("detector found forbidden Pin in transport.go: %v", violations)
 	}
 
-	// Negative control: inject the forbidden pattern into a temp copy and
-	// assert the detector flags it. This proves the detector is not a no-op.
+	// Inject an invalid pin into the temporary copy. The detector must report
+	// it for this negative control to be meaningful.
 	injected := strings.Replace(string(realSrc),
-		"p.Pin(&heap[0]) // REAL pin: heap pointer, GC span-tracked",
-		"p.Pin(&mmapPayload[0]) // FORBIDDEN: pin on mmap region (negative control)",
+		"p.Pin(&heap[0]) // Pin the Go-heap slice, not the mmap source.",
+		"p.Pin(&mmapPayload[0]) // invalid negative control: pin the mmap source",
 		1)
 	if injected == string(realSrc) {
-		t.Fatal("negative control: could not inject forbidden pattern (anchor string not found)")
+		t.Fatal("negative control: source anchor not found")
 	}
 	violations := detectForbiddenPin(injected)
 	if len(violations) == 0 {
-		t.Fatal("FORBIDDEN bare Pin on mmap region present but detector did not flag it (detector is a no-op)")
+		t.Fatal("negative control: detector did not report Pin on the mmap source")
 	}
-	t.Logf("negative control OK: detector flagged %d forbidden Pin(s): %v", len(violations), violations)
+	t.Logf("negative control: detector reported %d invalid Pin call(s): %v", len(violations), violations)
 }
 
-// detectForbiddenPin scans transport.go source for Pin calls whose argument is
-// a sub-element of a non-heap []byte. The ONLY permitted Pin argument form is
-// &heap[0] (or &<heapvar>[0]) where the variable was created by make([]byte,...).
-// This is a textual detector: it rejects any Pin whose first argument is not
-// &heap[0] (modulo the heap variable name), and specifically bans the mmap/buf
-// forms. It is deliberately conservative — a false positive here is a build
-// failure, which is the correct failure mode for a source guard.
+// detectForbiddenPin reports Pin calls whose argument is not an index into a
+// slice declared with name := make([]byte, ...). It is a textual guard for
+// transport.go, not a general Go analysis. Other targets, including mmap
+// pointers, are returned as violations so the test fails conservatively.
 func detectForbiddenPin(src string) []string {
 	var violations []string
 	lines := strings.Split(src, "\n")
-	// Collect identifiers declared as make([]byte,...) — these are the only
+	// Collect identifiers declared as make([]byte, ...) — these are the only
 	// permitted Pin targets.
 	heapVars := make(map[string]bool)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		// match: name:= make([]byte,...) or var name []byte = make(...)
 		if i := strings.Index(trimmed, ":="); i > 0 {
 			lhs := strings.TrimSpace(trimmed[:i])
 			rest := strings.TrimSpace(trimmed[i+2:])
@@ -439,7 +393,7 @@ func detectForbiddenPin(src string) []string {
 			continue
 		}
 		arg := strings.TrimSpace(rest[:end])
-		// Permitted form: &<heapVar>[0] where heapVar is a make([]byte,...) var.
+		// Accept an index into a slice recorded as a Go-heap allocation.
 		if strings.HasPrefix(arg, "&") {
 			varPart := arg[1:]
 			if idx := strings.IndexByte(varPart, '['); idx > 0 {
@@ -456,8 +410,8 @@ func detectForbiddenPin(src string) []string {
 	return violations
 }
 
-// TestTransmitHeapBuffer_NoUnsafeInSource (unsafe) asserts transport.go
-// does NOT import "unsafe". unsafe is tolerated ONLY in transport_test.go for
+// TestTransmitHeapBuffer_NoUnsafeInSource asserts transport.go
+// does not import "unsafe". unsafe is tolerated only in transport_test.go for
 // the uintptr address-distinctness assertion.
 func TestTransmitHeapBuffer_NoUnsafeInSource(t *testing.T) {
 	data, err := os.ReadFile("transport.go")

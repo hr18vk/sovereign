@@ -4,68 +4,13 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — production guards for the ApplyCRDTDeltaBatch batched framing.
+// Batched reconstruction integrity tests.
 //
-// This file is the biting test the mandate requires. It drives the
-// PRODUCTION ApplyCRDTDeltaBatch (pkg/sync/crdt_apply_batch.go) — the batched
-// sibling of's ApplyCRDTDeltaEvent — end-to-end through three cases:
-//
-//	(a) All-consistent 3-element batch: marshal a CRDTDeltaBatch of three
-//
-// CRDTDeltaEvent frames each with PayloadDigest == SHA-256(payload), call
-// ApplyCRDTDeltaBatch(wire), assert each of the 3 entity IDs has exactly 1
-// entry in engine.State().Get(entityID_j), every CRDTEntry contract field
-// matches the rt* sentinels per element, and Join applied all 3.
-//
-//	(b) Mid-batch mismatch at index 1, atomic-reject: marshal a CRDTDeltaBatch
-//
-// with elements 0 and 2 consistent and element 1 mismatched, call
-// ApplyCRDTDeltaBatch(wire), assert a *WireIntegrityError is returned
-// (wrapped so the error names element index 1 and errors.As recovers the
-// seam's diagnostic context — EntityID/OriginNodeID/on-wire+recomputed
-// digests/Kind), and engine.State() has ZERO entries for entityID_0,
-// entityID_1, AND entityID_2 — atomic-reject, no partial apply.
-//
-//	(c) Empty batch: marshal a 0-element CRDTDeltaBatch, call
-//
-// ApplyCRDTDeltaBatch(wire), assert no error and State() unchanged.
-//
-// GUARDS (heightened a third time — production enforcement is live on main;
-// extends it to batched transport). Three mandatory mutation proofs
-// run in the verifier's own hands (see the report):
-//
-//	Mutation A (per-element routing bypass) — introduce a temporary path in
-//
-// ApplyCRDTDeltaBatch that decodes element i and calls Join with it
-// directly, skipping ReconstructEntry for that element. Case 2 FAILS
-// because the mismatched element 1 reaches Join and is applied; the
-// "ZERO entries for entityID_1" assertion fires. The bypass is the exact
-// C6-on-element-k-of-batch-B failure exists to close.
-//
-//	Mutation B (per-element neutered bytes.Equal) — neuter ReconstructEntry's
-//
-// bytes.Equal check; run Case 2 with element 1 mismatched. It FAILS
-// because the seam no longer catches the mismatch, the batch completes
-// with no error, Join is called, and the atomic-reject assertion (ZERO
-// entries for entityID_1) fires. Proves the seam's bite survives the batch
-// path, not just the single-event path.
-//
-//	Mutation C (partial-apply / S1b regression) — introduce a path that calls
-//
-// Join PER element as each reconstructs, instead of accumulating and
-// joining once at the end. Case 2 with element 1 mismatched: element 0
-// reconstructs and is JOINED before element 1's mismatch is hit; the
-// assertion "ZERO new entries for entityID_0" FAILS (element 0 was
-// partially applied). Proves the S1a architecture
-// (reconstruct-all-then-join-once): a future "per-element Join
-// optimization" bites the guards.
-//
-// Scope discipline: this file ADDS a test only. It reuses the shared rt*
-// sentinels and the production CRDTDeltaEventWireVersion from crdt_apply.go
-// (the single source of truth; read directly by name, NOT redefined) and
-// rtReconstructDotCounter from crdt_reconstruct_test.go.
-// It modifies NO existing test or production file — the verifier's diff on
-// the/2b/2c/2d files must be empty.
+// The three cases cover a valid three-event batch, a digest mismatch in the
+// middle event, and an empty batch. The mismatch case checks the wrapped
+// WireIntegrityError and verifies that no event from the rejected batch joins.
+// Distinct dot counters distinguish partial application from the entries left
+// by the valid batch.
 package sync
 
 import (
@@ -92,15 +37,9 @@ type batchElementSpec struct {
 	dotCounter    uint64
 }
 
-// buildBatchWireFrame is the test-side batch wire-byte builder. It
-// assembles a CRDTDeltaBatch containing N CRDTDeltaEvent frames (one per spec),
-// MARSHALS it to capnp bytes, and returns the []byte — exactly the shape an
-// inbound batched transport frame hands to the production ApplyCRDTDeltaBatch.
-// It mirrors the buildApplyWireFrame helper but builds a batch rather
-// than a single event. Every shared CRDTEntry contract field is stamped with
-// the rt* sentinels; per-element overrides are (entityID, payload,
-// payloadDigest, dotCounter) so a mismatch can be planted at any index and
-// distinct entity IDs keep the joined entries distinguishable in State().
+// buildBatchWireFrame marshals one CRDTDeltaEvent per spec. Shared fields use
+// the rt sentinels; entity ID, payload, digest, and dot counter vary per event
+// so fixtures can target a specific index and distinguish joined entries.
 func buildBatchWireFrame(t *testing.T, specs []batchElementSpec) []byte {
 	t.Helper()
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
@@ -166,26 +105,19 @@ func applyBatchEntityID(i int) string {
 	return fmt.Sprintf("%s;el=%d", rtEntityID, i)
 }
 
-// applyBatch2DotOffset is a constant dot offset for the consistent elements
-// of the Case 2 mismatched batch. Using applyBatchDotCounter(i)+offset (instead
-// of applyBatchDotCounter(i)) means a partial-apply of an early-reconstructed
-// element joins a NEW dotted entry under that entityID rather than deduping
-// against the Case-1 entry — so the atomic-reject assertion (State().Get has
-// exactly 1 entry per entityID) catches a per-element-apply regression
-// (Mutation C) as a 2-entry result instead of an invisible dedup.
+// applyBatch2DotOffset gives rejected-batch entries different dots from the
+// entries already joined by the valid-batch case. A partial application would
+// therefore produce two entries instead of being hidden by dot deduplication.
 const applyBatch2DotOffset uint64 = 100
 
-// applyBatchDotCounter returns a distinct nonzero DotCounter per element index so
-// a zero-fill mutation (the C5-class silent fall-through) changes a known
-// nonzero field to zero and the per-element DotCounter assertion fires.
+// applyBatchDotCounter returns a distinct nonzero DotCounter for each element
+// so missing or zero-filled fields fail the joined-state assertions.
 func applyBatchDotCounter(i int) uint64 {
 	return rtReconstructDotCounter + uint64(i)
 }
 
-// assertJoinedEntryFields reuses the/2d field-by-field
-// contract assertions, parameterized by the element's entityID and dot
-// counter so the per-element cases share the same guards as the single-event
-// test (not weakened — the originals' lines are copied, not relaxed).
+// assertJoinedEntryFields checks every CRDTEntry contract field and confirms
+// that the stored digest matches the original payload.
 func assertJoinedEntryFields(t *testing.T, ce CRDTEntry, entityID string, dotCounter uint64) {
 	t.Helper()
 	if ce.PayloadDigest != rtPayloadDigest {
@@ -198,7 +130,7 @@ func assertJoinedEntryFields(t *testing.T, ce CRDTEntry, entityID string, dotCou
 		t.Errorf("DotNodeID: got %x, want %x (must come off the wire, not zero-filled, per element)", ce.DotNodeID, rtHostA)
 	}
 	if ce.DotCounter != dotCounter {
-		t.Errorf("DotCounter: got %#x, want %#x — MUTATION B CATCH: a zero-fill on the batch path makes this fail against the joined state, per element", ce.DotCounter, dotCounter)
+		t.Errorf("DotCounter: got %#x, want %#x; joined state must preserve each event's dot", ce.DotCounter, dotCounter)
 	}
 	if ce.H3Index != rtH3Index {
 		t.Errorf("H3Index: got %#x, want %#x (must come off the wire, not zero-filled, per element)", ce.H3Index, rtH3Index)
@@ -224,37 +156,17 @@ func assertJoinedEntryFields(t *testing.T, ce CRDTEntry, entityID string, dotCou
 	}
 }
 
-// TestApplyCRDTDeltaBatchRejects is the production guards. It
-// drives ApplyCRDTDeltaBatch on (1) an all-consistent 3-element batch, (2) a
-// mid-batch mismatch at index 1 that must atomic-reject with the seam's
-// diagnostic context wrapped to name element index 1 and leave State() with
-// ZERO new entries, and (3) an empty batch that must be a no-op. Mutation
-// proofs A/B/C (run in the verifier's own hands on report-back) confirm the
-// per-element routing bypass, the per-element neutered bytes.Equal, and the
-// per-element-apply (S1b) regression all make Case 2 fail red.
+// TestApplyCRDTDeltaBatchRejects checks successful application, atomic
+// rejection of a mid-batch digest mismatch with full diagnostic context, and
+// empty-batch behavior.
 func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
-	engineB := setupRTEngine(t, rtHostB, 100) // bound-vs-existing-fixture resolution (mandate escalation menu,
-	// option (a) — documented): this pre-test mints unrealistically-large
-	// eyecatch DotCounter sentinels (chosen for zero-fill-detection, NOT as
-	// plausible DotCounters). The production default (AbsoluteSlack=1000)
-	// closes A1 on the real wire and is byte-identical to the design constraint; opting THIS
-	// engine into the unbounded slack knob admits the sentinels WITHOUT widening
-	// the production default that closes A1. The skew axis is exercised
-	// on a fresh engine with the production default in crdt_lamport_skew_test.go.
+	engineB := setupRTEngine(t, rtHostB, 100)
+	// Large sentinels make missing dot fields visible. Unbounded slack admits
+	// them here; crdt_lamport_skew_test.go exercises the production bound.
 	engineB.SetLamportAbsoluteSlack(LamportSkewAbsoluteSlackUnbounded)
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 1: all-consistent 3-element batch, end-to-end.
-	//
-	// Build a CRDTDeltaBatch of three events, each consistent
-	// (PayloadDigest == SHA-256(payload)), each with a distinct entityID and
-	// distinct nonzero DotCounter, call ApplyCRDTDeltaBatch(wire), and assert:
-	// (a) no error,
-	// (b) each of the 3 entity IDs has exactly 1 entry in State().Get,
-	// (c) every CRDTEntry contract field matches the rt* sentinels per element,
-	// (d) Join applied all 3 (State() reflects them).
-	// Proves the batch wires the seam to Join correctly for the happy path N=3.
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 1: three valid events join under distinct entity IDs with every
+	// contract field preserved.
 	var specs1 []batchElementSpec
 	for i := 0; i < 3; i++ {
 		specs1 = append(specs1, batchElementSpec{
@@ -265,51 +177,22 @@ func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
 		})
 	}
 	consistentBatch := buildBatchWireFrame(t, specs1)
-	if err := engineB.ApplyCRDTDeltaBatch(consistentBatch); err != nil {
+	if _, err := engineB.ApplyCRDTDeltaBatch(consistentBatch); err != nil {
 		t.Fatalf("Case 1 (all-consistent 3-element batch): ApplyCRDTDeltaBatch rejected a consistent batch: %v — the batch path must succeed when every element's SHA-256(payload) == PayloadDigest and all fields read cleanly", err)
 	}
 	for i := 0; i < 3; i++ {
 		eid := applyBatchEntityID(i)
 		got := engineB.State().Get(eid)
 		if len(got) != 1 {
-			t.Fatalf("Case 1 element %d: State().Get(%q) has %d entries, want exactly 1 — Join did NOT apply this validated batch element, so the batch did not wire the seam to Join correctly for N=3", i, eid, len(got))
+			t.Fatalf("Case 1 element %d: State().Get(%q) has %d entries, want exactly 1 — Join did not apply this validated batch element, so the batch did not wire the seam to Join correctly for N=3", i, eid, len(got))
 		}
 		assertJoinedEntryFields(t, got[0], eid, applyBatchDotCounter(i))
 	}
-	t.Logf("Batch-apply Case 1 GREEN: ApplyCRDTDeltaBatch applied a 3-element consistent batch — all 3 entity IDs present in State() with every CRDTEntry contract field matching the rt* sentinels.")
+	t.Logf("three valid batch events joined with all CRDTEntry fields preserved")
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 2: mid-batch mismatch at index 1, atomic-reject.
-	//
-	// Build a CRDTDeltaBatch with elements 0 and 2 consistent and element 1
-	// mismatched (random-wrong digest), call ApplyCRDTDeltaBatch(wire), assert:
-	// (a) error returned,
-	// (b) errors.As reveals the underlying *WireIntegrityError AND the
-	// wrapping names element index 1,
-	// (c) the seam's diagnostic context (EntityID, OriginNodeID, on-wire/
-	// recomputed digests, Kind) is present on the underlying wie,
-	// (d) State() has ZERO entries for entityID_1 AND ZERO for entityID_0
-	// and entityID_2 — atomic-reject, NO partial apply.
-	//
-	// MUTATION A (per-element routing bypass): a temporary bypass in
-	// ApplyCRDTDeltaBatch that decodes element i and calls Join directly
-	// (skipping ReconstructEntry for element 1) makes Case 2 FAIL: the
-	// mismatched element reaches Join and is applied; the "ZERO entries for
-	// entityID_1" assertion fires. The bypass is the exact C6-on-element-k
-	// failure extends live enforcement to catch.
-	//
-	// MUTATION B (per-element neutered bytes.Equal): neuter ReconstructEntry's
-	// bytes.Equal; Case 2 with element 1 mismatched FAILS because the seam no
-	// longer catches the mismatch, the batch completes with no error, Join is
-	// called, and the atomic-reject assertion (ZERO entries for entityID_1)
-	// fires.
-	//
-	// MUTATION C (partial-apply / S1b regression): introduce per-element Join
-	// (join-as-you-go) instead of accumulate-then-join-once; Case 2 with
-	// element 1 mismatched FAILS because element 0 reconstructs and is JOINED
-	// before element 1's mismatch is hit; the "ZERO new entries for
-	// entityID_0" assertion fires (element 0 was partially applied).
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 2: a wrong digest at index 1 rejects the batch. The error names the
+	// index and preserves WireIntegrityError's entity, origin, digest, and kind
+	// fields. No element from this batch may join, including earlier valid ones.
 	wrongDigest := sha256.Sum256([]byte(rtPayload + "mismatched-element-1-by-a-buggy-or-tampering-peer"))
 	if wrongDigest == rtPayloadDigest {
 		wrongDigest[0] ^= 0x01
@@ -325,27 +208,27 @@ func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
 		{entityID: applyBatchEntityID(2), payload: rtPayload, payloadDigest: rtPayloadDigest, dotCounter: applyBatchDotCounter(2) + applyBatch2DotOffset},
 	}
 	mismatchedBatch := buildBatchWireFrame(t, specs2)
-	err := engineB.ApplyCRDTDeltaBatch(mismatchedBatch)
+	_, err := engineB.ApplyCRDTDeltaBatch(mismatchedBatch)
 	if err == nil {
-		t.Fatalf("APPLY-BATCH INVARIANT BROKEN: ApplyCRDTDeltaBatch accepted a batch with element 1 mismatched — MUTATION A CATCH: a per-element routing bypass makes this fire (the mismatch reached Join and got applied). wire-integrity gap is LIVE on the batch path: SHA-256(payload) != PayloadDigest for element 1 but the batch entry point returned nil")
+		t.Fatalf("ApplyCRDTDeltaBatch accepted element 1 with SHA-256(payload) != PayloadDigest; want a digest-mismatch rejection")
 	}
 
-	// The wrapping MUST name element index 1.
+	// The wrapping must name element index 1.
 	if !strings.Contains(err.Error(), "element 1") {
-		t.Fatalf("APPLY-BATCH INVARIANT BROKEN: batch error does not name the failing element index; got %q — the percent-w wrap must preserve the element index so a corrupt element is attributable within the batch", err.Error())
+		t.Fatalf("CRDT reconstruction integrity invariant broken: batch error does not name the failing element index; got %q — the percent-w wrap must preserve the element index so a corrupt element is attributable within the batch", err.Error())
 	}
 
-	// errors.As MUST recover the underlying *WireIntegrityError with its full
-	// diagnostic context — the Option C payoff, now reachable on the batch path.
+	// errors.As must recover the underlying WireIntegrityError and its complete
+	// diagnostic context through the element-index wrapper.
 	var wie *WireIntegrityError
 	if !errors.As(err, &wie) {
-		t.Fatalf("APPLY-BATCH INVARIANT BROKEN: ApplyCRDTDeltaBatch rejected the mismatched batch with the wrong error type %T; expected *WireIntegrityError (the seam's typed error) recoverable via errors.As through the element-index wrap", err)
+		t.Fatalf("CRDT reconstruction integrity invariant broken: ApplyCRDTDeltaBatch rejected the mismatched batch with the wrong error type %T; expected *WireIntegrityError (the seam's typed error) recoverable via errors.As through the element-index wrap", err)
 	}
 	if wie.EntityID != mismatchedEID {
-		t.Errorf("Case 2 diagnostic EntityID: got %q, want %q — the error must carry the mismatched element's entityID so the failed element is attributable on the batch path (Option C payoff)", wie.EntityID, mismatchedEID)
+		t.Errorf("Case 2 diagnostic EntityID: got %q, want %q; error must identify the mismatched element", wie.EntityID, mismatchedEID)
 	}
 	if wie.OriginNodeID != rtHostA {
-		t.Errorf("Case 2 diagnostic OriginNodeID: got %x, want %x — the error must carry the origin peer id of the failing element on the batch path (Option C payoff)", wie.OriginNodeID, rtHostA)
+		t.Errorf("Case 2 diagnostic OriginNodeID: got %x, want %x; error must identify the failing element's origin", wie.OriginNodeID, rtHostA)
 	}
 	if wie.OnWireDigest != wrongDigest {
 		t.Errorf("Case 2 diagnostic OnWireDigest: got %x, want %x — the error must carry the digest the wire carried for element 1", wie.OnWireDigest, wrongDigest)
@@ -357,35 +240,17 @@ func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
 		t.Errorf("Case 2 Kind: got %d, want %d (WireIntegrityDigestMismatch)", wie.Kind, WireIntegrityDigestMismatch)
 	}
 
-	// ── THE CRITICAL BATCH ATOMICITY ASSERTION ──
-	// Atomic-reject (S1a): a mid-batch mismatch leaves State() with ZERO new
-	// entries for ANY entityID in the rejected batch — no partial apply. Element
-	// 0 and element 2 reconstructed cleanly BEFORE element 1's mismatch was
-	// hit, but they must NOT have been applied: ApplyCRDTDeltaBatch reconstructs
-	// ALL then joins ONCE, and the early return on element 1 short-circuits
-	// Join entirely. If a per-element-apply regression (Mutation C) joined
-	// element 0 before the mismatch, State().Get(entityID_0) would have 1 entry
-	// and this assertion would fire.
-	//
-	// engineB already holds the three Case-1 consistent entries (entityID_0/1/2
-	// for the *consistent* batch). The mismatched batch uses the SAME entityIDs
-	// (applyBatchEntityID(i)) but element 1 carries a wrong digest and elements
-	// 0/2 carry a DIFFERENT dot counter (applyBatchDotCounter(i) — same as Case 1
-	// by construction, so a successful apply would DEDUP against the Case-1
-	// entry rather than add a second). To make the atomic-reject assertion
-	// unambiguous, we assert that the joined entries for entityID_0 and
-	// entityID_2 are STILL exactly the Case-1 entries (DotCounter ==
-	// applyBatchDotCounter(i) and PayloadDigest == rtPayloadDigest), proving the
-	// mismatched batch did NOT re-apply them, and that entityID_1 STILL holds
-	// exactly its Case-1 entry (the mismatched element did NOT reach Join).
+	// Each ID already has its valid Case 1 entry. Different dots in Case 2 make
+	// any partial application visible as another entry; unchanged payload and dot
+	// checks confirm that only the original entries remain.
 	for i := 0; i < 3; i++ {
 		eid := applyBatchEntityID(i)
 		got := engineB.State().Get(eid)
 		if len(got) != 1 {
-			t.Fatalf("APPLY-BATCH INVARIANT BROKEN: after the mismatched batch, State().Get(%q) has %d entries, want exactly 1 (only the consistent Case-1 entry) — MUTATION A/B/C CATCH: the rejected batch left a partial apply (an element reached Join despite the mid-batch mismatch), reopening C6 / S1b on the batch path", eid, len(got))
+			t.Fatalf("after rejected batch, State().Get(%q) has %d entries, want only the original Case 1 entry", eid, len(got))
 		}
 		if got[0].PayloadDigest == wrongDigest {
-			t.Fatalf("APPLY-BATCH INVARIANT BROKEN: State().Get(%q)[0].PayloadDigest is the MISMATCHED wrongDigest %x — the corrupt element reached Join on the batch path; the seam's atomic rejection did not prevent the apply; C6 is live on element %d of the batch", eid, wrongDigest, i)
+			t.Fatalf("CRDT reconstruction integrity invariant broken: State().Get(%q)[0].PayloadDigest is the mismatched wrongDigest %x — the corrupt element reached Join on the batch path; the seam's atomic rejection did not prevent the apply; the wire-integrity gap is live on element %d of the batch", eid, wrongDigest, i)
 		}
 		if got[0].PayloadDigest != rtPayloadDigest {
 			t.Errorf("Case 2 post-rejection: State().Get(%q)[0].PayloadDigest %x != rtPayloadDigest %x — Join must still hold only the consistent Case-1 entry for element %d", eid, got[0].PayloadDigest, rtPayloadDigest, i)
@@ -394,22 +259,11 @@ func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
 			t.Errorf("Case 2 post-rejection: State().Get(%q)[0].DotCounter %#x != applyBatchDotCounter(%d) %#x — the mismatched batch must not have re-applied element %d with a different dot", eid, got[0].DotCounter, i, applyBatchDotCounter(i), i)
 		}
 	}
-	t.Logf("Batch-apply Case 2 GREEN: ApplyCRDTDeltaBatch rejects a mid-batch mismatch at element 1 with %q (errors.As → *WireIntegrityError carrying EntityID/OriginNodeID/digests/Kind) and State() has ZERO new entries for entityID_0/1/2 — atomic-reject, no partial apply.", err.Error())
+	t.Logf("mid-batch mismatch rejected with %q; no new entries joined", err.Error())
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 3: empty batch, no-op.
-	//
-	// Build a 0-element CRDTDeltaBatch, call ApplyCRDTDeltaBatch(wire), assert:
-	// (a) no error,
-	// (b) State() is unchanged (the three Case-1 entries are still exactly
-	// what they were; no zero-field Join, no spurious entry).
-	// Defends against "loop over zero elements and silently call Join with an
-	// empty delta" behaving as anything other than a no-op. (Join-on-empty-delta
-	// is a no-op by construction — pkg/sync/crdt.go Join returns early when the
-	// Seq yields zero incoming entries — verified by this case green.)
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 3: an empty Seq makes Join a no-op and preserves all Case 1 entries.
 	emptyBatch := buildBatchWireFrame(t, nil)
-	if err := engineB.ApplyCRDTDeltaBatch(emptyBatch); err != nil {
+	if _, err := engineB.ApplyCRDTDeltaBatch(emptyBatch); err != nil {
 		t.Fatalf("Case 3 (empty batch): ApplyCRDTDeltaBatch rejected a 0-element batch: %v — an empty batch is a no-op, not an error", err)
 	}
 	for i := 0; i < 3; i++ {
@@ -422,5 +276,5 @@ func TestApplyCRDTDeltaBatchRejects(t *testing.T) {
 			t.Errorf("Case 3: State().Get(%q)[0].PayloadDigest %x != rtPayloadDigest %x — the empty batch disturbed the Case-1 entry for element %d", eid, got[0].PayloadDigest, rtPayloadDigest, i)
 		}
 	}
-	t.Logf("Batch-apply Case 3 GREEN: ApplyCRDTDeltaBatch on a 0-element batch is a no-op — no error, State() unchanged.")
+	t.Logf("empty batch returned no error and left state unchanged")
 }

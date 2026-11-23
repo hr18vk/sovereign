@@ -6,38 +6,16 @@
 
 // Transport wiring for ReconstructEntry.
 //
-// Background: PayloadDigest == SHA-256(payload) was once assumed but never
-// enforced anywhere on the receive path. ReconstructEntry is the production
-// seam that closes that gap, but it shipped with no production caller — no
-// production capnp CRDTDeltaEvent decode → Join path existed.
+// ApplyCRDTDeltaEvent decodes one CRDTDeltaEvent, validates its digest,
+// attribution, and Lamport counter, then joins the reconstructed entry into the
+// engine. It retains only PayloadDigest; the payload bytes are discarded after
+// validation. Batch decoding lives in crdt_apply_batch.go.
 //
-// This file is the wiring. It authors the FIRST production entry point that
-// decodes an inbound CRDTDeltaEvent wire frame, routes EVERY frame through
-// ReconstructEntry (no bypass), and on success builds a CRDTDelta whose
-// Entries Seq feeds the validated entries into Join. Join's signature is
-// UNCHANGED; the payload lifecycle is owned here, not in Join, and the payload
-// bytes are DISCARDED after the integrity check (only PayloadDigest is stored
-// on CRDTEntry, the existing contract). The wire-integrity concern and the
-// merge concern stay cleanly separated.
-//
-// SCOPE:
-//
-// - Single CRDTDeltaEvent frame per call. The schema is single-event (see
-// api/capnp/api/capnp/schema.capnp — CRDTDeltaEvent is one struct, not a
-// List). Multi-event batched transport, length-prefix framing, and
-// gzip/Snappy are deferred work — this file does not author a schema wrapper
-// to hold a List(CRDTDeltaEvent); that is a separate schema decision.
-//
-// - Go-heap capnp decode via capnp.Unmarshal + single-segment arena. The
-// production ingestion transport (internal/transport) is linux-tagged and
-// uses a jemalloc-backed zero-copy arena; THAT path is out of scope here
-// (the entry point below is the engine<->engine sync receive path, not the
-// client->engine ingestion path, and it must be portable off linux). The
-// capnp *Message is Released after ReconstructEntry has read every field
-// (the seam copies the contract fields into Go-heap CRDTEntry/[32]byte
-// values synchronously; nothing the Seq or Join touches still escapes into
-// the capnp arena by the time Release runs), so the release-before-return
-// ordering is UAF-safe.
+// This engine-to-engine path uses capnp.Unmarshal and a single-segment arena so
+// it remains portable. The Linux client-ingestion transport uses a different,
+// jemalloc-backed arena. ReconstructEntry copies every field out of the Cap'n
+// Proto message before the deferred Release, so neither Join nor the Entries
+// iterator retains an alias into that message.
 package sync
 
 import (
@@ -47,72 +25,27 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// CRDTDeltaEventWireVersion is the compiled-in schema version the production
-// decoder expects on every inbound CRDTDeltaEvent frame. It is the single
-// forward-compat / rolling-upgrade surface: the decoder fails explicitly on
-// mismatch rather than silently falling through to zero-received fields (the
-// silent-fall-through failure mode). Bump it ONLY when the CRDTDeltaEvent wire
-// layout changes in a way an old decoder cannot honor.
-//
-// This is the ONE source of truth for the compiled-in wire version: the tests
-// read this symbol directly (the prior package-local test duplicate
-// crdtDeltaEventWireVersion was consolidated into this single production symbol
-// so a future bump changes exactly one site and a forgotten test site is a
-// compile error, not a silent wire-version skew).
+// CRDTDeltaEventWireVersion is the schema version accepted by the decoder.
+// Version mismatches are rejected rather than decoded as zero-valued fields.
+// Change this constant when a new wire layout is incompatible with this decoder;
+// tests refer to the same symbol so fixtures cannot silently drift.
 const CRDTDeltaEventWireVersion uint16 = 1
 
-// ApplyCRDTDeltaEvent is the production entry point for an inbound
-// CRDTDeltaEvent wire frame. It owns the capnp decode→ReconstructEntry→Join
-// boundary, enforcing wire integrity on EVERY frame before it reaches Join. It
-// is the FIRST production caller of ReconstructEntry.
+// ApplyCRDTDeltaEvent decodes and applies one inbound CRDTDeltaEvent.
 //
-// CONTRACT (every clause enforced, none optional):
+// The frame passes through ReconstructEntryWithSkewBound before Join. A digest,
+// attribution, or skew rejection returns its *WireIntegrityError unchanged and
+// leaves engine state untouched; callers can use errors.As to inspect the wire
+// diagnostics. Decode and version failures return ordinary wrapped errors
+// because they may not have entity or digest context.
 //
-// 1. Decodes the wire []byte into a capnp_schema.CRDTDeltaEvent via
-// capnp.Unmarshal + ReadRootCRDTDeltaEvent. On decode failure, returns a
-// typed error (production — never t.Fatalf). The capnp *Message is
-// Released via defer before return.
-//
-// 2. Routes EVERY decoded frame through ReconstructEntry. There is NO bypass
-// path that decodes a frame and calls Join directly — the proof is the
-// Mutation A bite in crdt_apply_test.go: a deliberately-bypassed temporary
-// build lets a mismatched pair reach Join and the guards catch it red.
-//
-// 3. On a *WireIntegrityError from the seam: returns the error WITH the
-// seam's diagnostic context (entityID, originNodeID, on-wire + recomputed
-// digests) and DOES NOT call Join for that frame. The seam's rejection is
-// terminal for the frame.
-//
-// 4. On success: builds a CRDTDelta whose Entries Seq yields (rec.EntityID,
-// rec.Entry) and calls engine.Join(delta). rec.Payload is DISCARDED here (only
-// PayloadDigest is stored on CRDTEntry, the existing contract; payload
-// retention for audit/replay is future work). Join's signature is UNCHANGED —
-// it consumes only (entityID, CRDTEntry) via the Seq, exactly as today.
-//
-// Error handling:
-//
-// - Decode failure (capnp.Unmarshal / ReadRootCRDTDeltaEvent) or version
-// mismatch: returns fmt.Errorf("crdt: decode CRDTDeltaEvent:...") wrapping
-// the underlying error or describing the version mismatch. NOT a
-// *WireIntegrityError — the frame could not be parsed as a CRDTDeltaEvent
-// at all, so there is no entityID/digest context to carry.
-// - Seam rejection: returns the *WireIntegrityError unchanged, so callers
-// may errors.As it and recover the diagnostic context.
-//
-// The method is a receiver on *DeltaCRDTEngine so it can call engine.Join with
-// the reconstructed delta, mirroring how InsertLocal lives on the same engine.
-// Multi-frame batching, length-prefix framing, and gzip/Snappy are NOT handled
-// here (deferred work).
+// On success, Join receives a single-entry CRDTDelta containing copies of the
+// validated fields. Payload bytes are discarded after the integrity check. The
+// Cap'n Proto message is released on every return path.
 func (e *DeltaCRDTEngine) ApplyCRDTDeltaEvent(wire []byte) error {
-	// ── Decode the wire []byte into a capnp_schema.CRDTDeltaEvent ──
-	// Production decode: capnp.Unmarshal returns a *Message backed by the
-	// caller's wire bytes (single-segment, zero-copy). The Message MUST be
-	// Released when we are done; the seam reads every contract field
-	// synchronously and copies them into Go-heap CRDTEntry/[32]byte values, so
-	// nothing that escapes into Join or the Seq still aliases the arena by the
-	// time Release runs. defer.Release is UAF-safe because ReconstructEntry
-	// returns before this function returns and Join consumes only the copied
-	// Go-heap values.
+	// Unmarshal borrows the caller's bytes. ReconstructEntry copies every field
+	// before returning, and Join consumes only those copies, so the deferred
+	// message release cannot invalidate retained data.
 	msg, err := capnp.Unmarshal(wire)
 	if err != nil {
 		return fmt.Errorf("crdt: decode CRDTDeltaEvent: unmarshal: %w", err)
@@ -124,54 +57,29 @@ func (e *DeltaCRDTEngine) ApplyCRDTDeltaEvent(wire []byte) error {
 		return fmt.Errorf("crdt: decode CRDTDeltaEvent: read root: %w", err)
 	}
 
-	// Forward-compat guard: the version tag MUST match the compiled-in wire
+	// Forward-compat guard: the version tag must match the compiled-in wire
 	// version. A mismatch is an explicit refusal — never a silent fall-through
-	// to zero-received fields (the silent-fall-through failure mode).
+	// to zero-received fields.
 	if ev.Version() != CRDTDeltaEventWireVersion {
 		return fmt.Errorf("crdt: decode CRDTDeltaEvent: wire version mismatch: got %d, want %d — refusing silent fall-through to zero-received fields",
 			ev.Version(), CRDTDeltaEventWireVersion)
 	}
 
-	// ── Route EVERY frame through ReconstructEntryWithSkewBound ──
-	// The live single-event path now routes through the WRAPPING seam, not
-	// through bare ReconstructEntry. The wrapper calls ReconstructEntry FIRST
-	// (digest + attribution checks byte-identical to the base seam) and ONLY
-	// THEN computes the receiver-state-sourced skew bound and rejects on
-	// DotCounter > bound (skew runs AFTER digest+attribution). The atomic
-	// LamportSnapshot is built ONCE here (the caller's responsibility) so the
-	// bound is coherent against a concurrent InsertLocal on this same receiver;
-	// the wrapper never lazily re-reads e.lamport mid-call. A bypass here
-	// re-opens both the digest/attribution gap and the far-future-stamp attack
-	// on the live path (Mutation A/B in crdt_apply_test.go and
-	// crdt_lamport_skew_test.go prove the guards catch both).
+	// Take one receiver snapshot for both integrity and skew validation.
+	// ReconstructEntryWithSkewBound checks the digest and dot attribution before
+	// rejecting a counter above the bound. Passing the snapshot in keeps those
+	// checks on one view rather than rereading engine fields during validation.
 	snapshot := e.LamportSnapshot()
 	rec, err := ReconstructEntryWithSkewBound(ev, snapshot)
 	if err != nil {
-		// ReconstructEntry returns *WireIntegrityError on a digest mismatch or
-		// a wire-read failure. Return it unchanged so callers may errors.As it
-		// and recover the seam's diagnostic context (entityID, originNodeID,
-		// on-wire + recomputed digests) — the context a decode-time rejection
-		// would lose. Do NOT call Join: the seam's rejection is terminal.
+		// Preserve the typed integrity error and its entity, origin, and digest
+		// context. A rejected frame never reaches Join.
 		return err
 	}
 
-	// ── Build the CRDTDelta and call Join, DISCARDING the payload ──
-	// rec.Entry holds every CRDTEntry contract field read off the wire and
-	// SHA-256-validated against rec.Payload. We DISCARD rec.Payload here —
-	// only PayloadDigest is stored on CRDTEntry, the existing contract. The
-	// Seq yields (rec.EntityID, rec.Entry); the payload bytes do not cross
-	// into Join (Join's signature is unchanged; the wire/merge separation is
-	// deliberate).
-	//
-	// The Seq is defined via a free helper (makeSingleEntrySeq, not an inline
-	// closure in the composite literal) for the same reason the test's
-	// makeReplaySeq is: keeping the function literal out of the composite
-	// literal grammar so gofmt/vet parse it unambiguously. CRDTDelta's EBR
-	// fields (rootRef/arenaRef/ebrPart) are deliberately left zero — those are
-	// populated only by GenerateDelta for the engine's own emitted deltas; a
-	// Join-side delta built from reconstructed wire frames owns no HAMT root
-	// to retire, so Release() is a no-op on it (the Release guard checks
-	// ebrPart != nil first).
+	// Join needs only the validated entry and its digest, not the payload bytes.
+	// This incoming delta owns no generated HAMT snapshot or EBR participant, so
+	// those lifecycle fields remain zero and require no Release call.
 	delta := CRDTDelta{
 		OriginNodeID: rec.Entry.OriginNodeID,
 		Entries:      makeSingleEntrySeq(rec.EntityID, rec.Entry),
@@ -180,20 +88,10 @@ func (e *DeltaCRDTEngine) ApplyCRDTDeltaEvent(wire []byte) error {
 	return nil
 }
 
-// makeSingleEntrySeq builds a push-based Seq that yields exactly one
-// (entityID, entry) pair — the validated output of ReconstructEntry for a
-// single CRDTDeltaEvent frame. It mirrors the test-side makeReplaySeq helper in
-// crdt_capnp_roundtrip_test.go but is sized for the single-event wire schema
-// (no slice to range over). Defined as a free helper rather than an inline
-// closure so the function literal stays out of the CRDTDelta composite
-// literal — the same idiom the existing test file uses for makeReplaySeq.
-//
-// The entry is passed by value (not pointer) so the Seq closure owns an
-// independent copy of the already-validated CRDTEntry; nothing the closure
-// captures aliases the capnp arena by the time Join consumes it. The arena was
-// Released via the deferred msg.Release() in the caller, and the field reads in
-// ReconstructEntry copied every capnp Data field into [N]byte arrays on the
-// returned CRDTEntry before that Release runs.
+// makeSingleEntrySeq returns an iterator for one reconstructed entity and
+// entry. The entry is captured by value, after ReconstructEntry has copied its
+// fixed-size fields out of the Cap'n Proto message, so the iterator retains no
+// alias into the wire buffer.
 func makeSingleEntrySeq(entityID string, entry CRDTEntry) Seq {
 	return func(yield func(id string, e CRDTEntry) bool) {
 		yield(entityID, entry)

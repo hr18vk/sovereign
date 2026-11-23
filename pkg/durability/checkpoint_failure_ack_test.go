@@ -6,10 +6,9 @@
 
 package durability
 
-//checkpoint_failure_ack_test.go — T16, the 503-on-durable-write guard (ADR-0045). It lives in its OWN file because it references-only bridge API
-// (CheckpointErrors): the T7/T17 RED capture reverts bridge.go to the
-// pre-fix revision, and this file must be movable aside without breaking that
-// compilation unit.
+// A periodic checkpoint runs after its mutation is already durable. Its
+// failure must therefore be logged and counted without changing the write's
+// acknowledgement (ADR-0045 §5).
 
 import (
 	"bytes"
@@ -22,53 +21,42 @@ import (
 	"testing"
 )
 
-// TestCheckpointFailureNeverFailsTheACK is the 503-on-durable-write guard. The
-// byte-traced HEAD defect: AppendMutations returns nil (the mutation is
-// fsync'd — DURABLE), then the periodic checkpoint's fsync fails, and
-// bridge.go returned THAT error to the caller — gossip.go:1297 → control.go:463
-// stamps 503 on a durable write; the client retries and re-inserts, minting a
-// SECOND set of dots for the same keys (the 800-extra-dots candidate).
+// TestCheckpointFailureNeverFailsTheACK makes the mutation's fsync succeed and
+// the following checkpoint's fsync fail. PutLocal must still return nil, the
+// checkpoint failure must be counted and logged, and recovery must find exactly
+// one dot for the mutation.
 //
-// The guard: K=1 so the single Put triggers a checkpoint; the sync hook
-// succeeds for the mutation's fsync (call 1) and fails the checkpoint's
-// (call 2). Assert: PutLocal returns NIL (the ACK is 200), the failure is
-// METERED (CheckpointErrors) and LOGGED, and the mutation survives a
-// crash-recovery (it was durable all along).
-//
-// RED (bug-inject): PutLocal's `b.noteMutations(1)` reverted to the HEAD shape
-// (`if K>0 { if err:= b.AppendCheckpoint(); err != nil { return dot, err } }`)
-// → the rigged checkpoint failure reaches the caller → the nil-ACK assertion
-// fires.
+// Returning the checkpoint error would make the control path send a 503 for a
+// durable write. A client retry could then insert the same keys again and mint
+// a second set of dots.
 func TestCheckpointFailureNeverFailsTheACK(t *testing.T) {
 	var logBuf bytes.Buffer
 	defer log.SetOutput(os.Stderr)
 	log.SetOutput(&logBuf)
 
-	walPath := filepath.Join(t.TempDir(), "t16.wal")
+	walPath := filepath.Join(t.TempDir(), "checkpoint-failure.wal")
 	live := newLiveBridge(t, walPath, 1) // K=1: every put designates a checkpoint
 
 	var calls int32
 	WALAsChaos(live.WAL()).SetSyncHookForTest(func() error {
 		if atomic.AddInt32(&calls, 1) == 2 {
-			return errors.New("T16 rigged checkpoint fsync failure")
+			return errors.New("injected checkpoint fsync failure")
 		}
 		return nil
 	})
 
 	dot, err := live.PutLocal(utf8EntityID(1), stagedPayload(1), temporalEntry(1))
 	if err != nil {
-		t.Fatalf("PutLocal returned %v — a DURABLE write was 503'd by its (optional, best-effort) checkpoint (R8a violated)", err)
+		t.Fatalf("PutLocal returned %v after the mutation was durable; the optional checkpoint must not fail the write", err)
 	}
-	// T-A3: the decouple runs the checkpoint on a background goroutine,
-	// so the absorbed failure (the meter + the log) is recorded ASYNC. Drain
-	// before asserting, or the meter reads 0 / the log is empty purely because
-	// the runner has not been scheduled yet — not because the failure vanished.
+	// The checkpoint runner records its error and log asynchronously. Drain it
+	// before reading either observation.
 	live.waitCheckpointsIdle()
 	if got := live.CheckpointErrors(); got != 1 {
-		t.Errorf("METER: CheckpointErrors=%d, want 1 — the absorbed checkpoint failure must be counted", got)
+		t.Errorf("CheckpointErrors=%d, want 1 for the absorbed checkpoint failure", got)
 	}
 	if !strings.Contains(logBuf.String(), "checkpoint failed") {
-		t.Errorf("LOG: the absorbed checkpoint failure was not logged (log tail: %q)", logBuf.String())
+		t.Errorf("absorbed checkpoint failure was not logged; log tail: %q", logBuf.String())
 	}
 	_ = dot
 

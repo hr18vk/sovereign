@@ -17,8 +17,8 @@ import (
 )
 
 func newTestArena(t *testing.T) *HamtArena {
-	// Allocate a 512MB virtual arena for tests.
-	// Since it's MAP_ANON | MAP_PRIVATE, it doesn't use physical RAM until accessed.
+	// Reserve 512 MiB of anonymous virtual memory; pages are committed only
+	// when the test accesses them.
 	arena, err := NewHamtArena(512*1024*1024, NewEBRManager())
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -251,25 +251,12 @@ func TestHAMT_MerkleRoot_Empty(t *testing.T) {
 }
 
 func BenchmarkHAMT_Set(b *testing.B) {
-	// Steady-state HAMT.Set throughput under EBR reclamation.
+	// Measure steady-state Set throughput while reclaiming the previous
+	// immutable root on every iteration. Retiring the wrapper and advancing the
+	// epoch lets the three-epoch EBR ring recycle path-copied arena blocks.
 	//
-	// this benchmark previously orphaned every prior *HAMT
-	// wrapper without retiring it, leaking ~1300 B/op of path-copied
-	// arena nodes unbounded. At b.N=500K (the framework's default
-	// scaling toward 1s) the 512 MiB arena OOM'd at hamt_arena.go:329
-	// (runN=0x7a985=501,125). The fix mirrors the production
-	// InsertLocal reclamation contract (crdt.go:399-404) and the
-	// sibling BenchmarkHAMTInsertZeroAlloc (physics_test.go:169-177):
-	// retire the previous HAMT wrapper via EBR and advance the epoch
-	// each iteration, so the three-epoch ring buffer physically
-	// recycles slab offsets and the arena reaches steady state. This
-	// is architecturally pure — Retire/AdvanceEpoch operate on the
-	// sync.Pool-backed RetiredNode list, never on the Go heap.
-	//
-	// Arena size is calibrated to 2 GiB (mmap is MAP_ANON|MAP_PRIVATE,
-	// so the virtual reservation does not consume physical RAM until
-	// touched), matching BenchmarkHAMTInsertZeroAlloc's calibration
-	// per §3 Gate 2 and.
+	// The 2 GiB anonymous mapping reserves virtual address space; physical
+	// pages are committed only when touched.
 	arena := allocTestArenaSized(b, 2*1024*1024*1024)
 	h := NewHAMT(arena)
 	warmEBRPool(arena)
@@ -284,11 +271,8 @@ func BenchmarkHAMT_Set(b *testing.B) {
 		key := makeBinaryKey(&keyBuf, uint64(i))
 		prev := h
 		h = h.Set(key, entries)
-		// Retire the previous HAMT wrapper via EBR — zero heap
-		// allocations. Mirrors DeltaCRDTEngine.InsertLocal's
-		// reclamation contract (crdt.go:399-404): old state is
-		// retired and epoch advanced, letting EBR's three-epoch ring
-		// physically recycle slab offsets.
+		// Match InsertLocal's reclamation sequence: retire the old root and
+		// advance the epoch so EBR can recycle its arena blocks.
 		arena.ebr.Retire(unsafe.Pointer(prev))
 		arena.ebr.AdvanceEpoch()
 	}
@@ -322,7 +306,7 @@ func TestHamtNodeOffsets(t *testing.T) {
 	t.Logf("Offsetof(nextFree): %d", unsafe.Offsetof(n.nextFree))
 }
 
-// --- ADR 8 Mathematical Size and Alignment Verification ---
+// Size and alignment checks for the arena-backed representations.
 
 func TestCRDTEntry_SizeAndAlignment(t *testing.T) {
 	var e CRDTEntry

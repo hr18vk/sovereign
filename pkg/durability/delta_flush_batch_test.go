@@ -6,21 +6,15 @@
 
 package durability
 
-//delta_flush_batch_test.go — the HALF-B guards (the
-// query-tier DELTA flush that kills the O(N^2) cross-checkpoint re-flush).
+// Tests for decoupled, delta-only checkpoints (ADR-0050) and checkpoint CRC32C
+// handling (ADR-0053). They cover query-tier upload counts, durable reads after
+// a delta flush, and recovery through the binding and image fallback paths.
 //
-//	T-B1 the fsync-count guard: the query-tier upload WORK drops from O(N) per
-// checkpoint to O(Δ) (0 on a no-change checkpoint).
-//	T-B2 the correctness guard: after a delta checkpoint, a durable read returns
-// the latest for BOTH a changed AND an unchanged entity.
-//	T-B3 the recovery guard: a crash with the decoupled+delta checkpoint path
-// re-attains the root (the binding/phantom/missing-image fallback, I2).
-//
-// The work metric is the l0/ per-entity upload count (uploadL0Uploads): each
-// upload is ONE file carrying BOTH fsyncs (tmp.Sync localfs.go:150 +
-// fsyncParentDir:172), and a full re-flush OVERWRITES the same per-entity keys
-// — so the distinct-file COUNT cannot distinguish full from delta, but the
-// upload WORK can. The ckpt/ recovery image is excluded (always 1/checkpoint).
+// The work metric is the l0/ per-entity upload count (uploadL0Uploads). Each
+// upload writes and syncs one file and its parent directory. A full flush
+// overwrites the same keys as a delta flush, so distinct-file counts cannot
+// distinguish them; upload counts can. The ckpt/ recovery image is excluded
+// because every checkpoint writes one image.
 
 import (
 	"context"
@@ -35,11 +29,11 @@ import (
 	"github.com/hr18vk/sovereign/internal/database"
 )
 
-// TestDeltaFlushFsyncCount proves the query-tier flush is DELTA-ONLY:
-// the per-checkpoint l0/ upload count drops from O(N) to O(Δ). NEGATIVE CONTROL:
-// with debugFullQueryFlush forcing the pre-full flush, a no-change
-// checkpoint re-uploads ALL N entities (the O(N) regression the guard exists to
-// catch) — so the delta assertion (0) genuinely distinguishes the two shapes.
+// TestDeltaFlushFsyncCount measures l0/ uploads for a full first checkpoint,
+// an unchanged checkpoint, and a checkpoint with new entities. A second bridge
+// with debugFullQueryFlush enabled provides the full-flush comparison: its
+// unchanged checkpoint must upload every entity, while the delta path uploads
+// none.
 func TestDeltaFlushFsyncCount(t *testing.T) {
 	const N = 50 // base entities
 	const M = 10 // new entities in the delta
@@ -50,7 +44,7 @@ func TestDeltaFlushFsyncCount(t *testing.T) {
 	live := newLiveBridge(t, walPath, 0) // K=0: caller-driven checkpoints
 	live.SetSnapshotter(lfs, true)
 
-	// Checkpoint 1: N inserts → FULL flush (first checkpoint, lastFlushedDot nil).
+	// Checkpoint 1: N inserts → full flush (first checkpoint, lastFlushedDot nil).
 	for i := 0; i < N; i++ {
 		if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal %d: %v", i, err)
@@ -61,20 +55,20 @@ func TestDeltaFlushFsyncCount(t *testing.T) {
 		t.Fatalf("checkpoint 1: %v", err)
 	}
 	if c1 := uploads() - before; c1 != N {
-		t.Fatalf("checkpoint 1 (first flush) uploaded %d l0 files, want %d (the FULL first flush)", c1, N)
+		t.Fatalf("checkpoint 1 (first flush) uploaded %d l0 files, want %d (the full first flush)", c1, N)
 	}
 
-	// Checkpoint 2: NO changes → DELTA flush must upload ZERO query-tier files.
+	// Checkpoint 2: no changes → delta flush must upload zero query-tier files.
 	// (The recovery image at ckpt/ is still written — it is not an l0/ upload.)
 	before = uploads()
 	if err := live.AppendCheckpoint(); err != nil {
 		t.Fatalf("checkpoint 2: %v", err)
 	}
 	if c2 := uploads() - before; c2 != 0 {
-		t.Fatalf("checkpoint 2 (no change) uploaded %d l0 files, want 0 (the DELTA flush must skip unchanged entities; got the O(N) re-flush)", c2)
+		t.Fatalf("checkpoint 2 (no change) uploaded %d l0 files, want 0 (the delta flush must skip unchanged entities; got the O(N) re-flush)", c2)
 	}
 
-	// Checkpoint 3: M NEW entities → DELTA flush uploads exactly M.
+	// Checkpoint 3: M new entities → delta flush uploads exactly M.
 	for i := N; i < N+M; i++ {
 		if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal %d: %v", i, err)
@@ -85,16 +79,16 @@ func TestDeltaFlushFsyncCount(t *testing.T) {
 		t.Fatalf("checkpoint 3: %v", err)
 	}
 	if c3 := uploads() - before; c3 != M {
-		t.Fatalf("checkpoint 3 uploaded %d l0 files, want %d (the DELTA — only the new entities)", c3, M)
+		t.Fatalf("checkpoint 3 uploaded %d l0 files, want %d (the delta — only the new entities)", c3, M)
 	}
 
-	// NEGATIVE CONTROL: force the full flush (debugFullQueryFlush) and show a
-	// no-change checkpoint re-uploads ALL N — the pre-O(N) shape.
+	// Force the full-flush comparison. Its unchanged checkpoint must upload all
+	// N entities, in contrast to zero uploads on the delta path.
 	walPath2 := filepath.Join(t.TempDir(), "tb1full.wal")
 	lfs2 := newSnapshotStore(t)
 	live2 := newLiveBridge(t, walPath2, 0)
 	live2.SetSnapshotter(lfs2, true)
-	live2.debugFullQueryFlush.Store(true) // BUG-INJECT: revert to the O(N) full flush
+	live2.debugFullQueryFlush.Store(true) // fault injection: revert to the O(N) full flush
 	for i := 0; i < N; i++ {
 		if _, err := live2.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal(full) %d: %v", i, err)
@@ -104,21 +98,19 @@ func TestDeltaFlushFsyncCount(t *testing.T) {
 		t.Fatalf("full checkpoint 1: %v", err)
 	}
 	before = uploads()
-	if err := live2.AppendCheckpoint(); err != nil { // NO change — but full flush
+	if err := live2.AppendCheckpoint(); err != nil { // no change — but full flush
 		t.Fatalf("full checkpoint 2: %v", err)
 	}
 	if got := uploads() - before; got != N {
-		t.Fatalf("NEGATIVE CONTROL BROKEN: full-flush no-change checkpoint uploaded %d l0 files, want %d (the O(N) re-flush) — the guard cannot distinguish delta from full", got, N)
+		t.Fatalf("full-flush no-change checkpoint uploaded %d l0 files, want %d; the comparison no longer distinguishes full from delta", got, N)
 	}
 }
 
-// TestDeltaFlushDurableReadCorrect is the correctness guard: after a
-// DELTA checkpoint, a durable (Arrow L0) read must return the latest state for
-// BOTH a changed AND an unchanged entity. The resolver's per-entity prefix merge
-// (max-SystemTime dominance) makes an unchanged entity's older file suffice; the
-// changed entity's newer file must win. BUG-INJECT: advance an entity's flush
-// watermark WITHOUT flushing it (a lost delta) → the durable read goes STALE →
-// the guard catches it.
+// TestDeltaFlushDurableReadCorrect checks both kinds of entity after a delta
+// checkpoint. The changed entity must resolve to its newer file, while an
+// unchanged entity still resolves to its older file. A second subtest advances
+// an entity's flush watermark without writing its delta; the durable read must
+// then expose the missing update by returning the stale value.
 func TestDeltaFlushDurableReadCorrect(t *testing.T) {
 	ctx := context.Background()
 	const base = int64(1_700_000_000_000_000_000)
@@ -136,7 +128,7 @@ func TestDeltaFlushDurableReadCorrect(t *testing.T) {
 	}
 
 	// setup returns a snapshotter-backed bridge (index on, K=0 caller-driven) +
-	// a DURABLE-ONLY resolver (NO live source — it reads the Arrow L0 tier).
+	// a durable-only resolver (no live source — it reads the Arrow L0 tier).
 	setup := func(t *testing.T) (*Bridge, *database.Resolver) {
 		walPath := filepath.Join(t.TempDir(), "tb2.wal")
 		lfs := newSnapshotStore(t)
@@ -165,19 +157,19 @@ func TestDeltaFlushDurableReadCorrect(t *testing.T) {
 		if _, err := live.PutLocal("entity-B", payloadB, entryAt(base)); err != nil {
 			t.Fatalf("PutLocal B: %v", err)
 		}
-		if err := live.AppendCheckpoint(); err != nil { // checkpoint 1: FULL (A@base, B)
+		if err := live.AppendCheckpoint(); err != nil { // checkpoint 1: full (A@base, B)
 			t.Fatalf("checkpoint 1: %v", err)
 		}
-		// Update A (later SystemTime ⇒ new dot); B is UNCHANGED.
+		// Update A (later SystemTime ⇒ new dot); B is unchanged.
 		if _, err := live.PutLocal("entity-A", payloadA2, entryAt(base+1000)); err != nil {
 			t.Fatalf("PutLocal A2: %v", err)
 		}
-		if err := live.AppendCheckpoint(); err != nil { // checkpoint 2: DELTA (only A)
+		if err := live.AppendCheckpoint(); err != nil { // checkpoint 2: delta (only A)
 			t.Fatalf("checkpoint 2: %v", err)
 		}
 		// The changed entity A reads its UPDATE; the unchanged entity B still reads.
 		if got := readDigest(t, res, "entity-A"); got != digestA2 {
-			t.Fatalf("changed entity A durable digest = %x, want %x (the delta flush LOST the update)", got[:8], digestA2[:8])
+			t.Fatalf("changed entity A durable digest = %x, want %x (the delta flush lost the update)", got[:8], digestA2[:8])
 		}
 		if got := readDigest(t, res, "entity-B"); got != digestB {
 			t.Fatalf("unchanged entity B durable digest = %x, want %x (the delta flush must not lose an unchanged entity)", got[:8], digestB[:8])
@@ -196,7 +188,7 @@ func TestDeltaFlushDurableReadCorrect(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PutLocal A2: %v", err)
 		}
-		// BUG-INJECT: advance A's flush watermark to its NEW dot WITHOUT flushing —
+		// Fault injection: advance A's flush watermark to its new dot without flushing —
 		// the lost-delta defect class. planQueryTierDelta now (wrongly) sees A as clean.
 		live.lastFlushedMu.Lock()
 		if live.lastFlushedDot == nil {
@@ -207,25 +199,23 @@ func TestDeltaFlushDurableReadCorrect(t *testing.T) {
 		if err := live.AppendCheckpoint(); err != nil { // checkpoint 2: A skipped (lost delta)
 			t.Fatalf("checkpoint 2: %v", err)
 		}
-		// The durable read is STALE (only checkpoint 1's value) — the guard detects it.
+		// The durable read is stale (only checkpoint 1's value) — the negative control detects it.
 		if got := readDigest(t, res, "entity-A"); got != digestA1 {
-			t.Fatalf("BUG-INJECT BROKEN: a dropped delta did NOT go stale (got %x, want the stale %x) — the guard cannot detect a lost delta", got[:8], digestA1[:8])
+			t.Fatalf("dropped delta returned %x, want stale value %x; the fault no longer exposes a lost delta", got[:8], digestA1[:8])
 		}
 	})
 }
 
-// TestDeltaCheckpointRecovery is the recovery guard (I2, check ON):
-// the decoupled + delta checkpoint path must NOT break crash recovery.:
-// decoupled periodic checkpoints + a crash re-attain the root (the recovery
-// image stays FULL and bound). a torn final image — the kill-9-mid-flush
-// result — must fall back to exact-WAL replay and STILL re-attain the root (the
-// binding/decode fallback, recovery.go). The WAL is authoritative throughout.
+// TestDeltaCheckpointRecovery checks crash recovery with decoupled delta
+// checkpoints. An intact image and WAL must reproduce the live root. A torn
+// final image must be rejected in favor of exact-WAL replay, which must
+// reproduce the same root without using image state.
 func TestDeltaCheckpointRecovery(t *testing.T) {
 	const N = 20
 	ctx := context.Background()
 
 	// build runs N utf8 entities through a snapshotter-backed bridge at K=1 (the
-	// DECOUPLED periodic path), drains the background runner, captures the live
+	// decoupled periodic path), drains the background runner, captures the live
 	// root, then crashes (close WAL+engine directly — the buildWorkload kill-9
 	// convention; the mutations are already fsync'd durable).
 	build := func(t *testing.T) (walPath string, lfs *LocalFS, liveRoot [32]byte) {
@@ -253,7 +243,7 @@ func TestDeltaCheckpointRecovery(t *testing.T) {
 		walPath, lfs, liveRoot := build(t)
 		rec, witness := recoverBounded(t, walPath, lfs)
 		if got := rec.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("ROOT MISMATCH: recovered %x != live %x — the decoupled+delta checkpoint path broke recovery (I2)", got, liveRoot)
+			t.Fatalf("recovered root %x differs from live root %x after decoupled delta checkpoints", got, liveRoot)
 		}
 		if got := countDots(t, rec); got != N {
 			t.Fatalf("recovered %d dots, want %d", got, N)
@@ -265,7 +255,7 @@ func TestDeltaCheckpointRecovery(t *testing.T) {
 
 	t.Run("TornImageFallsBack", func(t *testing.T) {
 		walPath, lfs, liveRoot := build(t)
-		// Kill-9 mid-flush leaves a TORN image at the final checkpoint key. Find
+		// Kill-9 mid-flush leaves a torn image at the final checkpoint key. Find
 		// the final watermark from the WAL and overwrite its image with garbage.
 		rep, err := ReplayWAL(walPath)
 		if err != nil {
@@ -279,13 +269,13 @@ func TestDeltaCheckpointRecovery(t *testing.T) {
 		if err := lfs.Upload(ctx, snapshotKey(wm), strings.NewReader(string(torn)), int64(len(torn))); err != nil {
 			t.Fatalf("corrupt image: %v", err)
 		}
-		// Recovery must REFUSE the torn image and fall back to exact-WAL replay.
+		// Recovery must refuse the torn image and fall back to exact-WAL replay.
 		rec, witness := recoverBounded(t, walPath, lfs)
 		if !witness.ExactWALFallback {
-			t.Fatalf("MARKER: ExactWALFallback=false — a torn kill-9 image was used SILENTLY (the I2 fallback did not fire)")
+			t.Fatalf("ExactWALFallback=false after a torn image; recovery must not use the image")
 		}
 		if got := rec.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("ROOT MISMATCH after torn-image fallback: recovered %x != live %x (the WAL alone must rebuild the live state)", got, liveRoot)
+			t.Fatalf("recovered root %x differs from live root %x after torn-image fallback", got, liveRoot)
 		}
 		if got := countDots(t, rec); got != N {
 			t.Fatalf("recovered %d dots after fallback, want %d", got, N)

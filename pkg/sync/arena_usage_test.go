@@ -21,7 +21,7 @@ func TestArenaUsagePerSet(t *testing.T) {
 	entries[0].DotCounter = 1
 	var keyBuf [8]byte
 
-	// Insert 1000 keys, measure total arena consumed
+	// Measure arena consumption across 1,000 Set calls.
 	const N = 1000
 	for i := 0; i < N; i++ {
 		key := makeBinaryKey(&keyBuf, uint64(i))
@@ -32,7 +32,7 @@ func TestArenaUsagePerSet(t *testing.T) {
 	used := after - before
 	t.Logf("Arena used for %d Sets: %d bytes, per-op: %d bytes", N, used, used/N)
 
-	// Insert another 1000 to see if per-op grows (deeper trie)
+	// Repeat the measurement after deepening the trie.
 	before2 := arena.bumpOffset.Load()
 	for i := 0; i < N; i++ {
 		key := makeBinaryKey(&keyBuf, uint64(i+N))

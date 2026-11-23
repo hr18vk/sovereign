@@ -23,7 +23,8 @@ func newTestMemTable(arenaSize uint32, maxEntries uint32) (*MemTable, *mockS3Upl
 	alloc := NewJemallocAllocator()
 	s3 := newMockS3()
 	flusher := NewL0Flusher(alloc, s3, "test-bucket")
-	// Override O2.5: No PIIGate parameter. Override 8.1: fallbackDir for tests.
+	// The mock uploader keeps the test independent of object storage. An empty
+	// fallback directory disables the local spill path.
 	mt := NewMemTable(alloc, arenaSize, maxEntries, flusher, "")
 	return mt, s3
 }
@@ -52,8 +53,8 @@ func TestMemTable_InsertAndFlush(t *testing.T) {
 	err := mt.Close(ctx)
 	require.NoError(t, err)
 
-	// After Close(), all async flushes are guaranteed complete.
-	// Should have flushed once (async at 50K) + once (sync at Close for the 1 remaining).
+	// Close has drained the automatic flush at 50,000 entries and synchronously
+	// flushed the final entry.
 	assert.GreaterOrEqual(t, s3.Len(), 1)
 	assert.Equal(t, int64(0), mt.FlushErrors())
 }
@@ -117,12 +118,12 @@ func TestMemTable_PIIMaskingEnforced(t *testing.T) {
 	err = mt.Flush(ctx)
 	require.NoError(t, err)
 
-	// Drain any async flushes (none expected here, but defensive).
+	// Close also drains any asynchronous flush.
 	if err := mt.Close(ctx); err != nil {
 		t.Logf("memtable close: %v", err)
 	}
 
-	// Verify the uploaded Arrow data does NOT contain the raw PII.
+	// Inspect the uploaded Arrow data for the payload and redaction marker.
 	assert.GreaterOrEqual(t, s3.Len(), 1)
 	for _, data := range s3.Uploads() {
 		assert.NotContains(t, string(data), "499118665246")
@@ -149,7 +150,7 @@ func TestMemTable_GracefulShutdownFlush(t *testing.T) {
 		_ = mt.Write(ctx, event)
 	}
 
-	// Close should: sync-flush remaining events, wait for all async flushes.
+	// Close flushes the remaining events and waits for asynchronous uploads.
 	err := mt.Close(ctx)
 	require.NoError(t, err)
 
@@ -158,8 +159,8 @@ func TestMemTable_GracefulShutdownFlush(t *testing.T) {
 }
 
 func TestMemTable_AsyncFlushDoesNotBlockWrites(t *testing.T) {
-	// This test verifies that the write path is NOT blocked during S3 upload.
-	// We use a slow mock uploader that sleeps for 100ms per upload.
+	// A 100 ms upload delay distinguishes asynchronous flushing from an upload
+	// on the write path.
 	alloc := NewJemallocAllocator()
 	slowS3 := &slowMockS3Uploader{delay: 100 * time.Millisecond}
 	flusher := NewL0Flusher(alloc, slowS3, "test-bucket")
@@ -168,9 +169,9 @@ func TestMemTable_AsyncFlushDoesNotBlockWrites(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// Write 250 events. This should trigger 2 async flushes (at 100 and 200).
-	// If the flush were synchronous, this would take ≥200ms.
-	// With async flush, writes should complete in <50ms.
+	// The 250 writes trigger asynchronous flushes at 100 and 200 entries. Two
+	// synchronous uploads would take at least 200 ms; the 150 ms threshold leaves
+	// room for scheduler variance while rejecting that behavior.
 	start := time.Now()
 
 	for i := 0; i < 250; i++ {
@@ -188,16 +189,12 @@ func TestMemTable_AsyncFlushDoesNotBlockWrites(t *testing.T) {
 
 	writeDuration := time.Since(start)
 
-	// Write path should complete fast — the S3 uploads are async.
-	// Allow generous margin but reject if it took as long as synchronous would.
 	assert.Less(t, writeDuration, 150*time.Millisecond,
 		"write path blocked by S3 upload — async flush is broken")
 
-	// Now Close() should wait for the async flushes to drain.
+	// Close waits for both uploads to finish.
 	err := mt.Close(ctx)
 	require.NoError(t, err)
-
-	// Verify uploads completed.
 	assert.GreaterOrEqual(t, int(slowS3.uploadCount.Load()), 2)
 }
 

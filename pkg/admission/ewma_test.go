@@ -17,10 +17,9 @@ import (
 	"testing"
 )
 
-// makePub returns a deterministic 32-byte pubkey seeded by byte b. Tests
-// use this rather than circl GenerateKey to keep pkg/admission free of
-// the pkg/identity import (the bucket accepts raw []byte and copies into
-// [32]byte; only the canonical-copy path is exercised).
+// makePub returns a deterministic 32-byte identity filled with b. Accept
+// treats these bytes as opaque, so tests do not need generated key pairs or
+// imports from the identity packages.
 func makePub(b byte) [32]byte {
 	var k [32]byte
 	for i := range k {
@@ -32,49 +31,24 @@ func makePub(b byte) [32]byte {
 // pubBytes returns the []byte view of a [32]byte key for Accept calls.
 func pubBytes(k [32]byte) []byte { return k[:] }
 
-// ---------------------------------------------------------------------------
-// — COMPILE-ERROR GUARD (the roadmap-wording fabrication ban)
-// ---------------------------------------------------------------------------
-
-// TestPeerBucket_KeyIsArray32Byte asserts the bucket key type is EXACTLY
-// [32]byte. The positive compile-time assertion `var _ PeerBucketKey =
-// [32]byte{}` lives in peer_key_slice_probe.go under a build tag that is
-// NEVER set in the normal build, so it does not pollute production. The
-// negative-compile guard (the same file declares `var _ PeerBucketKey =
-// ed25519.PublicKey{}`) MUST fail to compile — it detector-bans the
-// "map[ed25519.PublicKey]" compile-error pattern from this package's
-// source identity.
-//
-// The roadmap wording "map[ed25519.PublicKey]*PeerEWMA" (line 61) is a
-// COMPILE ERROR: circl's ed25519.PublicKey is `type PublicKey []byte`
-// (pubkey112.go:7), and Go slices are non-comparable, so the compiler
-// rejects `map[ed25519.PublicKey]X` with:
-//
-//	invalid map key type ed25519.PublicKey
-//
-// This test verifies the positive assertion holds at runtime and
-// documents the banned compile-error string. The negative guard is
-// verified by the build-tag probe file (peer_key_slice_probe.go), which
-// is compiled only under the `peer_key_slice_probe` tag to assert the
-// slice-key form fails; the error string is pasted in that file's
-// comment.
+// TestPeerBucket_KeyIsArray32Byte checks that PeerBucketKey has [32]byte
+// as its underlying type and that copying a public key preserves all 32
+// bytes. The peer_key_slice_probe build tag supplies the complementary
+// negative test: a circl Ed25519 public key is a slice, so using it as a map
+// key fails with "invalid map key type ed25519.PublicKey".
 func TestPeerBucket_KeyIsArray32Byte(t *testing.T) {
-	// Positive compile-time assertion: [32]byte satisfies PeerBucketKey.
+	// This assignment compiles only when [32]byte is the underlying type.
 	var _ PeerBucketKey = [32]byte{}
-	// PeerBucketKey is exactly [32]byte — same underlying type.
 	var k PeerBucketKey
 	if size := len(k); size != 32 {
 		t.Fatalf("PeerBucketKey must be exactly 32 bytes, got %d", size)
 	}
-	// The slice-key form is banned: a []byte is NOT assignable to
-	// PeerBucketKey (different underlying types). This is the runtime
-	// mirror of the compile ban — if someone made PeerBucketKey a slice,
-	// this would stop compiling.
+	// A slice cannot be assigned to PeerBucketKey; changing the key to a
+	// slice would also break the comparable map-key requirement.
 	src := makePub(1)
 	var sliceKey []byte = src[:]
-	_ = sliceKey // not assignable to PeerBucketKey; documented below.
-	// Confirm the canonical copy path: a 32-byte []byte copies into the
-	// [32]byte key with no truncation.
+	_ = sliceKey
+	// Confirm that the copy path preserves the complete key.
 	var pk PeerBucketKey
 	seed := makePub(7)
 	copy(pk[:], seed[:])
@@ -83,17 +57,12 @@ func TestPeerBucket_KeyIsArray32Byte(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — wrong-length pubkey REJECTED before bucket touch
-// ---------------------------------------------------------------------------
-
-// TestPeerBucket_RejectShortPub asserts a 31-byte pubkey is rejected
-// BEFORE the bucket map is touched (no map growth, no allocation). The
-// bucket map size must be unchanged after the rejected Accept.
+// TestPeerBucket_RejectShortPub checks that a 31-byte public key returns Drop
+// without creating a peer entry.
 func TestPeerBucket_RejectShortPub(t *testing.T) {
 	b := NewPeerBucket()
 	short := make([]byte, 31) // len != 32
-	got := b.Accept(short, 1)
+	got, _ := b.Accept(short, 1)
 	if got != Drop {
 		t.Fatalf("31-byte pubkey must be rejected (Drop), got %v", got)
 	}
@@ -103,12 +72,11 @@ func TestPeerBucket_RejectShortPub(t *testing.T) {
 	}
 }
 
-// TestPeerBucket_RejectLongPub asserts a 33-byte pubkey is rejected
-// BEFORE the bucket map is touched.
+// TestPeerBucket_RejectLongPub checks the same boundary for a 33-byte key.
 func TestPeerBucket_RejectLongPub(t *testing.T) {
 	b := NewPeerBucket()
 	long := make([]byte, 33) // len != 32
-	got := b.Accept(long, 1)
+	got, _ := b.Accept(long, 1)
 	if got != Drop {
 		t.Fatalf("33-byte pubkey must be rejected (Drop), got %v", got)
 	}
@@ -117,8 +85,8 @@ func TestPeerBucket_RejectLongPub(t *testing.T) {
 	}
 }
 
-// totalMapSize returns the total number of PeerEWMA entries across all
-// shards. Used to prove a rejected Accept did not grow the map.
+// totalMapSize counts entries across all shards so malformed-key tests can
+// verify that Accept did not grow the map.
 func totalMapSize(b *PeerBucket) int {
 	n := 0
 	for i := range b.shards {
@@ -130,90 +98,67 @@ func totalMapSize(b *PeerBucket) int {
 	return n
 }
 
-// ---------------------------------------------------------------------------
-// — per-peer token bucket math
-// ---------------------------------------------------------------------------
-
-// TestPeerBucket_HonestPeerKeepsBudget asserts a peer submitting modest
-// Counter deltas stays above the drop threshold across N admits. A
-// modest delta (+1 per frame) drains the initial budget far slower than
-// the test runs admits, so every admit is Keep.
+// TestPeerBucket_HonestPeerKeepsBudget checks that 1,000 consecutive counters
+// remain within a fresh peer's budget without interim watermark commits. Each
+// Accept charges the absolute counter, for a cumulative charge of 500,500.
 func TestPeerBucket_HonestPeerKeepsBudget(t *testing.T) {
 	b := NewPeerBucket()
 	pub := makePub(1)
 
 	const admits = 1000
 	for i := 0; i < admits; i++ {
-		// Counter advances by 1 per frame — a modest honest rate.
-		got := b.Accept(pubBytes(pub), uint64(i+1))
+		// Submit the next absolute counter while the watermark stays pending.
+		got, _ := b.Accept(pubBytes(pub), uint64(i+1))
 		if got != Keep {
-			t.Fatalf("honest peer (delta=1) must stay Keep at admit %d, got %v (budget=%d)",
+			t.Fatalf("peer with consecutive counters returned %v at admit %d, want Keep (budget=%d)",
 				i, got, b.Budget(pubBytes(pub)))
 		}
 	}
-	// The honest peer must still have most of its budget left.
+	// The consecutive counters leave nearly all of the initial budget available.
 	if bg := b.Budget(pubBytes(pub)); bg == 0 {
-		t.Fatalf("honest peer budget must be > 0 after %d modest admits", admits)
+		t.Fatalf("peer budget is zero after %d consecutive counters, want a positive balance", admits)
 	}
 }
 
-// TestPeerBucket_AttackerDrainsToZero asserts a peer ratcheting Counter
-// by MaxUint64-equivalent deltas drains to 0 and its frames DROP. A
-// single delta of math.MaxUint64 exceeds the initial budget, so the
-// attacker's first ratchet admit drops.
+// TestPeerBucket_AttackerDrainsToZero checks that repeated MaxUint64-scale
+// ratchets return Drop. Each gap exceeds the remaining budget. Rejected gaps
+// leave the budget unchanged rather than zeroing it, and they must not commit
+// a watermark that would make later frames free.
 func TestPeerBucket_AttackerDrainsToZero(t *testing.T) {
 	b := NewPeerBucket()
 	pub := makePub(2)
 
-	// First admit: counter 1, delta 0 (first sight) -> Keep, budget intact.
-	if got := b.Accept(pubBytes(pub), 1); got != Keep {
-		t.Fatalf("attacker first sight must be Keep (delta 0), got %v", got)
+	// The first counter charges one unit and leaves ample budget.
+	if got, _ := b.Accept(pubBytes(pub), 1); got != Keep {
+		t.Fatalf("attacker first sight must be Keep (delta 1), got %v", got)
 	}
-	// Ratchet by MaxUint64: counter jumps to MaxUint64, delta = MaxUint64-1.
-	// That delta exceeds the budget -> Drop, budget pinned to 0.
-	if got := b.Accept(pubBytes(pub), ^uint64(0)); got != Drop {
+	// The jump to MaxUint64 exceeds the budget and is rejected uncharged.
+	if got, _ := b.Accept(pubBytes(pub), ^uint64(0)); got != Drop {
 		t.Fatalf("MaxUint64 ratchet must Drop (delta exceeds budget), got %v", got)
 	}
-	// SEMANTIC CHANGE — recorded in ADR-0045's block
-	// BEFORE this edit, not silently applied. OLD: an over-budget gap ZEROED the
-	// budget, so "drained" was observable as Budget()==0. NEW: the gap is Dropped
-	// WITHOUT zeroing, because zeroing turned one large gap into a death sentence
-	// for a legitimate origin rejoining after a partition — and because an
-	// UNACCEPTED frame was never charged, so refusing to zero cannot widen the
-	// Sybil bound (accepted advancement per origin is still <= initialBudget).
-	// The PROPERTY this guard defends is unchanged and asserted directly below:
-	// the ratcheting attacker can never advance, so its frames keep Dropping.
-	// The change is additionally STRICTLY STRONGER here: previously the dropped
-	// ratchet still advanced lastCounter to MaxUint64, making every later frame delta-0 — a
-	// permanent admission BYPASS from a single dropped frame (see
-	// TestRatchetDoesNotAdvanceHWM).
-	if got := b.Accept(pubBytes(pub), ^uint64(0)-1); got != Drop {
+	// A rejected gap neither drains the budget nor commits its counter. Later
+	// large gaps therefore remain over budget instead of becoming free
+	// duplicates against a MaxUint64 watermark.
+	if got, _ := b.Accept(pubBytes(pub), ^uint64(0)-1); got != Drop {
 		t.Fatalf("attacker must remain unable to advance after the ratchet: a second huge gap must Drop, got %v", got)
 	}
-	// Subsequent admits stay Drop (budget is 0, any positive delta keeps it 0).
-	if got := b.Accept(pubBytes(pub), ^uint64(0)); got != Drop {
-		t.Fatalf("drained attacker must stay Drop, got %v", got)
+	// Repeating the same over-budget counter must produce the same decision.
+	if got, _ := b.Accept(pubBytes(pub), ^uint64(0)); got != Drop {
+		t.Fatalf("repeated over-budget counter returned %v, want Drop", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — Sybil isolation (the load-bearing CPA)
-// ---------------------------------------------------------------------------
-
-// TestPeerBucket_SybilIsolation asserts ONE attacker MaxUint64-ratchets
-// while 31 honest peers submit modest deltas, and the 31 honest peers'
-// admit decisions stay UNCHANGED — their budgets are unaffected by the
-// attacker's drain because they have SEPARATE buckets. This is the
-// load-bearing Sybil-isolation assertion: a single attacker cannot
-// exhaust the admission budget of honest peers.
+// TestPeerBucket_SybilIsolation checks that repeated MaxUint64 ratchets from
+// one identity do not change Keep decisions for 31 other identities. Every
+// identity has its own budget even when keys share a shard.
 func TestPeerBucket_SybilIsolation(t *testing.T) {
 	b := NewPeerBucket()
 
 	const honestPeers = 31
 	honest := make([][32]byte, honestPeers)
 	for i := range honest {
-		// Distinct pubkeys: byte 0 = peer index (low 4 bits shard it),
-		// rest = index too, so all 31 hash to spread across shards.
+		// Fill every byte with the peer index to create distinct keys whose
+		// low four bits distribute them across shards.
 		var k [32]byte
 		for j := range k {
 			k[j] = byte(i + 1)
@@ -222,53 +167,42 @@ func TestPeerBucket_SybilIsolation(t *testing.T) {
 	}
 	attacker := makePub(0xFF)
 
-	//every honest peer submits a modest delta and is Keep.
+	// Establish every non-attacking peer with a unit advance.
 	for i := range honest {
-		if got := b.Accept(pubBytes(honest[i]), 1); got != Keep {
-			t.Fatalf("honest peer %d first admit must be Keep, got %v", i, got)
+		if got, _ := b.Accept(pubBytes(honest[i]), 1); got != Keep {
+			t.Fatalf("non-attacking peer %d first admit must be Keep, got %v", i, got)
 		}
 	}
 
-	//the attacker ratchets MaxUint64 and drains to Drop.
-	if got := b.Accept(pubBytes(attacker), ^uint64(0)); got != Drop {
+	// Both ratchets exceed the attacker's remaining budget and return Drop.
+	// Rejection leaves the budget uncharged rather than setting it to zero.
+	if got, _ := b.Accept(pubBytes(attacker), ^uint64(0)); got != Drop {
 		t.Fatalf("attacker MaxUint64 ratchet must Drop, got %v", got)
 	}
-	// See the note in TestPeerBucket_AttackerDrainsToZero —
-	// Budget()==0 is no longer the drained observable. The Sybil property this
-	// guard exists for is that the attacker cannot advance while honest peers are
-	// untouched; below asserts the honest half, and this asserts the
-	// attacker half without depending on the removed zeroing.
-	if got := b.Accept(pubBytes(attacker), ^uint64(0)-1); got != Drop {
+	if got, _ := b.Accept(pubBytes(attacker), ^uint64(0)-1); got != Drop {
 		t.Fatalf("attacker must stay unable to advance (second huge gap must Drop), got %v", got)
 	}
 
-	// (the CPA): the 31 honest peers submit further modest deltas
-	// and stay Keep — their budgets are UNAFFECTED by the attacker's drain.
+	// Continue advancing all other peers while the attacker is rejected.
 	for round := 0; round < 100; round++ {
 		for i := range honest {
-			got := b.Accept(pubBytes(honest[i]), uint64(round+2))
+			got, _ := b.Accept(pubBytes(honest[i]), uint64(round+2))
 			if got != Keep {
-				t.Fatalf("honest peer %d must stay Keep at round %d (attacker drained), got %v budget=%d",
+				t.Fatalf("non-attacking peer %d returned %v at round %d during attacker rejection, want Keep (budget=%d)",
 					i, round, got, b.Budget(pubBytes(honest[i])))
 			}
 		}
 	}
 
-	//the attacker stays Drop while honest peers keep flowing.
-	if got := b.Accept(pubBytes(attacker), ^uint64(0)); got != Drop {
+	// The attacker remains rejected after the other peers finish their rounds.
+	if got, _ := b.Accept(pubBytes(attacker), ^uint64(0)); got != Drop {
 		t.Fatalf("attacker must stay Drop after isolation, got %v", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — STATIC GUARD: no-re-open guard (protected-core crdt.go muscle)
-// ---------------------------------------------------------------------------
-
-// forbiddenEngineSymbols are identifiers that belong to the protected-core
-// crdt.go engine. 3.1 is transport-layer and pre-3.0; it MUST NOT call
-// the engine or touch its private fields. If any of these appear in
-// pkg/admission Go source OUTSIDE comments, the silent-re-open pattern
-// is present and the test FAILS — detector-banning it from source.
+// forbiddenEngineSymbols lists engine implementation details that the
+// admission package must not reference. Keeping these references out of
+// non-test code preserves the package's independence from the CRDT engine.
 var forbiddenEngineSymbols = []string{
 	"lamportCounter",
 	"observedInboundRate",
@@ -276,18 +210,14 @@ var forbiddenEngineSymbols = []string{
 	"AdvanceLamportTo",
 }
 
-// TestPeerBucket_ForbiddenSymbolsAbsent greps pkg/admission Go source for
-// the forbidden engine identifiers. It parses each.go file (excluding
-// _test.go and the build-tag probe) and FAILS if any forbidden symbol
-// appears in code (identifiers), allowing it only in comments. This
-// makes the silent-re-open of protected-core crdt.go detector-banned from
-// pkg/admission source.
+// TestPeerBucket_ForbiddenSymbolsAbsent parses non-test Go files and rejects
+// references to private engine symbols. Comment text is excluded, so tests and
+// documentation can name the boundary without creating a code dependency.
 func TestPeerBucket_ForbiddenSymbolsAbsent(t *testing.T) {
 	dir := "."
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
-		// Skip _test.go files (tests may reference forbidden symbols in
-		// comments documenting the ban) and the build-tag probe file.
+		// Only production files can introduce a package dependency.
 		name := fi.Name()
 		return strings.HasSuffix(name, ".go") &&
 			!strings.HasSuffix(name, "_test.go")
@@ -318,9 +248,8 @@ func TestPeerBucket_ForbiddenSymbolsAbsent(t *testing.T) {
 				}
 				for _, sym := range forbiddenEngineSymbols {
 					if ident.Name == sym {
-						t.Errorf("FORBIDDEN symbol %q appears in code in %s "+
-							"(silent-re-open of protected-core crdt.go detector-banned)",
-							sym, filepath.Base(fname))
+						t.Errorf("engine implementation symbol %q appears in non-test code in %s; "+
+							"pkg/admission must remain independent", sym, filepath.Base(fname))
 					}
 				}
 				return true
@@ -329,16 +258,9 @@ func TestPeerBucket_ForbiddenSymbolsAbsent(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// — RACE gate (concurrent Admit across 32 distinct pubkeys)
-// ---------------------------------------------------------------------------
-
-// TestPeerBucket_ConcurrentAdmitNoRace runs 32 goroutines, each
-// hammering Accept on its own distinct [32]byte pubkey with mixed honest
-// + attacker patterns, under -race. 0 data race must be reported. The
-// sharded design (16 shards, per-shard mutex) means peers in different
-// shards never contend; the attacker goroutine saturates only its own
-// shard.
+// TestPeerBucket_ConcurrentAdmitNoRace exercises 32 identities concurrently:
+// one repeatedly submits a MaxUint64 counter and the others advance and commit
+// small counters. Run with -race to check PeerBucket's shard locking.
 func TestPeerBucket_ConcurrentAdmitNoRace(t *testing.T) {
 	b := NewPeerBucket()
 	const goroutines = 32
@@ -348,28 +270,32 @@ func TestPeerBucket_ConcurrentAdmitNoRace(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			pub := makePub(byte(id))
-			// Goroutine 0 is the attacker (MaxUint64 ratchet); the rest
-			// are honest peers with modest deltas.
+			// Goroutine 0 repeats an over-budget ratchet; the others make
+			// small advances.
 			if id == 0 {
 				for i := 0; i < 1000; i++ {
-					_ = b.Accept(pubBytes(pub), ^uint64(0))
+					_, _ = b.Accept(pubBytes(pub), ^uint64(0))
 				}
 				return
 			}
 			for i := 0; i < 1000; i++ {
-				_ = b.Accept(pubBytes(pub), uint64(i+1))
+				// Commit every charge to model authenticated frames and to cover
+				// CommitHWM's shard-lock path under the race detector. Without
+				// commits, the pending watermark would repeatedly charge absolute
+				// counters and exhaust the peer's budget.
+				if _, ch := b.Accept(pubBytes(pub), uint64(i+1)); ch > 0 {
+					b.CommitHWM(pubBytes(pub), uint64(i+1))
+				}
 			}
 		}(g)
 	}
 	wg.Wait()
-	// The attacker (id 0) must be drained; honest peers must be Keep-able.
-	// Budget()==0 is no longer the drained observable (see
-	// TestPeerBucket_AttackerDrainsToZero). Assert the behavioural property instead:
-	// after the concurrent run the ratcheting attacker still cannot advance.
-	if got := b.Accept(pubBytes(makePub(0)), ^uint64(0)-1); got != Drop {
+	// The ratcheting identity remains over budget. A large advance for another
+	// identity still fits because its earlier charges total only 1,000 tokens.
+	if got, _ := b.Accept(pubBytes(makePub(0)), ^uint64(0)-1); got != Drop {
 		t.Fatalf("attacker (id 0) must still be unable to advance after the concurrent run, got %v", got)
 	}
-	if got := b.Accept(pubBytes(makePub(1)), 1_000_000); got != Keep {
-		t.Fatalf("honest peer (id 1) must still be Keep after concurrent run, got %v", got)
+	if got, _ := b.Accept(pubBytes(makePub(1)), 1_000_000); got != Keep {
+		t.Fatalf("non-attacking peer (id 1) must still be Keep after concurrent run, got %v", got)
 	}
 }

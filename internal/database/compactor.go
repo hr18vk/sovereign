@@ -4,15 +4,15 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package database implements the Epoch-Based Tombstone Garbage Collector
-// for CRDT pruning (ADR 7).
+// Package database implements an epoch-based tombstone garbage collector
+// for CRDT pruning.
 //
-// ADR 7 MANDATE: Over a 100-year temporal ledger lifecycle, tombstones
-// and vector clock metadata from OR-Set CRDTs create geometric memory
-// bloat. If left unchecked, this metadata exceeds physical RAM limits
-// of edge devices. The compactor prunes causally stable tombstones
-// during LSM L0 compaction, collapsing space complexity from O(n) to
-// O(|active|) — bounded by current active state, not historical trajectory.
+// Over a long-running temporal ledger, tombstones and vector clock
+// metadata from OR-Set CRDTs create geometric memory bloat. If left
+// unchecked, this metadata exceeds physical RAM limits of edge devices.
+// The compactor prunes causally stable tombstones during LSM L0
+// compaction, collapsing space complexity from O(n) to O(|active|) —
+// bounded by current active state, not historical trajectory.
 package database
 
 import (
@@ -22,22 +22,21 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// ADR 7 Constants
+// Epoch compaction constants
 // ---------------------------------------------------------------------------
 
 const (
 	// DefaultEpochDurationSec is the global epoch bump interval.
-	// ADR 7: "The network periodically bumps Epoch E_new."
-	// 60 seconds provides a balance between pruning frequency and
-	// network convergence time for causal stability.
+	// The network periodically advances the active epoch; 60 seconds
+	// balances pruning frequency against network convergence time for
+	// causal stability.
 	DefaultEpochDurationSec = 60
 
 	// DefaultStabilityLag is the number of epochs a tombstone must
 	// survive past the globally stabilized watermark before pruning.
-	// ADR 7: "Once all threads and remote peers safely clear Epoch E_old,
-	// the tombstones inextricably linked to E_old are safely and
-	// permanently deleted."
-	// A lag of 2 ensures no in-flight delta references a pruned tombstone.
+	// Once all threads and remote peers have cleared an epoch, the
+	// tombstones linked to it can be permanently deleted. A lag of 2
+	// ensures no in-flight delta references a pruned tombstone.
 	DefaultStabilityLag uint64 = 2
 )
 
@@ -46,9 +45,9 @@ const (
 // ---------------------------------------------------------------------------
 
 // TombstoneRecord represents a tombstone entry in the CRDT lattice.
-// ADR 7: "When a civic record is modified or deleted, the CRDT generates
-// a tombstone to permanently record the deletion, ensuring the action
-// propagates to all disconnected peers."
+// When a record is modified or deleted, the CRDT generates a tombstone
+// to permanently record the deletion, ensuring the action propagates
+// to all disconnected peers.
 //
 // Fields are value types — no pointers, no heap escape on the hot path.
 type TombstoneRecord struct {
@@ -56,7 +55,7 @@ type TombstoneRecord struct {
 	EntityID string
 
 	// Epoch is the epoch number when this tombstone was created.
-	// ADR 7: "A peer acquires an entry for a transaction in Epoch E_old."
+	// A peer acquires an entry for a transaction in a given epoch.
 	Epoch uint64
 
 	// NodeID identifies the originating peer.
@@ -70,12 +69,12 @@ type TombstoneRecord struct {
 }
 
 // ---------------------------------------------------------------------------
-// EpochCompactor — ADR 7 Tombstone Garbage Collector
+// EpochCompactor — epoch-based tombstone garbage collector
 // ---------------------------------------------------------------------------
 
-// EpochCompactor implements Epoch-Based Garbage Collection for CRDT tombstones.
+// EpochCompactor implements epoch-based garbage collection for CRDT tombstones.
 //
-// ADR 7 Protocol:
+// Protocol:
 //  1. Active epoch increments globally every DefaultEpochDurationSec
 //  2. Peers report their minimum observed epoch via AdvancePeerEpoch
 //  3. The global stable epoch = min(all peer epochs)
@@ -124,16 +123,16 @@ func (c *EpochCompactor) CurrentEpoch() uint64 {
 }
 
 // BumpEpoch atomically advances the global epoch.
-// ADR 7: "The network periodically bumps Epoch E_new."
+// The network periodically advances the active epoch.
 // Returns the new epoch value.
 func (c *EpochCompactor) BumpEpoch() uint64 {
 	return c.currentEpoch.Add(1)
 }
 
 // AdvancePeerEpoch updates the acknowledged epoch for a specific peer.
-// ADR 7: "Once the global matrix confirms the unanimous receipt of a
+// Once the global matrix confirms the unanimous receipt of a
 // specific vector clock threshold, the local replica executes an
-// irreversible pruning sequence."
+// irreversible pruning sequence.
 func (c *EpochCompactor) AdvancePeerEpoch(nodeID [16]byte, epoch uint64) {
 	c.peerMu.Lock()
 	current, exists := c.peerEpochs[nodeID]
@@ -144,8 +143,8 @@ func (c *EpochCompactor) AdvancePeerEpoch(nodeID [16]byte, epoch uint64) {
 }
 
 // StableEpoch computes the globally stable epoch: min(all peer epochs).
-// ADR 7: "Causal Stabilization defines a strict point in time where no
-// concurrent operations are physically possible."
+// Causal stabilization defines a strict point in time where no
+// concurrent operations are physically possible.
 //
 // If no peers are registered, returns 0 (nothing is stable yet).
 func (c *EpochCompactor) StableEpoch() uint64 {
@@ -166,7 +165,7 @@ func (c *EpochCompactor) StableEpoch() uint64 {
 }
 
 // InsertTombstone records a new deletion tombstone in the current epoch.
-// ADR 7: "A peer acquires an entry for a transaction in Epoch E_old."
+// A peer acquires an entry for a transaction in the current epoch.
 func (c *EpochCompactor) InsertTombstone(entityID string, nodeID [16]byte, counter uint64) {
 	record := TombstoneRecord{
 		EntityID:  entityID,
@@ -185,16 +184,14 @@ func (c *EpochCompactor) InsertTombstone(entityID string, nodeID [16]byte, count
 
 // PruneTombstones executes the epoch-based garbage collection sweep.
 //
-// ADR 7: "Once all threads and remote peers safely clear Epoch E_old,
-// the tombstones inextricably linked to E_old are safely and permanently
-// deleted."
+// Once all threads and remote peers have safely cleared an epoch,
+// the tombstones linked to it are permanently deleted.
 //
-// Returns the number of tombstones pruned and the remaining count.
+// Returns a set of pruned entity IDs and the remaining tombstone count.
 //
-// CRITICAL: This method is designed to be called during the LSM MemTable
-// L0 compaction flush, keeping active memory fast and lock-free.
-// ADR 7: "The actual physical excision of tombstones is delayed and
-// executed during the LSM MemTable L0 compaction flush."
+// This method is called during the LSM MemTable L0 compaction flush.
+// The actual physical excision of tombstones is delayed and executed
+// during that flush.
 func (c *EpochCompactor) PruneTombstones() (pruned map[string]struct{}, remaining int) {
 	stableEpoch := c.StableEpoch()
 	pruned = make(map[string]struct{})

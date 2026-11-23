@@ -6,12 +6,9 @@
 
 package main
 
-// Regression guards for the NON-DESTRUCTIVE loopback pprof endpoint
-// (startPprof + pprofBindAddr in main.go). The endpoint exists so a silicon run
-// can capture a wedged seed's goroutine/mutex/block profile WITHOUT the
-// destructive kill -QUIT. These guards run in-process (loopback) and are
-// non-vacuous: they drive the REAL net.Listener + mux + pprof handlers and
-// bug-inject a dead port so the capture assertion cannot pass on a tautology.
+// These tests exercise the loopback pprof listener and its address rules.
+// They use real HTTP handlers, verify that profile capture leaves the server
+// running, and check that a connection to an unused port fails.
 
 import (
 	"io"
@@ -22,13 +19,9 @@ import (
 	"time"
 )
 
-// TestPprofEndpoint_Loopback_NonDestructive is the load-bearing guard:
-// start the REAL pprof server on an ephemeral loopback port, capture a goroutine
-// dump (?debug=2), and assert (a) HTTP 200, (b) a non-empty dump, (c) the dump
-// contains a KNOWN frame — "created by main.startPprof" proves OUR server was
-// captured, not some other process's — and (d) the server is STILL SERVING after
-// the capture (non-destructive: a second capture also returns 200). It also
-// asserts the bound address is loopback (127.0.0.1) — the FORBIDDEN rule.
+// TestPprofEndpoint_Loopback_NonDestructive captures a goroutine profile from
+// an ephemeral loopback listener. The startPprof frame identifies this process,
+// and a second successful capture shows that profiling did not stop the server.
 func TestPprofEndpoint_Loopback_NonDestructive(t *testing.T) {
 	srv, err := startPprof("127.0.0.1:0") // ephemeral loopback port
 	if err != nil {
@@ -36,9 +29,8 @@ func TestPprofEndpoint_Loopback_NonDestructive(t *testing.T) {
 	}
 	defer srv.Close()
 
-	// The bound address MUST be loopback — the endpoint is never public.
 	if !strings.HasPrefix(srv.Addr, "127.0.0.1:") {
-		t.Fatalf("pprof bound to non-loopback addr %q (FORBIDDEN — must be 127.0.0.1)", srv.Addr)
+		t.Fatalf("pprof bound to non-loopback address %q", srv.Addr)
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -47,31 +39,25 @@ func TestPprofEndpoint_Loopback_NonDestructive(t *testing.T) {
 	// First capture.
 	body := httpGetBody(t, client, url)
 	if len(body) == 0 {
-		t.Fatalf("goroutine dump is EMPTY — the endpoint returned no stack data")
+		t.Fatalf("goroutine profile is empty")
 	}
-	// A real goroutine dump carries the "goroutine N [state]:" headers AND, for our
-	// server goroutine, the "created by...sovereign-node.startPprof" line (the dump
-	// qualifies the symbol by its full import path, NOT the short "main." — verified
-	// 2026-09-07: "created by github.com/hr18vk/sovereign/cmd/sovereign-node.startPprof").
-	// Both must be present — the second proves the capture is of THIS process's pprof
-	// server, not a tautology.
+	// A goroutine profile has "goroutine N [state]:" headers. The startPprof
+	// frame ties this capture to the server goroutine in the current process.
 	if !strings.Contains(body, "goroutine ") {
-		t.Fatalf("dump lacks a 'goroutine ' header — not a goroutine profile; got: %.200q", body)
+		t.Fatalf("response is not a goroutine profile: %.200q", body)
 	}
 	if !strings.Contains(body, "sovereign-node.startPprof") {
-		t.Fatalf("dump lacks the known frame 'sovereign-node.startPprof' — the capture is not provably OUR server; got: %.400q", body)
+		t.Fatalf("profile lacks the startPprof frame: %.400q", body)
 	}
 
-	// NON-DESTRUCTIVE: the server must still answer after a capture (a destructive
-	// dump — the kill -QUIT class — would make this second request fail).
+	// A second capture verifies that the first did not stop the server.
 	body2 := httpGetBody(t, client, url)
 	if !strings.Contains(body2, "goroutine ") {
-		t.Fatalf("second capture failed — the endpoint is NOT non-destructive; got: %.200q", body2)
+		t.Fatalf("second capture returned an invalid profile: %.200q", body2)
 	}
 
-	// The mutex/block endpoints answer 200 whether or not collection is armed
-	// (they return an empty profile header when --diag-profile is OFF). We only
-	// require reachability here; the CONTENT is gated on --diag-profile.
+	// Mutex and block profiles remain reachable when collection is disabled;
+	// --diag-profile controls whether they contain samples.
 	for _, p := range []string{"/debug/pprof/mutex", "/debug/pprof/block"} {
 		resp, err := client.Get("http://" + srv.Addr + p)
 		if err != nil {
@@ -85,31 +71,29 @@ func TestPprofEndpoint_Loopback_NonDestructive(t *testing.T) {
 	}
 }
 
-// TestPprofEndpoint_DeadPortFails is the BUG-INJECTION control: pointing
-// the SAME capture at a dead port MUST FAIL (connection refused). This proves the
-// guard detects a real capture — it is not a tautology that passes on any curl.
+// TestPprofEndpoint_DeadPortFails is the negative control. A profile request
+// to an unused loopback port must fail rather than produce an empty success.
 func TestPprofEndpoint_DeadPortFails(t *testing.T) {
-	// Obtain a guaranteed-free loopback port by binding then closing it.
+	// Bind and close an ephemeral port so the request has no listener to reach.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("bind scratch: %v", err)
 	}
 	deadAddr := ln.Addr().String()
-	ln.Close() // now nothing is listening on deadAddr
+	ln.Close() // deadAddr now has no listener
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + deadAddr + "/debug/pprof/goroutine?debug=2")
 	if err == nil {
 		resp.Body.Close()
-		t.Fatalf("capture from a DEAD port (%s) unexpectedly SUCCEEDED — the guard cannot distinguish a live capture from a dead one", deadAddr)
+		t.Fatalf("profile request to unused address %s unexpectedly succeeded", deadAddr)
 	}
-	// err != nil is the REQUIRED outcome (connection refused).
+	// A connection error is the expected result.
 }
 
-// TestPprofBindAddr_LoopbackEnforced pins the address-resolution contract:
-// the host is ALWAYS 127.0.0.1 (structurally — a non-loopback --pprof-addr host is
-// dropped), the port derives from the metrics port (+1000) by default, and an
-// explicit port overrides it. Every case asserts the loopback prefix.
+// TestPprofBindAddr_LoopbackEnforced checks port precedence and confirms that
+// every result uses 127.0.0.1. An explicit --pprof-addr port wins; otherwise the
+// metrics port plus 1000 is used. Any supplied host is discarded.
 func TestPprofBindAddr_LoopbackEnforced(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -117,11 +101,11 @@ func TestPprofBindAddr_LoopbackEnforced(t *testing.T) {
 		flag        string
 		want        string
 	}{
-		{"derive-from-silicon-metrics (seed node-0)", "0.0.0.0:9100", "", "127.0.0.1:10100"},
+		{"derive-from-metrics", "0.0.0.0:9100", "", "127.0.0.1:10100"},
 		{"derive-from-default-metrics", "127.0.0.1:7431", "", "127.0.0.1:8431"},
 		{"explicit-port", "", "9998", "127.0.0.1:9998"},
 		{"explicit-loopback-honored", "", "127.0.0.1:7777", "127.0.0.1:7777"},
-		{"non-loopback-host-DROPPED (FORBIDDEN to expose)", "", "0.0.0.0:9999", "127.0.0.1:9999"},
+		{"non-loopback-host-discarded", "", "0.0.0.0:9999", "127.0.0.1:9999"},
 		{"explicit-port-beats-derivation", "0.0.0.0:9100", "7777", "127.0.0.1:7777"},
 		{"empty-everything-fallback", "", "", "127.0.0.1:8431"},
 	}
@@ -131,7 +115,7 @@ func TestPprofBindAddr_LoopbackEnforced(t *testing.T) {
 			t.Errorf("%s: pprofBindAddr(%q, %q) = %q, want %q", c.name, c.metricsAddr, c.flag, got, c.want)
 		}
 		if !strings.HasPrefix(got, "127.0.0.1:") {
-			t.Errorf("%s: result %q is NOT loopback — the FORBIDDEN rule is broken", c.name, got)
+			t.Errorf("%s: result %q is not a loopback address", c.name, got)
 		}
 	}
 }

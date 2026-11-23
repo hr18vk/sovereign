@@ -10,27 +10,15 @@ import (
 	"testing"
 )
 
-// noopAdvancer is a LogicalAdvancer whose AdvanceLamportTo is a no-op,
-// isolating the controller's own cost (clock read + epsilon compare +
-// interface call) from the engine's CAS loop. The real engine's
-// AdvanceLamportTo is a bounded CAS (crdt.go:1640-1685) that is itself
-// sub-us on the accept path; the noop gives a clean lower bound on the
-// controller overhead so the Admit ns/op is attributable to the gate
-// alone.
+// noopAdvancer is a LogicalAdvancer whose AdvanceLamportTo is a no-op.
+// Admit does not use the advancer, so these benchmarks measure only the
+// synthetic clock read and drift comparison.
 type noopAdvancer struct{}
 
 func (noopAdvancer) AdvanceLamportTo(uint64) {}
 
-// BenchmarkIngressHLCScalarCap_32c measures the Admit path cost
-// (ns/op, B/op, allocs/op). The "_32c" suffix is the ROADMAP target
-// gear tag; the HONEST gear for this run is 4c (GOMAXPROCS=4, CPU part
-// 0xd40) — the 32c re-run is PENDING Karpenter c8g
-// provisioning. Do NOT relabel a 4c number as 32c.
-//
-// The Admit ns/op MUST be demonstrably < 71.4 us/op (the VerifyCRDTFrame
-// wall, PROVEN). A reject-path Admit of
-// ~tens of ns satisfies this trivially; the ingestion seam is verified
-// by comparing the reported ns/op against the 71.4 us Verify wall.
+// BenchmarkIngressHLCScalarCap_32c measures the cost and allocations of Admit
+// for a frame 1500 microseconds ahead of the local clock, within the bound.
 func BenchmarkIngressHLCScalarCap_32c(b *testing.B) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
@@ -38,19 +26,17 @@ func BenchmarkIngressHLCScalarCap_32c(b *testing.B) {
 
 	// Accept-path frame: 1500 us-future (within epsilon).
 	const incomingPhysical = t0 + 1500
-	const incomingLogical uint64 = 42
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = cap.Admit(incomingPhysical, incomingLogical)
+		_ = cap.Admit(incomingPhysical)
 	}
 }
 
-// BenchmarkIngressHLCScalarCap_Reject_32c measures the reject path —
-// the path a Byzantine-time burst takes. It MUST be cheaper than the
-// accept path (no AdvanceLamportTo call) and far cheaper than the 71.4
-// us Verify wall, so a burst is dropped in sub-us before Verify.
+// BenchmarkIngressHLCScalarCap_Reject_32c measures rejection of a frame 3000
+// microseconds ahead of the local clock. Accept and reject run the same drift
+// check; only the comparison outcome differs.
 func BenchmarkIngressHLCScalarCap_Reject_32c(b *testing.B) {
 	const t0 int64 = 1_700_000_000_000_000
 	clock := NewSyntheticClock(t0)
@@ -58,11 +44,10 @@ func BenchmarkIngressHLCScalarCap_Reject_32c(b *testing.B) {
 
 	// Reject-path frame: 3000 us-future (beyond epsilon).
 	const incomingPhysical = t0 + 3000
-	const incomingLogical uint64 = 42
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = cap.Admit(incomingPhysical, incomingLogical)
+		_ = cap.Admit(incomingPhysical)
 	}
 }

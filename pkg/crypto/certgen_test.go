@@ -15,9 +15,9 @@ import (
 	"testing"
 )
 
-// TestCertgen_RoundTrip proves the dev-mesh CA mints a CA cert + a leaf cert
-// whose PEM files round-trip: the CA cert parses, the leaf key+cert load as
-// a tls.Certificate, and the leaf chains to the CA under x509 verification.
+// TestCertgen_RoundTrip checks that the development-mesh CA and leaf PEM files
+// round-trip: the CA certificate parses, the leaf key and certificate load as
+// a tls.Certificate, and the leaf chains to the CA under X.509 verification.
 func TestCertgen_RoundTrip(t *testing.T) {
 	ca, err := NewMeshCA()
 	if err != nil {

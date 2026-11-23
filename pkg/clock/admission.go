@@ -4,70 +4,52 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package clock implements the Byzantine-clock admission gate for the
-// planetary-fanout CRDT mesh. IngressHLCScalarCap is the FIRST gate an
-// inbound frame crosses — it runs BEFORE the ~71.4 us/op Ed25519
-// VerifyCRDTFrame gate (PROVEN) so that a
-// Byzantine-time burst is dropped in sub-us rather than burning 71.4 us
-// of signature verification per frame before the drop.
+// Package clock implements physical-clock admission for inbound CRDT frames.
+// IngressHLCScalarCap rejects timestamps too far ahead of the receiver before
+// signature verification, so rejected frames do not incur that cost.
 //
-// Architectural ordering invariant (load-bearing, tested):
+// The receive path applies its gates in this order:
 //
-//	[wire] -> IngressHLCScalarCap.Admit(...) // sub-us clock cap, CHEAP
+//	[wire] -> IngressHLCScalarCap.Admit
+//	       -> VerifyCRDTFrame
+//	       -> DeltaCRDTEngine.Join
 //
-// -> if accepted: VerifyCRDTFrame(...) // 71.4 us/op, EXPENSIVE
-// -> if verify ok: engine.Join(...) // CRDT merge
-//
-// pkg/clock imports pkg/sync (read-only) for the LogicalAdvancer seam;
-// pkg/sync does NOT import pkg/clock, so there is no import cycle.
+// LogicalAdvancer lets *sync.DeltaCRDTEngine supply logical-clock updates
+// without an import dependency between this package and pkg/sync.
 package clock
 
-// maxDriftEpsilon is the HLC physical-bound epsilon, CONSTRAINT Z
-// (the architecture specification's clock contract).
-// Value 2000 MICROSECONDS == 2 milliseconds. This is the ONLY
-// unit-correct form of "2000" permitted by CONSTRAINT Z ("2000
-// ONLY if the input clock is in microseconds"). The label
-// "2000 ms" (= 2 seconds) is a 1000x fabrication that admits 1000x
-// the clock-error bound as non-Byzantine and voids the HLC defense;
-// it is detector-banned by TestMaxDriftEpsilon_UnitInvariant.
-const maxDriftEpsilon int64 = 2000 // microseconds == 2 ms (CONSTRAINT Z)
+// maxDriftEpsilon is the maximum accepted future offset for the HLC physical
+// clock: 2000 microseconds, or 2 milliseconds. Interpreting the same value as
+// milliseconds would widen the bound to 2 seconds.
+// TestMaxDriftEpsilon_UnitInvariant checks both the value and its unit label.
+const maxDriftEpsilon int64 = 2000 // 2000 microseconds (2 ms)
 
-// maxDriftEpsilonUnit is the unit sentinel read by the static guard
-// (TestMaxDriftEpsilon_UnitInvariant). It MUST stay "microsecond".
-// BANNED values: empty, "millisecond"-only (would imply the 2000 is
-// in ms = 2 s), "2000 ms".
+// maxDriftEpsilonUnit records the time unit used by maxDriftEpsilon.
+// TestMaxDriftEpsilon_UnitInvariant requires the exact "microsecond" label so
+// the numeric bound cannot silently acquire a different unit.
 const maxDriftEpsilonUnit = "microsecond"
 
-// LogicalAdvancer is the wrapper-safe seam into the frozen CRDT engine.
-// *pkg/sync.DeltaCRDTEngine satisfies this via its existing exported
-// method AdvanceLamportTo (crdt.go:1639). The controller does NOT read
-// the private lamportCounter field (crdt.go:133) — that would re-open
-// frozen crdt.go. engine.AdvanceLamportTo already enforces
-// max(local, remote) internally (crdt.go:1641-1643: current:= Load();
-// if current >= remoteCounter { break }; CAS(current, remoteCounter)),
-// so the controller feeds incomingLogical unconditionally on accept and
-// the engine's own monotone CAS handles the scalar advance.
+// LogicalAdvancer accepts Lamport-clock updates. *sync.DeltaCRDTEngine
+// implements it with AdvanceLamportTo. That method uses compare-and-swap to
+// install only counters greater than the current value, so callers can forward
+// a counter without reading the engine's private state.
 type LogicalAdvancer interface {
 	AdvanceLamportTo(remoteCounter uint64)
 }
 
-// WallClock reads the local physical wall time. Production wiring
-// (Amazon Time Sync / chrony) is future work, not done here.
-// The current build ships SyntheticClock for tests and a SystemClock stub
-// (time.Now().UnixMicro()); a later change replaces SystemClock with the
-// chrony reader. Do NOT fabricate a chrony reader here.
+// WallClock reads the local physical wall time. SystemClock uses the
+// operating system clock; SyntheticClock gives tests fixed or explicitly
+// advanced values.
 type WallClock interface {
-	// PhysicalNowUSec returns the local physical wall time in
-	// MICROSECONDS since the Unix epoch. The microsecond domain is
-	// load-bearing: CONSTRAINT Z resolves the rejection boolean as
-	// incomingPhysicalUSec - localPhysicalUSec > maxDriftEpsilon (us).
+	// PhysicalNowUSec returns the local physical wall time in microseconds
+	// since the Unix epoch. Admit uses the same unit for its drift bound.
 	PhysicalNowUSec() int64
 }
 
-// IngressHLCScalarCap is the Byzantine-clock admission controller. It is
-// safe for concurrent use: the Admit read path is read-only on the
-// clock, and the engine AdvanceLamportTo is already race-proven
-// (atomic CAS, no lock).
+// IngressHLCScalarCap applies the HLC physical-time bound to inbound frames.
+// The controller holds no mutable state. Concurrent use is safe when the
+// WallClock and LogicalAdvancer implementations support concurrent calls;
+// SystemClock, SyntheticClock, and *sync.DeltaCRDTEngine do so.
 type IngressHLCScalarCap struct {
 	clock  WallClock
 	engine LogicalAdvancer
@@ -79,34 +61,35 @@ func NewIngressHLCScalarCap(clock WallClock, engine LogicalAdvancer) *IngressHLC
 	return &IngressHLCScalarCap{clock: clock, engine: engine}
 }
 
-// Admit applies the HLC physical-bound cap (CONSTRAINT Z) to an inbound
-// frame BEFORE the expensive Verify gate. incomingPhysicalUSec is the
-// frame's physical wall time in MICROSECONDS; incomingLogical is its
-// Lamport/Dot counter.
+// Admit reports whether a frame's physical timestamp is no more than
+// maxDriftEpsilon ahead of the local clock. incomingPhysicalUSec is measured
+// in microseconds since the Unix epoch. The rejection condition is:
 //
-// Rejection boolean (microsecond domain, CONSTRAINT Z):
-//
-//	if incomingPhysicalUSec - localPhysicalUSec > maxDriftEpsilon {
-//
-// return false // Byzantine future frame, drop BEFORE Verify
-//
+//	if incomingPhysicalUSec-localPhysicalUSec > maxDriftEpsilon {
+//		return false
 //	}
 //
-// Verification against the roadmap acceptance deltas:
+// An offset of 1500 microseconds is accepted; an offset of 3000 is rejected.
+// A timestamp behind the local clock is also accepted as a normal late frame.
 //
-//	1500 us-future -> 1500 > 2000 is FALSE -> ACCEPT (correct)
-//	3000 us-future -> 3000 > 2000 is TRUE -> REJECT (correct)
-//
-// On accept, the controller feeds incomingLogical to
-// engine.AdvanceLamportTo unconditionally; the engine's internal
-// max(local, remote) guard (crdt.go:1642) no-ops a stale logical. A
-// past-physical frame (incomingPhysicalUSec < local) is a normal late
-// frame, not Byzantine, and is accepted.
-func (c *IngressHLCScalarCap) Admit(incomingPhysicalUSec int64, incomingLogical uint64) bool {
+// Admit performs no logical-clock update. Verification and application must
+// finish before the caller advances Lamport state for the frame.
+func (c *IngressHLCScalarCap) Admit(incomingPhysicalUSec int64) bool {
 	localPhysicalUSec := c.clock.PhysicalNowUSec()
 	if incomingPhysicalUSec-localPhysicalUSec > maxDriftEpsilon {
 		return false
 	}
-	c.engine.AdvanceLamportTo(incomingLogical)
 	return true
+}
+
+// Advance forwards incomingLogical to the engine's AdvanceLamportTo. The
+// engine ignores values that do not exceed its current counter.
+//
+// Normal receipt processing advances the clock through Join as entries are
+// applied. Advance is available for explicit post-apply catch-up. A caller
+// must not advance an incoming counter before skew validation: validation
+// compares that counter with a local-clock snapshot that must not already
+// include the incoming value.
+func (c *IngressHLCScalarCap) Advance(incomingLogical uint64) {
+	c.engine.AdvanceLamportTo(incomingLogical)
 }

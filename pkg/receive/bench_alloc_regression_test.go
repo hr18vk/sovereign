@@ -4,32 +4,32 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package receive — bench_alloc_regression_test.go is the
-// bench-level regression gate that converts the REPORTED 638→538 alloc/op
-// measurement into a PERSISTENT gate. The unit guard
-// TestZeroCopyPayloadAllocReduction (pkg/sync) pins the value-return change at the ReconstructEntry granularity
-// (2 allocs/op < 4 baseline). This guard pins the alloc-hardening pair at the FULL integrated
+// Package receive — this file is the bench-level regression gate that converts
+// the reported 638→538 alloc/op measurement into a persistent gate. The unit
+// test TestG09b (pkg/sync) pins the value-receiver optimization at the ReconstructEntry granularity
+// (2 allocs/op < 4 baseline). This test pins both the zero-copy slice and value-receiver optimizations at the full integrated
 // ingest-path granularity: a real signed CRDTDeltaBatch through
 // Receiver.HandleBatchFrame → ApplyCRDTDeltaBatch → ReconstructEntryWithSkewBound
 // → ReconstructEntry → Join, with the capnp decode + the Seq closure + the
-// per-shard CAS — the WHOLE path a production node runs on the peer wire.
+// per-shard CAS — the whole path a production node runs on the peer wire.
 //
-// A unit guard cannot catch a subtler regression: a future commit that adds a
+// A unit test cannot catch a subtler regression: a future commit that adds a
 // new capnp accessor returning a string copy (re-introducing the
-// string(b)/[]byte(string) round-trip the zero-copy read removed), or a new
+// string(b)/[]byte(string) round-trip that the zero-copy slice optimization removed), or a new
 // allocation inside the batch accumulator that the unit-level
-// ReconstructEntry(ReconstructedEntry) guard bypasses, would slip past the unit guard
-// but fail this integrated-path guard. This is the bench→test conversion: the bench REPORTS; the
-// test ENFORCES, so a silent regression fails the gate instead of silently
-// inflating the wall [a review identified the bench→test gap;
-// this guard closes it].
+// ReconstructEntry(ReconstructedEntry) test bypasses, would slip past the
+// zero-copy Payload alloc-reduction gate (ADR-0014 §3) but fail the integrated
+// bench alloc-reduction gate (ADR-0014 §3). This is the bench→test conversion:
+// the bench reports; the test enforces, so a silent regression fails the gate
+// instead of silently inflating the ceiling — a regression that appears only
+// on the integrated path, not in the unit test.
 //
-// The ceiling is calibrated with measured headroom: the alloc-hardening pair = 538 allocs/op
-// at N=100 (reproduced -cpu=1 and -cpu=4). The gate asserts
+// The ceiling is calibrated with measured headroom: the optimizations achieve 538 allocs/op
+// at N=100 (reproduced at -cpu=1 and -cpu=4). The gate asserts
 // allocs/delta <= 5.8 (580/batch) — a ~8% headroom so allocator jitter does
-// not flake the gate, but a revert of the value-return change (back to *ReconstructedEntry, the
-// 638 baseline = 6.38/delta) FAILS loudly. testing.AllocsPerRun is
-// DETERMINISTIC for a fixed call sequence (the allocator path is a pure
+// not flake the gate, but a revert of the value-receiver optimization (back to *ReconstructedEntry, the
+// 638 baseline = 6.38/delta) fails loudly. testing.AllocsPerRun is
+// deterministic for a fixed call sequence (the allocator path is a pure
 // function of the live code), so 5.8 is a real bound, not a probabilistic one.
 package receive
 
@@ -50,11 +50,11 @@ import (
 
 // buildAllocBenchBatchWire builds a signed CRDTDeltaBatch of n distinct self-originated
 // deltas against rcvOriginNodeID — a self-contained mirror of buildBenchBatchWire
-// (batch_bench_test.go:62) that accepts testing.TB so it runs in a *testing.T
-// (the bench helper hardcodes *testing.B). The wire is byte-faithful: a real
-// origin frame the receiver's Dir resolves (newBenchReceiver registers
-// rcvOriginNodeID) and ReconstructEntry accepts (DotNodeID == OriginNodeID, the
-// attribution check; PayloadDigest == SHA-256(Payload), the the zero-copy-read SHA catch).
+// that accepts testing.TB so it runs in a *testing.T (the bench helper
+// hardcodes *testing.B). The wire is byte-faithful: a real origin frame the
+// receiver's Dir resolves (newBenchReceiver registers rcvOriginNodeID) and
+// ReconstructEntry accepts (DotNodeID == OriginNodeID, the attribution check;
+// PayloadDigest == SHA-256(Payload), the SHA-256 catch).
 func buildAllocBenchBatchWire(tb testing.TB, n int, baseDot uint64) []byte {
 	tb.Helper()
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
@@ -105,11 +105,11 @@ func buildAllocBenchBatchWire(tb testing.TB, n int, baseDot uint64) []byte {
 	return data
 }
 
-// buildAllocBenchSignedFrame mints ONE signed BatchEnvelope (the amortization target:
+// buildAllocBenchSignedFrame mints one signed BatchEnvelope (the amortization target:
 // one Ed25519 over the whole batch wire) and applies it once to warm the
 // engine (the timed loop re-Joins idempotently — the CRDT dedupes, so the
-// measured op is a no-op apply + a FULL every-op verify, mirroring the bench's
-// honest lower-bound construction exactly).
+// measured op is a no-op apply + a full every-op verify, mirroring the bench's
+// lower-bound construction).
 func buildAllocBenchSignedFrame(t *testing.T, recv *Receiver, originSeed []byte, n int) []byte {
 	t.Helper()
 	batchWire := buildAllocBenchBatchWire(t, n, 1)
@@ -120,29 +120,29 @@ func buildAllocBenchSignedFrame(t *testing.T, recv *Receiver, originSeed []byte,
 	var sigArr [attribution.OriginSigSize]byte
 	copy(sigArr[:], sig)
 	frame := attribution.MarshalBatchEnvelope(rcvOriginNodeID, sigArr, 1, uint16(n), batchWire)
-	// Warm ONCE: a real apply so the timed loop's re-Join is idempotent (the
+	// Warm once: a real apply so the timed loop's re-Join is idempotent (the
 	// engine bounds to N entries — no arena exhaustion across the AllocsPerRun
-	// loop; the verify runs FULLY every op, the same honest lower bound the
+	// loop; the verify runs fully every op, the same lower bound the
 	// bench enforces).
 	warm := recv.HandleBatchFrame(frame)
 	if warm.Verdict != Accept {
-		t.Fatalf("warm-up frame: verdict=%s want Accept (reason: %v) — the frame failed the gate (the guard is invalid)", warm.Verdict, warm.Reason)
+		t.Fatalf("warm HandleBatchFrame: got %s, want Accept (reason: %v)", warm.Verdict, warm.Reason)
 	}
 	return frame
 }
 
-// TestBenchAllocNoRegression drives the FULL integrated ingest path (the
+// TestBenchAllocNoRegression drives the full integrated ingest path (the
 // same one BenchmarkBatchedVerifyParallel/shared/N=100 measures) and asserts
-// the per-delta alloc count does not regress past the the alloc-hardening pair headroom. It is
-// the bench→test conversion: the unit guard pins ReconstructEntry; this guard pins
+// the per-delta alloc count does not regress past the alloc headroom. It is
+// the bench→test conversion: the zero-copy Payload alloc-reduction gate (ADR-0014 §3) pins the unit ReconstructEntry; the integrated bench alloc-reduction gate (ADR-0014 §3) pins
 // the integrated path (HandleBatchFrame → ApplyCRDTDeltaBatch →
 // ReconstructEntry → Join, including the capnp decode + Seq closure +
-// per-shard CAS — the allocations that live OUTSIDE the unit guard's reach).
+// per-shard CAS — the allocations that live outside the unit test's reach).
 //
-// RED-verified on a revert to *ReconstructedEntry (the value-return change undone): the
+// Verified on a revert to *ReconstructedEntry: the
 // integrated per-delta count inflates 5.38 → 6.38, failing the 5.8 ceiling.
-// A new string-copy path on the capnp seam (a the zero-copy-read regression) that the unit
-// guard bypasses would also inflate past the headroom.
+// A new string-copy path on the capnp seam that the unit
+// test bypasses would also inflate past the headroom.
 func TestBenchAllocNoRegression(t *testing.T) {
 	originPub, originPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -150,9 +150,9 @@ func TestBenchAllocNoRegression(t *testing.T) {
 	}
 	originSeed := originPriv.Seed()
 	// Build a fresh engine + receiver + Directory (the same construction
-	// newBenchReceiver uses in bench_silicon_test.go:91 — origin pub
-	// registered so Dir.Lookup resolves it). The bench helper hardcodes
-	// *testing.B, so this guard builds an identical receiver from a *testing.T.
+	// newBenchReceiver uses — origin pub registered so Dir.Lookup resolves it).
+	// The bench helper hardcodes *testing.B, so this test builds an identical
+	// receiver from a *testing.T.
 	engine, err := eng.NewDeltaCRDTEngine(rcvOriginNodeID, 0, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDeltaCRDTEngine: %v", err)
@@ -171,8 +171,8 @@ func TestBenchAllocNoRegression(t *testing.T) {
 	const N = 100
 	frame := buildAllocBenchSignedFrame(t, recv, originSeed, N)
 
-	// ~8% headroom over the measured 5.38 allocs/delta (538/batch at N=100 on
-	// -cpu=1 and -cpu=4). A the value-return revert to 638 = 6.38/delta fails.
+	// ~8% headroom over the measured 5.38 allocs/delta (538/batch at N=100).
+	// A revert to *ReconstructedEntry (638 = 6.38/delta) fails.
 	// testing.AllocsPerRun is deterministic for a fixed call sequence — 5.8 is
 	// a real bound, not a probabilistic flake ceiling.
 	const allocsPerDeltaCeiling = 5.8
@@ -180,18 +180,18 @@ func TestBenchAllocNoRegression(t *testing.T) {
 	allocsPerBatch := testing.AllocsPerRun(30, func() {
 		v := recv.HandleBatchFrame(frame)
 		if v.Verdict != Accept {
-			t.Fatalf("integrated-alloc-guard: HandleBatchFrame verdict = %s, want Accept (reason: %v) — a timed frame failed the gate (the guard is invalid)", v.Verdict, v.Reason)
+			t.Fatalf("integrated alloc gate: HandleBatchFrame verdict = %s, want Accept (reason: %v) — a timed frame failed the gate (the test is invalid)", v.Verdict, v.Reason)
 		}
 	})
 	allocsPerDelta := allocsPerBatch / float64(N)
 
 	if allocsPerDelta > allocsPerDeltaCeiling {
-		t.Fatalf("integrated ingest-path allocs/delta = %.3f (> %.3f ceiling; %.0f/batch at N=%d). "+
-			"A the value-return revert (back to *ReconstructedEntry, the 638 baseline = 6.38/delta) OR a NEW string/allocation path "+
+		t.Fatalf("integrated alloc gate FAILED: integrated ingest-path allocs/delta = %.3f (> %.3f ceiling; %.0f/batch at N=%d). "+
+			"A revert back to *ReconstructedEntry (the 638 baseline = 6.38/delta) OR a new string/allocation path "+
 			"on the capnp decode → ReconstructEntry → Join seam regressed past the headroom. "+
-			"Re-run BenchmarkBatchedVerifyParallel/shared/N=100 to confirm; if the bench still shows ~538 the guard mis-calibrated (raise the ceiling), "+
-			"if the bench shows >580 the regression is REAL — bisect to find the new alloc site.",
+			"Re-run BenchmarkBatchedVerifyParallel/shared/N=100 to confirm; if the bench still shows ~538 the test mis-calibrated (raise the ceiling), "+
+			"if the bench shows >580 the regression is real — bisect to find the new alloc site.",
 			allocsPerDelta, allocsPerDeltaCeiling, allocsPerBatch, N)
 	}
-	t.Logf("integrated ingest path (HandleBatchFrame → ApplyCRDTDeltaBatch → ReconstructEntry → Join) = %.3f allocs/delta (%.0f/batch at N=%d) <= %.1f ceiling — the alloc-hardening pair hold at the integrated granularity (the unit guard holds ReconstructEntry; this guard holds the path)", allocsPerDelta, allocsPerBatch, N, allocsPerDeltaCeiling)
+	t.Logf("integrated alloc gate PASS: integrated ingest path (HandleBatchFrame → ApplyCRDTDeltaBatch → ReconstructEntry → Join) = %.3f allocs/delta (%.0f/batch at N=%d) <= %.1f ceiling — zero-copy payload and value-receiver optimizations hold at integrated granularity (ADR-0014 §3)", allocsPerDelta, allocsPerBatch, N, allocsPerDeltaCeiling)
 }

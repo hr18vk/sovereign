@@ -4,29 +4,22 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package crypto provides the dev-mesh certificate authority used by the
-// TLS 1.3 transport (pkg/transport/tls_transport.go) and the production node
-// binary (cmd/sovereign-node) for the dev mesh.
+// Package crypto provides the development-mesh certificate authority used by
+// the TLS 1.3 transport and the sovereign-node binary.
 //
-// This is a DEV mesh CA, NOT a production PKI. It mints an Ed25519 root key +
-// self-signed x509 CA certificate and per-node leaf certificates signed by
-// that CA, writing PEM files to disk for the TLS transport to load. A
-// production PKI (offline root, intermediate CAs, HSM-backed key custody,
-// OCSP/CRL revocation, automated rotation) is explicitly post-10-day and is
-// named in ADR-0006's honesty section.
+// NewMeshCA creates an Ed25519 root key and a self-signed X.509 CA certificate.
+// The CA signs per-node leaf certificates and writes PEM files for the TLS
+// transport to load. This is not a production PKI: offline roots, intermediate
+// CAs, HSM-backed key custody, and OCSP are out of scope (ADR-0006).
 //
-// Ed25519 (not RSA/ECDSA) is chosen to match the engine's identity bridge
-// (pkg/identity signs CRDT deltas with circl Ed25519): one signature
-// algorithm on the wire, 64-byte signatures, ZIP-215-compatible verification.
-// The CRDT-delta verification path (pkg/identity/verify.go) uses circl
-// ed25519 v1.6.4 and BANS stdlib crypto/ed25519 for that purpose
-// (pkg/identity/doc.go:9); that ban does NOT extend here — certgen uses
-// stdlib crypto/ed25519 + crypto/x509 for x509 certificate generation, which
-// is the documented stdlib path (crypto/x509.CreateCertificate with
-// PublicKeyAlgorithm: x509.Ed25519). The two key spaces are distinct:
-// transport-layer mTLS keys (this package) vs CRDT-delta signing keys
-// (pkg/identity). They share an algorithm for operational simplicity, not a
-// key.
+// Ed25519 matches the engine's identity bridge, which signs CRDT deltas with
+// circl Ed25519. Both protocols therefore use 64-byte signatures. The
+// CRDT-delta verification path uses circl ed25519 v1.6.4 and ZIP-215
+// verification rules; its rejection of the standard library's ed25519 verifier
+// does not apply to certificates. This package uses crypto/ed25519 and
+// crypto/x509, including x509.CreateCertificate with x509.Ed25519. Transport
+// mTLS keys and CRDT-delta signing keys remain separate; they share only the
+// signature algorithm.
 package crypto
 
 import (
@@ -43,17 +36,13 @@ import (
 	"time"
 )
 
-// MeshCA is the dev-mesh certificate authority: an Ed25519 root key pair and
-// the self-signed x509 CA certificate that signs per-node leaves.
+// MeshCA is the development-mesh certificate authority: an Ed25519 root key
+// pair and the self-signed X.509 CA certificate that signs per-node leaves.
 //
-// ADR-0035: MeshCA also owns the in-process revoked-serial set the CRL
-// issuer signs. revokedSerials is the CA-authoritative revocation ledger — a
-// serial appended via RevokeLeaf is published in the next IssueCRL. The set is
-// NOT concurrency-guarded: the dev-mesh CA is a single-goroutine construction
-// surface (NewMeshCA → IssueLeaf → RevokeLeaf → IssueCRL run in the order the
-// operator or the test harness drives them); a concurrent RevokeLeaf is a
-// caller bug (the same single-owner contract the existing IssueLeaf has — it
-// mutates no shared state today, so the field adds NO new contention).
+// MeshCA also owns the revoked-serial set included in each CRL (ADR-0035).
+// RevokeLeaf adds a serial, and the next IssueCRL call signs the resulting
+// list. The set has no synchronization; callers must serialize RevokeLeaf and
+// IssueCRL with other CA operations.
 type MeshCA struct {
 	caKey          ed25519.PrivateKey
 	caPub          ed25519.PublicKey
@@ -63,7 +52,7 @@ type MeshCA struct {
 	revokedSerials []*big.Int
 }
 
-// Leaf is a per-node leaf credential: an Ed25519 key pair and the x509 leaf
+// Leaf is a per-node credential: an Ed25519 key pair and the X.509 leaf
 // certificate signed by the MeshCA, plus the PEM-ready DER bytes.
 type Leaf struct {
 	nodeID      string
@@ -73,18 +62,17 @@ type Leaf struct {
 	leafCertDER []byte
 }
 
-// serialNumber generates a positive, bounded serial number for an x509
-// certificate. It uses crypto/rand so serials are unpredictable (avoiding
-// the predictable-serial collision / forgery class); the 62-bit bound keeps
-// it inside the ASN.1 INTEGER range Go's x509 marshals cleanly.
+// serialNumber returns an unpredictable X.509 serial number of at most 62
+// bits. The random draw reduces the chance of collisions across certificates
+// issued by this CA, and the bound keeps the ASN.1 INTEGER encoding small.
 func serialNumber() (*big.Int, error) {
 	limit := new(big.Int).Lsh(big.NewInt(1), 62) // 2^62
 	return rand.Int(rand.Reader, limit)
 }
 
-// NewMeshCA generates a fresh Ed25519 root key and a self-signed x509 CA
-// certificate. The CA is IsCA:true with KeyUsage CertSign|CRLSign; it is the
-// trust root the TLS transport's RootCAs pool loads (WriteCAPEM).
+// NewMeshCA generates a fresh Ed25519 root key and a self-signed X.509 CA
+// certificate. The CA has IsCA set and KeyUsage CertSign|CRLSign; the TLS
+// transport loads it into its RootCAs pool from the file written by WriteCAPEM.
 func NewMeshCA() (*MeshCA, error) {
 	caPub, caKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -129,56 +117,40 @@ func NewMeshCA() (*MeshCA, error) {
 	}, nil
 }
 
-// IssueLeaf mints a per-node leaf certificate signed by the CA. nodeID is
-// embedded as the leaf CommonName (and an organization unit) so a presented
-// leaf identifies the node on the wire. The leaf is a server+client cert
-// (KeyUsage DigitalSignature; ExtKeyUsage ServerAuth+ClientAuth) so the same
-// leaf serves both sides of the mTLS handshake. The lifetime is the 1-year dev
-// default (notBefore = now-1m, notAfter = notBefore+1y) — byte-identical to
-// the earlier behavior the existing guards (TestCertgen_RoundTrip +
-// TestTLSCertRotation_SIGHUP) assert.
+// IssueLeaf mints a per-node leaf certificate signed by the CA. nodeID is the
+// leaf CommonName, and the organizational unit is "node". KeyUsage permits
+// digital signatures, and ExtKeyUsage permits both server and client
+// authentication, so one leaf serves both sides of the mTLS handshake. The
+// default lifetime is one year, starting one minute before issuance.
 func (c *MeshCA) IssueLeaf(nodeID string) (*Leaf, error) {
 	return c.issueLeaf(nodeID, time.Now().Add(-time.Minute), time.Now().Add(-time.Minute).AddDate(1, 0, 0))
 }
 
-// IssueLeafWithLifetime is the ADR-0035 lifetime-parameterized leaf
-// minter. It shares the EXACT template + signing path of IssueLeaf (the only
-// delta is the caller-supplied NotBefore/NotAfter) so a test guard can mint a
-// leaf whose NotAfter is in the PAST (the expired-leaf rejection guard —
-// default Go-tls chain validation rejects it at the handshake) and the rotation
-// manager can mint a SHORT-LIVED leaf (the rotation-trigger guard compresses the
-// design doc's 30-day cadence into a sub-second lifetime to test the trigger
-// in-wall-clock).
-// Production rotation uses IssueLeaf at the SAME paths (the 1-year default is
-// the operator-visible lifetime; the trigger's --cert-rotation-lifetime flag is
-// the poll threshold, NOT a re-minted lifetime — see ADR-0035 §M4). notAfter
-// MUST be after notBefore or x509.CreateCertificate rejects the template (the
-// stdlib guard); the caller owns the temporal sanity.
+// IssueLeafWithLifetime mints a leaf certificate with caller-supplied NotBefore
+// and NotAfter timestamps (ADR-0035). It shares the certificate template and
+// signing path with IssueLeaf. Tests use it to cover expiry and rotation with
+// expired or short-lived certificates. The node's rotation path still calls
+// IssueLeaf: --cert-rotation-lifetime controls when renewal starts, not the
+// default one-year lifetime of the new certificate. notAfter must be later
+// than notBefore or x509.CreateCertificate rejects the template.
 func (c *MeshCA) IssueLeafWithLifetime(nodeID string, notBefore, notAfter time.Time) (*Leaf, error) {
 	return c.issueLeaf(nodeID, notBefore, notAfter)
 }
 
-// IssueLeafWithIP is the ADR-0041 IP-SAN-parameterized leaf minter for
-// the cross-region silicon gate. It shares the EXACT template + signing path of
-// IssueLeaf (the only delta is the caller-supplied IPAddresses SAN) so a leaf
-// minted for a node with a KNOWN public IP verifies when the peer dial uses that
-// IP as the TLS ServerName (main.go:1381 peerSet.Dial(ctx, pa, host, peerID)
-// where host = splitHostPort(pa) — the addr's host). The default IssueLeaf sets
-// IPAddresses=nil with the comment "populated by the deploy if a fixed IP is
-// known" — THIS minter is that deploy path (the cmd/-bootstrap helper
-// mints each node's leaf WITH its host's public IP). A nil/empty ips keeps the
-// DNSNames-only template (byte-identical to IssueLeaf) so a caller that passes
-// no IPs does NOT regress. The DNSNames are unchanged ({nodeID, "localhost"}) so
-// a localhost-loopback dial still verifies (the smoke-test path).
+// IssueLeafWithIP mints a one-year leaf whose IP subject alternative names
+// come from ips (ADR-0041). It otherwise uses the same template and signing
+// path as IssueLeaf. A peer that dials one of these IP addresses can verify it
+// through the IP SAN when the address is used as the TLS server name. The
+// bootstrap helper uses this method for nodes with known public addresses.
+// A nil or empty ips produces the same DNS-only template as IssueLeaf. The
+// DNS names remain nodeID and "localhost", so loopback dials still verify.
 func (c *MeshCA) IssueLeafWithIP(nodeID string, ips []net.IP) (*Leaf, error) {
 	return c.issueLeafIP(nodeID, time.Now().Add(-time.Minute), time.Now().Add(-time.Minute).AddDate(1, 0, 0), ips)
 }
 
-// issueLeafIP is the IP-SAN core, mirroring issueLeaf's template field-for-field
-// EXCEPT IPAddresses (issueLeaf hardcodes nil; this takes the caller's list). It
-// is a SEPARATE path from issueLeaf (NOT a branch inside it) so the existing
-// IssueLeaf/IssueLeafWithLifetime single-path discipline + their byte-identical
-// tests are untouched — a regression here cannot leak into the rotation path.
+// issueLeafIP implements leaf issuance with caller-supplied IP SANs. It uses
+// the same template as issueLeaf except for IPAddresses. The separate path
+// keeps IP-SAN handling out of the default and rotation issuance paths.
 func (c *MeshCA) issueLeafIP(nodeID string, notBefore, notAfter time.Time, ips []net.IP) (*Leaf, error) {
 	if c == nil || c.caCert == nil {
 		return nil, errors.New("certgen: nil or uninitialized MeshCA")
@@ -202,7 +174,7 @@ func (c *MeshCA) issueLeafIP(nodeID string, notBefore, notAfter time.Time, ips [
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		IPAddresses:           ips, // the deploy path: the node's public IP (nil = DNSNames-only, byte-identical IssueLeaf)
+		IPAddresses:           ips, // nil or empty leaves hostname verification to DNSNames
 		DNSNames:              []string{nodeID, "localhost"},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
@@ -225,12 +197,9 @@ func (c *MeshCA) issueLeafIP(nodeID string, notBefore, notAfter time.Time, ips [
 	}, nil
 }
 
-// issueLeaf is the shared core of IssueLeaf + IssueLeafWithLifetime. It is the
-// single signing path so the two public minters CANNOT drift (a divergence
-// would let a lifetime-parameterized leaf escape a template field the default
-// minter sets — the single-path discipline the revocation design names: "the
-// CRL is a SERIAL check, NOT a trust-root check" generalizes to "the leaf is a
-// single template, NOT a per-minter template").
+// issueLeaf is the shared core of IssueLeaf and IssueLeafWithLifetime. Keeping
+// the template and signing operation here prevents the lifetime-specific
+// variant from omitting fields set by the default minter.
 func (c *MeshCA) issueLeaf(nodeID string, notBefore, notAfter time.Time) (*Leaf, error) {
 	if c == nil || c.caCert == nil {
 		return nil, errors.New("certgen: nil or uninitialized MeshCA")
@@ -278,7 +247,7 @@ func (c *MeshCA) issueLeaf(nodeID string, notBefore, notAfter time.Time) (*Leaf,
 }
 
 // WriteCAPEM writes the CA certificate (PEM-encoded) to ca.pem in dir and
-// returns the path. The CA private key is NOT written — a dev mesh CA key
+// returns the path. The CA private key is not written — a dev mesh CA key
 // stays in-process; only the public trust anchor is persisted for the
 // transport's RootCAs pool.
 func (c *MeshCA) WriteCAPEM(dir string) (caPath string, err error) {
@@ -333,59 +302,38 @@ func (l *Leaf) LeafKey() ed25519.PrivateKey { return l.leafKey }
 // NodeID returns the node identifier embedded in the leaf CommonName.
 func (l *Leaf) NodeID() string { return l.nodeID }
 
-// ──────────────────────────────────────────────────────────────────────────
-// ADR-0035: the CRL issuer — the SERIAL-level revocation surface.
+// CRL issuance
 //
-// the design doc gate ("a node presenting an EXPIRED OR REVOKED cert
-// is rejected at the TLS handshake") has two claws (the revocation audit):
-// (a) EXPIRED — default Go-tls chain validation ALREADY rejects an expired
-// leaf (the NotAfter check is in x509.Certificate.Verify). The transport
-// inherits (a) for free; the change does NOT claim it as new work.
-// (b) REVOKED — requires a SERIAL-level reject. A revoked cert passes the
-// chain (the CA still signed it) UNLESS the transport consults a CRL. This
-// is the load-bearing change: the CA publishes a signed list of revoked
-// serials (IssueCRL → WriteCRLPEM), the transport hot-reloads the PEM
-// (ReloadCRL), parses it into an in-memory serial set, and the
-// VerifyPeerCertificate callback rejects a presented leaf whose serial is
-// in the set. CRL (NOT OCSP) is chosen because the dev/operator-mesh CA is
-// operator-controlled + offline-friendly; an OCSP responder is a NEW
-// network surface + a NEW availability SPOF (disclosed ADR-0035 §6).
+// Expiry and revocation are separate handshake checks (ADR-0035). Go's TLS
+// chain validation checks NotAfter and rejects expired leaves. A revoked
+// certificate still chains to its CA, so the transport must also compare its
+// serial with a CRL. IssueCRL signs the CA's revoked serials, WriteCRLPEM
+// persists the list, and the transport's ReloadCRL method loads it into an
+// in-memory set. VerifyPeerCertificate rejects a presented leaf whose serial
+// is in that set. CRLs suit this operator-controlled CA because they work
+// offline and do not require an OCSP responder or its network availability.
 //
-// The CRL is signed with x509.CreateRevocationList (the MODERN Go 1.23+ API,
-// NOT the deprecated x509.CreateCRL — confirmed go.mod go 1.26.1). The CA cert's
-// KeyUsageCRLSign bit is set at NewMeshCA (certgen.go:90), and CreateCertificate
-// auto-populates the CA's SubjectKeyId (SHA-256(pubkey)[:20], verified by the
-// This change CRL probe) — both are preconditions x509.CreateRevocationList names
-// ("the crlSign bit must be set in KeyUsage" + "issuer must have SubjectKeyId
-// set") and BOTH are already satisfied by the EXISTING CA. No CA-cert change.
+// IssueCRL uses x509.CreateRevocationList rather than the deprecated
+// x509.CreateCRL. NewMeshCA sets KeyUsageCRLSign, and CreateCertificate
+// populates the CA SubjectKeyId using the leftmost 160 bits of the public
+// key's SHA-256 hash. These satisfy CreateRevocationList's requirements for
+// the crlSign key usage and an issuer SubjectKeyId.
 //
-// Honest residual (disclosed ADR-0035 §6): Go's RevocationList.CheckSignatureFrom
-// rejects an Ed25519-signed CRL with "parent certificate cannot sign this kind
-// of certificate" (verified by the CRL probe — a stdlib quirk, NOT a
-// signature defect; the CRL's Ed25519 signature IS valid). The transport
-// therefore consults the in-memory revoked-serial SET (parsed from the CRL the
-// CA — the SAME operator in-process owner — produced), NOT a per-handshake
-// CheckSignatureFrom. The trust model is path-ownership (the SAME model the CA
-// pool uses: AppendCertsFromPEM loads the self-signed root WITHOUT verifying
-// its self-signature). A production change that ships a CRL from an OUT-of-process
-// CA must add the Ed25519 CRL signature verification (a CheckSignatureFrom
-// replacement that accepts Ed25519) — disclosed, NOT closed.
-// ──────────────────────────────────────────────────────────────────────────
+// The transport does not call RevocationList.CheckSignatureFrom when it loads
+// a CRL. It trusts the local PEM file by path ownership, just as it loads the
+// self-signed root through AppendCertsFromPEM without separately checking its
+// self-signature. A deployment that accepts CRLs from an external CA must
+// verify each CRL's signature and provenance before installing it.
 
 // ErrSerialAlreadyRevoked is returned by RevokeLeaf when the serial is already
-// in the revoked set. Revocation is idempotent from the CA's ledger view (a
-// duplicate append would publish a duplicate entry in the CRL — the stdlib
-// ParseRevocationList tolerates duplicates, but the ledger is kept clean).
+// in the revoked set. Although x509.ParseRevocationList tolerates duplicate
+// entries, RevokeLeaf rejects them to keep each published CRL unambiguous.
 var ErrSerialAlreadyRevoked = errors.New("certgen: serial already revoked")
 
-// RevokeLeaf appends a serial to the CA's in-process revoked-serial ledger.
-// The serial is published in the next IssueCRL. Idempotent: a duplicate append
-// returns ErrSerialAlreadyRevoked (the ledger stays clean — no duplicate CRL
-// entries). The serial is the leaf's x509 SerialNumber (leaf.LeafCert().
-// SerialNumber); it is a 62-bit random (serialNumber(), certgen.go:63) so a
-// revocation is serial-scoped, NOT CA-scoped (the serial-scope principle: a
-// SIBLING leaf2 NOT in the set STILL passes the handshake — the revoked-leaf
-// rejection guard).
+// RevokeLeaf adds a serial to the CA's in-process revoked set for inclusion in
+// the next IssueCRL call. Duplicate additions return ErrSerialAlreadyRevoked.
+// Revocation is scoped to the leaf's SerialNumber, so other leaves signed by
+// the same CA remain valid.
 func (c *MeshCA) RevokeLeaf(serial *big.Int) error {
 	if c == nil || c.caCert == nil {
 		return errors.New("certgen: nil or uninitialized MeshCA")
@@ -402,17 +350,15 @@ func (c *MeshCA) RevokeLeaf(serial *big.Int) error {
 	return nil
 }
 
-// IssueCRL signs an X.509 v2 Certificate Revocation List (RFC 5280) over the
-// CA's current revoked-serial ledger. The CRL is the signed list the transport
-// hot-reloads (ReloadCRL parses the PEM, extracts the serials into an in-memory
-// set the VerifyPeerCertificate callback consults). An empty ledger yields a
-// valid empty CRL (the stdlib omits the revokedCertificates sequence — a
-// transport with no revoked serials rejects nothing, the byte-identical
-// pre-revocation behavior). crlNumber is the CRL's sequence number (the v2
-// cRLNumber extension); the caller passes a monotone counter so a hot-reload
-// can detect a stale CRL (a regression in cRLNumber is a CA bug, disclosed but
-// not enforced here — the transport swaps the set unconditionally on a
-// successful parse).
+// IssueCRL signs an X.509 v2 Certificate Revocation List (RFC 5280) containing
+// the CA's current revoked serials. The transport's ReloadCRL method parses
+// the PEM and extracts the serials into the set consulted by
+// VerifyPeerCertificate. With no revoked serials, IssueCRL returns a valid
+// empty CRL and the transport rejects no certificates on revocation grounds.
+// crlNumber becomes the cRLNumber extension. Callers should increase it for
+// each new CRL so receivers can identify stale lists; this method does not
+// enforce ordering, and the transport replaces its set after any successful
+// parse.
 func (c *MeshCA) IssueCRL(crlNumber int64) ([]byte, error) {
 	if c == nil || c.caCert == nil {
 		return nil, errors.New("certgen: nil or uninitialized MeshCA")
@@ -434,11 +380,10 @@ func (c *MeshCA) IssueCRL(crlNumber int64) ([]byte, error) {
 	return x509.CreateRevocationList(rand.Reader, tmpl, c.caCert, c.caKey)
 }
 
-// WriteCRLPEM writes the CRL (PEM-encoded, type "X509 CRL") to crl.pem in dir
-// and returns the path. It is the CRL sibling of WriteCAPEM: the CA publishes
-// the revoked-serial list to disk the SAME way it publishes the trust anchor —
-// the transport hot-reloads both via the SAME mechanism (the triple
-// hot-reload: leaf + CA pool + CRL, each atomic under the RWMutex).
+// WriteCRLPEM writes crlDER as a PEM block of type "X509 CRL" to crl.pem in
+// dir and returns the path. The transport can reload the resulting file with
+// ReloadCRL; leaf, CA pool, and CRL reloads are independent and each swaps its
+// state under the transport's RWMutex.
 func (c *MeshCA) WriteCRLPEM(dir string, crlDER []byte) (crlPath string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err

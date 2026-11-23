@@ -6,24 +6,20 @@
 
 package mesh
 
-// Guards for /v1/batch-insert (pkg/mesh/control.go).
-// Internal test (package mesh) so the guards reach the UNEXPORTED JSON response
-// types the handler returns — batchInsertResponse / batchInsertItemStatus /
-// insertResponse / dotHex — the SAME types control_test.go decodes (the
-// /v1/insert ACK-before-durability guards). The in-process harness mirrors
-// control_test.go verbatim: eng.DataDir + NewDeltaCRDTEngine + durability.OpenWAL
-// + NewBridge + NewGossiper + SetBridge + NewControlServer + httptest.NewServer
-// (NO TLS listener — we hit ControlServer.Handler over httptest, the same
-// discipline control_test.go uses).
+// Tests for /v1/batch-insert (pkg/mesh/control.go).
 //
-// FALSIFIABLE + fault-injection-PROVEN (NOT tautologies):
-// TestBatchInsertHappy — 100 entries → 200, all inserted (Code 200 +
-//     non-empty DotHex), each /v1/get → present.
-// TestBatchInsertPartialBatch — Negative control: one empty-key entry → that entry Code 400,
-//     the rest Code 200 (partial batch honest, NOT 200-all).
-// TestBatchInsertWALFailPerEntry — one entry's WAL fsync fails → that entry
-// Code 503, the rest Code 200 (the ACK-before-durability contract is
-//     PER-ENTRY, NOT per-batch).
+// These tests use package mesh so they can decode the unexported JSON response
+// types returned by the handler. The in-process harness mirrors control_test.go:
+// eng.DataDir, NewDeltaCRDTEngine, durability.OpenWAL, NewBridge, NewGossiper,
+// SetBridge, NewControlServer, and httptest.NewServer. Requests go directly to
+// ControlServer.Handler through httptest, without a TLS listener.
+//
+// The successful-insert case anchors two negative controls:
+//   TestBatchInsertPartialBatch reports 400 for an empty-key entry and 200 for
+//     the valid entries, rather than reporting success for the whole batch.
+//   TestBatchInsertWALFailPerEntry reports 503 for entries whose WAL fsync
+//     fails. The durability contract from ADR-0014 and ADR-0015 applies to each
+//     entry, not to the batch as a whole.
 
 import (
 	"bytes"
@@ -38,19 +34,17 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// batchItemReq is the per-entry shape POST /v1/batch-insert accepts (mirrors the
-// server's insertRequest so the bitemporal stamps default identically to
-// /v1/insert). Key/Val only — the guard asserts the default-open-ended
-// bitemporal stamping path (the common case).
+// batchItemReq mirrors the per-entry request accepted by POST
+// /v1/batch-insert. Key and Val leave the bitemporal timestamps at their
+// defaults: valid from the write time and open-ended.
 type batchItemReq struct {
 	Key string `json:"key"`
 	Val string `json:"val"`
 }
 
-// newBatchControlServer builds the in-process /v1/batch-insert harness (mirrors
-// control_test.go's TestControlInsert_DurableWriteReturns200 setup). The WAL is
-// OPEN (durable) by default; the WAL-fail guard closes it after the first entry
-// to force a per-entry fsync failure.
+// newBatchControlServer builds the same in-process harness as
+// TestControlInsert_DurableWriteReturns200. The caller supplies an open WAL;
+// the failure test closes it after the first entry to force fsync errors.
 func newBatchControlServer(t *testing.T, nodeID [16]byte, wal *durability.WAL) (*httptest.Server, *eng.DeltaCRDTEngine, *Gossiper) {
 	t.Helper()
 	eng.DataDir = t.TempDir()
@@ -68,8 +62,8 @@ func newBatchControlServer(t *testing.T, nodeID [16]byte, wal *durability.WAL) (
 	return srv, engine, g
 }
 
-// postBatch POSTs the items to /v1/batch-insert + decodes the per-entry status
-// array. Returns the decoded batchInsertResponse.
+// postBatch POSTs items to /v1/batch-insert and returns the decoded
+// batchInsertResponse with one status per entry.
 func postBatch(t *testing.T, srv *httptest.Server, items []batchItemReq) batchInsertResponse {
 	t.Helper()
 	body, _ := json.Marshal(struct {
@@ -81,10 +75,10 @@ func postBatch(t *testing.T, srv *httptest.Server, items []batchItemReq) batchIn
 	}
 	defer resp.Body.Close()
 	// A partial batch is 200 at the HTTP layer (per-entry failures are in the
-	// JSON body, NOT the HTTP status) — so a 4xx/5xx here is a transport/handler
-	// error, NOT an honest partial-batch signal.
+	// JSON body, not the HTTP status) — so a 4xx/5xx here is a transport/handler
+	// error, not a partial-batch signal.
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /v1/batch-insert returned HTTP %d (want 200 — partial-batch failures are per-entry in the body, NOT the HTTP status); body=%s", resp.StatusCode, readBodyForTest(resp))
+		t.Fatalf("POST /v1/batch-insert returned HTTP %d (want 200 — partial-batch failures are per-entry in the body, not the HTTP status); body=%s", resp.StatusCode, readBodyForTest(resp))
 	}
 	var r batchInsertResponse
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
@@ -93,11 +87,10 @@ func postBatch(t *testing.T, srv *httptest.Server, items []batchItemReq) batchIn
 	return r
 }
 
-// TestBatchInsertHappy is the positive control: 100 entries → all inserted
-// (Inserted==100, Failed==0, every item Code 200 + non-empty DotHex), and each
-// key is readable via /v1/get (the round-trip-closure proof — the entry landed
-// locally AND is queryable, NOT just ACKed). A red→green anchor: green at HEAD
-// (the happy path) so the negative controls below are load-bearing against it.
+// TestBatchInsertHappy inserts 100 entries and requires Inserted == 100,
+// Failed == 0, and a nonzero DotHex with status 200 for every item. PointGet
+// checks each key's count, origin, and dot counter; HTTP reads then verify that
+// three inserted values are visible through /v1/get.
 func TestBatchInsertHappy(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "batch-ok.wal")
 	wal, err := durability.OpenWAL(walPath)
@@ -115,77 +108,68 @@ func TestBatchInsertHappy(t *testing.T) {
 	r := postBatch(t, srv, items)
 
 	if r.Inserted != n {
-		t.Fatalf("batch-insert happy: Inserted=%d, want %d (all entries durable)", r.Inserted, n)
+		t.Fatalf("batch insert: Inserted=%d, want %d durable entries", r.Inserted, n)
 	}
 	if r.Failed != 0 {
-		t.Fatalf("batch-insert happy: Failed=%d, want 0 (no failures on the happy path); statuses: %+v", r.Failed, r.Items)
+		t.Fatalf("batch insert: Failed=%d, want 0; statuses: %+v", r.Failed, r.Items)
 	}
 	if len(r.Items) != n {
-		t.Fatalf("batch-insert happy: len(Items)=%d, want %d (one status per entry)", len(r.Items), n)
+		t.Fatalf("batch insert: len(Items)=%d, want %d statuses", len(r.Items), n)
 	}
 	for i, st := range r.Items {
 		if st.Code != http.StatusOK {
-			t.Fatalf("batch-insert happy: item %d Code=%d, want 200", i, st.Code)
+			t.Fatalf("batch insert: item %d Code=%d, want 200", i, st.Code)
 		}
 		if st.DotHex == "" || st.DotHex == allZeroHex() {
-			t.Fatalf("batch-insert happy: item %d DotHex=%q, want a non-empty non-zero receipt", i, st.DotHex)
+			t.Fatalf("batch insert: item %d DotHex=%q, want a nonzero receipt", i, st.DotHex)
 		}
 	}
 
-	// Round-trip closure (HONEST — presence alone is a partial lie; a bug that
-	// dropped half the keys + doubled the others would pass a len>0 check). Three
-	// checks per key:
-	//  (a) COUNT: each distinct key carries EXACTLY 1 entry (100 keys → 100
-	//      entries, one each — catches a count-drift bug that 0-fills some keys
-	//      + 2-fills others, which a len>0 check would miss).
-	//  (b) ATTRIBUTION: the entry's DotNodeID == test503NodeID (the local node
-	//      that inserted — catches a zero-dot/foreign-dot misattribution that
-	//      slipped through the 200 ACK).
-	//  (c) the entry's DotCounter is non-zero (the dot was actually minted).
+	// Checking only that keys are present would miss count drift. Require one
+	// entry per key, attributed to the local node with a nonzero dot counter.
 	for i := 0; i < n; i++ {
-		entries := engine.State().Get(batchKey(i))
+		entries := engine.PointGet(batchKey(i))
 		if len(entries) != 1 {
-			t.Fatalf("batch-insert happy: key %q has %d entries, want EXACTLY 1 (count drift — a len>0 check would miss a 0-fill-some/2-fill-others bug)", batchKey(i), len(entries))
+			t.Fatalf("batch insert: key %q has %d entries, want exactly 1", batchKey(i), len(entries))
 		}
 		if entries[0].DotNodeID != test503NodeID {
-			t.Fatalf("batch-insert happy: key %q entry DotNodeID=%x, want %x (the local node — a misattribution slipped through the 200 ACK)", batchKey(i), entries[0].DotNodeID, test503NodeID)
+			t.Fatalf("batch insert: key %q DotNodeID=%x, want local node %x", batchKey(i), entries[0].DotNodeID, test503NodeID)
 		}
 		if entries[0].DotCounter == 0 {
-			t.Fatalf("batch-insert happy: key %q entry DotCounter=0 (the dot was never minted — a zero-dot that ACKed 200)", batchKey(i))
+			t.Fatalf("batch insert: key %q has zero DotCounter after a 200 response", batchKey(i))
 		}
 	}
 
-	// HTTP round-trip: the PRODUCTION read path (GET /v1/get?key=...) sees the
-	// batch insert — NOT just the in-process State.Get. On the originator node
-	// (node 0, the same node that inserted), the cache hit returns the Payload.
-	// Spot-check 3 keys (start, mid, end) via the real HTTP endpoint.
+	// Read the first, middle, and last keys through the production HTTP
+	// endpoint. On the originator, the cache returns the payload as well as
+	// presence, so compare the complete value.
 	for _, i := range []int{0, n / 2, n - 1} {
 		resp, err := http.Get(srv.URL + "/v1/get?key=" + batchKey(i))
 		if err != nil {
-			t.Fatalf("batch-insert happy: GET /v1/get?key=%s: %v", batchKey(i), err)
+			t.Fatalf("GET /v1/get?key=%s: %v", batchKey(i), err)
 		}
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("batch-insert happy: GET /v1/get?key=%s returned HTTP %d, want 200 (the batch insert is NOT readable via the production HTTP path)", batchKey(i), resp.StatusCode)
+			t.Fatalf("GET /v1/get?key=%s returned HTTP %d, want 200", batchKey(i), resp.StatusCode)
 		}
 		var gr getResponse
 		if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
-			t.Fatalf("batch-insert happy: decode /v1/get body for key %s: %v", batchKey(i), err)
+			t.Fatalf("decode /v1/get body for key %s: %v", batchKey(i), err)
 		}
 		resp.Body.Close()
 		if !gr.Present {
-			t.Fatalf("batch-insert happy: GET /v1/get?key=%s Present=false, want true (the entry is NOT visible via the production HTTP read path)", batchKey(i))
+			t.Fatalf("GET /v1/get?key=%s Present=false, want true", batchKey(i))
 		}
 		if gr.Payload != batchVal(i) {
-			t.Fatalf("batch-insert happy: GET /v1/get?key=%s Payload=%q, want %q (the VALUE is wrong — the batch inserted a different value than the round-trip reads; a presence-only check would miss this)", batchKey(i), gr.Payload, batchVal(i))
+			t.Fatalf("GET /v1/get?key=%s Payload=%q, want %q", batchKey(i), gr.Payload, batchVal(i))
 		}
 	}
-	t.Logf("batch-insert happy PASS: %d entries inserted (all Code 200 + non-empty DotHex), all %d readable via State().Get (EXACTLY 1 entry each, DotNodeID=local, DotCounter>0); 3 keys round-tripped via the real GET /v1/get (Present=true, Payload=value matched)", n, n)
+	t.Logf("batch insert: %d entries inserted with nonzero receipts; all %d keys have one local, nonzero dot; three values matched through /v1/get", n, n)
 }
 
-// TestBatchInsertPartialBatch is the negative control: a batch with ONE bad entry
-// (empty key) MUST report that entry Code 400 + the rest Code 200 (a PARTIAL
-// batch reported HONESTLY, NOT a lying 200-all). This is the
-// READ-Seam-honest contract — does NOT bypass the per-entry validation.
+// TestBatchInsertPartialBatch submits one empty key among valid entries. The
+// rejected item must return 400 without a receipt; the other items must retain
+// their own 200 statuses and receipts rather than inheriting a batch-wide
+// result.
 func TestBatchInsertPartialBatch(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "batch-partial.wal")
 	wal, err := durability.OpenWAL(walPath)
@@ -204,48 +188,43 @@ func TestBatchInsertPartialBatch(t *testing.T) {
 	r := postBatch(t, srv, items)
 
 	if r.Inserted != 2 {
-		t.Fatalf("batch-insert partial: Inserted=%d, want 2 (the 2 valid entries)", r.Inserted)
+		t.Fatalf("partial batch: Inserted=%d, want 2 valid entries", r.Inserted)
 	}
 	if r.Failed != 1 {
-		t.Fatalf("batch-insert partial: Failed=%d, want 1 (the empty-key entry)", r.Failed)
+		t.Fatalf("partial batch: Failed=%d, want 1 empty-key failure", r.Failed)
 	}
-	// The per-entry statuses MUST be honest: item 1 → 400, items 0 + 2 → 200.
 	if len(r.Items) != 3 {
-		t.Fatalf("batch-insert partial: len(Items)=%d, want 3", len(r.Items))
+		t.Fatalf("partial batch: len(Items)=%d, want 3", len(r.Items))
 	}
 	for _, st := range r.Items {
 		switch st.Index {
 		case 1:
 			if st.Code != http.StatusBadRequest {
-				t.Fatalf("batch-insert partial: bad entry (index %d, key=%q) Code=%d, want 400 (empty key)", st.Index, st.Key, st.Code)
+				t.Fatalf("empty-key entry (index %d, key=%q) Code=%d, want 400", st.Index, st.Key, st.Code)
 			}
 			if st.DotHex != "" {
-				t.Fatalf("batch-insert partial: bad entry DotHex=%q, want empty (no receipt for a rejected entry)", st.DotHex)
+				t.Fatalf("empty-key entry DotHex=%q, want no receipt", st.DotHex)
 			}
 		default:
 			if st.Code != http.StatusOK {
-				t.Fatalf("batch-insert partial: valid entry (index %d) Code=%d, want 200 (a partial batch does NOT fail the valid entries)", st.Index, st.Code)
+				t.Fatalf("valid entry (index %d) Code=%d, want 200 despite another entry's failure", st.Index, st.Code)
 			}
 			if st.DotHex == "" || st.DotHex == allZeroHex() {
-				t.Fatalf("batch-insert partial: valid entry (index %d) DotHex=%q, want non-empty non-zero", st.Index, st.DotHex)
+				t.Fatalf("valid entry (index %d) DotHex=%q, want a nonzero receipt", st.Index, st.DotHex)
 			}
 		}
 	}
-	t.Logf("batch-insert partial PASS: 1 empty-key entry → Code 400, 2 valid → Code 200 (partial batch honest, NOT 200-all)")
+	t.Logf("partial batch: empty key returned 400 without a receipt; two valid entries returned 200 with receipts")
 }
 
-// TestBatchInsertWALFailPerEntry is the per-entry ACK-before-durability control
-// (the contract, batch-shaped). It proves the contract is PER-ENTRY, NOT
-// per-batch: ONE entry whose WAL fsync fails → that entry Code 503, the REST
-// Code 200 (the batch does NOT fail wholesale on one fsync failure). This is the
-// load-bearing difference from a per-batch ACK (which would 503 the whole batch
-// + lie about the entries that DID land durably).
+// TestBatchInsertWALFailPerEntry closes the WAL after one successful insert,
+// then submits two more entries. Each failed write must return 503 without a
+// DotHex receipt, while the earlier durable write remains present. This extends
+// the durability checks in ADR-0014 and ADR-0015 to the batch endpoint.
 //
-// The forced failure mirrors control_test.go's TestControlInsert_WALFailureReturns503:
-// pre-close the WAL so the next PutLocal's fsync errors → InsertLocalEvents
-// returns eng.CausalDot{} for THAT entry. The entries BEFORE the close land
-// durably (200); the entry AFTER the close is non-durable (503). Per-entry, NOT
-// per-batch.
+// Closing the WAL makes PutLocal's fsync fail and InsertLocalEvents return the
+// zero CausalDot. The active bridge makes that sentinel trigger the handler's
+// 503 response instead of acknowledging an undurable write.
 func TestBatchInsertWALFailPerEntry(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "batch-walfail.wal")
 	wal, err := durability.OpenWAL(walPath)
@@ -254,63 +233,56 @@ func TestBatchInsertWALFailPerEntry(t *testing.T) {
 	}
 	srv, engine, g := newBatchControlServer(t, test503NodeID, wal)
 
-	// Entry 0 lands DURABLY (WAL open). Then close the WAL mid-batch so entry 1's
-	// fsync fails → 503. Entry 2 also fails (WAL still closed) → 503. This proves
-	// the per-entry contract: the batch reports a MIX of 200 + 503 honestly.
+	// Entry 0 is durable. Entries 1 and 2 are submitted after the WAL closes and
+	// must each report 503 without affecting the earlier receipt.
 	items := []batchItemReq{
 		{Key: batchKey(0), Val: batchVal(0)}, // durable (WAL open)
 		{Key: batchKey(1), Val: batchVal(1)}, // WAL closed below → 503
 		{Key: batchKey(2), Val: batchVal(2)}, // WAL still closed → 503
 	}
-	// POST the FIRST entry separately so it lands before the WAL close (the
-	// in-process httptest server is synchronous, so the first Post completes +
-	// fsyncs before we close the WAL).
+	// The synchronous httptest server completes and fsyncs this request before
+	// the test closes the WAL.
 	first := postBatch(t, srv, items[:1])
 	if first.Items[0].Code != http.StatusOK {
-		t.Fatalf("batch-insert WAL-fail setup: entry 0 (WAL open) Code=%d, want 200 (the durable precondition)", first.Items[0].Code)
+		t.Fatalf("WAL-failure setup: entry 0 Code=%d, want 200 with the WAL open", first.Items[0].Code)
 	}
-	// Close the WAL → the next PutLocal's fsync errors.
 	if err := wal.Close(); err != nil {
-		t.Fatalf("pre-close WAL (force per-entry failure): %v", err)
+		t.Fatalf("close WAL to force write failures: %v", err)
 	}
 
-	// POST entries 1 + 2 (WAL closed → both fsync-fail). The bridge is still
-	// active (g.SetBridge wired it; we did NOT clear it), so the zero-dot
-	// sentinel triggers the per-entry 503 guard.
+	// The bridge remains active, so each zero-dot result returns 503.
 	rest := postBatch(t, srv, items[1:])
 	if rest.Inserted != 0 {
-		t.Fatalf("batch-insert WAL-fail per-entry: Inserted=%d, want 0 (both entries' fsync failed — WAL closed)", rest.Inserted)
+		t.Fatalf("WAL-failure writes: Inserted=%d, want 0 because both fsyncs failed", rest.Inserted)
 	}
 	if rest.Failed != 2 {
-		t.Fatalf("batch-insert WAL-fail per-entry: Failed=%d, want 2 (the per-entry ACK-before-durability contract counts each failed entry)", rest.Failed)
+		t.Fatalf("WAL-failure writes: Failed=%d, want 2", rest.Failed)
 	}
 	for _, st := range rest.Items {
 		if st.Code != http.StatusServiceUnavailable {
-			t.Fatalf("batch-insert WAL-fail per-entry: entry index %d Code=%d, want 503 (the WAL-failed entry must NOT be ACKed as durable)", st.Index, st.Code)
+			t.Fatalf("WAL-failed entry index %d Code=%d, want 503", st.Index, st.Code)
 		}
 		if st.DotHex != "" {
-			t.Fatalf("batch-insert WAL-fail per-entry: entry index %d DotHex=%q, want empty (no receipt for a non-durable write)", st.Index, st.DotHex)
+			t.Fatalf("WAL-failed entry index %d DotHex=%q, want no durable receipt", st.Index, st.DotHex)
 		}
 	}
-	// Belt-and-suspenders: entry 0 (the durable one) IS present; entries 1 + 2
-	// (the non-durable ones) are present IN-MEMORY (InsertLocal mints the dot
-	// before the WAL append) — but the ACK contract is about DURABILITY, NOT
-	// in-memory presence. Assert entry 0 present (the durable precondition); the
-	// 503 statuses are the honest "not durable" signal for 1 + 2.
+	// InsertLocal can retain an in-memory dot before its WAL append fails, so
+	// presence alone is not the durability contract. The earlier successful
+	// entry must remain present, and the failed entries' 503 responses carry the
+	// durability result.
 	if entries := engine.State().Get(batchKey(0)); len(entries) == 0 {
-		t.Fatalf("batch-insert WAL-fail per-entry: durable entry 0 NOT present in State().Get (the durable precondition is broken)")
+		t.Fatalf("durable entry 0 is absent after later WAL failures")
 	}
-	_ = g // g.SetBridge wired the bridge; the zero-dot sentinel depends on BridgeActive
-	t.Logf("batch-insert WAL-fail per-entry PASS: entry 0 → 200 (durable), entries 1+2 → 503 (WAL closed mid-batch) — the ACK-before-durability contract is PER-ENTRY, NOT per-batch")
+	_ = g // SetBridge keeps BridgeActive true for the zero-dot 503 guard.
+	t.Logf("entry 0 returned 200 with the WAL open; entries 1 and 2 returned 503 without receipts after it closed")
 }
 
-// batchKey / batchVal produce deterministic, distinct keys + values (mirrors the
-// -gate inject shape `-key-%d` / `%010d` so the guard is
-// production-faithful).
+// batchKey and batchVal produce deterministic, distinct fixture keys and
+// values using the same zero-padded index shape as the mesh write tests.
 func batchKey(i int) string { return "batch-key-" + batchIdx(i) }
 func batchVal(i int) string { return batchIdx(i) }
 
-// batchIdx is a zero-padded 3-digit index (sufficient for the 100-entry guard).
+// batchIdx returns a zero-padded three-digit index, sufficient for 100 entries.
 func batchIdx(i int) string {
 	const hexd = "0123456789"
 	b := make([]byte, 3)

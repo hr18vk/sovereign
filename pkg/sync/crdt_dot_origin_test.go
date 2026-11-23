@@ -4,78 +4,13 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — causal-dot integrity (dot/origin attribution) production guards.
+// Causal-dot attribution tests for single events and batches.
 //
-// This file is the biting test the mandate requires. It drives the
-// PRODUCTION ApplyCRDTDeltaEvent (pkg/sync/crdt_apply.go) and
-// ApplyCRDTDeltaBatch (pkg/sync/crdt_apply_batch.go) — the entry
-// points — end-to-end through the dot/origin attribution axis the
-// earlier wire-integrity arc proved for PayloadDigest (SHA-256
-// cross-validation) but never proved for the causal dot.
-//
-// HISTORY THIS FILE CLOSES (continuation of the wire-integrity arc):
-//
-//	The earlier wire-integrity phases proved PayloadDigest == SHA-256(payload)
-//	on every inbound frame — single-event via ApplyCRDTDeltaEvent, batched via
-//	ApplyCRDTDeltaBatch (atomic-reject). That closed the digest axis.
-//	The causal-dot axis remained open: a buggy or hostile peer could stamp
-//	an inbound CRDTDeltaEvent with a DotNodeID that does not equal the frame's
-//	OriginNodeID — claiming a dot from a counter-space the origin doesn't own.
-//	This file closes that gap on the SAME seam, with the SAME guards shape.
-//
-// THE FOUR DESIGN CONSTRAINTS THIS TEST ENFORCES:
-//
-//  1. the check lives in ReconstructEntry (Option C, NOT Join, NOT
-//
-// capnp.Unmarshal). Case 1/2 prove the live path rejects via the seam.
-//  2. (ordering) the dot/origin check runs BEFORE the SHA-256
-//
-// cross-validation. Case 4 proves a doubly-corrupt frame reports
-// WireIntegrityDotOriginMismatch FIRST (cheapest-to-detect violation).
-// Mutation C proves a re-ordering behind the digest check bites the guards.
-//  3. diagnostic context: the WireIntegrityError for the dot/origin
-//
-// violation carries EntityID + OriginNodeID + DotNodeID + Kind so a failed
-// frame is attributable. Case 2/3 assert the mismatched pair on the error.
-//  4. the batch path inherits the check via ReconstructEntry. Case 3
-//
-// proves it: a 3-element batch with the MIDDLE element's DotNodeID !=
-// OriginNodeID is atomic-rejected, ZERO new entries for all 3.
-//
-// THE THREE MANDATORY MUTATION PROOFS:
-//
-//	Mutation A (neuter the dot/origin check): remove the
-//
-// `if rec.DotNodeID != originNodeID` block in ReconstructEntry. Case 2
-// FAILS because the seam no longer catches the attribution mismatch, the
-// frame reconstructs cleanly (digest is consistent), and the foreign-
-// dotted entry reaches Join -> State().Get(rtEntityID) finds an entry
-// that should not be there.
-//
-//	Mutation B (bypass the seam on the dot/origin path): introduce a temporary
-//
-// bypass in ApplyCRDTDeltaEvent that synthesizes the entry off ev directly,
-// skipping ReconstructEntry, so the dot/origin mismatch reaches Join. Case
-// 2 FAILS — structurally identical to the Mutation A bypass, now
-// catching the same class of bypass for the attribution concern.
-//
-//	Mutation C (re-order the check behind the digest check — an ordering regression):
-//
-// move the dot/origin check to AFTER the SHA-256 cross-validation in
-// ReconstructEntry. Case 4 FAILS because the doubly-corrupt frame now
-// reports WireIntegrityDigestMismatch first and the
-// `wie.Kind == WireIntegrityDotOriginMismatch` assertion fires.
-//
-// Scope discipline: this file ADDS a test ONLY. It does not modify
-// crdt_reconstruct.go's digest-mismatch block, field-unread block, Read() order,
-// or any earlier wire-integrity test file, crdt_apply.go, crdt_apply_batch.go,
-// crdt.go, or hamt.go — the verifier's git diff ebfad50..HEAD on every file in
-// the must-be-byte-identical list MUST be empty. It reuses the shared rt*
-// sentinels, the production CRDTDeltaEventWireVersion from crdt_apply.go (the
-// single source of truth; read directly by name, NOT redefined), and
-// rtReconstructDotCounter from crdt_reconstruct_test.go / crdt_apply_test.go
-// fixtures (NOT redefined) so the contract guards pin against the SAME
-// surface the prior phases bit on.
+// ReconstructEntry rejects a frame whose DotNodeID differs from OriginNodeID,
+// preventing an origin from claiming a dot in another node's counter space.
+// The tests cover acceptance, single-event rejection, atomic batch rejection,
+// diagnostic fields, and validation order. Attribution is checked before the
+// payload digest, so a frame with both faults reports DotOriginMismatch.
 package sync
 
 import (
@@ -89,35 +24,18 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// rtSomeOtherNodeID is the attribution-mismatch sentinel: a 16-byte
-// peer id DISTINCT from rtHostA and rtHostB. A frame whose DotNodeID ==
-// rtSomeOtherNodeID but OriginNodeID == rtHostA is a foreign-dotted frame —
-// the frame is CLAIMING a dot from rtSomeOtherNodeID's counter-space while
-// attributing the origin to rtHostA. This is the attribution violation the seam
-// catches. Distinctness from BOTH rtHostA (the origin) and rtHostB (the
-// receiver) is what makes the mismatch unambiguous — a serializer that
-// accidentally swapped DotNodeID with OriginNodeID would still set them equal
-// (both rtHostA); only a genuinely-different dot surfaces the violation.
+// rtSomeOtherNodeID differs from both the sender and receiver. Pairing it with
+// OriginNodeID rtHostA creates a frame that attributes a dot to a counter space
+// the claimed origin does not own.
 var rtSomeOtherNodeID = [16]byte{
 	0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
 	0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
 }
 
-// buildDotOriginWireFrame is the test-side wire-byte builder. It
-// assembles a CRDTDeltaEvent whose DotNodeID and OriginNodeID can be stamped
-// INDEPENDENTLY — the exact shape a buggy-or-hostile peer produces when it
-// claims a dot from a counter-space the origin doesn't own. It MARSHALS the
-// frame to capnp bytes and returns the []byte — exactly the shape an inbound
-// transport frame hands to the production ApplyCRDTDeltaEvent.
-//
-// This mirrors the buildApplyWireFrame and buildBatchWireFrame
-// helpers but allows the dot/origin pair to diverge. Every OTHER CRDTEntry
-// contract field is stamped with the rt* sentinels; the caller controls
-// (originNodeID, dotNodeID, payload, payloadDigest, dotCounter) so a
-// doubly-corrupt frame (both dot/origin mismatch AND digest mismatch) can be
-// planted for Case 4, and a consistent frame for Case 1. The digest defaults to
-// rtPayloadDigest (SHA-256(rtPayload)) so the digest axis is CLEAN unless the
-// caller passes a wrongDigest — isolating the attribution concern in Case 2.
+// buildDotOriginWireFrame marshals a CRDTDeltaEvent with independently chosen
+// origin and dot node IDs. The caller also controls the payload, digest, and
+// dot counter, allowing attribution and digest faults to be isolated or
+// combined while all other fields retain their shared sentinels.
 func buildDotOriginWireFrame(t *testing.T, entityID string, originNodeID, dotNodeID [16]byte, digest [32]byte, payload string, dotCounter uint64) []byte {
 	t.Helper()
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
@@ -158,11 +76,11 @@ func buildDotOriginWireFrame(t *testing.T, entityID string, originNodeID, dotNod
 	return data
 }
 
-// rtDotOriginEntityID is the single-event entityID for Case 1/2/4 — DISTINCT from
-// the roundtrip/apply rtEntityID so ApplyCRDTDeltaEvent writes into host B's
-// state under its OWN key, isolating its join from any prior test state.
-// 40-char (same shape as rtEntityID) so a 16-byte-truncation regression still
-// changes both length and content on the far side.
+// rtDotOriginEntityID is the single-event entityID for Cases 1, 2, and 4 —
+// distinct from the roundtrip/apply rtEntityID so ApplyCRDTDeltaEvent writes
+// into host B's state under its own key, isolating this test's join from any
+// prior test state. 40-char (same shape as rtEntityID) so a 16-byte-truncation
+// regression still changes both length and content on the far side.
 const rtDotOriginEntityID = "tenant=acme;ledger=txn;id=dot-origin-attribution"
 
 // rtDotOriginDotCounter is a distinct nonzero DotCounter for the single-event
@@ -235,7 +153,7 @@ type dotOriginBatchSpec struct {
 
 // dotOriginBatchEntityID returns a distinct 40-char entityID per batch element,
 // derived from rtDotOriginEntityID so the far-side field-equality assertions
-// isolate this batch from the single-event case and from the sibling batch's state.
+// isolate this batch from the single-event and from the prior batch.
 func dotOriginBatchEntityID(i int) string {
 	return fmt.Sprintf("%s;el=%d", rtDotOriginEntityID, i)
 }
@@ -245,35 +163,15 @@ func dotOriginBatchDotCounter(i int) uint64 {
 	return rtDotOriginDotCounter + uint64(i) + 1
 }
 
-// TestCausalDotAttributionRejects is the production guards.
-// It drives the PRODUCTION ApplyCRDTDeltaEvent and ApplyCRDTDeltaBatch on four
-// cases — the consistent happy path (1), the single-event attribution mismatch
-// (2), the batched attribution mismatch with atomic-reject (3), and the
-// doubly-corrupt ordering contract (4). All three mandatory mutations (A
-// neuter, B bypass, C re-order) MUST make the relevant case fail red when
-// applied; run them by temporarily editing crdt_reconstruct.go (A, C) or
-// crdt_apply.go (B), running this test, and pasting the literal failing line
-// into the report. Restore before commit.
+// TestCausalDotAttributionRejects covers valid attribution, single-event and
+// batch rejection, and attribution-before-digest validation order.
 func TestCausalDotAttributionRejects(t *testing.T) {
-	engineB := setupRTEngine(t, rtHostB, 100) // bound-vs-existing-fixture resolution:
-	// This pre-test mints unrealistically-large
-	// eyecatch DotCounter sentinels (chosen for zero-fill-detection, NOT as
-	// plausible DotCounters). The production default (AbsoluteSlack=1000)
-	// closes the real-wire slack bound and is byte-identical to the design constraint; opting THIS
-	// engine into the unbounded slack knob admits the sentinels WITHOUT widening
-	// the production default that closes it. The skew axis is exercised
-	// on a fresh engine with the production default in crdt_lamport_skew_test.go.
+	engineB := setupRTEngine(t, rtHostB, 100)
+	// Unbounded slack admits the large dot sentinels used to detect missing
+	// fields; skew enforcement has separate production-default tests.
 	engineB.SetLamportAbsoluteSlack(LamportSkewAbsoluteSlackUnbounded)
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 1 — Consistent attribution, single-event happy path.
-	//
-	// Marshal a frame whose DotNodeID == OriginNodeID == rtHostA (matching the
-	// earlier wire-integrity rt* contract), call ApplyCRDTDeltaEvent(wire), and
-	// assert: (a) no error, (b) the entry is present in State().Get with
-	// DotNodeID == rtHostA and OriginNodeID == rtHostA, and (c) Join applied
-	// it. Proves the guard does not break the consistent-attribution happy path.
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 1: matching dot and origin IDs are accepted and joined unchanged.
 	consistentWire := buildDotOriginWireFrame(t, rtDotOriginEntityID, rtHostA, rtHostA, rtPayloadDigest, rtPayload, rtDotOriginDotCounter)
 	if err := engineB.ApplyCRDTDeltaEvent(consistentWire); err != nil {
 		t.Fatalf("Case 1 (consistent attribution): ApplyCRDTDeltaEvent rejected a frame whose DotNodeID == OriginNodeID == rtHostA: %v — the live path must succeed when attribution is consistent and the digest is consistent", err)
@@ -281,7 +179,7 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 
 	gotConsistent := engineB.State().Get(rtDotOriginEntityID)
 	if len(gotConsistent) == 0 {
-		t.Fatalf("Case 1: State().Get(%q) returned no entries — Join did NOT apply the validated delta; the consistent-attribution happy path is broken", rtDotOriginEntityID)
+		t.Fatalf("Case 1: State().Get(%q) returned no entries — Join did not apply the validated delta; the consistent-attribution happy path is broken", rtDotOriginEntityID)
 	}
 	if len(gotConsistent) != 1 {
 		t.Fatalf("Case 1: State().Get(%q) returned %d entries, want 1 — Join applied the delta to the wrong cardinality", rtDotOriginEntityID, len(gotConsistent))
@@ -296,41 +194,25 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 	if ce.DotCounter != rtDotOriginDotCounter {
 		t.Errorf("Case 1 DotCounter: got %#x, want %#x — the dot counter must reach Join off the wire (not zero-filled)", ce.DotCounter, rtDotOriginDotCounter)
 	}
-	// Belt-and-braces: the joined digest MUST equal SHA-256(rtPayload).
+	// Digest validation remains independent of attribution validation.
 	recomputedConsistent := sha256.Sum256([]byte(rtPayload))
 	if !bytes.Equal(recomputedConsistent[:], ce.PayloadDigest[:]) {
-		t.Errorf("Case 1: joined PayloadDigest %x != SHA-256(rtPayload) %x — the digest axis (reconstruct) still holds on the dot-origin path", ce.PayloadDigest, recomputedConsistent)
+		t.Errorf("Case 1: joined PayloadDigest %x != SHA-256(rtPayload) %x — the digest axis still holds on this path", ce.PayloadDigest, recomputedConsistent)
 	}
-	t.Logf("Case 1 GREEN: consistent-attribution frame (DotNodeID == OriginNodeID == rtHostA) applied via ApplyCRDTDeltaEvent — entry present in State().Get(%q) with DotNodeID == OriginNodeID == rtHostA.", rtDotOriginEntityID)
+	t.Logf("consistent attribution applied for %q with matching dot and origin IDs", rtDotOriginEntityID)
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 2 — Dot/origin attribution mismatch, single-event rejection.
-	//
-	// Marshal a frame whose DotNodeID = rtSomeOtherNodeID and OriginNodeID =
-	// rtHostA (a foreign-dotted frame — the dot is from
-	// rtSomeOtherNodeID's counter-space while the origin is claimed as rtHostA),
-	// call ApplyCRDTDeltaEvent(wire), and assert:
-	// (a) error returned,
-	// (b) errors.As(err, &wie) recovers the production *WireIntegrityError,
-	// (c) wie.Kind == WireIntegrityDotOriginMismatch,
-	// (d) wie.EntityID == rtDotOriginEntityID, wie.OriginNodeID == rtHostA,
-	// wie.DotNodeID == rtSomeOtherNodeID (the design constraint diagnostic context),
-	// (e) the entry is NOT in State().Get(rtDotOriginEntityID) — the rejection
-	// PREVENTED Join from applying the foreign-dotted frame.
-	//
-	// Mutation A (neuter the dot/origin check): the foreign-dotted entry
-	// reaches Join -> the `entry NOT in State()` assertion fires red.
-	// Mutation B (bypass the seam for the dot/origin concern): same red line.
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 2: a foreign dot is rejected with WireIntegrityDotOriginMismatch.
+	// The error retains the entity, claimed origin, and dot IDs; Join must not
+	// add anything beyond the valid entry from Case 1.
 	mismatchWire := buildDotOriginWireFrame(t, rtDotOriginEntityID, rtHostA, rtSomeOtherNodeID, rtPayloadDigest, rtPayload, rtDotOriginDotCounter)
 	err := engineB.ApplyCRDTDeltaEvent(mismatchWire)
 	if err == nil {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaEvent accepted a frame whose DotNodeID %x != OriginNodeID %x — MUTATION A/B CATCH: a neutered dot/origin check or a seam bypass lets the foreign-dotted frame reach Join and the attribution gap is LIVE on the wire path", rtSomeOtherNodeID, rtHostA)
+		t.Fatalf("ApplyCRDTDeltaEvent accepted DotNodeID %x with OriginNodeID %x; want attribution rejection before Join", rtSomeOtherNodeID, rtHostA)
 	}
 
 	var wie *WireIntegrityError
 	if !errors.As(err, &wie) {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaEvent rejected the foreign-dotted frame with the wrong error type %T; expected *WireIntegrityError (the seam's typed error) so the attribution failure is errors.As-able", err)
+		t.Fatalf("ApplyCRDTDeltaEvent rejected the foreign-dotted frame with the wrong error type %T; expected *WireIntegrityError so the attribution failure is errors.As-able", err)
 	}
 	if wie.Kind != WireIntegrityDotOriginMismatch {
 		t.Errorf("Case 2 Kind: got %d, want %d (WireIntegrityDotOriginMismatch) — the seam must classify a dot/origin mismatch distinctly from a digest mismatch", wie.Kind, WireIntegrityDotOriginMismatch)
@@ -339,58 +221,31 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 		t.Errorf("Case 2 diagnostic EntityID: got %q, want %q — the error must carry the entityID so the failed frame is attributable", wie.EntityID, rtDotOriginEntityID)
 	}
 	if wie.OriginNodeID != rtHostA {
-		t.Errorf("Case 2 diagnostic OriginNodeID: got %x, want %x — the error must carry the CLAIMED origin peer id", wie.OriginNodeID, rtHostA)
+		t.Errorf("Case 2 diagnostic OriginNodeID: got %x, want %x — the error must carry the claimed origin peer id", wie.OriginNodeID, rtHostA)
 	}
 	if wie.DotNodeID != rtSomeOtherNodeID {
-		t.Errorf("Case 2 diagnostic DotNodeID: got %x, want %x — the error must carry the CLAIMED dot peer id so BOTH sides of the mismatched pair are named", wie.DotNodeID, rtSomeOtherNodeID)
+		t.Errorf("Case 2 diagnostic DotNodeID: got %x, want %x — the error must carry the claimed dot peer id so both sides of the mismatched pair are named", wie.DotNodeID, rtSomeOtherNodeID)
 	}
 
-	// THE CRITICAL LIVE-PATH ASSERTION: the foreign-dotted frame was NOT
-	// applied. If a neutered dot/origin check (Mutation A) or a seam bypass
-	// (Mutation B) let the foreign-dotted frame reach Join, State().Get would
-	// find an entry (Join would have applied a dot from
-	// rtSomeOtherNodeID's counter-space to rtHostA's origin) and this fires.
+	// Only the valid Case 1 entry may remain. An additional entry or a foreign
+	// DotNodeID would show that the mismatched frame reached Join.
 	gotMismatched := engineB.State().Get(rtDotOriginEntityID)
 	if len(gotMismatched) != 1 || gotMismatched[0].DotNodeID != rtHostA {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: after the mismatched single-event batch, State().Get(%q) has %d entries (DotNodeID of [0] = %x); want exactly 1 entry with DotNodeID == rtHostA — MUTATION A/B CATCH: the foreign-dotted frame (DotNodeID=%x) reached Join despite the attribution mismatch; the attribution gap is LIVE on the single-event live path", rtDotOriginEntityID, len(gotMismatched), func() [16]byte {
+		t.Fatalf("after the mismatched single-event, State().Get(%q) has %d entries (DotNodeID of [0] = %x); want exactly 1 entry with DotNodeID == rtHostA — the foreign-dotted frame (DotNodeID=%x) reached Join despite the attribution mismatch", rtDotOriginEntityID, len(gotMismatched), func() [16]byte {
 			if len(gotMismatched) > 0 {
 				return gotMismatched[0].DotNodeID
 			}
 			return [16]byte{}
 		}(), rtSomeOtherNodeID)
 	}
-	t.Logf("Case 2 GREEN: ApplyCRDTDeltaEvent rejects a foreign-dotted frame (DotNodeID=%x, OriginNodeID=%x) with %q (errors.As → *WireIntegrityError Kind=DotOriginMismatch carrying EntityID/OriginNodeID/DotNodeID) and State().Get still holds only the Case-1 consistent entry.", rtSomeOtherNodeID, rtHostA, err.Error())
+	t.Logf("foreign dot %x with origin %x rejected with %q; only the valid entry remains", rtSomeOtherNodeID, rtHostA, err.Error())
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 3 — Batched dot/origin mismatch at index 1, atomic-reject
-	// (inheritance, the design constraint).
-	//
-	// Marshal a 3-element CRDTDeltaBatch where element 1 has DotNodeID =
-	// rtSomeOtherNodeID, OriginNodeID = rtHostA (the middle element is the
-	// foreign-dotted one), elements 0 and 2 consistent; call
-	// ApplyCRDTDeltaBatch(wire), and assert:
-	// (a) error returned naming element 1,
-	// (b) errors.As through the %w wrap recovers *WireIntegrityError with
-	// Kind == WireIntegrityDotOriginMismatch,
-	// (c) the diagnostic context (EntityID/OriginNodeID/DotNodeID) names
-	// element 1,
-	// (d) State().Get for all 3 entity IDs has ZERO new entries (the
-	// same atomic-reject contract the digest check guards).
-	//
-	// This is the proof that the dot/origin check SURVIVES the batch path: no
-	// new entry point, no batch-specific check — the per-element
-	// ReconstructEntry call enforces it identically to the digest axis.
-	// ─────────────────────────────────────────────────────────────────────
-	// Use a fresh engine to isolate Case 3's batch from Case 1's joined state.
+	// Case 3: a foreign dot in the middle event rejects the entire batch.
+	// The wrapped error identifies element 1 and retains its diagnostic fields.
+	// A fresh engine makes the zero-new-entry assertion unambiguous.
 	engineBatch := setupRTEngine(t, rtHostB, 1000)
-	// bound-vs-existing-fixture resolution:
-	// This pre-test mints unrealistically-large
-	// eyecatch DotCounter sentinels (chosen for zero-fill-detection, NOT as
-	// plausible DotCounters). The production default (AbsoluteSlack=1000)
-	// closes the real-wire slack bound and is byte-identical to the design constraint; opting THIS
-	// engine into the unbounded slack knob admits the sentinels WITHOUT widening
-	// the production default that closes it. The skew axis is exercised
-	// on a fresh engine with the production default in crdt_lamport_skew_test.go.
+	// Unbounded slack admits the large dot sentinels used to detect missing
+	// fields; skew enforcement has separate production-default tests.
 	engineBatch.SetLamportAbsoluteSlack(LamportSkewAbsoluteSlackUnbounded)
 
 	mismatchedEID := dotOriginBatchEntityID(1)
@@ -400,9 +255,9 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 		{entityID: dotOriginBatchEntityID(2), originNodeID: rtHostA, dotNodeID: rtHostA, payload: rtPayload, payloadDigest: rtPayloadDigest, dotCounter: dotOriginBatchDotCounter(2)},
 	}
 	mismatchedBatchWire := buildBatchDotOriginWireFrame(t, specs)
-	errBatch := engineBatch.ApplyCRDTDeltaBatch(mismatchedBatchWire)
+	_, errBatch := engineBatch.ApplyCRDTDeltaBatch(mismatchedBatchWire)
 	if errBatch == nil {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaBatch accepted a 3-element batch whose MIDDLE element has DotNodeID %x != OriginNodeID %x — the batch path must inherit the dot/origin check via ReconstructEntry", rtSomeOtherNodeID, rtHostA)
+		t.Fatalf("ApplyCRDTDeltaBatch accepted middle element with DotNodeID %x != OriginNodeID %x; want atomic rejection", rtSomeOtherNodeID, rtHostA)
 	}
 	// The wrap names element 1 (the failing index).
 	if !containsSubstring(errBatch.Error(), "element 1") {
@@ -410,13 +265,13 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 	}
 	var wieBatch *WireIntegrityError
 	if !errors.As(errBatch, &wieBatch) {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaBatch rejected the attribution-mismatched batch with the wrong error type %T; expected *WireIntegrityError recoverable via errors.As through the element-index wrap", errBatch)
+		t.Fatalf("ApplyCRDTDeltaBatch rejected the attribution-mismatched batch with the wrong error type %T; expected *WireIntegrityError recoverable via errors.As through the element-index wrap", errBatch)
 	}
 	if wieBatch.Kind != WireIntegrityDotOriginMismatch {
 		t.Errorf("Case 3 Kind: got %d, want %d (WireIntegrityDotOriginMismatch) — the batch path must classify a dot/origin mismatch distinctly (inherited from the seam)", wieBatch.Kind, WireIntegrityDotOriginMismatch)
 	}
 	if wieBatch.EntityID != mismatchedEID {
-		t.Errorf("Case 3 diagnostic EntityID: got %q, want %q — the error must carry the failing element's entityID so element 1 is attributable on the batch path (Option C payoff)", wieBatch.EntityID, mismatchedEID)
+		t.Errorf("Case 3 diagnostic EntityID: got %q, want %q — the error must carry the failing element's entityID so element 1 is attributable on the batch path", wieBatch.EntityID, mismatchedEID)
 	}
 	if wieBatch.OriginNodeID != rtHostA {
 		t.Errorf("Case 3 diagnostic OriginNodeID: got %x, want %x — the error must carry claim rtHostA as the origin of the foreign-dotted element 1", wieBatch.OriginNodeID, rtHostA)
@@ -424,36 +279,18 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 	if wieBatch.DotNodeID != rtSomeOtherNodeID {
 		t.Errorf("Case 3 diagnostic DotNodeID: got %x, want %x — the error must carry rtSomeOtherNodeID as the foreign dot of element 1", wieBatch.DotNodeID, rtSomeOtherNodeID)
 	}
-	// Atomic-reject: ZERO new entries for ALL three entity IDs.
+	// Atomic rejection: zero new entries for all three entity IDs.
 	for i := 0; i < 3; i++ {
 		eid := dotOriginBatchEntityID(i)
 		got := engineBatch.State().Get(eid)
 		if len(got) != 0 {
-			t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: after the mismatched batch, State().Get(%q) has %d entries, want ZERO — the batch path's atomic-reject (batch-apply) was NOT inherited by the dot/origin check: element %d reached Join despite the mid-batch attribution mismatch", eid, len(got), i)
+			t.Fatalf("after the mismatched batch, State().Get(%q) has %d entries, want zero — the batch path's atomic rejection was not inherited by the dot/origin check: element %d reached Join despite the mid-batch attribution mismatch", eid, len(got), i)
 		}
 	}
-	t.Logf("Case 3 GREEN: ApplyCRDTDeltaBatch rejects a 3-element batch whose element 1 is foreign-dotted with %q (errors.As → *WireIntegrityError Kind=DotOriginMismatch carrying element-1's EntityID/OriginNodeID/DotNodeID) and State().Get has ZERO new entries for all 3 entity IDs — atomic-reject, no partial apply.", errBatch.Error())
+	t.Logf("batch attribution mismatch rejected with %q; no entries joined", errBatch.Error())
 
-	// ─────────────────────────────────────────────────────────────────────
-	// Case 4 — Doubly-corrupt frame ordering (the ordering contract, the design constraint).
-	//
-	// Marshal a frame with BOTH a dot/origin mismatch (DotNodeID =
-	// rtSomeOtherNodeID, OriginNodeID = rtHostA) AND a digest mismatch
-	// (PayloadDigest != SHA-256(payload)), call ApplyCRDTDeltaEvent(wire), and
-	// assert:
-	// (a) error returned,
-	// (b) errors.As recovers *WireIntegrityError,
-	// (c) wie.Kind == WireIntegrityDotOriginMismatch (NOT
-	// WireIntegrityDigestMismatch — the ordering contract: the
-	// dot/origin check runs BEFORE the SHA-256 check),
-	// (d) the entry is NOT in State().Get.
-	//
-	// Mutation C (re-order the check behind the digest): Case 4 FAILS because
-	// the doubly-corrupt frame now reports WireIntegrityDigestMismatch first
-	// and the wie.Kind assertion fires. This proves the ordering is a contract, not an
-	// accident — and that a future "put the digest check first" re-ordering
-	// bites the guards.
-	// ─────────────────────────────────────────────────────────────────────
+	// Case 4: when attribution and digest are both wrong, the reported error is
+	// DotOriginMismatch because attribution is checked first. No entry joins.
 	wrongDigest := sha256.Sum256([]byte(rtPayload + "doubly-corrupt-both-attribution-and-digest"))
 	if wrongDigest == rtPayloadDigest {
 		wrongDigest[0] ^= 0x01
@@ -463,39 +300,30 @@ func TestCausalDotAttributionRejects(t *testing.T) {
 	}
 	// Fresh engine so Case 4's state assertion is unambiguous.
 	engineDoubly := setupRTEngine(t, rtHostB, 2000)
-	// bound-vs-existing-fixture resolution:
-	// This pre-test mints unrealistically-large
-	// eyecatch DotCounter sentinels (chosen for zero-fill-detection, NOT as
-	// plausible DotCounters). The production default (AbsoluteSlack=1000)
-	// closes the real-wire slack bound and is byte-identical to the design constraint; opting THIS
-	// engine into the unbounded slack knob admits the sentinels WITHOUT widening
-	// the production default that closes it. The skew axis is exercised
-	// on a fresh engine with the production default in crdt_lamport_skew_test.go.
+	// Unbounded slack admits the large dot sentinels used to detect missing
+	// fields; skew enforcement has separate production-default tests.
 	engineDoubly.SetLamportAbsoluteSlack(LamportSkewAbsoluteSlackUnbounded)
 
 	doublyWire := buildDotOriginWireFrame(t, rtDotOriginEntityID, rtHostA, rtSomeOtherNodeID, wrongDigest, rtPayload, rtDotOriginDotCounter)
 	errDoubly := engineDoubly.ApplyCRDTDeltaEvent(doublyWire)
 	if errDoubly == nil {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaEvent accepted a doubly-corrupt frame (DotNodeID=%x != OriginNodeID=%x AND PayloadDigest != SHA-256(payload)) — the seam must reject on the FIRST detected violation, not silently apply", rtSomeOtherNodeID, rtHostA)
+		t.Fatalf("ApplyCRDTDeltaEvent accepted a doubly-corrupt frame (DotNodeID=%x != OriginNodeID=%x and PayloadDigest != SHA-256(payload)) — the seam must reject on the first detected violation, not silently apply", rtSomeOtherNodeID, rtHostA)
 	}
 	var wieDoubly *WireIntegrityError
 	if !errors.As(errDoubly, &wieDoubly) {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: ApplyCRDTDeltaEvent rejected the doubly-corrupt frame with the wrong error type %T; expected *WireIntegrityError", errDoubly)
+		t.Fatalf("ApplyCRDTDeltaEvent rejected the doubly-corrupt frame with the wrong error type %T; expected *WireIntegrityError", errDoubly)
 	}
 	if wieDoubly.Kind != WireIntegrityDotOriginMismatch {
-		t.Fatalf("DOT-ORIGIN ORDERING CONTRACT BROKEN: doubly-corrupt frame reported Kind %d, want %d (WireIntegrityDotOriginMismatch) — MUTATION C CATCH: the dot/origin check must run BEFORE the SHA-256 cross-validation (the ordering invariant); a re-ordering behind the digest check makes this assertion fire red", wieDoubly.Kind, WireIntegrityDotOriginMismatch)
+		t.Fatalf("frame with attribution and digest faults reported Kind %d, want %d (WireIntegrityDotOriginMismatch): attribution must be checked first", wieDoubly.Kind, WireIntegrityDotOriginMismatch)
 	}
 	gotDoubly := engineDoubly.State().Get(rtDotOriginEntityID)
 	if len(gotDoubly) != 0 {
-		t.Fatalf("DOT-ORIGIN INVARIANT BROKEN: after the doubly-corrupt single-event, State().Get(%q) has %d entries, want ZERO — the seam must reject the frame before Join applies it", rtDotOriginEntityID, len(gotDoubly))
+		t.Fatalf("after the doubly-corrupt single-event, State().Get(%q) has %d entries, want zero — the seam must reject the frame before Join applies it", rtDotOriginEntityID, len(gotDoubly))
 	}
-	t.Logf("Case 4 GREEN: doubly-corrupt frame (DotNodeID=%x != OriginNodeID=%x AND PayloadDigest != SHA-256(payload)) reports WireIntegrityDotOriginMismatch FIRST — the ordering contracts the dot/origin check BEFORE the digest check; Mutation C bites this assertion.", rtSomeOtherNodeID, rtHostA)
+	t.Logf("frame with DotNodeID=%x != OriginNodeID=%x and a digest mismatch reported WireIntegrityDotOriginMismatch first", rtSomeOtherNodeID, rtHostA)
 }
 
-// containsSubstring is a tiny helper so the test does not pull strings.Contains
-// into the import block for one call (keeping the imports tight, matching the
-// repo convention of std-lib-only imports where a single call do not justify a
-// package). Equivalent to strings.Contains(s, substr).
+// containsSubstring reports whether s contains substr.
 func containsSubstring(s, substr string) bool {
 	if len(substr) == 0 {
 		return true

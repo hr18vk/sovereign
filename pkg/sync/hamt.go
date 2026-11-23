@@ -27,11 +27,9 @@ type CausalDot struct {
 	Counter uint64
 }
 
-// CRDTEntry is a single element in the Add-Wins Set lattice.
-//
-// ADR 10: Dot fields are flattened from the nested CausalDot struct into
-// DotNodeID and DotCounter to eliminate indirection and ensure the struct
-// is exactly 120 bytes with zero internal padding.
+// CRDTEntry is a single element in the Add-Wins Set lattice. Its dot fields
+// are flattened to avoid indirection; the 120-byte layout has no internal
+// padding.
 type CRDTEntry struct {
 	PayloadDigest  [32]byte
 	OriginNodeID   [16]byte
@@ -51,11 +49,9 @@ func (e CRDTEntry) Dot() CausalDot {
 	return CausalDot{NodeID: e.DotNodeID, Counter: e.DotCounter}
 }
 
-// hamtLeaf stores entries for a single entity ID at a leaf node.
-//
-// ADR 10: All fields are off-heap. entityPtr and entriesPtr are NodePtr
-// values pointing into the mmap arena. entityLen/entriesLen are the
-// element counts. This struct is exactly 32 bytes.
+// hamtLeaf stores entries for one entity ID. The key and entries live in the
+// mmap arena; entityPtr and entriesPtr locate them, and the length fields hold
+// their byte and element counts respectively. The struct occupies 32 bytes.
 type hamtLeaf struct {
 	hash       uint64
 	entityPtr  NodePtr
@@ -78,15 +74,10 @@ func makeLeaf(arena *HamtArena, key string, hash uint64, entries []CRDTEntry) ha
 	}
 }
 
-// copyLeaf creates an independent deep copy of a leaf's arena-allocated
-// data (entity string and CRDT entry array). This is necessary when
-// reusing leaves from an old node in a new node: when the old node is
-// DecRef'd, its leaf data is freed, so the new node must own independent
-// copies.
-//
-// Unlike the eradicated "Hybrid Trie" deep copy (which copied ALL trapped
-// entries on every intermediate node traversal), this copy is O(1) per
-// leaf and only happens during mutations at the leaf level.
+// copyLeaf copies a leaf's key and entries into fresh arena allocations. The
+// new node must own these copies because decrementing the old node's reference
+// count eventually releases its leaf data. Copying is confined to leaves on a
+// mutation path.
 func copyLeaf(arena *HamtArena, src hamtLeaf) hamtLeaf {
 	dst := src
 	if src.entityPtr != 0 && src.entityLen > 0 {
@@ -125,22 +116,12 @@ type HAMT struct {
 	count int
 }
 
-// NewHAMT constructs the empty root HAMT.
-//
-// ZERO-GC MANDATE: The wrapper struct itself is allocated from
-// the off-heap arena via `arena.allocHAMTWrapper()`, NOT the Go heap.
-// This is critical for type-uniformity with HAMT.Set/Delete — the
-// DeltaCRDTEngine's InsertLocal retires the OLD root state via
-// `e.ebr.Retire(unsafe.Pointer(current))` and the EBR freeRetiredList
-// then casts that pointer to `*HAMT` and calls `freeHAMTWrapper` on
-// it. If this constructor returned a Go-heap pointer, that free would
-// dereference a Go-heap address as a mmap offset and SIGSEGV. Worse,
-// it would silently leak the 32-byte Go-heap struct because the EBR
-// never routes it back through the slab free-list.
-//
-// The arena invariant `e.arena` on DeltaCRDTEngine roots the mmap'd
-// arena on the Go heap for the lifetime of the engine, satisfying
-// the contract documented on allocHAMTWrapper.
+// NewHAMT constructs an empty HAMT whose wrapper and root are allocated in
+// the arena. InsertLocal retires roots through EBR, which releases their
+// wrappers with freeHAMTWrapper; a Go-heap wrapper would make that path treat
+// a heap address as an arena offset and would not return the wrapper to its
+// slab. DeltaCRDTEngine.arena keeps the mmap-backed allocator reachable for
+// the lifetime of these wrappers.
 func NewHAMT(arena *HamtArena) *HAMT {
 	res := arena.allocHAMTWrapper()
 	res.root = arena.AllocNode()
@@ -150,9 +131,9 @@ func NewHAMT(arena *HamtArena) *HAMT {
 	return res
 }
 
-// newHAMTWithSeed constructs an empty root HAMT with a specific seed —
-// used by deterministic Merkle-root tests. Same off-heap contract as
-// NewHAMT.
+// newHAMTWithSeed constructs an empty HAMT with a fixed hash seed for
+// deterministic Merkle-root tests. It has the same arena ownership contract
+// as NewHAMT.
 func newHAMTWithSeed(arena *HamtArena, seed maphash.Seed) *HAMT {
 	res := arena.allocHAMTWrapper()
 	res.root = arena.AllocNode()
@@ -179,31 +160,12 @@ func (h *HAMT) Get(entityID string) []CRDTEntry {
 	return res
 }
 
-// Set returns a new HAMT with `entityID` mapped to `entries`.
-//
-// PATH-COPYING + ZERO-GC CONTRACT (— Zero-GC Microscope):
-//
-//	ALLOCATION #1 ELIMINATED — redundant []CRDTEntry clone.
-//
-// The previous implementation cloned the caller-supplied `entries`
-// slice via `make([]CRDTEntry, len(entries))` before passing it
-// down to `root.set`. This was a defensive copy whose contents were
-// fully and synchronously copied into the mmap arena by makeLeaf →
-// arena.allocCRDTEntries before Set returned — the Go-heap clone
-// contributed zero data safety, only one extraneous heap allocation
-// per Set. It is gone. The caller may reuse / mutate `entries` the
-// instant Set returns, because by that point the bytes live only in
-// mmap'd C-space.
-//
-//	ALLOCATION #2 ELIMINATED — result HAMT wrapper.
-//
-// The result *HAMT is now provisioned by `h.arena.allocHAMTWrapper()`
-// from the segregated slab allocator inside the mmap arena, instead of
-// `res:= &HAMT{...}` which the escape analyzer moved to the Go heap.
-// This severs the last heap-allocation source on the Set hot path.
-// The arena pointer field inside the wrapper is GC-invisible; the
-// arena itself stays rooted on the Go heap by the owning engine or
-// test (see allocHAMTWrapper safety contract).
+// Set returns a new HAMT with entityID mapped to entries. It path-copies the
+// affected nodes and allocates the result wrapper in the arena. makeLeaf
+// synchronously copies entries into the arena, so the caller may reuse or
+// mutate its slice after Set returns. The caller must keep the arena reachable
+// from the Go heap because the off-heap wrapper's arena pointer is invisible
+// to the collector.
 func (h *HAMT) Set(entityID string, entries []CRDTEntry) *HAMT {
 	hash := h.hashKey(entityID)
 	existing := h.root.get(entityID, hash, 0)
@@ -228,14 +190,9 @@ func (h *HAMT) Set(entityID string, entries []CRDTEntry) *HAMT {
 	return res
 }
 
-// Delete returns a new HAMT without `entityID`. Paired with Set in the
-// Zero-GC mandate: the result wrapper is allocated from the off-heap
-// arena via allocHAMTWrapper, not the Go heap.
-//
-// NOTE on the no-op path (key absent): this function returns `h` (the
-// receiver) directly — no new wrapper is allocated, so no allocation
-// occurs for that case. The returned *HAMT is the SAME pointer as the
-// receiver, allowing the caller to treat both cases uniformly.
+// Delete returns a new HAMT without entityID. As in Set, the result wrapper
+// comes from the arena. If the key is absent, Delete returns the receiver
+// unchanged and does not allocate a wrapper.
 func (h *HAMT) Delete(entityID string) *HAMT {
 	hash := h.hashKey(entityID)
 	existing := h.root.get(entityID, hash, 0)
@@ -251,10 +208,9 @@ func (h *HAMT) Delete(entityID string) *HAMT {
 	return res
 }
 
-// RootPtr returns the off-heap NodePtr of the HAMT root node. Read-only,
-// exposed for the Residency §2 chaos-probe (internal/chaos) so it can locate a
-// live pointer to corrupt for the guaranteed off-heap SIGSEGV. Off the hot
-// read/write path; Zero-GC invariants are unaffected.
+// RootPtr returns the root's arena address. The crash tests in internal/chaos
+// use it to locate off-heap memory for a fault-injection dereference. It is
+// read-only and is not used by HAMT reads or mutations.
 func (h *HAMT) RootPtr() NodePtr { return h.root }
 
 func (h *HAMT) ForEach(fn func(entityID string, entries []CRDTEntry) bool) {
@@ -345,11 +301,10 @@ func allocChildrenArray(arena *HamtArena, children []NodePtr) NodePtr {
 	return NodePtr(ptr)
 }
 
-// allocEntriesArray copies hamtLeaf structs into the arena as a
-// length-prefixed contiguous block. This is a SHALLOW copy of the
-// hamtLeaf structs — the caller must ensure each leaf's entityPtr and
-// entriesPtr point to independently allocated arena data (via copyLeaf
-// or makeLeaf) to prevent use-after-free when old nodes are DecRef'd.
+// allocEntriesArray copies leaf descriptors into a length-prefixed arena
+// block. It does not copy their keys or entries: the caller must use copyLeaf
+// or makeLeaf so each leaf owns independent data after the old node is
+// released.
 func allocEntriesArray(arena *HamtArena, entries []hamtLeaf) NodePtr {
 	if len(entries) == 0 {
 		return 0
@@ -420,15 +375,9 @@ func (p NodePtr) get(key string, hash uint64, depth int) []CRDTEntry {
 	return children[pos].get(key, hash, depth+1)
 }
 
-// -------------------------------------------------------------------
-// MANDATE 1: set() — mathematically correct HAMT with NO trapped entries
-// -------------------------------------------------------------------
-//
-// A correct HAMT intermediate node holds ONLY children (entriesPtr = 0).
-// When a collision occurs at a leaf (a new key must be inserted into a
-// leaf that doesn't contain it), the existing entries and the new entry
-// are pushed DOWN into deeper child leaves via distributeLeaves().
-// Intermediate nodes never carry entriesPtr.
+// Intermediate nodes contain children, not leaf entries. A collision at a
+// leaf builds deeper nodes until the old and new keys occupy different child
+// positions; entries remain in leaf nodes throughout the path copy.
 
 func (p NodePtr) set(arena *HamtArena, key string, hash uint64, entries []CRDTEntry, depth int) NodePtr {
 	if p == 0 {
@@ -456,7 +405,7 @@ func (p NodePtr) set(arena *HamtArena, key string, hash uint64, entries []CRDTEn
 		}
 	}
 
-	// --- INTERMEDIATE NODE: has children, entriesPtr MUST be 0 ---
+	// --- Intermediate node: has children, entriesPtr must be 0 ---
 
 	idx := (hash >> (uint(depth) * hamtBits)) & hamtMask
 	bit := uint32(1) << idx
@@ -479,7 +428,7 @@ func (p NodePtr) set(arena *HamtArena, key string, hash uint64, entries []CRDTEn
 		newNode.bitmap = n.bitmap | bit
 
 		oldChildren := getChildren(n.childrenPtr, popcount(n.bitmap))
-		// MANDATE 3: stack-allocated scratch array — zero heap allocations
+		// A fixed-size stack scratch array avoids a Go heap allocation.
 		var childScratch [hamtWidth]NodePtr
 		newChildren := childScratch[:len(oldChildren)+1]
 		copy(newChildren[:pos], oldChildren[:pos])
@@ -491,7 +440,7 @@ func (p NodePtr) set(arena *HamtArena, key string, hash uint64, entries []CRDTEn
 		}
 
 		newNode.childrenPtr = allocChildrenArray(arena, newChildren)
-		// MANDATE 1: intermediate nodes hold ONLY children
+		// Intermediate nodes hold only children
 		newNode.entriesPtr = 0
 
 		return newNodePtr
@@ -549,7 +498,7 @@ func (p NodePtr) set(arena *HamtArena, key string, hash uint64, entries []CRDTEn
 	}
 
 	newNode.childrenPtr = allocChildrenArray(arena, newChildren)
-	// MANDATE 1: intermediate nodes hold ONLY children
+	// Intermediate nodes hold only children
 	newNode.entriesPtr = 0
 
 	return newNodePtr

@@ -17,24 +17,20 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// LATENCY HONESTY. The bridge adds an AppendMutation fsync to the
-// origin write path. The fsync cost is REAL; hiding it would fabricate
-// durability. This bench measures PutLocal ns/op (InsertLocal + AppendMutation
-// fsync) vs bare engine.InsertLocal ns/op, on the benchmark host
-// (NOT a 32c number). The honest delta = the production write-path latency
-// price of fsync-per-mutation durability.
+// These benchmarks compare PutLocal, including its AppendMutation fsync, with
+// bare engine.InsertLocal. Their difference measures the write-path latency of
+// fsync-per-mutation durability on the host running the benchmark; it is not a
+// 32-core fleet result.
 //
-// Run: go test -bench=BenchmarkBridgePutLocal -benchmem -count=5./pkg/durability/
-// The bench writes to a temp-file WAL (real fsync) so the number reflects the
-// production cost, not a /dev/null sink.
+// Run: go test -bench=BenchmarkBridgePutLocal -benchmem -count=5 ./pkg/durability/
+// The WAL is a temporary file, so the benchmark performs real fsyncs rather
+// than writing to a null sink.
 
-// benchArenaSize is larger than the test arena (64MiB) because the bench runs
-// to high b.N and the mmap arena is a bump allocator that does not reclaim
-// EBR-retired nodes until Close. Each InsertLocal path-copies ~256B; a 64MiB
-// arena fills at ~256k ops (the bench's typical max N). 1GiB handles ~4M ops,
-// comfortably above the bench ceiling, so the per-op ns/op is measured without
-// an arena-exhaustion panic. This is a bench-only knob; production sets the
-// arena via --arena-mib.
+// benchArenaSize accommodates high b.N values because the mmap arena is a bump
+// allocator that does not reclaim EBR-retired nodes until Close. At roughly
+// 256 bytes path-copied per InsertLocal, 64 MiB fills after about 256,000
+// operations and 1 GiB after about 4 million. The larger arena avoids an
+// exhaustion panic during a long benchmark. Production uses --arena-mib.
 const benchArenaSize uintptr = 1024 * 1024 * 1024
 
 func benchNodeID() [16]byte {
@@ -63,15 +59,13 @@ func benchEntry(i int) eng.CRDTEntry {
 	}
 }
 
-// BenchmarkBridgePutLocal measures the durable write path: InsertLocal +
-// AppendMutation (fsync). Compare against BenchmarkBareInsertLocal to read
-// the fsync latency price.
+// BenchmarkBridgePutLocal measures InsertLocal followed by an AppendMutation
+// fsync. BenchmarkBareInsertLocal supplies the in-memory baseline.
 //
-// The bench reuses a bounded working set of entity IDs (the realistic
-// steady-state pattern — a production node overwrites a bounded set of
-// entities, it does not mint unbounded new ones) so the fixed 64MiB arena is
-// not exhausted at high b.N. Each iteration overwrites entity (i % workingSet)
-// with a fresh, strictly-higher dot, exactly as a live origin does.
+// The benchmark reuses a bounded working set, as an origin overwriting an
+// existing key space does. Each iteration writes entity i%workingSet with a
+// fresh, strictly greater dot. The 1 GiB benchArenaSize leaves room for the
+// path copies retained by this workload.
 func BenchmarkBridgePutLocal(b *testing.B) {
 	const workingSet = 4096
 	walPath := filepath.Join(b.TempDir(), "bench.wal")
@@ -100,9 +94,9 @@ func BenchmarkBridgePutLocal(b *testing.B) {
 	}
 }
 
-// BenchmarkBareInsertLocal measures the in-memory write path (no WAL, no
-// fsync) — the baseline. The delta vs BenchmarkBridgePutLocal is the
-// fsync latency price of durability.
+// BenchmarkBareInsertLocal measures InsertLocal with a payload digest but no
+// WAL or fsync. Its difference from BenchmarkBridgePutLocal is the measured
+// latency added by durable append.
 func BenchmarkBareInsertLocal(b *testing.B) {
 	const workingSet = 4096
 	eng.DataDir = b.TempDir()
@@ -124,7 +118,6 @@ func BenchmarkBareInsertLocal(b *testing.B) {
 	}
 }
 
-// TestMain keeps the bench file from polluting the package's test binary with
-// stray temp dirs when run as a plain test (no-op here; the bench funcs own
-// their setup).
+// TestMain uses the default test runner. The benchmarks manage their own
+// temporary directories through testing.B.
 func TestMain(m *testing.M) { os.Exit(m.Run()) }

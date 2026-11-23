@@ -6,14 +6,11 @@
 
 package database
 
-// Regression guards for an intermittent internal/database jemalloc heap
-// corruption (SIGSEGV addr=0x30 on the 64KB size class), root-caused
-// to a WRONG-SIZE FREE: a caller freed a RESLICED jemalloc buffer (buf[:n]), so
-// sdallocx received the content length n (3266) instead of the usable size
-// jemalloc recorded (32768), returning a 32KB large block to the wrong size class
-// and corrupting the heap metadata that a later 64KB flush alloc/free tripped
-// over. The fix makes Free derive the size from malloc_usable_size (jemalloc's
-// ground truth), not len(b). These guards pin that contract.
+// Regression tests for jemalloc Free() usable-size tracking.
+//
+// Free derives the block's allocation size from malloc_usable_size rather than
+// len(b) so freeing a resliced buffer (buf[:n]) still returns the full block to
+// the right jemalloc size class and keeps BytesAllocated accurate.
 
 import (
 	"bytes"
@@ -22,24 +19,20 @@ import (
 	"testing"
 )
 
-// The determinized culprit guard. Drives the EXACT wrong-size-free pattern (free a
-// resliced buffer) and asserts the engine survives AND the usable-size accounting
-// stays exact. Deterministic: pre-fix the accounting drift (Free subtracts
-// len(b)=content, not the usable size) fails the balance check on EVERY run —
-// it does not depend on the intermittent SIGSEGV. Bug-injection-proven: reverting
-// Free to sdallocx(ptr, len(b)) makes this FAIL.
+// TestReslicedFreeIsSafeAndBalanced frees resliced 32KB buffers and verifies
+// BytesAllocated stays balanced across subsequent 64KB allocations.
 func TestReslicedFreeIsSafeAndBalanced(t *testing.T) {
 	a := NewJemallocAllocator()
 	base := a.BytesAllocated()
-	const req = 32 * 1024 // the size class the wrong-size-free culprit crossed (32KB large)
+	const req = 32 * 1024 // the size class the corruption crossed (32KB large)
 	for i := 0; i < 512; i++ {
 		buf := a.Allocate(req)
 		content := 1000 + (i % 2000) // a variable content length < req
 		for j := 0; j < content; j++ {
 			buf[j] = byte(j)
 		}
-		// THE BUG PATTERN: free a reslice (buf[:content]), not the full buffer.
-		// Pre-fix this corrupted the heap AND drifted the accounting; post-fix
+		// The bug pattern: free a reslice (buf[:content]), not the full buffer.
+		// Pre-fix this corrupted the heap and drifted the accounting; post-fix
 		// Free frees the whole block via malloc_usable_size.
 		a.Free(buf[:content])
 	}
@@ -59,10 +52,8 @@ func TestReslicedFreeIsSafeAndBalanced(t *testing.T) {
 	}
 }
 
-// The usable-size-exact accounting pin. The 2048->32768 anomaly was a
-// symptom of the corrupted heap lying about a block's usable size; post-fix the
-// accounting is exact on every transition. Pin: BytesAllocated tracks the live
-// blocks' usable sizes exactly and returns to baseline after the last free.
+// TestReallocateAccountingExact verifies BytesAllocated tracks usable sizes
+// across Allocate, grow/shrink Reallocate, and Free.
 func TestReallocateAccountingExact(t *testing.T) {
 	a := NewJemallocAllocator()
 	if got := a.BytesAllocated(); got != 0 {
@@ -86,21 +77,18 @@ func TestReallocateAccountingExact(t *testing.T) {
 	}
 }
 
-// The audit instrument is LOAD-BEARING (not vacuous). Armed
-// (SUPREMUM_JEMALLOC_AUDIT=1) it must (a) flag a resliced wrong-size free call
-// and (b) PANIC on a double free. Runs the offending call in a subprocess so the
-// panic cannot abort the parent suite. This guards the diagnostic that found the
-// wrong-size-free defect against silently rotting into a tautology.
+// TestAuditInstrumentIsLoadBearing verifies that SUPREMUM_JEMALLOC_AUDIT=1
+// logs resliced frees and panics on double frees in isolated subprocesses.
 func TestAuditInstrumentIsLoadBearing(t *testing.T) {
 	switch os.Getenv("JEMALLOC_AUDIT_SELFTEST") {
 	case "wrongsize":
-		// child: a resliced free (the wrong-size-free caller pattern) — the audit must LOG it.
+		// child: a resliced free (the corruption caller pattern) — the instrument must log it.
 		a := NewJemallocAllocator()
 		buf := a.Allocate(32768)
 		a.Free(buf[:1000])
 		return
 	case "doublefree":
-		// child: a double free — audit must PANIC (this class stays unsafe).
+		// child: a double free — the instrument must panic (this class stays unsafe).
 		a := NewJemallocAllocator()
 		buf := a.Allocate(4096)
 		a.Free(buf)
@@ -108,28 +96,28 @@ func TestAuditInstrumentIsLoadBearing(t *testing.T) {
 		return
 	}
 	if testing.Short() {
-		t.Skip("subprocess audit guard runs outside -short")
+		t.Skip("subprocess audit test runs outside -short")
 	}
 
-	// Wrong-size arm: the fix makes the free safe, so the child EXITS CLEANLY,
-	// but the armed audit must have logged the wrong-size call to stderr.
+	// Wrong-size arm: the fix makes the free safe, so the child exits cleanly,
+	// but the armed instrument must have logged the wrong-size call to stderr.
 	cmdWrong := exec.Command(os.Args[0],
 		"-test.run", "^TestAuditInstrumentIsLoadBearing$", "-test.count=1", "-test.v")
 	cmdWrong.Env = append(os.Environ(), "SUPREMUM_JEMALLOC_AUDIT=1", "JEMALLOC_AUDIT_SELFTEST=wrongsize")
 	outWrong, errWrong := cmdWrong.CombinedOutput()
 	if !bytes.Contains(outWrong, []byte("WRONG-SIZE-FREE-CALL")) {
-		t.Fatalf("armed audit did NOT flag a resliced wrong-size free (instrument is vacuous); output: %s (err=%v)", outWrong, errWrong)
+		t.Fatalf("armed audit did not flag a resliced wrong-size free; output: %s (err=%v)", outWrong, errWrong)
 	}
 
-	// Double-free arm: the audit must PANIC (non-zero exit) naming the class.
+	// Double-free arm: the instrument must panic (non-zero exit) naming the class.
 	cmdDbl := exec.Command(os.Args[0],
 		"-test.run", "^TestAuditInstrumentIsLoadBearing$", "-test.count=1")
 	cmdDbl.Env = append(os.Environ(), "SUPREMUM_JEMALLOC_AUDIT=1", "JEMALLOC_AUDIT_SELFTEST=doublefree")
 	outDbl, errDbl := cmdDbl.CombinedOutput()
 	if errDbl == nil {
-		t.Fatalf("armed audit did NOT panic on a double free (exit 0); instrument is vacuous; output: %s", outDbl)
+		t.Fatalf("armed instrument did not panic on a double free (exit 0); output: %s", outDbl)
 	}
 	if !bytes.Contains(outDbl, []byte("INVALID-OR-DOUBLE-FREE")) {
-		t.Fatalf("armed audit double-free did not report INVALID-OR-DOUBLE-FREE; output: %s", outDbl)
+		t.Fatalf("armed audit double-free did not report the expected class; output: %s", outDbl)
 	}
 }

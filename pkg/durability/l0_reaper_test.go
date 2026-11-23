@@ -4,47 +4,16 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// (ADR-0021) guards (the REAL *LocalFS guards) — the L0 reaper fork, driven
-// against a REAL *LocalFS (the guard-principle "drive the route, not
-// the seam" — the same discipline/15 used).
+// L0 reaper tests over real LocalFS storage (ADR-0021). Compaction leaves the
+// merged L0 files and a manifest on disk as a recovery backstop. The reaper
+// deletes the manifest-listed L0 files only after verifying that their L1 still
+// exists, then deletes the manifest.
 //
-// The reaper CLOSES the monotonic L0 disk leak ADR-0020 §6c deferred: the
-// compaction write path (l1_compactor.go) writes a manifest at
-// compaction/{hex8}/{sysNs}.manifest listing the L0 files it merged into the L1,
-// but the L0 files are KEPT FOREVER as the crash-recovery backstop (no code
-// deletes them; every compaction leaves N L0 files PLUS the manifest on disk).
-// The reaper deletes the manifest-listed L0 files AFTER verifying the L1 still
-// exists (Stage C safety guard), then deletes the manifest.
-//
-// THE GUARDS (mirrors the §1.5 spec):
-//
-// - T1 — THE HEADLINE: write N per-entity checkpoints → run compaction (a
-// manifest listing the N L0s is written, the L1 is written, the L0s STAY)
-// → Reap → every superseded L0 is deleted, the manifest is deleted, the L1
-// is untouched, and L0 files NOT in the manifest are untouched.
-// RED-before-reaping (the L0s exist) → GREEN-after (os.Stat → not found).
-//
-// - T2 — the safety guard (the load-bearing test): delete the L1 a manifest
-// points at, then Reap → the reaper MUST NOT delete the L0s NOR the
-// manifest; SkippedOrphan increments. This is the critical safety condition
-// the whole reaper exists to enforce: an L0 whose L1 is gone is the SOLE
-// durable copy → preserve it.
-//
-// - T3 — idempotent reaper: run Reap TWICE. The second run observes the
-// manifest + L0s already deleted (LocalFS.Delete returns nil for
-// os.IsNotExist) → zero-deletes, zero-error, no manifest (it was deleted
-// round 1; not re-listed). The second run is a clean no-op, NOT an error.
-//
-// - T4 — partial reap: a manifest with K L0s; make ONE L0 delete fail (a
-// fault-injecting LocalFS wrapper) so only the first succeeds → the manifest
-// is NOT deleted (Stage D stops on the first delete failure); the already-
-// deleted L0 stays deleted (monotone forward progress); SkippedError
-// increments. The next sweep (against the real LocalFS) reaps the rest.
-//
-// These guards live in pkg/durability (the home of LocalFS) because an
-// internal/database test cannot import pkg/durability (import cycle: snapshot.go
-// imports internal/database) — the precedent. The frozen-md5 +
-// scope-hygiene guards (T5/T6) live in internal/database/crdt_frozen_repin_test.go.
+// The fixtures cover a complete reap, a missing L1, repeated sweeps, and a delete
+// failure partway through a manifest. They also check that unrelated L0 files
+// survive and that a completed L1 still serves queries after its L0 inputs are
+// reclaimed. These tests live beside LocalFS to avoid an import cycle with
+// internal/database.
 package durability
 
 import (
@@ -60,19 +29,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newReaperLocalFS builds a REAL *LocalFS (reuses the helper — same root,
-// same temp-dir cleanup, same compile-checked interface satisfaction). The reaper
-// guards drive the production-on-disk path the guard-principle demands.
+// newReaperLocalFS uses the shared LocalFS fixture so reaper tests exercise the
+// same on-disk interfaces and cleanup as the compaction tests.
 func newReaperLocalFS(t *testing.T) *LocalFS {
 	t.Helper()
 	return newLocalFS(t)
 }
 
-// writeNMerge writes `n` per-entity checkpoints for ONE entity and runs a
-// compaction to produce a manifest listing all `n` L0 keys → returns the merged
-// set (manifestKey, l1Key, l0Keys, hash8). The L0 files STAY on disk after the
-// compaction (keeps them as the backstop — the reaper reclaims them).
-// RED-before-reaping helper for T1.
+// writeNMerge writes n checkpoints and compacts them into an L1. It returns the
+// manifest, L1, merged L0 keys, and entity hash. Compaction intentionally leaves
+// the L0 files in place for the reaper to reclaim.
 func writeNMerge(t *testing.T, lfs *LocalFS, alloc *database.JemallocAllocator, entity string, n int) (manifestKey, l1Key string, l0Keys []string, hash8 [8]byte) {
 	t.Helper()
 	writeNCheckpoints(t, alloc, lfs, entity, n)
@@ -99,20 +65,18 @@ func keyExists(t *testing.T, lfs *LocalFS, key string) bool {
 	return true
 }
 
-// deleteKey removes a key directly (bypassing the reaper — used by T2 to
-// simulate the filesystem losing the L1 a manifest points at).
+// deleteKey removes an object directly to simulate loss of the L1 named by a
+// manifest.
 func deleteKey(t *testing.T, lfs *LocalFS, key string) {
 	t.Helper()
 	err := lfs.Delete(context.Background(), "local", key)
-	require.NoErrorf(t, err, "direct delete %s (T2 fault setup)", key)
+	require.NoErrorf(t, err, "delete L1 %s to simulate loss", key)
 }
 
-// --- T1 — THE HEADLINE: Reap deletes every superseded L0 + the manifest, leaves
-// the L1 + non-manifest L0s untouched (RED-then-GREEN over a REAL *LocalFS). ---
-//
-// Setup a SECOND entity (entity "bravo") with its own L0 file that is NOT in the
-// reaped manifest, to prove the reaper deletes ONLY the manifest-listed L0s.
-// The bravo L0 is NOT superseded (no compaction ran for it) → it MUST survive.
+// TestReapDeletesSupersededL0AndManifestRedThenGreen verifies a complete reap.
+// A second entity supplies an unmerged L0 file that must survive because it is
+// absent from the manifest. The merged L1 and its query results must survive as
+// well.
 func TestReapDeletesSupersededL0AndManifestRedThenGreen(t *testing.T) {
 	ctx := context.Background()
 	lfs := newReaperLocalFS(t)
@@ -121,8 +85,8 @@ func TestReapDeletesSupersededL0AndManifestRedThenGreen(t *testing.T) {
 	const N = 8
 	manifestKey, l1Key, l0Keys, _ := writeNMerge(t, lfs, alloc, entity, N)
 
-	// A SECOND entity with an UNSUPERSEDED L0 (no compaction → no manifest → the
-	// reaper MUST NOT touch it). Proves the reaper deletes ONLY manifest-listed
+	// A second entity with an un-superseded L0 (no compaction → no manifest → the
+	// reaper must not touch it). Proves the reaper deletes only manifest-listed
 	// L0s, not every L0 on disk.
 	const bystander = "bravo"
 	writeNCheckpoints(t, alloc, lfs, bystander, 1)
@@ -132,54 +96,43 @@ func TestReapDeletesSupersededL0AndManifestRedThenGreen(t *testing.T) {
 	require.Lenf(t, bystanderL0s, 1, "bystander entity bravo must have exactly 1 L0 file")
 	bystanderL0 := bystanderL0s[0]
 
-	// --- RED stage: before reaping, every superseded L0 exists + the manifest
-	// exists; the L1 exists (the reaper's Stage C will verify it). ---
+	// Establish every input before reaping, including the L1 that the safety
+	// check must verify and the unrelated bystander file.
 	for _, k := range l0Keys {
-		require.Truef(t, keyExists(t, lfs, k), "RED: superseded L0 %s must exist BEFORE reaping", k)
+		require.Truef(t, keyExists(t, lfs, k), "superseded L0 %s must exist before reaping", k)
 	}
-	require.Truef(t, keyExists(t, lfs, manifestKey), "RED: manifest %s must exist BEFORE reaping", manifestKey)
-	require.Truef(t, keyExists(t, lfs, l1Key), "RED: L1 %s must exist (the reaper verifies it at Stage C)", l1Key)
-	require.Truef(t, keyExists(t, lfs, bystanderL0), "RED: bystander L0 %s must exist (will prove the reaper leaves non-manifest L0s alone)", bystanderL0)
+	require.Truef(t, keyExists(t, lfs, manifestKey), "manifest %s must exist before reaping", manifestKey)
+	require.Truef(t, keyExists(t, lfs, l1Key), "L1 %s must exist for the reaper safety check", l1Key)
+	require.Truef(t, keyExists(t, lfs, bystanderL0), "unrelated L0 %s must exist before reaping", bystanderL0)
 
-	// --- GREEN stage: run the reaper. ---
 	reaper := database.NewL0Reaper(lfs, lfs, lfs, "local")
 	res := reaper.Reap(ctx)
 
-	// Stage F tally assertions: exactly 1 manifest fully reaped, N L0s deleted,
-	// 0 orphan, 0 error.
-	assert.Equalf(t, 1, res.ReapedManifests, "T1: exactly 1 manifest fully reaped (got %d)", res.ReapedManifests)
-	assert.Equalf(t, N, res.ReapedL0, "T1: all %d manifest-listed L0s deleted (got %d)", N, res.ReapedL0)
-	assert.Equalf(t, 0, res.SkippedOrphan, "T1: 0 orphan (the L1 IS present — Stage C admits); got %d", res.SkippedOrphan)
-	assert.Equalf(t, 0, res.SkippedError, "T1: 0 delete-error; got %d", res.SkippedError)
+	assert.Equalf(t, 1, res.ReapedManifests, "got %d fully reaped manifests, want 1", res.ReapedManifests)
+	assert.Equalf(t, N, res.ReapedL0, "all %d manifest-listed L0 files must be deleted; got %d", N, res.ReapedL0)
+	assert.Equalf(t, 0, res.SkippedOrphan, "got %d orphan skips with the L1 present", res.SkippedOrphan)
+	assert.Equalf(t, 0, res.SkippedError, "got %d delete errors", res.SkippedError)
 
-	// Every superseded L0 is GONE (os.Stat → not found).
 	for _, k := range l0Keys {
-		assert.Falsef(t, keyExists(t, lfs, k), "GREEN: superseded L0 %s must be DELETED after reaping", k)
+		assert.Falsef(t, keyExists(t, lfs, k), "superseded L0 %s still exists after reaping", k)
 	}
-	// The manifest is GONE.
-	assert.Falsef(t, keyExists(t, lfs, manifestKey), "GREEN: manifest %s must be DELETED after reaping (Stage E)", manifestKey)
-	// The L1 is UNTOUCHED (the reaper deletes superseded L0s, NOT the L1 they were merged into).
-	assert.Truef(t, keyExists(t, lfs, l1Key), "GREEN: L1 %s must be UNTOUCHED (the reaper preserves the L1 it verified)", l1Key)
-	// The NON-manifest bystander L0 is UNTOUCHED (the reaper deletes ONLY manifest-listed L0s).
-	assert.Truef(t, keyExists(t, lfs, bystanderL0), "GREEN: non-manifest L0 %s (entity bravo) must be UNTOUCHED (the reaper deletes ONLY manifest-listed L0s)", bystanderL0)
+	assert.Falsef(t, keyExists(t, lfs, manifestKey), "manifest %s still exists after reaping", manifestKey)
+	assert.Truef(t, keyExists(t, lfs, l1Key), "merged L1 %s was deleted during reaping", l1Key)
+	assert.Truef(t, keyExists(t, lfs, bystanderL0), "non-manifest L0 %s was deleted during reaping", bystanderL0)
 
-	// And AsOf still resolves the entity's data via the L1 alone (the superseded
-	// L0s are gone but their rows live in the L1 — the backstop-reaped, truth-
-	// preserved invariant). Query at the oldest validTime the L1 covers.
+	// The L1 alone must still serve the oldest row after its L0 inputs are gone.
 	resolver := database.NewResolver(lfs, lfs, alloc, "reaper-bucket", database.ResolverConfig{MaxL0Files: 100})
 	oldestSysNs := l0KeysFirstSysNs(t, l0Keys)
 	got, gerr := resolver.AsOf(ctx, entity, time.Unix(0, oldestSysNs), time.Unix(0, oldestSysNs+1))
-	require.NoErrorf(t, gerr, "T1: AsOf must still resolve the entity via the L1 after the L0s are reaped (truth preserved)")
+	require.NoErrorf(t, gerr, "AsOf failed through the L1 after reaping its L0 inputs")
 	require.NotNil(t, got)
-	assert.Equalf(t, entity, got.EntityID, "T1: AsOf returns the right entity (no keying collision)")
+	assert.Equalf(t, entity, got.EntityID, "AsOf returned a different entity after reaping")
 
-	t.Logf("T1 RED: %d superseded L0s + manifest existed; GREEN: reaper deleted all %d L0s + the manifest, left the L1 + the non-manifest bravo L0 untouched; AsOf still 200 via the L1 (truth preserved)",
-		N, N)
+	t.Logf("before reaping, %d superseded L0 files existed; reaping deleted %d and their manifest; the L1 and unrelated L0 survived and served the query", N, N)
 }
 
-// l0KeysFirstSysNs extracts the {sysNs} segment from the lex-smallest L0 key in
-// the set (l0/{hex16}/{sysNs}.arrow). The manifest lists the L0 keys sorted; the
-// smallest key carries the OLDEST sysNs (the L1's firstSysT, the query target).
+// l0KeysFirstSysNs extracts sysNs from the first sorted L0 key. That key holds
+// the oldest system time in the merged L1 and supplies the query timestamp.
 func l0KeysFirstSysNs(t *testing.T, l0Keys []string) int64 {
 	t.Helper()
 	require.NotEmpty(t, l0Keys)
@@ -196,10 +149,9 @@ func l0KeysFirstSysNs(t *testing.T, l0Keys []string) int64 {
 	return sys
 }
 
-// --- T2 — the SAFETY GUARD: an L1 that is GONE → the reaper PRESERVES the
-// manifest's L0s + the manifest (the L0s are the sole durable copy). The whole
-// reaper exists to enforce this. SkippedOrphan MUST increment; the L0s MUST
-// stay on disk; the manifest MUST stay on disk (not deleted). ---
+// TestOrphanL1SafetyGuardPreservesL0AndManifest removes the L1 named by a
+// manifest. Because the L0 inputs are then the only durable copy, the reaper
+// must preserve them and the manifest and increment SkippedOrphan.
 func TestOrphanL1SafetyGuardPreservesL0AndManifest(t *testing.T) {
 	ctx := context.Background()
 	lfs := newReaperLocalFS(t)
@@ -208,41 +160,38 @@ func TestOrphanL1SafetyGuardPreservesL0AndManifest(t *testing.T) {
 	const N = 6
 	manifestKey, l1Key, l0Keys, _ := writeNMerge(t, lfs, alloc, entity, N)
 
-	// Simulate the filesystem LOSING the L1 (a disk error, a manual wipe, an S3
+	// Simulate the filesystem losing the L1 (a disk error, a manual wipe, an S3
 	// lifecycle rule). The manifest still points at it; the L0s are the backstop.
 	deleteKey(t, lfs, l1Key)
-	require.Falsef(t, keyExists(t, lfs, l1Key), "T2 setup: the L1 must be GONE (simulated loss)")
+	require.Falsef(t, keyExists(t, lfs, l1Key), "L1 still exists after simulated loss")
 
-	// Every L0 + the manifest exist BEFORE reaping (the backstop is intact).
+	// Every L0 and the manifest remain in place as the only durable copy.
 	for _, k := range l0Keys {
-		require.Truef(t, keyExists(t, lfs, k), "T2 setup: superseded L0 %s must exist (it is the backstop)", k)
+		require.Truef(t, keyExists(t, lfs, k), "backstop L0 %s is missing before reaping", k)
 	}
 	require.True(t, keyExists(t, lfs, manifestKey))
 
-	// Reap. The reaper's Stage C download of the L1 FAILS (the L1 is gone) → the
-	// reaper treats it as orphan → PRESERVES the L0s + the manifest.
+	// The failed L1 download must classify the manifest as orphaned before any
+	// L0 delete is attempted.
 	reaper := database.NewL0Reaper(lfs, lfs, lfs, "local")
 	res := reaper.Reap(ctx)
 
-	// The SAFETY assertions: ZERO manifests reaped, ZERO L0s deleted, ONE orphan.
-	assert.Equalf(t, 0, res.ReapedManifests, "T2 SAFETY: 0 manifests reaped (the L1 is GONE — the reaper refuses); got %d", res.ReapedManifests)
-	assert.Equalf(t, 0, res.ReapedL0, "T2 SAFETY: 0 L0s deleted (the L0s are the sole durable copy — PRESERVED); got %d", res.ReapedL0)
-	assert.Equalf(t, 1, res.SkippedOrphan, "T2: exactly 1 manifest skipped as ORPHAN (the L1 is gone); got %d", res.SkippedOrphan)
-	assert.Equalf(t, 0, res.SkippedError, "T2: 0 delete-error (nothing was attempted — Stage C refused before Stage D); got %d", res.SkippedError)
+	assert.Equalf(t, 0, res.ReapedManifests, "reaped %d manifests with the L1 missing", res.ReapedManifests)
+	assert.Equalf(t, 0, res.ReapedL0, "deleted %d sole-copy L0 files with the L1 missing", res.ReapedL0)
+	assert.Equalf(t, 1, res.SkippedOrphan, "got %d orphan skips with the L1 missing, want 1", res.SkippedOrphan)
+	assert.Equalf(t, 0, res.SkippedError, "got %d delete errors although no L0 delete should run", res.SkippedError)
 
-	// The L0s are PRESERVED on disk (the backstop). Every one still exists.
 	for _, k := range l0Keys {
-		assert.Truef(t, keyExists(t, lfs, k), "T2 SAFETY: superseded L0 %s must be PRESERVED (it is the sole durable copy — the L1 is gone)", k)
+		assert.Truef(t, keyExists(t, lfs, k), "sole-copy L0 %s was deleted with the L1 missing", k)
 	}
-	// The manifest is PRESERVED (the reaper did NOT delete it — it skipped it).
-	assert.Truef(t, keyExists(t, lfs, manifestKey), "T2 SAFETY: the manifest %s must be PRESERVED (the reaper retains it for the next sweep; the L1 may be restored)", manifestKey)
+	assert.Truef(t, keyExists(t, lfs, manifestKey), "manifest %s was deleted instead of retained for the next sweep", manifestKey)
 
-	t.Logf("T2 SAFETY: L1 gone → reaper skipped the manifest as orphan (SkippedOrphan=1), PRESERVED all %d L0s + the manifest (the backstop intact, the sole durable copy)", N)
+	t.Logf("missing L1 produced one orphan skip; all %d L0 files and the manifest were preserved", N)
 }
 
-// --- T3 — IDEMPOTENT reaper: Reap TWICE. The first run reaps fully (deletes the
-// L0s + the manifest); the second run is a CLEAN NO-OP (the manifest is already
-// gone → it is not even listed; zero deletes, zero error, zero manifest). ---
+// TestIdempotentSecondSweepIsCleanNoOp runs a complete reap and then verifies
+// that a second sweep has no manifests to process. A recreated manifest also
+// checks that deleting already-absent L0 keys remains successful and counted.
 func TestIdempotentSecondSweepIsCleanNoOp(t *testing.T) {
 	ctx := context.Background()
 	lfs := newReaperLocalFS(t)
@@ -252,60 +201,44 @@ func TestIdempotentSecondSweepIsCleanNoOp(t *testing.T) {
 	manifestKey, l1Key, l0Keys, _ := writeNMerge(t, lfs, alloc, entity, N)
 	reaper := database.NewL0Reaper(lfs, lfs, lfs, "local")
 
-	// First sweep: reaps fully.
 	res1 := reaper.Reap(ctx)
-	require.Equalf(t, 1, res1.ReapedManifests, "T3 sweep 1: 1 manifest reaped")
-	require.Equalf(t, N, res1.ReapedL0, "T3 sweep 1: all %d L0s deleted", N)
-	require.Falsef(t, keyExists(t, lfs, manifestKey), "T3 sweep 1: manifest gone")
-	require.Truef(t, keyExists(t, lfs, l1Key), "T3 sweep 1: L1 untouched")
+	require.Equalf(t, 1, res1.ReapedManifests, "first sweep did not reap exactly one manifest")
+	require.Equalf(t, N, res1.ReapedL0, "first sweep must delete all %d L0 files", N)
+	require.Falsef(t, keyExists(t, lfs, manifestKey), "manifest remains after first sweep")
+	require.Truef(t, keyExists(t, lfs, l1Key), "L1 was deleted during first sweep")
 	for _, k := range l0Keys {
-		require.Falsef(t, keyExists(t, lfs, k), "T3 sweep 1: L0 %s gone", k)
+		require.Falsef(t, keyExists(t, lfs, k), "L0 %s remains after first sweep", k)
 	}
 
-	// Second sweep: the manifest is GONE (deleted sweep 1) → ListObjects under
-	// compaction/ returns the OTHER entities' manifests (none — only alpha was
-	// compacted) → the second run observes ZERO manifests. It is a clean no-op:
-	// zero manifests reaped, zero L0s deleted, zero orphan, zero error. NOT an
-	// error (LocalFS.Delete's os.IsNotExist nil path is exercised if any stale
-	// reference remained, but here the manifest isn't even re-listed).
+	// The first sweep removed the only manifest, so the second has no work and
+	// must report no deletes, orphan skips, or errors.
 	res2 := reaper.Reap(ctx)
-	assert.Equalf(t, 0, res2.ReapedManifests, "T3 sweep 2: 0 manifests reaped (the manifest was deleted sweep 1 → not re-listed); got %d", res2.ReapedManifests)
-	assert.Equalf(t, 0, res2.ReapedL0, "T3 sweep 2: 0 L0s deleted (nothing to reap); got %d", res2.ReapedL0)
-	assert.Equalf(t, 0, res2.SkippedOrphan, "T3 sweep 2: 0 orphan; got %d", res2.SkippedOrphan)
-	assert.Equalf(t, 0, res2.SkippedError, "T3 sweep 2: 0 error (a clean no-op, NOT an error on the missing manifest); got %d", res2.SkippedError)
+	assert.Equalf(t, 0, res2.ReapedManifests, "second sweep reaped %d manifests, want 0", res2.ReapedManifests)
+	assert.Equalf(t, 0, res2.ReapedL0, "second sweep deleted %d L0 files, want 0", res2.ReapedL0)
+	assert.Equalf(t, 0, res2.SkippedOrphan, "second sweep reported %d orphan skips", res2.SkippedOrphan)
+	assert.Equalf(t, 0, res2.SkippedError, "second sweep reported %d errors", res2.SkippedError)
 
-	// Re-state the steady-state: the L1 is STILL untouched (the second sweep did
-	// not delete it either), the L0s + manifest are still gone.
-	assert.Truef(t, keyExists(t, lfs, l1Key), "T3 sweep 2: L1 still untouched")
-	assert.Falsef(t, keyExists(t, lfs, manifestKey), "T3 sweep 2: manifest still gone")
+	assert.Truef(t, keyExists(t, lfs, l1Key), "second sweep deleted the L1")
+	assert.Falsef(t, keyExists(t, lfs, manifestKey), "manifest reappeared after second sweep")
 
-	// Now exercise the os.IsNotExist nil path directly: re-creating the manifest
-	// by hand and reaping AGAIN proves Delete-on-missing-L0 is nil (idempotent
-	// delete). Write a manifest pointing at L0 keys that are ALREADY gone; Reap
-	// verifies the L1 (still present) → Stage D deletes each L0 (already gone →
-	// LocalFS.Delete returns nil for os.IsNotExist) → Stage E deletes the
-	// manifest. Forward progress on an already-reaped keyspace.
+	// Recreate the manifest with the L1 still present and all L0 files already
+	// absent. LocalFS.Delete treats os.IsNotExist as success, so the sweep can
+	// finish and remove the manifest again.
 	writeManifest(t, lfs, manifestKey, l1Key, l0Keys)
 	require.True(t, keyExists(t, lfs, manifestKey))
 	res3 := reaper.Reap(ctx)
-	assert.Equalf(t, 1, res3.ReapedManifests, "T3 sweep 3: the re-created manifest reaps (the L1 still verifies at Stage C; Stage D's Deletes return nil for the already-gone L0s — idempotent — then Stage E deletes the manifest); got %d", res3.ReapedManifests)
-	// HONEST counting: the reaper counts EVERY successful Delete call as a
-	// reaped L0 (a Delete that returns nil — whether it physically removed a file
-	// OR the file was already-absent, the idempotent os.IsNotExist-nil path). The
-	// re-created manifest still lists ALL N L0 keys, so the reaper re-issues
-	// Delete on each — all return nil (idempotent, already gone) → all N count.
-	// This is the documented per-sweep tally: "successful Delete calls", not
-	// "files physically removed this sweep" (which would need a pre-Stat per L0 —
-	// an IO the reaper's safety contract does not require).
-	assert.Equalf(t, N, res3.ReapedL0, "T3 sweep 3: N=%d L0 Deletes succeeded (idempotent nil on already-gone files; the reaper counts a successful Delete call, incl. the idempotent already-absent path, as a reaped L0 — see l0_reaper.go Stage D + the L0ReapL0Deleted metric description); got %d", N, res3.ReapedL0)
-	assert.Falsef(t, keyExists(t, lfs, manifestKey), "T3 sweep 3: the re-created manifest is deleted (Stage E)")
+	assert.Equalf(t, 1, res3.ReapedManifests, "recreated manifest produced %d completed reaps, want 1", res3.ReapedManifests)
+	// ReapedL0 counts successful Delete calls, including idempotent success for
+	// an already-absent key, rather than physical removals in this sweep.
+	assert.Equalf(t, N, res3.ReapedL0, "recreated manifest must count all %d successful L0 deletes; got %d", N, res3.ReapedL0)
+	assert.Falsef(t, keyExists(t, lfs, manifestKey), "recreated manifest remains after its sweep")
 
-	t.Logf("T3: sweep 1 reaped (1 manifest, %d L0s); sweep 2 clean no-op (0/0/0/0); sweep 3 reaped the re-created manifest (idempotent Delete-on-missing re-counted N successful nil Deletes)", N)
+	t.Logf("second sweep was a no-op; recreated manifest recorded %d successful deletes of already-absent L0 keys", N)
 }
 
-// writeManifest writes a manifest body (l1Key + l0Keys) at manifestKey via
-// the LocalFS Upload path — used by T3 sweep 3 to re-create an already-deleted
-// manifest and exercise the idempotent-Delete-on-missing-L0 path.
+// writeManifest uploads an L1 key and its original L0 key list. Recreating a
+// deleted manifest lets the repeated-sweep test exercise idempotent deletion of
+// L0 keys that are already absent.
 func writeManifest(t *testing.T, lfs *LocalFS, manifestKey, l1Key string, l0Keys []string) {
 	t.Helper()
 	var body strings.Builder
@@ -316,17 +249,13 @@ func writeManifest(t *testing.T, lfs *LocalFS, manifestKey, l1Key string, l0Keys
 		body.WriteByte('\n')
 	}
 	err := lfs.Upload(context.Background(), manifestKey, strings.NewReader(body.String()), int64(body.Len()))
-	require.NoErrorf(t, err, "write manifest %s (T3 sweep-3 setup)", manifestKey)
+	require.NoErrorf(t, err, "recreate manifest %s for idempotent deletion", manifestKey)
 }
 
-// --- T4 — PARTIAL reap: a fault-injecting LocalFS wrapper makes the SECOND L0
-// delete fail → Stage D stops → the manifest is RETAINED; the first L0 IS
-// deleted (monotone forward progress); SkippedError increments. The next sweep
-// (against the real LocalFS) reaps the rest. ---
-//
-// The wrapper delegates List/Download/Upload to the real LocalFS but Delete
-// fails once the Nth delete succeeds (failAfter). This proves Stage D's "stop on
-// the first delete failure + retain the manifest" contract.
+// TestPartialReapDeleteFailureRetainsManifest fails the second L0 delete after
+// one success. The reaper must stop, retain the manifest for retry, report one
+// SkippedError, and leave the remaining L0 files intact. A fault-free sweep must
+// then finish the manifest, accepting idempotent deletes for the earlier key.
 func TestPartialReapDeleteFailureRetainsManifest(t *testing.T) {
 	ctx := context.Background()
 	lfs := newReaperLocalFS(t)
@@ -335,74 +264,52 @@ func TestPartialReapDeleteFailureRetainsManifest(t *testing.T) {
 	const N = 5
 	manifestKey, l1Key, l0Keys, _ := writeNMerge(t, lfs, alloc, entity, N)
 
-	// Fault injector: let exactly `failAfter` L0 deletes succeed, then FAIL the
-	// next L0 delete (return a real error — NOT a missing-file, which is
-	// idempotent nil). The manifest delete (Stage E) is NEVER reached (Stage D
-	// stops first). failAfter=1 → the FIRST L0 is deleted, the SECOND fails.
+	// Allow one L0 delete, then return a non-NotExist error for the next. The
+	// manifest delete must remain unreachable after this failure.
 	const failAfter = 1
 	faulty := &faultyDeleter{real: lfs, failAfter: failAfter}
 
-	// The reaper takes the faulted deleter but the REAL lister/downloader (the
-	// fault must surface ONLY at delete time, so Stage A/B/C run against the
-	// real store; the L1 verifies fine).
+	// Only the deleter carries the fault; listing and downloading still use the
+	// real store so the L1 existence check succeeds.
 	reaper := database.NewL0Reaper(lfs, lfs, faulty, "local")
 	res := reaper.Reap(ctx)
 
-	// Stage D stopped after failAfter deletes → manifest NOT reaped (Stage E
-	// never ran) → SkippedError increments; exactly failAfter L0s were deleted
-	// (counted before the fault).
-	assert.Equalf(t, 0, res.ReapedManifests, "T4: 0 manifests reaped (Stage D stopped on the delete failure → Stage E did NOT run); got %d", res.ReapedManifests)
-	assert.Equalf(t, failAfter, res.ReapedL0, "T4: exactly %d L0 deleted before the fault (forward progress); got %d", failAfter, res.ReapedL0)
-	assert.Equalf(t, 0, res.SkippedOrphan, "T4: 0 orphan (the L1 verifies fine — the fault is at delete time only); got %d", res.SkippedOrphan)
-	assert.Equalf(t, 1, res.SkippedError, "T4: exactly 1 SkippedError (the manifest with the failed delete); got %d", res.SkippedError)
+	assert.Equalf(t, 0, res.ReapedManifests, "completed %d manifests after the delete failure, want 0", res.ReapedManifests)
+	assert.Equalf(t, failAfter, res.ReapedL0, "the first %d L0 deletes must succeed before the fault; got %d", failAfter, res.ReapedL0)
+	assert.Equalf(t, 0, res.SkippedOrphan, "reported %d orphan skips with a valid L1", res.SkippedOrphan)
+	assert.Equalf(t, 1, res.SkippedError, "reported %d delete errors, want 1", res.SkippedError)
 
-	// The manifest is RETAINED (Stage D stopped → Stage E did NOT delete it).
-	assert.Truef(t, keyExists(t, lfs, manifestKey), "T4: manifest RETAINED (the reaper retries the failed delete next sweep)")
-	// The L1 is untouched (the reaper never deletes the L1).
-	assert.Truef(t, keyExists(t, lfs, l1Key), "T4: L1 untouched")
-	// The FIRST failAfter L0s ARE deleted (forward progress is monotone); the
-	// REMAINING L0s (incl. the one whose delete failed + the ones after it) are
-	// PRESERVED (Stage D stopped).
+	assert.Truef(t, keyExists(t, lfs, manifestKey), "manifest was deleted despite the failed L0 delete")
+	assert.Truef(t, keyExists(t, lfs, l1Key), "L1 was deleted during the partial reap")
 	deleted := l0Keys[:failAfter]
 	remaining := l0Keys[failAfter:]
 	for _, k := range deleted {
-		assert.Falsef(t, keyExists(t, lfs, k), "T4: the first %d L0(s) ARE deleted (forward progress): %s", failAfter, k)
+		assert.Falsef(t, keyExists(t, lfs, k), "after %d successful delete, L0 %s still exists", failAfter, k)
 	}
 	for _, k := range remaining {
-		assert.Truef(t, keyExists(t, lfs, k), "T4: L0 %s PRESERVED (Stage D stopped on the failed delete — the manifest + remaining L0s retry next sweep)", k)
+		assert.Truef(t, keyExists(t, lfs, k), "L0 %s was deleted after the failure stopped the reap", k)
 	}
 
-	// The RESUME: run a SECOND sweep against the REAL LocalFS (fault cleared).
-	// The remaining L0s are now reaped + the manifest is reaped (Stage D
-	// succeeds for all remaining → Stage E deletes the manifest). The already-
-	// deleted first L0 returns nil (idempotent) — but it is NOT re-listed in the
-	// manifest's body as a NEW delete; the manifest still lists ALL N, so the
-	// reaper re-issues Delete on the already-gone first L0 (nil) + the remaining
-	// N-failAfter (succeed). The sweep reaps the manifest.
+	// Retry against the unfaulted store. The retained manifest still lists every
+	// original key: deleting the earlier key succeeds idempotently, and the rest
+	// are physically removed before the manifest is deleted.
 	reaper2 := database.NewL0Reaper(lfs, lfs, lfs, "local")
 	res2 := reaper2.Reap(ctx)
-	// The retained manifest still lists ALL N L0s (it was not modified by the
-	// partial sweep). On resume, the reaper re-issues Delete on each: the first
-	// failAfter are already-gone (idempotent nil, counted) + the remaining
-	// N-failAfter succeed (counted) → res2.ReapedL0 == N; the manifest reaps
-	// (Stage E runs now that Stage D cleared); zero error this time.
-	assert.Equalf(t, 1, res2.ReapedManifests, "T4 resume: 1 manifest reaped (Stage D cleared → Stage E); got %d", res2.ReapedManifests)
-	assert.Equalf(t, N, res2.ReapedL0, "T4 resume: N=%d L0 Deletes succeeded (the first %d idempotent-nil on already-gone + the remaining %d real); got %d", N, failAfter, N-failAfter, res2.ReapedL0)
-	assert.Equalf(t, 0, res2.SkippedError, "T4 resume: 0 error (the fault cleared); got %d", res2.SkippedError)
-	assert.Truef(t, !keyExists(t, lfs, manifestKey), "T4 resume: the manifest is now reaped (Stage D+E succeed against the fault-free store); manifest gone")
-	// Every L0 is now gone (the remaining + the already-deleted stay deleted).
+	assert.Equalf(t, 1, res2.ReapedManifests, "resume completed %d manifests, want 1", res2.ReapedManifests)
+	assert.Equalf(t, N, res2.ReapedL0, "resume must report %d successful deletes: %d idempotent and %d remaining; got %d", N, failAfter, N-failAfter, res2.ReapedL0)
+	assert.Equalf(t, 0, res2.SkippedError, "resume reported %d errors after the fault cleared", res2.SkippedError)
+	assert.Truef(t, !keyExists(t, lfs, manifestKey), "manifest remains after the successful resume")
 	for _, k := range l0Keys {
-		assert.Falsef(t, keyExists(t, lfs, k), "T4 resume: L0 %s gone (the partial reap resumed + completed)", k)
+		assert.Falsef(t, keyExists(t, lfs, k), "L0 %s remains after the successful resume", k)
 	}
-	assert.Truef(t, keyExists(t, lfs, l1Key), "T4 resume: L1 still untouched")
+	assert.Truef(t, keyExists(t, lfs, l1Key), "resume deleted the L1")
 
-	t.Logf("T4 PARTIAL: fault after %d delete(s) → manifest RETAINED, %d L0 deleted (forward progress), SkippedError=1; resume sweep reaped the manifest + the remaining %d L0s",
-		failAfter, failAfter, N-failAfter)
+	t.Logf("delete failure after %d success left %d L0 file deleted and retained the manifest; resume completed the remaining %d deletes and removed it", failAfter, failAfter, N-failAfter)
 }
 
-// faultyDeleter wraps a *LocalFS and makes the (failAfter+1)th Delete
-// call FAIL with a real error. It delegates List/Download/Upload to the real
-// store so Stage A/B/C run against the truth; only Stage D's delete is faulted.
+// faultyDeleter fails the first L0 delete after failAfter successful calls.
+// The reaper receives it only as an S3Deleter; listing and downloading continue
+// to use the real LocalFS.
 type faultyDeleter struct {
 	real      *LocalFS
 	failAfter int // how many Delete calls succeed before the fault
@@ -411,24 +318,18 @@ type faultyDeleter struct {
 
 func (f *faultyDeleter) Delete(ctx context.Context, bucket, key string) error {
 	f.calls++
-	// Stage D deletes the L0s one by one. Let the first `failAfter` succeed,
-	// then FAIL the next (a real IO error, NOT a missing-file → so it is NOT
-	// the idempotent-nil path). The manifest delete (Stage E) is guarded by
-	// Stage D stopping first → never reached under this fault.
+	// Let the first failAfter L0 deletes succeed, then return a non-NotExist
+	// error. The failed delete stops the loop before manifest deletion.
 	if f.calls > f.failAfter && !strings.HasPrefix(key, "compaction/") {
-		// Fault: the reaper sees a real delete error, stops Stage D for this
-		// manifest, retains it. The already-deleted first L0s stay deleted.
-		return fmt.Errorf("simulated delete failure on %s (call #%d)", key, f.calls)
+		// Stop this manifest's reap and retain its unprocessed keys for retry.
+		return fmt.Errorf("reaper fault: simulated delete failure on %s (call #%d)", key, f.calls)
 	}
 	return f.real.Delete(ctx, bucket, key)
 }
 
-// The faulty deleter still needs to satisfy the S3Deleter interface — but the
-// reaper takes it positionally as database.S3Deleter, so it MUST ALSO satisfy the
-// List/Download/Upload seams IF it were injected for those. It is NOT (T4
-// injects the REAL lfs for those), so this only needs Delete. Compile-time check:
+// The partial-reap test injects faultyDeleter only for deletion, so Delete is
+// sufficient to satisfy the interface used at that call site.
 var _ database.S3Deleter = (*faultyDeleter)(nil)
 
-// keep the os import alive (newReaperLocalFS uses t.TempDir via; this file
-// directly uses os via... none — guard removed if gofmt complains).
+// os.IsNotExist is part of the idempotent deletion contract exercised above.
 var _ = os.IsNotExist

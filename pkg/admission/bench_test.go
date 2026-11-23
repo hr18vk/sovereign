@@ -11,17 +11,16 @@ import (
 	"testing"
 )
 
-// BenchmarkPeerBucket_32c measures the honest-peer Admit path cost
-// (ns/op, B/op, allocs/op). The "_32c" suffix is the ROADMAP target gear
-// tag; the HONEST gear for this run is 4c (GOMAXPROCS=4, CPU part
-// 0xd40) — the 32c re-run is PENDING Karpenter c8g
-// provisioning. Do NOT relabel a 4c number as 32c.
+// BenchmarkPeerBucket_32c measures Accept's cost in ns/op, B/op, and
+// allocs/op. The benchmark name is retained for compatibility; every result
+// must still report the GOMAXPROCS setting and hardware used for that run.
 //
-// The honest-peer Admit ns/op MUST be sub-us (it runs BEFORE 3.0's
-// IngressHLCScalarCap.Admit, which is itself sub-us, AND before the
-// 71.4 us/op VerifyCRDTFrame wall, PROVEN). A
-// sharded-map lookup + one [32]byte copy + a handful of arithmetic ops
-// under a per-shard mutex should measure in the tens-of-ns range.
+// Accept runs before IngressHLCScalarCap.Admit and VerifyCRDTFrame. Its map
+// lookup, key copy, and arithmetic under a per-shard mutex should keep this
+// inexpensive gate well below the signature verification cost (ADR-0002).
+// The loop leaves the watermark pending, so it includes charging decisions
+// until the remaining budget cannot cover the next counter, followed by
+// over-budget drops.
 func BenchmarkPeerBucket_32c(b *testing.B) {
 	bucket := NewPeerBucket()
 	pub := makePub(1)
@@ -30,31 +29,26 @@ func BenchmarkPeerBucket_32c(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// Honest peer: Counter advances by 1 per frame (modest delta).
-		_ = bucket.Accept(pb, uint64(i+1))
+		// Submit consecutive absolute counters without committing the watermark.
+		_, _ = bucket.Accept(pb, uint64(i+1))
 	}
 }
 
-// BenchmarkPeerBucket_Attacker_32c measures the drop-decision path cost
-// for the MaxUint64 attacker. After the attacker's bucket is drained
-// (budget 0), every subsequent Accept is a Drop decision — the path a
-// Sybil burst takes. It MUST be cheaper than the honest accept path
-// (no budget deduction math on the drop tail) and far cheaper than the
-// 71.4 us Verify wall, so a Sybil burst is dropped in sub-us before
-// Verify. Honest 4c gear tag.
+// BenchmarkPeerBucket_Attacker_32c measures repeated rejection of a
+// MaxUint64 counter. The gap exceeds the peer's remaining budget, so each
+// ratchet returns Drop before signature verification without changing the
+// budget or the committed watermark.
 func BenchmarkPeerBucket_Attacker_32c(b *testing.B) {
 	bucket := NewPeerBucket()
 	pub := makePub(2)
 	pb := pubBytes(pub)
 
-	// Drain the attacker's bucket first: a MaxUint64 ratchet pins
-	// budget to 0 so the benchmark loop measures the steady-state Drop.
-	_ = bucket.Accept(pb, 1)
-	_ = bucket.Accept(pb, math.MaxUint64)
-
+	// Create the peer with a small charge, then measure the over-budget path.
+	_, _ = bucket.Accept(pb, 1)
+	_, _ = bucket.Accept(pb, math.MaxUint64)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = bucket.Accept(pb, math.MaxUint64)
+		_, _ = bucket.Accept(pb, math.MaxUint64)
 	}
 }

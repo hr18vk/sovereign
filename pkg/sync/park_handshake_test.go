@@ -6,48 +6,21 @@
 
 package sync
 
-// — PERSIST-WORKER PARK-HANDSHAKE RACE CLOSURE (the durability
-// guard fix). shipped a close-channel handshake that only proved
-// the worker goroutine was SCHEDULED (it reached close(persistWorkerReady)),
-// NOT that it had PARKED on the `for val:= range e.persistCh` receive
-// (S0). Under bench-sweep scheduler contention the FIRST NextDot's
-// select-default send dropped the only persist job, Close() drained an empty
-// channel, the worker saw closed and exited without ever calling
-// persistLamport, and recoverLamport read 0 instead of 1001.
+// The persist worker acknowledges that it is about to receive from persistCh.
+// Closing persistWorkerReady alone would show only that the goroutine had been
+// scheduled; the first NextDot could still execute its non-blocking send before
+// the worker reached the receive, dropping the only persisted value.
 //
-// 2.5c.1 is a SURGICAL MICRO-FIX: a CAP-1 buffered persistWorkerParked ack
-// channel. The worker sends struct{}{} on it IMMEDIATELY before the
-// for-range; the constructor blocks on the receive. A buffered-send
-// synchronizes-with that receive, so unblocking PROVES the worker is parked
-// on the persistCh receive before NewDeltaCRDTEngine returns — the first
-// NextDot's select-send ALWAYS rendezvouses. persistCh stays UNBUFFERED (the
-// exactly-one-in-flight invariant is preserved); Close() is unchanged
-// (the drain contract was end-to-end correct once the cold-start park is
-// proven). This is NOT 2.5d (the CAS-storm sharding) — that is deferred.
+// The worker sends on persistWorkerParked immediately before its receive loop.
+// The channel has capacity one, and NewDeltaCRDTEngine waits for that send. The
+// happens-before relationship ensures the worker is at the loop before the
+// constructor returns. persistCh itself remains unbuffered, and Close still
+// drains it through the worker WaitGroup.
 //
-// The guards are:
-//
-// - TestParkHandshakeStatic: a STATIC regex guard over
-// pkg/sync/crdt.go asserting the 2.5c.1 park-handshake invariants (the
-// park ack send, the cap-1 buffer, the two-stage constructor wait in
-// order, the preserved 2.5c worker shape). No t.Skip under any
-// condition; red-on-mute.
-// - TestColdStartFirstSendNeverDrops: the LOAD-BEARING
-// runtime bite. 1000 iterations (200 under -race) of: fresh engine in a
-// fresh t.TempDir(), ONE NextDot(), Close(), reconstruct in the SAME
-// dir, assert recoverLamport reads 1001. Gate is sawMiss==0 — a single
-// miss is a HARD FAIL naming the iteration. This is the guard the 2.5c
-// SHOULD have been but at 100 iterations missed the sub-1% race.
-// - TestParkHappensBeforeReasoning: a STATIC documentation
-// guard asserting the source comment block above the park-ack send
-// contains "happens-before" (the architectural reasoning is pinned in
-// source so a future engineer does not regress to a close-channel
-// handshake without understanding why). Red-on-mute.
-//
-// The guards do NOT downgrade red. The runtime guard does NOT t.Skip (it
-// MUST prove the park handshake holds under -race, which makes the race
-// window LARGER, not smaller — only the iteration count is reduced 1000→200
-// under -race via the raceEnabled gate, mirroring the precedent).
+// Static tests check the channel, acknowledgement, ordering, and source
+// documentation. The cold-start test repeats construction, one NextDot, Close,
+// and reconstruction 1,000 times (200 with the race detector), requiring every
+// recovered Lamport value to be 1001.
 
 import (
 	"os"
@@ -57,44 +30,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"unicode"
 )
 
-// stripWhitespace removes every Unicode space (unicode.IsSpace) so a code
-// shape can be matched regardless of how gofmt pads tokens. gofmt is free to
-// add or drop spaces around operators (:=, =, <-, commas) — a literal byte
-// match on gofmt-normalized source is brittle and false-trips the instant the
-// file is reformatted. The static shape guards in this package therefore match
-// the whitespace-stripped form, which gofmt can never perturb.
-func stripWhitespace(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) {
-			return -1
-		}
-		return r
-	}, s)
-}
-
-// codeShape reports whether shape appears in src once ALL whitespace is
-// stripped from both. This keeps the match whitespace-insensitive (gofmt can
-// never false-trip it) while still requiring the exact token sequence — a
-// genuinely different shape still fails, so the guard is not vacuous. Write
-// shape in natural gofmt form (e.g. "iblt := NewArenaIBLT(1024, 4, ...)").
-func codeShape(src, shape string) bool {
-	return strings.Contains(stripWhitespace(src), stripWhitespace(shape))
-}
-
-// codeShapeIndex is the index-returning sibling of codeShape. Whitespace
-// stripping is a pure monotone deletion, so the relative order of two disjoint
-// matches is preserved — the returned indices remain valid for the textual-
-// ordering assertions (P5 / P5b) that compare byte positions.
-func codeShapeIndex(src, shape string) int {
-	return strings.Index(stripWhitespace(src), stripWhitespace(shape))
-}
-
-// parkReadCrdtSource reads the LIVE
-// pkg/sync/crdt.go source (os.ReadFile, NOT go/embed — the guard must sweep
-// the current tree). cwd is pkg/sync under `go test./pkg/sync/`.
+// parkReadCrdtSource reads crdt.go from the current tree. The alternate path
+// accommodates a test invocation from the repository root.
 func parkReadCrdtSource(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("crdt.go")
@@ -102,18 +41,15 @@ func parkReadCrdtSource(t *testing.T) string {
 		alt := filepath.Join("pkg", "sync", "crdt.go")
 		data, err = os.ReadFile(alt)
 		if err != nil {
-			t.Fatalf("static guard: cannot read crdt.go: %v", err)
+			t.Fatalf("park static guard: cannot read crdt.go: %v", err)
 		}
 	}
 	return string(data)
 }
 
-// parkFuncBody isolates a function body in crdt.go source by name.
-// Unlike extractFuncBody (which matches only method receivers "func (e) Name("),
-// this helper handles BOTH package-level "func Name(" and method "func (e) Name("
-// signatures, because NewDeltaCRDTEngine is a package-level constructor. The
-// body is returned from the signature line to the next top-level "func " at
-// column 0 (mirrors extractFuncBody's end-detection).
+// parkFuncBody returns a named function or method from its signature through
+// the next top-level declaration. It handles both package-level functions and
+// methods with receivers, and rejects matches embedded in longer identifiers.
 func parkFuncBody(src, name string) string {
 	// Candidate start: a line beginning with "func " containing "name(".
 	needle := []byte(name + "(")
@@ -160,16 +96,10 @@ func parkFuncBody(src, name string) string {
 	return src[startIdx:end]
 }
 
-// parkStripGoComments removes Go // line comments and /* */ block
-// comments from a source slice so a textual-ordering regex does not match a
-// phrase that appears only inside a doc-comment (e.g. "for val:= range
-// e.persistCh" referenced in the comment block ABOVE the function). A
-// naive newline join followed by a regex sweep over the raw body would match
-// the comment mention before the real statement, producing a false ordering
-// inversion. The returned slice preserves newlines (comments replaced by
-// blank lines) so byte offsets are a monotone-of-the-original lower-bound;
-// textual-ordering checks below only compare relative byte index, which is
-// preserved under comment-blanking.
+// parkStripGoComments replaces Go comments with newlines. Source-order checks
+// can then compare executable statements without matching examples in comments.
+// Preserving line boundaries also keeps the function parser's positions stable
+// relative to the original source.
 func parkStripGoComments(src string) string {
 	var b strings.Builder
 	b.Grow(len(src))
@@ -212,10 +142,9 @@ func parkStripGoComments(src string) string {
 	return b.String()
 }
 
-// TestParkHandshakeStatic is the STATIC regex guard over
-// pkg/sync/crdt.go source asserting the 2.5c.1 park-handshake invariants P1
-// through P6. It has NO race/skip guard — it pins the shape under every
-// build mode and bites RED the instant any invariant regresses.
+// TestParkHandshakeStatic checks the park channel declarations,
+// acknowledgement, worker receive loop, and constructor wait order. It runs in
+// every build mode.
 func TestParkHandshakeStatic(t *testing.T) {
 	src := parkReadCrdtSource(t)
 
@@ -225,69 +154,42 @@ func TestParkHandshakeStatic(t *testing.T) {
 		got string
 	}
 
-	// P1: persistWorkerParked field of type chan struct{} declared in the
-	// engine struct (in the persist pad block adjacent to
-	// persistWorkerReady).
+	// P1 and P2: both worker signals are present.
 	p1Field := regexp.MustCompile(`persistWorkerParked\s+chan\s+struct\{\}`)
-
-	// P2: persistWorkerReady field STILL declared (the 2.5c stage-1 signal
-	// is KEPT — both channels coexist; 2.5c.1 only ADDS the stage-2 park).
 	p2Ready := regexp.MustCompile(`persistWorkerReady\s+chan\s+struct\{\}`)
 
-	// P3: persistWorkerParked initialized as a CAP-1 buffered channel in
-	// NewDeltaCRDTEngine. The `, 1` cap argument is load-bearing: an
-	// unbuffered park channel deadlocks the worker waiting for a receiver
-	// the constructor has not yet spawned. A regex missing the `, 1` is a
-	// HARD FAIL.
+	// P3: capacity one lets the worker acknowledge before the constructor starts
+	// receiving; an unbuffered acknowledgement would deadlock construction.
 	p3Make := regexp.MustCompile(`e\.persistWorkerParked\s*=\s*make\(\s*chan\s+struct\{\}\s*,\s*1\s*\)`)
 
-	// P4: the park ack send `e.persistWorkerParked <- struct{}{}` appears in
-	// the persistWorkerLoop body. (Textual-before-for-range ordering is
-	// P5's job; P4 just asserts the send exists somewhere in the worker.)
+	// P4: the worker sends the acknowledgement. P5 checks its position.
 	p4Send := regexp.MustCompile(`e\.persistWorkerParked\s*<-\s*struct\{\}\{\}`)
 
-	// P6: the 2.5c worker shape is preserved inside persistWorkerLoop —
-	// close(persistWorkerReady), the for-range over persistCh, and the
-	// persistLamport(val) call. 2.5c.1 only ADDS the park proof; it does not
-	// regress the worker/drain shape.
+	// P6: readiness, the receive loop, and the persist call remain in the worker.
 	p6Close := regexp.MustCompile(`close\(\s*e\.persistWorkerReady\s*\)`)
 	p6Range := regexp.MustCompile(`for\s+val\s+:=\s+range\s+e\.persistCh`)
 	p6Call := regexp.MustCompile(`e\.persistLamport\(\s*val\s*\)`)
 
 	workerBody := extractFuncBody(src, "persistWorkerLoop", "")
 	if workerBody == "" {
-		t.Fatalf("PARK-HANDSHAKE R3a: could not isolate persistWorkerLoop body")
+		t.Fatalf("park handshake static guard: could not isolate persistWorkerLoop body")
 	}
 
-	// P5 (textual ordering): the park ack send must appear TEXTUALLY BEFORE
-	// the `for val:= range e.persistCh` in the worker body (a send AFTER
-	// the for-range would be unreachable — it sits after the loop — and
-	// would NOT prove the worker parked before the first receive).
-	// Strip doc-comments so the P5 ordering check compares the ACTUAL
-	// code statements, not a phrase mentioned in the comment block above
-	// the function (the stage-2 comment legitimately references
-	// "for val:= range e.persistCh"). Comment-blanking preserves textual
-	// order so relative byte-index comparison remains valid.
+	// P5: the acknowledgement must precede the receive loop in executable code.
+	// A send after the loop would be unreachable during normal operation and
+	// could not establish readiness. Comment stripping keeps prose out of the
+	// ordering comparison.
 	workerCode := parkStripGoComments(workerBody)
-	// Whitespace-insensitive index: gofmt normalizes `for val := range` (space
-	// around :=) — a literal `val:=` byte match false-trips. codeShapeIndex
-	// strips whitespace from both sides so the ordering assertion is robust to
-	// gofmt while still requiring the exact token sequence (and the relative
-	// order of the two disjoint matches is preserved under the monotone strip).
-	sendIdx := codeShapeIndex(workerCode, "e.persistWorkerParked <- struct{}{}")
-	rangeIdx := codeShapeIndex(workerCode, "for val := range e.persistCh")
+	sendIdx := indexOfAt(workerCode, []byte("e.persistWorkerParked <- struct{}{}"), 0)
+	rangeIdx := indexOfAt(workerCode, []byte("for val := range e.persistCh"), 0)
 
-	// P5b (constructor ordering): the constructor tail MUST contain BOTH
-	// `<-e.persistWorkerReady` AND `<-e.persistWorkerParked` (or the
-	// tab-aligned variants) in that textual order. The stage-1 receive
-	// MUST precede the stage-2 receive (swapping them is stylistic at
-	// runtime — M3 — but the static guard catches the wrong order
-	// regardless, pinning the documented two-stage contract).
+	// P5b: the constructor waits for readiness and then for the park
+	// acknowledgement, matching the documented two-stage sequence.
 	readyRecv := regexp.MustCompile(`<-\s*e\.persistWorkerReady`)
 	parkedRecv := regexp.MustCompile(`<-\s*e\.persistWorkerParked`)
 	ctorBody := parkFuncBody(src, "NewDeltaCRDTEngine")
 	if ctorBody == "" {
-		t.Fatalf("PARK-HANDSHAKE R3a: could not isolate NewDeltaCRDTEngine body")
+		t.Fatalf("park handshake static guard: could not isolate NewDeltaCRDTEngine body")
 	}
 	readyRecvIdx := -1
 	parkedRecvIdx := -1
@@ -300,88 +202,76 @@ func TestParkHandshakeStatic(t *testing.T) {
 
 	invariants := []inv{
 		{"P1: persistWorkerParked chan struct{} field declared", p1Field, p1Field.FindString(src)},
-		{"P2: persistWorkerReady chan struct{} field STILL declared", p2Ready, p2Ready.FindString(src)},
+		{"P2: persistWorkerReady chan struct{} field declared", p2Ready, p2Ready.FindString(src)},
 		{"P3: e.persistWorkerParked = make(chan struct{}, 1) with cap-1", p3Make, p3Make.FindString(src)},
 		{"P4: park ack send e.persistWorkerParked <- struct{}{} in worker", p4Send, p4Send.FindString(workerBody)},
 		{"P6a: close(e.persistWorkerReady) in worker body", p6Close, p6Close.FindString(workerBody)},
-		{"P6b: for val:= range e.persistCh in worker body", p6Range, p6Range.FindString(workerBody)},
+		{"P6b: for val := range e.persistCh in worker body", p6Range, p6Range.FindString(workerBody)},
 		{"P6c: e.persistLamport(val) in worker body", p6Call, p6Call.FindString(workerBody)},
 		{"P5b-a: <-e.persistWorkerReady in constructor", readyRecv, readyRecv.FindString(ctorBody)},
 		{"P5b-b: <-e.persistWorkerParked in constructor", parkedRecv, parkedRecv.FindString(ctorBody)},
 	}
 	for _, invT := range invariants {
 		if invT.got == "" {
-			t.Errorf("PARK-HANDSHAKE R3a PARK-HANDSHAKE STATIC GUARD: %s — regex MISS (bite RED)", invT.id)
+			t.Errorf("park handshake static guard: %s: source pattern not found", invT.id)
 		}
 	}
 
 	// P5: send textually before for-range in the worker body.
 	if sendIdx < 0 {
-		t.Errorf("PARK-HANDSHAKE R3a P5: park ack send not found in worker body (cannot assert ordering)")
+		t.Errorf("park handshake P5: park ack send not found in worker body (cannot assert ordering)")
 	}
 	if rangeIdx < 0 {
-		t.Errorf("PARK-HANDSHAKE R3a P5: `for val := range e.persistCh` not found in worker body")
+		t.Errorf("park handshake P5: `for val := range e.persistCh` not found in worker body")
 	}
 	if sendIdx >= 0 && rangeIdx >= 0 && sendIdx > rangeIdx {
-		t.Errorf("PARK-HANDSHAKE R3a P5: park ack send (%d) textually AFTER for-range (%d) — the send must PRECEDE the receive to prove park (bite RED)", sendIdx, rangeIdx)
+		t.Errorf("park handshake P5: park ack send (%d) textually after for-range (%d) — the send must precede the receive to prove park", sendIdx, rangeIdx)
 	}
 
-	// P5b: stage-1 receive textually before stage-2 receive in the constructor.
+	// P5b: first receive textually before second receive in the constructor.
 	if readyRecvIdx < 0 {
-		t.Errorf("PARK-HANDSHAKE R3a P5b: <-e.persistWorkerReady not found in NewDeltaCRDTEngine body")
+		t.Errorf("park handshake P5b: <-e.persistWorkerReady not found in NewDeltaCRDTEngine body")
 	}
 	if parkedRecvIdx < 0 {
-		t.Errorf("PARK-HANDSHAKE R3a P5b: <-e.persistWorkerParked not found in NewDeltaCRDTEngine body")
+		t.Errorf("park handshake P5b: <-e.persistWorkerParked not found in NewDeltaCRDTEngine body")
 	}
 	if readyRecvIdx >= 0 && parkedRecvIdx >= 0 && readyRecvIdx > parkedRecvIdx {
-		t.Errorf("PARK-HANDSHAKE R3a P5b: stage-1 <-persistWorkerReady (%d) textually AFTER stage-2 <-persistWorkerParked (%d) — the two-stage order is documented (S0 stage 1 necessary-but-insufficient, stage 2 load-bearing); reversed order is a HARD FAIL (bite RED)", readyRecvIdx, parkedRecvIdx)
+		t.Errorf("park handshake P5b: first receive (%d) textually after second receive (%d) — the two-stage order is documented; reversed order is a hard fail", readyRecvIdx, parkedRecvIdx)
 	}
 
-	t.Logf("PARK-HANDSHAKE R3a PARK-HANDSHAKE STATIC GUARD: all invariants present (P1-P6 + P5 ordering + P5b constructor order)")
+	t.Logf("park handshake static guard: all invariants present (P1-P6 + P5 ordering + P5b constructor order)")
 }
 
-// TestColdStartFirstSendNeverDrops is the LOAD-BEARING runtime
-// bite. This is the guard the 2.5c SHOULD have been but at 100 iterations
-// missed the sub-1% cold-start race. It FORCES exactly the cold-start surface
-// 2.5c shipped: a fresh engine, ONE NextDot, Close, reconstruct in the SAME
-// dir, assert recoverLamport==1001. The gate is sawMiss==0.
+// TestColdStartFirstSendNeverDrops constructs an engine, calls NextDot once,
+// closes it, and requires reconstruction to recover 1001. Every iteration uses
+// a fresh directory so no earlier Lamport file can satisfy the check.
 //
-// Iteration count: UNGATED = 1000 (the ruthless floor that surfaces a 0.1%
-// race with >99.99% confidence). Under -race the count is reduced to 200 via
-// the raceEnabled gate (mirrors the precedent at physics_test.go:197
-// /_test.go:164) because -race instrumentation slows scheduling 5-
-// 10x and would otherwise exceed the 10m test timeout. The race window is
-// LARGER (not smaller) under -race, so the reduced count is still
-// load-bearing. BOTH counts MUST see sawMiss==0 — a single miss in any run is
-// a HARD FAIL naming the iteration.
-//
-// This guard does NOT t.Skip under -race (unlike the alloc-count guards which
-// skip because the race detector perturbs malloc counters — THIS guard is a
-// correctness guard and the race detector makes it MORE load-bearing, not
-// less). The ONLY skip is under testing.Short() per the standard discipline.
+// The 1,000-iteration run gives more than 99.99% confidence of observing a race
+// with per-iteration probability 0.1%. Race-enabled builds use 200 iterations
+// to bound instrumentation cost while retaining the scheduling interleaving.
+// Short mode skips this drive; the static handshake test still runs.
 func TestColdStartFirstSendNeverDrops(t *testing.T) {
 	numCPU := runtime.NumCPU()
-	t.Logf("PARK-HANDSHAKE R3b: runtime.NumCPU()=%d", numCPU)
+	t.Logf("cold-start test: runtime.NumCPU()=%d", numCPU)
 
 	if testing.Short() {
-		t.Skip("PARK-HANDSHAKE R3b cold-start race surface: 1000-iteration drive (200 under -race); skip under -short (the static guard TestParkHandshakeStatic always runs).")
+		t.Skip("cold-start race surface: 1000-iteration drive (200 under -race); skip under -short (the static guard TestParkHandshakeStatic always runs).")
 	}
 
-	// UNGATED floor = 1000 (the 2.5c was 100 and missed the race).
-	// Under -race = 200 (raceEnabled gate; -race makes the window LARGER).
+	// Race-enabled builds use fewer iterations to bound instrumentation cost.
 	iterations := 1000
 	if raceEnabled {
 		iterations = 200
 	}
-	t.Logf("PARK-HANDSHAKE R3b: iterations=%d (raceEnabled=%v)", iterations, raceEnabled)
+	t.Logf("cold-start test: iterations=%d (raceEnabled=%v)", iterations, raceEnabled)
 
 	var sawMiss int64
 	var sawOK int64
 	for iter := 0; iter < iterations; iter++ {
-		// FRESH tempdir per iter so recoverLamport reads ONLY this iter's
-		// file (no cross-iter reuse — the 2.5c DataDir package-global
-		// pattern means the engine must be reconstructed with DataDir=dir
-		// set BEFORE the second NewDeltaCRDTEngine).
+		// Fresh tempdir per iter so recoverLamport reads only this iter's
+		// file (no cross-iter reuse — the DataDir package-global pattern
+		// means the engine must be reconstructed with DataDir=dir set before
+		// the second NewDeltaCRDTEngine).
 		dir := t.TempDir()
 		oldDir := DataDir
 		DataDir = dir
@@ -403,38 +293,29 @@ func TestColdStartFirstSendNeverDrops(t *testing.T) {
 		_ = eng2.Close()
 		DataDir = oldDir
 
-		// The single NextDot fires at counter=1 -> nextLimit = 1 + 1000 = 1001.
-		// Under 2.5c.1 the worker is PROVABLY parked before the constructor
-		// returns, so the FIRST select-send rendezvouses and the Close drain
-		// completes the persist — the file MUST read 1001 (no scheduler-luck
-		// dependency). A recovered=0 means the worker never called
-		// persistLamport (the 2.5c cold-start drop reproduced) — HARD FAIL.
+		// The first NextDot computes nextLimit = 1 + 1000. The park handshake
+		// places the worker at its receive before construction returns, and Close
+		// waits for the write, so recovery must return 1001 regardless of scheduling.
 		const want uint64 = 1001
 		if recovered != want {
 			atomic.AddInt64(&sawMiss, 1)
-			t.Errorf("PARK-HANDSHAKE R3b iter %d/%d: recovered Lamport counter=%d, want %d — the cold-start park handshake DROPPED the first persist job (recoverLamport read 0; the 2.5c S0 race reproduced under the park-ack fix — HARD FAIL)", iter, iterations, recovered, want)
+			t.Errorf("cold-start iteration %d/%d recovered Lamport counter %d, want %d; the first value was not persisted", iter, iterations, recovered, want)
 		} else {
 			atomic.AddInt64(&sawOK, 1)
 		}
 	}
 	missCount := atomic.LoadInt64(&sawMiss)
 	okCount := atomic.LoadInt64(&sawOK)
-	t.Logf("PARK-HANDSHAKE R3b: iterations=%d sawOK=%d sawMiss=%d (gate is sawMiss==0)", iterations, okCount, missCount)
+	t.Logf("cold-start test: iterations=%d sawOK=%d sawMiss=%d (gate is sawMiss==0)", iterations, okCount, missCount)
 	if missCount != 0 {
-		t.Fatalf("PARK-HANDSHAKE R3b COLD-START PARK-HANDSHAKE BIT RED: sawMiss=%d across %d iterations (the 2.5c.1 park handshake did NOT hold — HARD FAIL)", missCount, iterations)
+		t.Fatalf("cold-start park handshake missed %d of %d persisted values", missCount, iterations)
 	}
-	t.Logf("PARK-HANDSHAKE R3b COLD-START PARK-HANDSHAKE BIT GREEN: %d/%d iterations recovered=1001 (sawMiss==0)", okCount, iterations)
+	t.Logf("cold-start park handshake passed: %d/%d iterations recovered=1001 (sawMiss==0)", okCount, iterations)
 }
 
-// TestParkHappensBeforeReasoning is a STATIC documentation
-// guard (no runtime drive) that asserts the SOURCE COMMENT BLOCK above the
-// `e.persistWorkerParked <- struct{}{}` send in crdt.go contains the phrase
-// "happens-before". The architectural reasoning is pinned in the source so a
-// future engineer does not regress the park proof to a close-channel
-// handshake without understanding WHY the buffered-ack is the only
-// structurally-correct fix. This is the muscle-memory guard — it preserves
-// the S0 smoking-gun reasoning in the source, not just in the report. Red-
-// on-mute; NO t.Skip under any condition.
+// TestParkHappensBeforeReasoning requires the worker and constructor source
+// comments to document the happens-before relationship at both ends of the park
+// acknowledgement. It complements the executable ordering checks.
 func TestParkHappensBeforeReasoning(t *testing.T) {
 	src := parkReadCrdtSource(t)
 
@@ -442,23 +323,21 @@ func TestParkHappensBeforeReasoning(t *testing.T) {
 	// immediately preceding the park-ack send contains "happens-before".
 	workerBody := extractFuncBody(src, "persistWorkerLoop", "")
 	if workerBody == "" {
-		t.Fatalf("PARK-HANDSHAKE R3c: could not isolate persistWorkerLoop body")
+		t.Fatalf("park happens-before guard: could not isolate persistWorkerLoop body")
 	}
 	hbRe := regexp.MustCompile(`happens-before`)
 	if !hbRe.MatchString(workerBody) {
-		t.Errorf("PARK-HANDSHAKE R3c PARK-HAPPENS-BEFORE REASONING: the persistWorkerLoop body does NOT contain the phrase `happens-before` in its comment block above the park-ack send. The S0 architectural reasoning MUST be pinned in source (a future engineer must understand WHY the buffered-ack is the only structurally-correct fix before regressing to a close-channel handshake) — bite RED")
+		t.Errorf("persistWorkerLoop does not document the happens-before relationship for the park acknowledgement")
 	}
 
-	// Cross-pin: the constructor's two-stage comment block MUST also contain
-	// "happens-before" (the park-proof rationale is documented at BOTH ends
-	// — the worker that sends the ack and the constructor that receives it).
+	// The constructor must document the receiving end of the same relationship.
 	ctorBody := parkFuncBody(src, "NewDeltaCRDTEngine")
 	if ctorBody == "" {
-		t.Fatalf("PARK-HANDSHAKE R3c: could not isolate NewDeltaCRDTEngine body")
+		t.Fatalf("park happens-before guard: could not isolate NewDeltaCRDTEngine body")
 	}
 	if !hbRe.MatchString(ctorBody) {
-		t.Errorf("PARK-HANDSHAKE R3c PARK-HAPPENS-BEFORE REASONING: the NewDeltaCRDTEngine two-stage park-handshake comment block does NOT contain `happens-before`. The stage-2 load-bearing park proof MUST be documented at the constructor receive end too — bite RED")
+		t.Errorf("NewDeltaCRDTEngine does not document the happens-before relationship for the park acknowledgement")
 	}
 
-	t.Logf("PARK-HANDSHAKE R3c PARK-HAPPENS-BEFORE REASONING: `happens-before` present in BOTH the persistWorkerLoop and NewDeltaCRDTEngine comment blocks (S0 reasoning pinned in source)")
+	t.Logf("park happens-before reasoning is documented in persistWorkerLoop and NewDeltaCRDTEngine")
 }

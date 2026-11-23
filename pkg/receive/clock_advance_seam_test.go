@@ -13,17 +13,17 @@ import (
 	"github.com/hr18vk/sovereign/pkg/durability"
 )
 
-// TestClockAdvanceSeam_RecordsOneOnActualAdvance is the STEP-3a seam
-// guard — the production receive path (Receiver.HandleFrame → onClockAdvance →
-// wal.AppendClockAdvance) exercised end-to-end, NOT through the Bridge helper
-// bypass the durability guards use. It drives a REAL signed relay-chain frame
-// through a REAL Receiver with a REAL durability WAL recorder, then replays
-// the WAL and asserts EXACTLY ONE WALRecClockAdvance whose value equals the
+// TestClockAdvanceSeam_RecordsOneOnActualAdvance is the seam test — the
+// production receive path (Receiver.HandleFrame → onClockAdvance →
+// wal.AppendClockAdvance) exercised end-to-end, not through the Bridge helper
+// bypass the durability negative-control use. It drives a real signed relay-chain frame
+// through a real Receiver with a real durability WAL recorder, then replays
+// the WAL and asserts exactly one WALRecClockAdvance whose value equals the
 // post-Join LamportCounter. This is the proof the gated hook (post>pre)
 // actually records a foreign advance and records the right high-water.
 func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15, admits 1 hop
+	const budgetNS = int64(1_000_000_000) // 1s -> MaxHopsForBudget(1s) = 16607; the single-hop relay chain is admitted
 	const foreignDot = uint64(100)
 	walPath := filepath.Join(t.TempDir(), "seam.wal")
 
@@ -33,7 +33,7 @@ func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 	// TestReceiver_CompositionOverSocketpair pattern).
 	r, sc, _, _ := setupReceiver(t, wallBase, budgetNS, nil)
 
-	// Build a REAL signed relay-chain frame at a foreign dotCounter HIGHER
+	// Build a real signed relay-chain frame at a foreign dotCounter higher
 	// than the engine's zero LamportCounter — so Join's AdvanceLamportTo
 	// actually jumps the clock (the load-bearing guard: post > pre).
 	inner := buildCRDTDeltaWire(t, "seam-entity-cd", foreignDot)
@@ -45,11 +45,11 @@ func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 	// admits the frame's physical timestamps (drift epsilon).
 	sc.Set(wallBase)
 
-	// Open the REAL durability WAL and bind a Recorder the production way:
+	// Open the real durability WAL and bind a Recorder the production way:
 	// main.go wires recv.SetClockAdvanceRecorder(func(c uint64) error { return
-	// bridge.WAL().AppendClockAdvance(c) }). The guard runs that exact lambda
-	// against a real WAL file, not the Bridge shell — this is the production
-	// path the DEFECT-2 audit found ZERO coverage for.
+	// bridge.WAL().AppendClockAdvance(c) }). The test runs that exact lambda
+	// against a real WAL file, not the Bridge shell — this is the clock-advance
+	// WAL recording path previously had no end-to-end test.
 	wal, err := durability.OpenWAL(walPath)
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
@@ -59,7 +59,7 @@ func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 		return wal.AppendClockAdvance(c)
 	})
 
-	// Drive the FULL production receive path. verdict MUST be Accept.
+	// Drive the full production receive path. verdict must be Accept.
 	v := r.HandleFrame(env.Marshal())
 	if v.Verdict != Accept {
 		t.Fatalf("HandleFrame verdict = %v (%v) — expected Accept (the seam test requires the frame clear every gate)", v.Verdict, v.Reason)
@@ -72,7 +72,7 @@ func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 	if got, want := len(rep.Advances), 1; got != want {
 		t.Fatalf("WAL advances: got %d, want exactly 1 (the hook must record exactly the one real advance)", got)
 	}
-	// The recorded value MUST equal the post-Join LamportCounter. The engine
+	// The recorded value must equal the post-Join LamportCounter. The engine
 	// seeded at 0 and the frame's dotCounter is 100, so the clock gate's
 	// AdvanceLamportTo(100) jumps the clock to 100; post > pre (100 > 0) →
 	// the guarded recorder fires once with value 100.
@@ -82,15 +82,15 @@ func TestClockAdvanceSeam_RecordsOneOnActualAdvance(t *testing.T) {
 }
 
 // TestClockAdvanceSeam_ZeroRecordsOnStaleReReceive is the load-bearing
-// negative: a stale/duplicate frame whose dotCounter does NOT advance the
-// clock (it is <= the entry high-water) MUST produce ZERO new WAL records.
-// Before the Step-2 fix the hook fired on every Accept and appended a spurious
-// no-op record + fsync per Accept (the DEFECT-1 fsync bomb). Now the post>pre
-// guard suppresses it. The first receive records exactly one advance; the
-// second receive of the SAME frame records ZERO (the clock is already 100).
+// negative: a stale/duplicate frame whose dotCounter does not advance the
+// clock (it is <= the entry high-water) must produce zero new WAL records.
+// The hook fires only when post > pre; a no-op AdvanceLamportTo (current >=
+// remote) yields post == pre, so the guard suppresses the record. The first
+// receive records exactly one advance; the second receive of the same frame
+// records zero (the clock is already 100).
 func TestClockAdvanceSeam_ZeroRecordsOnStaleReReceive(t *testing.T) {
 	const wallBase = int64(1_700_000_000_000_000)
-	const budgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15, admits 1 hop
+	const budgetNS = int64(1_000_000_000) // 1s -> MaxHopsForBudget(1s) = 16607; the single-hop relay chain is admitted
 	const foreignDot = uint64(100)
 	walPath := filepath.Join(t.TempDir(), "seam-stale.wal")
 
@@ -111,16 +111,17 @@ func TestClockAdvanceSeam_ZeroRecordsOnStaleReReceive(t *testing.T) {
 		return wal.AppendClockAdvance(c)
 	})
 
-	// First receive: foreign dotCounter 100 advances the clock 0→100 → ONE
-	// record.
+	// First receive: foreign dotCounter 100 advances the clock 0→100 (one
+	// record).
 	v1 := r.HandleFrame(env.Marshal())
 	if v1.Verdict != Accept {
 		t.Fatalf("first HandleFrame verdict = %v (%v)", v1.Verdict, v1.Reason)
 	}
-	// Second receive of the SAME frame: the clock is ALREADY 100, so
-	// AdvanceLamportTo(100) is a no-op at crdt.go:1642 (current >= remote) →
-	// post == pre → the guard fires ZERO records. This is the DEFECT-1 proof:
-	// the fsync bomb is dead.
+	// Second receive of the same frame: the clock is already 100, so
+	// AdvanceLamportTo(100) is a no-op (current >= remote) →
+	// post == pre → the guard fires zero records. This is the
+	// no-op-on-stale-receive proof: the post>pre guard suppresses the extra
+	// per-Accept fsync.
 	v2 := r.HandleFrame(env.Marshal())
 	if v2.Verdict != Accept {
 		t.Fatalf("stale re-receive verdict = %v (%v) — a dedup'd re-Accept passes the gates (state already merged)", v2.Verdict, v2.Reason)
@@ -130,7 +131,7 @@ func TestClockAdvanceSeam_ZeroRecordsOnStaleReReceive(t *testing.T) {
 		t.Fatalf("ReplayWAL: %v", err)
 	}
 	if got := len(rep.Advances); got != 1 {
-		t.Fatalf("WAL advances after stale re-receive: got %d, want exactly 1 (the second Accept must NOT append a record — the post>pre guard killed the fsync bomb)", got)
+		t.Fatalf("WAL advances after stale re-receive: got %d, want exactly 1 (the second Accept must not append a record — the post>pre guard suppresses the extra per-Accept fsync)", got)
 	}
 	if got := rep.Advances[0]; got != foreignDot {
 		t.Fatalf("recorded advance value: got %d, want %d", got, foreignDot)

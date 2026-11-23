@@ -6,43 +6,10 @@
 
 package sync
 
-// ---------------------------------------------------------------------------
-// — Flat-Combining Stack Verification (AWS Graviton Crucible)
-// ---------------------------------------------------------------------------
-//
-// This file is the verification suite for the Flat-Combining stack
-// (flatcomb.go). It mirrors the structure of elimination_test.go so the
-// OLD (elimination) and NEW (flat-combining) candidates share an
-// identical verification battery:
-//
-// 1. STRUCTURAL SIZE ASSERTION
-// TestFlatCombSlotSize — flatCombPub is exactly 128 bytes (two
-// cache lines), so adjacent publication records never false-share.
-// Structural precondition for the FC algorithm's spatial isolation.
-//
-// 2. ZERO-GC MICROSCOPE
-// TestFlatCombHotPathZeroAllocations — the unyielding CI gate that
-// proves the push/pop hot path allocates zero heap objects. Uses
-// testing.AllocsPerRun, identical to the / patterns.
-//
-// 3. SEQUENTIAL CORRECTNESS
-// TestFlatCombSequentialCorrectness — push N values, pop them,
-// verify LIFO. Catches basic stack-logic bugs before the concurrent
-// stress.
-//
-// 4. LINEARIZABILITY / CORRECTNESS
-// TestFlatCombLinearizability — concurrent stress mirroring
-// TestEliminationLinearizability but exercising the flat-combining
-// stack specifically.
-//
-// ADAPTER: flatCombStackAdapter adapts flatCombStack to the gateStack
-// interface and registers it with the gate's makeGateStack factory +
-// sets gateCandidateNameOverride in init(). This wiring means
-// TestScalingGate (the rewritten asymmetric gate) automatically
-// exercises the FC candidate once this test file is compiled into the
-// package. Switching the gate back to the elimination candidate when
-// needed is done by suppressing this init via build tag (deferred).
-// -----------------------------------------------------------------------
+// The flat-combining tests cover record layout, allocation-free push and pop,
+// sequential LIFO behavior, concurrent conservation of values and cycle
+// detection. The adapter selects this implementation for the shared scaling
+// gate, so it runs the same workload as the elimination stack.
 
 import (
 	"fmt"
@@ -54,15 +21,9 @@ import (
 	"unsafe"
 )
 
-// ---------------------------------------------------------------------------
-// ADAPTER — wire flatCombStack into the scaling gate (anti-self-deception)
-// ---------------------------------------------------------------------------
-
-// flatCombStackAdapter exposes flatCombStack via the gateStack
-// interface so the SAME asymmetric burst workload (scaling_gate_test.go)
-// drives the FC candidate as drove the elimination candidate. This is
-// the anti-self-deception measure: the workload is shared, the gate's
-// assertions are shared, only the candidate varies.
+// flatCombStackAdapter exposes flatCombStack through the scaling gate's stack
+// interface. The workload and assertions are shared with the other stack
+// implementations.
 type flatCombStackAdapter struct {
 	inner *flatCombStack
 }
@@ -79,18 +40,14 @@ func (a *flatCombStackAdapter) headLoad() uint64 {
 	return a.inner.head.Load()
 }
 
-// drainAll walks the SINGLE central FC head. FC has one head (the
-// combiner is the sole mutator), so this is a single-head walk shared
-// with the elimination + plain-Treiber adapters.
+// drainAll walks the single central head using the same helper as the
+// elimination and plain Treiber adapters.
 func (a *flatCombStackAdapter) drainAll(pool *ElimNodePool, poolCap int) (int64, bool) {
 	return drainSingleNodeStackFromHead(a.inner.head.Load(), pool, poolCap)
 }
 
-// init wires the FC candidate into the rewritten gate's
-// makeGateStack factory and sets the candidate name so the gate's
-// printed table attributes throughput correctly. By global-init order,
-// this runs after the package-var makeGateStack is initialized to its
-// elimination default (Go guarantees var init precedes init funcs).
+// init selects flat combining for the scaling gate. Package variable
+// initialization completes first, so this replaces the elimination default.
 func init() {
 	makeGateStack = func() gateStack {
 		return &flatCombStackAdapter{inner: NewFlatCombStack()}
@@ -99,16 +56,12 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// 1. STRUCTURAL SIZE ASSERTION
+// 1. Structural size assertion
 // ---------------------------------------------------------------------------
 
-// TestFlatCombSlotSize verifies flatCombPub is exactly 128 bytes (two
-// Neoverse-V1 cache lines) so adjacent publication records never
-// false-share. A spinning waiter on one record's seq line must never
-// invalidate an ADJACENT spinning waiter's line, and the combiner's
-// 128-stride scan must be a clean LLC sweep with no cross-invalidation.
-// This is the structural precondition for the FC algorithm's performance
-// and is a CI gate that FAILS LOUDLY on padding regression.
+// TestFlatCombSlotSize checks that each publication record occupies two
+// 64-byte cache lines. This padding keeps adjacent spinning waiters from
+// invalidating one another's sequence lines.
 func TestFlatCombSlotSize(t *testing.T) {
 	size := unsafe.Sizeof(flatCombPub{})
 	if size != 128 {
@@ -124,27 +77,13 @@ func TestFlatCombSlotSize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. ZERO-GC MICROSCOPE
+// 2. Zero-GC verification
 // ---------------------------------------------------------------------------
 
-// TestFlatCombHotPathZeroAllocations is the unyielding CI gate for the
-// Zero-GC mandate on the flat-combining stack hot path. Uses
-// testing.AllocsPerRun to measure heap allocations performed ONLY
-// inside the closure, averaged across N invocations — isolated from
-// benchmark framework noise, exactly as elimination_test.go does.
-//
-// The FC stack's hot path is allocRec (Treiber pop on the rec free-
-// list, a CAS, no heap) + publish (three atomic Stores to a private
-// rec line) + spin (one atomic Load on the same line) + freeRec
-// (Treiber push on the rec free-list, a CAS, no heap). The rec free-
-// list is a heap-embedded array in flatCombStack — its arena objects
-// were allocated once at NewFlatCombStack. The ElimNodePool is also
-// pre-allocated. So the hot path is genuinely heap-free.
-//
-// 1 allocation = a critical architectural failure of the Zero-GC
-// mandate (precisely what would happen if allocRec had to grow recs,
-// or if a closure/interface boxed, or if pool.allocIndex GC-grew the
-// free-list).
+// TestFlatCombHotPathZeroAllocations measures a push/pop pair with
+// testing.AllocsPerRun. Publication records and the node pool are allocated up
+// front, so acquiring, publishing, acknowledging and releasing a request must
+// not add a heap allocation.
 func TestFlatCombHotPathZeroAllocations(t *testing.T) {
 	stack := NewFlatCombStack()
 	pool := NewElimNodePool(elimTestPoolSize)
@@ -163,35 +102,22 @@ func TestFlatCombHotPathZeroAllocations(t *testing.T) {
 
 	if allocs != 0 {
 		t.Fatalf(
-			"CRITICAL FAILURE: flat-combining hot path breached Zero-GC mandate. "+
-				"Expected 0 AllocsPerOp, got %v. "+
-				"Context: {iterations=%d, allocs/op=%v}",
+			"flat-combining push/pop allocated %v objects per run; want 0. "+
+				"Iterations: %d. "+
+				"Allocations per run: %v",
 			allocs, iterations, allocs,
 		)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// 3. SEQUENTIAL CORRECTNESS
+// 3. Sequential correctness
 // ---------------------------------------------------------------------------
 
-// TestFlatCombSequentialCorrectness is a simple, deterministic sanity
-// check: push N values, pop them, verify LIFO order. Catches basic
-// stack-logic bugs (e.g., Next-link reversal, head-loading bug,
-// combiner mis-pairing) before concurrent stress.
-//
-// Edge cases checked:
-// - pop on empty returns (0, false).
-// - push then pop returns the SAME value once (single op round-trip).
-// - 1000 pushes then 1000 pops return LIFO order with no duplicates
-// and no missing values.
-// - after full drain, stack is empty again.
-//
-// This test runs the combiner's SERIAL batch path: a SINGLE goroutine
-// publishes a push and then becomes the combiner; the algorithm path
-// executes almost entirely via the "opportunistic combiner rule" branch.
-// It does not exercise the head-of-queue wait path, but it does exercise
-// the combiner combining-flag acquire + combine() cycle end-to-end.
+// TestFlatCombSequentialCorrectness checks empty pops, a zero payload and
+// LIFO order over 1,000 values. One goroutine publishes and combines each
+// request, exercising the opportunistic combiner path without a contested
+// waiter.
 func TestFlatCombSequentialCorrectness(t *testing.T) {
 	stack := NewFlatCombStack()
 	pool := NewElimNodePool(1024)
@@ -221,10 +147,10 @@ func TestFlatCombSequentialCorrectness(t *testing.T) {
 	stack.push(pool, prng, 0)
 	v, ok = stack.pop(pool, prng)
 	if !ok || v != 0 {
-		t.Fatalf("zero-payload round-trip: ok=%v v=%d (ok=true / v=0 expected; "+
-			"ok=false proves the FC stack used the value field instead of the "+
-			"ok-bit as the present/absent distinguisher — a CRITICAL bug given "+
-			"NullOffset64==0 collides with lawful zero payloads)", ok, v)
+		t.Fatalf("zero-payload round trip returned ok=%v, value=%d; want true, 0; "+
+			"the result must distinguish a stored zero from an empty stack using "+
+			"the ok bit rather than the value, since NullOffset64 is also zero; "+
+			"ok=false would lose that distinction", ok, v)
 	}
 
 	// Bulk LIFO order.
@@ -252,21 +178,17 @@ func TestFlatCombSequentialCorrectness(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. LINEARIZABILITY — concurrent stress (mirrors the elimination test)
+// 4. Linearizability — concurrent stress (mirrors the elimination test)
 // ---------------------------------------------------------------------------
 
-// TestFlatCombLinearizability stresses the flat-combining stack with
-// concurrent pushers and poppers, mirroring the elimination test's
-// shape: P goroutines, each pushing values in its own range and
-// popping whatever comes off, for a fixed duration. After all
-// goroutines quiesce, the remaining stack contents are drained and
-// cross-checked against the per-value net-surplus invariant:
+// TestFlatCombLinearizability runs concurrent producers and consumers for a
+// fixed duration. After they finish, draining the stack must account for every
+// operation:
 //
 //	drained == sum(goroutine.pushed - goroutine.popped)
 //
-// This is the same invariant the gate's (c) check enforces on the FC
-// stack. If any value is lost, duplicated, or fabricated by the
-// combiner batch or the head-commit / pairing logic, this fails.
+// A mismatch means the combiner, pairing logic or central-head commits lost
+// or duplicated values.
 func TestFlatCombLinearizability(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping FC linearizability stress in short mode")
@@ -343,44 +265,40 @@ func TestFlatCombLinearizability(t *testing.T) {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ FLAT-COMBINING LINEARIZABILITY STRESS TEST ║")
+	fmt.Println("║  Flat-combining linearizability stress test                      ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" Goroutines: %16d\n", numGoroutines)
-	fmt.Printf(" Total popped: %16d\n", totalPopped)
-	fmt.Printf(" Drained from stack: %16d\n", drainedCount)
-	fmt.Printf(" Net surplus: %16d\n", totalNetSurplus)
-	fmt.Printf(" GOMAXPROCS: %16d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  Goroutines:         %16d\n", numGoroutines)
+	fmt.Printf("  Total popped:        %16d\n", totalPopped)
+	fmt.Printf("  Drained from stack:  %16d\n", drainedCount)
+	fmt.Printf("  Net surplus:         %16d\n", totalNetSurplus)
+	fmt.Printf("  GOMAXPROCS:          %16d\n", runtime.GOMAXPROCS(0))
 	fmt.Println()
 
 	if drainedCount != totalNetSurplus {
 		t.Fatalf(
-			"LINEARIZABILITY VIOLATION: drained count (%d) != net surplus (%d). "+
-				"The flat-combining combiner batch / inside-combine pairing / "+
-				"head-commit logic lost or duplicated %d values. "+
-				"This proves the FC stack corrupted stack semantics.",
+			"flat-combining conservation mismatch: drained count %d != net surplus %d; "+
+				"the combiner batch, local pairing or central-head commits changed "+
+				"the value count by %d; "+
+				"check for lost or duplicated values",
 			drainedCount, totalNetSurplus, drainedCount-totalNetSurplus,
 		)
 	}
 
 	t.Logf(
-		"✓ FLAT-COMBINING LINEARIZABILITY VERIFIED: %d drained == %d surplus "+
+		"flat-combining conservation verified: %d drained == %d surplus "+
 			"(popped=%d, GOMAXPROCS=%d)",
 		drainedCount, totalNetSurplus, totalPopped, runtime.GOMAXPROCS(0),
 	)
 }
 
 // ---------------------------------------------------------------------------
-// 5. CYCLE DETECTION — the central stack walk structure (mirrors diag_test)
+// 5. Cycle detection — the central stack walk structure (mirrors diag_test)
 // ---------------------------------------------------------------------------
 
-// TestFlatCombCycleDetection walks the central FC Treiber stack WITHOUT
-// popping (direct head + next traversal via the packed-index encoding)
-// to detect cycles or corruption of the next-link field. Under FC the
-// sole mutator of head / next is the combiner, sequentially per batch,
-// so a quiescent stack has a well-formed LIFO list with NO cycles. A
-// cycle here would prove the combiner's head-commit CAS linked a node
-// back into the list improperly (an ABA cross-talk on head between
-// batches, or a broken next-value load in combinePopFromHead).
+// TestFlatCombCycleDetection follows packed next links without popping after
+// concurrent use. A repeated index or excessive depth indicates a corrupt
+// central list. The subsequent pop drain must visit the same number of nodes
+// as the walk.
 func TestFlatCombCycleDetection(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping concurrent cycle-detection stress in short mode.")
@@ -414,14 +332,14 @@ func TestFlatCombCycleDetection(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Walk the central stack WITHOUT popping.
+	// Walk the central stack without popping.
 	head := stack.head.Load()
 	visited := make(map[uint64]bool)
 	count := 0
 	for head != NullOffset64 {
 		headIdx := elimIndex(head)
 		if visited[headIdx] {
-			t.Fatalf("CYCLE detected at index %d after %d nodes on FC stack", headIdx, count)
+			t.Fatalf("cycle detected at index %d after %d nodes on FC stack", headIdx, count)
 		}
 		visited[headIdx] = true
 		count++

@@ -17,27 +17,27 @@ import (
 // ZIP-215 gate (cofactor-8 rejection via filippo.io/edwards25519 +
 // RFC-8032 strict Verify via circl) on a 120-byte CRDT delta frame.
 //
-// GEAR TAG (HONEST): GOMAXPROCS=4, CPU part 0xd40 (Cortex-A76-class,
-// Graviton3-era). This is NOT c8g.8xlarge at 32c. The function name
-// retains the _32c suffix per the roadmap's naming convention
-// (the TARGET gear for the published bar); the HONEST gear tag is this
-// comment and the commit message. Do NOT relabel a 4c number as a 32c
-// number. The 32c re-run is PENDING Karpenter c8g provisioning.
+// GEAR TAG: GOMAXPROCS=4, CPU part 0xd40 (Cortex-A76-class,
+// Graviton3-era). This is not c8g.8xlarge at 32c. The function name
+// retains the _32c suffix per the naming convention for the target
+// gear; the gear tag is this comment and the commit message. Do not
+// relabel a 4c number as a 32c number. The 32c re-run is pending
+// 32-core Graviton4 provisioning.
 //
-// The bench is sequential (for i:= 0; i < b.N; i++) rather than
-// b.RunParallel because runs with -cpu=4, which already spawns
+// The bench is sequential (for i := 0; i < b.N; i++) rather than
+// b.RunParallel because the run uses -cpu=4, which already spawns
 // 4 GOMAXPROCS workers; b.RunParallel would add a second layer of
 // parallelism that confuses the per-op ns reading. The published
 // number is the single-thread per-Verify cost at GOMAXPROCS=4.
 //
-// This number is the input to (relay hop-count bound) and
-// (attribution envelope). It must be PROVEN, not estimated.
+// This number is the input to the relay hop-count bound and
+// attribution envelope work. It must be measured, not estimated.
 func BenchmarkVerifyCRDTFrame_32c(b *testing.B) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		b.Fatal(err)
 	}
-	msg := make([]byte, 120) // 120-byte CRDT delta frame
+	msg := make([]byte, 120) // 120-byte CRDT delta frame per §2.X2
 	sig := ed25519.Sign(priv, msg)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(msg) + len(sig) + len(pub)))

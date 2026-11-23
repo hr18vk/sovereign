@@ -6,25 +6,19 @@
 
 package mesh
 
-// hybrid_frame_test.go — the hybrid end-to-end guard (ADR-0045): the
-// (Ed25519 + ML-DSA-65) sign/verify path had NEVER executed end-to-end — both
-// flags default false and no launcher passes them. A 2-node in-process harness
-// proves the seam; this guard is the 3-NODE real-TCP convergence required before
-// hybrid mode may be described as working.
+// This test exercises hybrid Ed25519 and ML-DSA-65 signing and verification
+// across three nodes connected by TLS (ADR-0045, appendix B). Hybrid signing
+// and verification are disabled by default, so every node opts in explicitly.
 //
-// Shape: the asymmetric_dial_test.go real-TCP stack (TLS transport, the
-// accept-loop fix registration, batch relay), but every node's identity is the HYBRID
-// constructor (NewNodeIdentityHybrid — PQ key minted from the same seed), every
-// Directory registers BOTH the classical and PQ pubkeys, every gossiper runs
-// SetHybridSign(true), every receiver runs SetHybridVerify(true). A injects 100
-// keys; all three sweep; convergence + the hybrid-accept counters are the gate.
+// NewNodeIdentityHybrid derives both keypairs from one seed. Each Directory
+// registers both public keys for every peer, each Gossiper enables hybrid
+// signing, and each Receiver enables hybrid verification. A inserts 100 keys
+// and all three nodes run anti-entropy sweeps. Matching roots alone are not
+// enough: the accept counters must also show that B and C verified hybrid
+// frames rather than converging through the v1 path.
 //
-// RED (config-inject): drop the SetHybridSign(true) arm → the senders
-// emit v1 frames → the receivers' BOTH-sigs gate REJECTS them → B/C stay
-// root-zero → the convergence assertion fires (roots …/00…/00…). The RED is
-// stronger than a counter miss: it proves the verify gate genuinely REQUIRES
-// the hybrid frame, i.e. the GREEN run's convergence came THROUGH the hybrid
-// path, not around it.
+// As a negative control, disabling SetHybridSign makes the receivers reject the
+// resulting v1 frames because they require both signatures.
 
 import (
 	"context"
@@ -81,7 +75,7 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 		if _, err := rand.Read(seed); err != nil {
 			t.Fatalf("rand seed %d: %v", i, err)
 		}
-		id, err := NewNodeIdentityHybrid(seed) // the hybrid arm: PQ keypair onboard
+		id, err := NewNodeIdentityHybrid(seed) // derive the post-quantum keypair from the same seed
 		if err != nil {
 			t.Fatalf("NewNodeIdentityHybrid %d: %v", i, err)
 		}
@@ -101,17 +95,17 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 		engN := newTestEngine(t, id.NodeID, arenaDir)
 		d := identity.NewDirectory()
 		recv := receive.NewReceiver(admission.NewPeerBucket(), clock.NewIngressHLCScalarCap(clock.NewSystemClock(), engN), clock.NewSystemClock(), d, engN, 50_000_000)
-		recv.SetHybridVerify(true) // the receive-side BOTH-sigs gate (ADR-0036)
+		recv.SetHybridVerify(true) // require both signatures on receipt (ADR-0036)
 		ps := NewPeerSet(tr, recv, id, engN)
 		g := NewGossiper(ps, id, engN, d)
-		g.SetHybridSign(true) // the send-side hybrid arm (ADR-0037)
+		g.SetHybridSign(true) // sign with both algorithms (ADR-0037)
 		g.SetBatchSize(DefaultBatchSize)
 		recv.SetRelayRetainer(g.RetainForeign)
 		recv.SetRelayRetainerBatch(g.RetainForeignBatch)
 		nodes[i] = &node{ident: id, eng: engN, dir: d, recv: recv, ps: ps, g: g, tr: tr}
 	}
-	// Cross-register classical + PQ pubkeys (a missing PQ pubkey would
-	// DropVerify every hybrid frame — the verify side of the guard).
+	// Register classical and post-quantum public keys for every peer. A missing
+	// post-quantum key makes verification reject every hybrid frame.
 	for i := 0; i < numNodes; i++ {
 		for j := 0; j < numNodes; j++ {
 			if i == j {
@@ -125,7 +119,7 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 			}
 		}
 	}
-	// Wire the hybrid-accept counters (closures capture the per-node counters).
+	// Each closure updates its own node's hybrid-accept counter.
 	for i := range nodes {
 		n := nodes[i]
 		n.recv.SetHybridAcceptReporter(func() { atomic.AddInt64(&n.hybridAcc, 1) })
@@ -135,9 +129,9 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 	defer cancel()
 	var wg sync.WaitGroup
 
-	// All three listen; B and C dial A (the symmetric star — the accept fix makes A's
-	// accept-registered inbound edges publishable, so one dial per pair is a
-	// full edge). Sweep on all three.
+	// All three nodes listen, and B and C dial A. Accepted inbound connections
+	// are registered for publishing, so one dial per pair provides a full edge.
+	// Every node sweeps.
 	for i := 0; i < numNodes; i++ {
 		ln, err := nodes[i].tr.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -163,9 +157,9 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 		asyncWait(t, nodes[j].ps, nodes[0].ident.NodeID)
 	}
 
-	// A injects the keys (the seed); all three sweep.
+	// A inserts the keys before all three nodes begin sweeping.
 	for i := 0; i < keys; i++ {
-		eid := fmt.Sprintf("b7-key-%d", i)
+		eid := fmt.Sprintf("hybrid-key-%d", i)
 		payload := fmt.Sprintf("value-%d", i)
 		nodes[0].g.InsertLocalEvents(eid, payload, eng.CRDTEntry{
 			SystemTime: int64(1_700_000_000 + i),
@@ -183,7 +177,7 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 	for time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 		for i := range nodes {
-			roots[i] = nodes[i].eng.State().MerkleRoot()
+			roots[i] = nodes[i].eng.MerkleRootFromShards()
 		}
 		if roots[0] == roots[1] && roots[1] == roots[2] {
 			converged = true
@@ -191,16 +185,15 @@ func TestB7_ThreeNodeHybridConverges(t *testing.T) {
 		}
 	}
 	if !converged {
-		t.Fatalf("B7: hybrid mesh did NOT converge in %s (roots %x / %x / %x) — the hybrid sign/verify path broke convergence", slo, roots[0], roots[1], roots[2])
+		t.Fatalf("hybrid mesh did not converge in %s (roots %x / %x / %x)", slo, roots[0], roots[1], roots[2])
 	}
-	// THE EXECUTION PROOF (not just convergence): hybrid frames were ACCEPTED on
-	// B and C (the counter fires only from the BOTH-sigs-verified seam). Without
-	// this the guard would pass on the v1 path and prove nothing about hybrid.
+	// The accept counter increments only after both signatures verify. Checking
+	// it prevents a v1-only exchange from satisfying this test.
 	for i := 1; i < numNodes; i++ {
 		if got := atomic.LoadInt64(&nodes[i].hybridAcc); got == 0 {
-			t.Errorf("node %d accepted ZERO hybrid frames — the mesh converged but the hybrid path never EXECUTED (the wired-but-never-exercised defect class)", i)
+			t.Errorf("node %d accepted no hybrid frames despite convergence", i)
 		}
 	}
-	t.Logf("B7 GREEN: 3-node hybrid mesh converged %d keys (root %x); hybrid accepts B=%d C=%d",
+	t.Logf("three-node hybrid mesh converged %d keys (root %x); hybrid accepts B=%d C=%d",
 		keys, roots[0], atomic.LoadInt64(&nodes[1].hybridAcc), atomic.LoadInt64(&nodes[2].hybridAcc))
 }

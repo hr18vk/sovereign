@@ -4,156 +4,116 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package admission implements the per-peer Sybil-burst isolation layer
-// of the planetary-fanout CRDT mesh. PeerBucket is the SECOND admission
-// gate an inbound frame crosses — it runs at the transport seam, BEFORE
-// the sub-us IngressHLCScalarCap clock gate
-// and long before the ~71.4 us/op Ed25519 VerifyCRDTFrame gate.
-// Where 3.0 drops Byzantine-TIME frames and the engine
-// skew bound (crdt.go:32 LamportSkewAbsoluteSlackUnbounded) admits any
-// inbound DotCounter below MaxUint64, 3.1 drops Byzantine-RATE frames
-// (the DotCounter-ratchet Sybil) at the TCP layer, isolated to the ONE
-// malicious identity, so a single attacker cannot exhaust the admission
-// budget of honest peers.
+// Package admission implements per-identity sequence-advance budgets for
+// inbound frames. PeerBucket rejects excessive advancement for one identity
+// without consuming the budgets of other identities. The receive path calls
+// Accept before its clock and signature checks, so rejected frames avoid
+// signature verification.
 //
-// Architectural ordering invariant (load-bearing, tested):
+// A relayed frame crosses the gates in this order:
 //
-//	[wire] -> PeerBucket.Accept(pub, counter) // sub-us, per-peer rate cap
+//	[wire] -> PeerBucket.Accept(pub, counter)
+//	       -> if Keep: IngressHLCScalarCap.Admit
+//	       -> if admitted: RelayEnvelope.Open
+//	       -> if authenticated: PeerBucket.CommitHWM
+//	       -> origin verification and CRDT merge
 //
-// -> if Keep: IngressHLCScalarCap.Admit // sub-us clock cap (3.0)
-// -> if accept: VerifyCRDTFrame // 71.4 us/op, EXPENSIVE
-// -> if verify ok: engine.Join // CRDT merge
-//
-// pkg/admission is CRDT-agnostic: it imports ONLY the standard library.
-// It does NOT import pkg/sync (so it never touches the frozen crdt.go),
-// does NOT import pkg/identity, and does NOT import circl. The bucket
-// keys on [32]byte — the canonical copy of a 32-byte Ed25519 public key
-// — because circl's ed25519.PublicKey is `type PublicKey []byte`
-// (pubkey112.go:7), a Go slice, and slices are non-comparable and
-// CANNOT be map keys ("invalid map key type"). The roadmap wording
-// "map[ed25519.PublicKey]*PeerEWMA" is a compile error and is superseded
-// by PeerBucketKey = [32]byte here.
+// The package depends only on the standard library. Accept receives the
+// sequence counter as a uint64 and copies the 32-byte identity into a
+// comparable [32]byte map key. This avoids importing the CRDT or identity
+// packages; circl's Ed25519 public-key type is a slice and cannot be a map key.
 package admission
 
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 )
 
-// PeerBucketKey is the canonical, comparable copy of a 32-byte Ed25519
-// public key. circl's ed25519.PublicKey is `type PublicKey []byte`
-// (pubkey112.go:7); ed25519.PublicKeySize == 32 (ed25519.go:56). Go
-// slices are non-comparable, so `map[ed25519.PublicKey]X` does NOT
-// compile — the compiler rejects it with "invalid map key type". The
-// bucket therefore keys on the fixed-size [32]byte array, copied once
-// from the inbound []byte pubkey. This is the load-bearing key-type
-// decision; the compile-time guard (TestPeerBucket_KeyIsArray32Byte)
-// and the negative-compile guard (peer_key_slice_probe) detector-ban
-// the slice-key pattern from this package's source identity.
+// PeerBucketKey is the comparable form of a 32-byte peer identity. Accept
+// copies the supplied bytes into this array before the map lookup. A circl
+// Ed25519 public key cannot be used directly because its underlying type is
+// a slice, and Go slices are not comparable. TestPeerBucket_KeyIsArray32Byte
+// checks the array type; the peer_key_slice_probe build tag retains the
+// complementary negative compilation test.
 type PeerBucketKey [32]byte
 
-// ewmaAlpha is the exponential moving average decay factor for the
-// per-peer inbound Counter-delta rate. alpha = 0.1 matches the engine's
-// own per-ENGINE EWMA at crdt.go:1674 (observedInboundRateBits update
-// inside AdvanceLamportTo: next = alpha*prev + (1-alpha)*sample). 3.1's
-// EWMA is a NEW, SEPARATE, PER-PEER structure — it does NOT touch
-// observedInboundRateBits and does NOT call AdvanceLamportTo (the
-// forbidden-symbol guard, TestPeerBucket_ForbiddenSymbolsAbsent,
-// detector-bans both identifiers from this package's source).
+// ewmaAlpha is the decay factor for each peer's inbound counter-delta EWMA.
+// Its value and update formula match the engine-wide inbound-rate average,
+// but this state is independent and does not call AdvanceLamportTo.
+// TestPeerBucket_ForbiddenSymbolsAbsent checks that the admission package
+// does not reference the engine's private rate fields.
 const ewmaAlpha = 0.1
 
-// initialBudget is the token budget a fresh PeerEWMA starts with. It is
-// the per-peer admission allowance before any rate deduction. A peer
-// whose cumulative Counter-delta drain stays under this budget is Keep;
-// once the drain reaches it, subsequent Accept calls return Drop until
-// the bucket is replenished (out of scope here — the transport
-// wires the refill on connection lifecycle).
-//
-// Sized so the acceptance test drains a MaxUint64-ratchet attacker in a
-// bounded small constant of admits: a single delta of math.MaxUint64
-// exceeds the budget, so the attacker's FIRST ratchet admit drops.
+// initialBudget is a fresh peer's allowance in counter-advancement units.
+// Accept rejects a positive delta greater than or equal to the remaining
+// budget without charging it. Duplicates remain admissible, and Refund can
+// restore an unattributed charge up to this allowance. There is no time-based
+// replenishment, so a MaxUint64 delta always exceeds a fresh peer's budget.
 const initialBudget uint64 = 1 << 20 // ~1M token units
 
-// FrameDecision is the transport-layer drop verdict. 3.1 ships the
-// decision; the real EAGAIN-at-TCP-layer wiring (syscall.EAGAIN /
-// net.OpError) lands in (epoll + SO_ATTACH_REUSEPORT_EBPF,
-// roadmap line 50 — NOT yet shipped). 3.1 does NOT fabricate the kernel
-// path: it returns Drop and the transport seam will call
-// EAGAIN at the socket once the kernel path exists.
+// FrameDecision tells the receive path whether to continue processing a
+// frame or reject it. This package returns the decision; it does not perform
+// socket operations.
 type FrameDecision int
 
 const (
-	// Keep means the frame's per-peer rate is within budget; the
-	// transport layer forwards it to the next gate (3.0 clock cap).
+	// Keep permits the frame to proceed to the next receive gate.
 	Keep FrameDecision = iota
-	// Drop means the frame's per-peer rate has exhausted the bucket;
-	// the transport layer drops it at the TCP layer (EAGAIN).
+	// Drop rejects a frame whose key length is invalid or whose positive
+	// sequence advancement does not fit within the remaining budget.
 	Drop
 )
 
-// PeerEWMA is the per-identity token bucket. It tracks an EWMA of the
-// inbound Counter-DELTA (the per-frame DotCounter advancement, NOT the
-// absolute Counter — the delta is what a Sybil ratchets) and a remaining
-// token budget. It is guarded by its shard's mutex; it is never accessed
-// outside its owning shard.
-//
-// The Counter-delta is the per-frame advancement the transport layer
-// extracts from the wire frame before calling Accept. 3.1 does NOT
-// import pkg/sync for CRDTEntry.Dot() (hamt.go:44); it accepts the raw
-// uint64 delta to keep pkg/admission CRDT-agnostic and avoid the
-// import-direction entanglement the engagement forbids (3.0 already
-// imports pkg/sync; 3.1 must NOT).
+// PeerEWMA holds one identity's counter-delta average and remaining budget.
+// Accept receives an absolute DotCounter or OriginSeq and computes its
+// advancement from lastCounter, keeping this package independent of the CRDT
+// representation. The owning shard's mutex guards every field.
 type PeerEWMA struct {
-	// rate is the EWMA of the inbound Counter-delta, stored as the
-	// IEEE-754 bits of a float64 (mirrors crdt.go:207's
-	// observedInboundRateBits atomic.Uint64-of-bits pattern, but in a
-	// NEW per-peer field — NOT the engine's field). Held under the
-	// shard mutex, so it is a plain uint64, not atomic.
+	// rate stores the EWMA as the IEEE-754 bits of a float64. The shard
+	// mutex makes an atomic field unnecessary.
 	rate uint64
 
-	// budget is the remaining token allowance. Each Accept deducts the
-	// observed delta; when budget reaches 0 the next Accept returns Drop.
-	// Held under the shard mutex.
+	// budget is the remaining counter-advancement allowance. A charging
+	// Keep deducts delta; Refund can restore an unattributed charge.
 	budget uint64
 
-	// lastCounter is the peer's previously observed DotCounter. The
-	// per-frame Counter-delta is counter - lastCounter (0 on first sight
-	// and on non-monotonic replay). Held under the shard mutex.
+	// lastCounter is the highest counter committed after authentication.
+	// A counter at or below it contributes zero new advancement.
 	lastCounter uint64
 }
 
-// shardCount is the number of PeerBucket shards. 16 shards keyed by the
-// low 4 bits of the pubkey gives 4× the realistic GOMAXPROCS (the storm
-// peak is 32 cores; 16 shards lets 16 distinct peers proceed with zero
-// cross-shard contention). A single sync.Mutex around the whole map would
-// serialize all 32 peers and FAIL the Sybil-isolation intent;
-// sharding makes isolation structural — the attacker's shard is the only
-// one it can saturate.
+// shardCount spreads identities across independently locked maps. Peers in
+// different shards can proceed concurrently, while every operation for one
+// identity uses the same mutex.
 const shardCount = 16
 
-// shardMask selects the low 4 bits (log2(16) == 4).
+// shardMask selects the low four bits used to choose a shard.
 const shardMask = shardCount - 1
 
-// shard holds a shard of the per-peer bucket map. Each shard has its own
-// sync.Mutex, so two peers hashing to different shards never contend.
+// shard protects one partition of the peer map.
 type shard struct {
 	mu sync.Mutex
 	m  map[PeerBucketKey]*PeerEWMA
 }
 
-// PeerBucket is the per-peer Sybil-burst isolation token bucket. It is
-// a sharded map of PeerEWMA keyed by the canonical [32]byte pubkey. The
-// Accept path is: zero-alloc length check (reject len != 32 BEFORE the
-// bucket lookup), one [32]byte copy, shard select on the low 4 bits,
-// shard-lock, map lookup (lazy-create on first sight), EWMA update +
-// budget deduction, verdict. The whole hot path is a single map lookup
-// and a handful of arithmetic ops under a per-shard mutex.
+// PeerBucket maintains independent sequence-advance budgets in a sharded map.
+// Accept rejects an invalid key length before the lookup, copies the key,
+// selects its shard, and lazily creates the peer entry on first sight. After
+// creation, a decision requires one locked map lookup and arithmetic.
 type PeerBucket struct {
 	shards [shardCount]shard
+
+	// disablePendingHWMBugInject is a test-only fault switch. When true,
+	// Accept writes lastCounter at charge time, recreating the attribution
+	// bypass that CommitHWM prevents. Its zero value is false in production.
+	// This cold field stays after the shard array; preserve the explicit
+	// field order rather than applying automatic layout changes.
+	disablePendingHWMBugInject atomic.Bool
 }
 
-// NewPeerBucket returns a ready PeerBucket with all shard maps
-// initialized.
+// NewPeerBucket returns a PeerBucket with initialized shard maps, ready for
+// concurrent use.
 func NewPeerBucket() *PeerBucket {
 	b := &PeerBucket{}
 	for i := range b.shards {
@@ -162,44 +122,34 @@ func NewPeerBucket() *PeerBucket {
 	return b
 }
 
-// shardIndex returns the shard index for a 32-byte pubkey. It uses the
-// low 4 bits of the first byte. The low bits of an Ed25519 public key
-// are a uniform field (the key is a uniformly random curve point
-// encoding), so the low-4-bit shard distribution is uniform across
-// honest peers; an attacker cannot target a single shard to amplify
-// contention without also randomizing its key (which just spreads it
-// across shards, preserving isolation).
+// shardIndex uses the low four bits of the identity's first byte, avoiding a
+// hash computation on the Accept path. Shard choice affects lock contention,
+// not budget isolation: colliding identities still have separate entries.
 func shardIndex(k PeerBucketKey) int {
 	return int(k[0]) & shardMask
 }
 
-// Accept applies the per-peer rate cap to an inbound frame. pub is the
-// 32-byte Ed25519 public key; counter is the frame's DotCounter value.
-// It returns Keep if the peer's rate is within budget, Drop if the peer
-// has exhausted its bucket.
+// Accept applies a per-identity sequence-advance budget. pub is a 32-byte
+// identity key and counter is the frame's absolute DotCounter or OriginSeq.
+// The method is safe for concurrent use.
 //
-// The verdict is computed from the Counter-DELTA between this Accept
-// and the peer's previous observed Counter (per the design contract:
-// "exponential moving average... token bucket deduction"). A peer's Counter is
-// monotonic; the delta is the per-frame advancement. A Sybil that
-// ratchets Counter by MaxUint64-equivalent deltas produces a huge delta
-// that drains its own bucket in bounded admits, while honest peers
-// submitting modest deltas keep their separate buckets intact.
+// A malformed key returns (Drop, 0) without touching a shard map. For a valid
+// key, Accept computes positive advancement from the committed watermark. A
+// duplicate or replay returns (Keep, 0) without changing the budget, EWMA, or
+// watermark. A positive delta updates the EWMA; if it is greater than or equal
+// to the remaining budget, Accept returns (Drop, 0) without charging or
+// committing it. Otherwise Accept deducts delta and returns (Keep, delta).
 //
-// pub of len != 32 is REJECTED before the bucket lookup (a zero-alloc
-// length check): a short/long pubkey cannot be a valid Ed25519 key
-// (ed25519.PublicKeySize == 32) and MUST NOT silently truncate into the
-// [32]byte key (the copy-length guard, TestPeerBucket_RejectShortPub /
-// TestPeerBucket_RejectLongPub).
-func (b *PeerBucket) Accept(pub []byte, counter uint64) FrameDecision {
-	// Zero-alloc length check BEFORE the bucket lookup. A pub of len !=
-	// 32 is not a valid Ed25519 key and is rejected without touching any
-	// shard map (no map growth, no allocation, no silent truncation).
+// The charged delta lets the caller Refund a frame rejected before its
+// identity is authenticated. Accept normally leaves lastCounter unchanged;
+// after authentication the caller commits the counter with CommitHWM.
+func (b *PeerBucket) Accept(pub []byte, counter uint64) (FrameDecision, uint64) {
+	// Reject malformed keys without allocating, truncating, or growing a map.
 	if len(pub) != 32 {
-		return Drop
+		return Drop, 0
 	}
 
-	// Copy the 32-byte pubkey into the canonical [32]byte key ONCE.
+	// Copy the identity into its comparable map-key form.
 	var k PeerBucketKey
 	copy(k[:], pub)
 
@@ -213,91 +163,111 @@ func (b *PeerBucket) Accept(pub []byte, counter uint64) FrameDecision {
 		s.m[k] = peer
 	}
 
-	// Derive the per-frame Counter-delta from the HIGH-WATER MARK. The first
-	// observation for a peer has no prior, so its delta is the counter itself;
-	// subsequent observations charge only NEW advancement.
-	//
-	// ── THE HIGH-WATER-MARK DISCIPLINE ───────────────────────────
-	// THE BUG THIS REPLACES (found on silicon): the earlier code wrote
-	// `peer.lastCounter = counter` UNCONDITIONALLY, so a NON-MONOTONIC arrival
-	// REWOUND the high-water mark and the next fresh counter re-drained a gap the
-	// origin had ALREADY paid for — sawtooth amplification. That was harmless while
-	// every origin's counters arrived monotonically (one sender per origin), and it
-	// became fatal once the batch relay was wired: 34 relayers began
-	// interleaving ONE origin's old and new OriginSeqs into ONE origin-keyed bucket.
-	// Measured consequence — the 1<<20 budget died in ~10 seconds on EVERY node,
-	// including the seed's own bucket (fed by reflected relays of its own batches):
-	// node-0 (SEED) 77,838 Drop / 5,945 Accept; node-34-eu 72,831 / 4,442.
-	// All of node-34's accepts fell inside ONE 10-second window, then ZERO accepts
-	// for the remaining 72 seconds — permanent admission death, not throttling. The
-	// second defect compounded it: `delta >= peer.budget` at budget==0 is satisfied
-	// by delta==0, so even ALREADY-SEEN frames dropped forever.
-	//
-	// THE INVARIANT THIS DISCIPLINE ESTABLISHES: the high-water mark NEVER rewinds, and ONLY a
-	// Keep advances it. Every case is tabulated in ADR-0045's block
-	// (fresh origin / monotonic advance / duplicate / replay / MaxUint64 ratchet /
-	// gap-over-budget), OLD behavior vs NEW, because this is a Byzantine-defense
-	// seam and a silent edit here would falsify the defense.
-	//
-	// THE SYBIL BOUND IS UNCHANGED: total ACCEPTED advancement per origin stays
-	// <= initialBudget. The discipline removes DOUBLE-CHARGING for the same advancement; it
-	// does not raise the ceiling.
+	// The first observation charges its absolute counter because lastCounter
+	// starts at zero. Later observations charge only advancement beyond the
+	// committed watermark. A replay must never rewrite that watermark: doing so
+	// would charge the next fresh counter for a gap that was already paid for.
+	// Independent relayers can produce exactly that non-monotonic arrival order.
 	prev := peer.lastCounter
 	var delta uint64
 	if counter > prev {
 		delta = counter - prev
 	}
 
-	// DUPLICATE / REPLAY (delta == 0, i.e. counter <= the high-water mark) → Keep
-	// IMMEDIATELY: no budget touch, no lastCounter write, no EWMA sample. A frame
-	// that advances the origin's sequence by NOTHING costs the origin nothing, so
-	// dropping it buys ZERO Sybil protection while costing convergence (it was the
-	// permanent-death half of the collapse). Join is idempotent, so an
-	// admitted duplicate is bounded work: verify + idempotent apply. Frame-rate
-	// flooding was NEVER this gate's job — that is transport backpressure
-	//untouched by this change.
+	// Duplicates and replays have no new advancement, so they Keep without
+	// changing the budget, watermark, or EWMA. Join is idempotent, although the
+	// caller still pays any applicable verification cost. Frame-rate
+	// backpressure belongs to the transport rather than this sequence budget.
 	if delta == 0 {
-		return Keep
+		return Keep, 0
 	}
 
-	// EWMA of the inbound Counter-delta, alpha = 0.1 (matches crdt.go:1674).
-	// next = alpha*prev + (1-alpha)*sample. Stored as IEEE-754 bits. Unchanged
-	// form, now fed only by real advancements; its only consumer is the Rate()
-	// accessor, and relayed duplicates no longer sample it (disclosed in the ADR,
-	// not redesigned).
+	// Sample each positive delta, including one subsequently rejected for
+	// exceeding the budget. Duplicates return before this update. Rate exposes
+	// the resulting EWMA for diagnostics and tests.
 	prevRate := math.Float64frombits(peer.rate)
 	nextRate := ewmaAlpha*prevRate + (1-ewmaAlpha)*float64(delta)
 	peer.rate = math.Float64bits(nextRate)
 
-	// GAP LARGER THAN THE REMAINING BUDGET → Drop, and:
-	// (a) do NOT advance lastCounter. If a DROPPED frame advanced the high-water
-	// mark, one MaxUint64 ratchet would set the HWM to MaxUint64 and every
-	// later frame would be delta-0 → Keep — the attacker converting a single
-	// dropped frame into a PERMANENT ADMISSION BYPASS, strictly worse than the
-	// sawtooth. Guard R4 (TestRatchetDoesNotAdvanceHWM) exists
-	// to make that impossible.
-	// (b) do NOT zero the budget. A legitimate origin that jumps a gap larger than
-	// its remainder (e.g. rejoining after a partition) keeps admitting later
-	// small advances; zeroing turned one large gap into a death sentence. The
-	// Sybil bound is identical either way — an UNACCEPTED frame was never
-	// charged, so refusing to zero cannot widen the accepted-advancement
-	// ceiling.
-	// The MaxUint64 ratchet still Drops on its first admit (MaxUint64-prev >= 1<<20)
-	// and on every subsequent one: the Byzantine acceptance contract is preserved.
+	// An over-budget gap is uncharged and cannot commit its counter. Otherwise a
+	// single rejected MaxUint64 counter would make every later frame a free
+	// duplicate. Leaving the remaining budget intact also lets an origin recover
+	// from a large gap with later affordable advances; rejecting a frame does not
+	// consume the allowance it failed to use.
+	//
+	// The comparison is inclusive, so a delta exactly equal to the budget drops.
 	if delta >= peer.budget {
-		return Drop
+		return Drop, 0
 	}
 
-	// KEEP: charge the real advancement and advance the high-water mark. This is
-	// the ONLY site that writes peer.lastCounter.
+	// Charge the advancement but leave its watermark pending. The receiver
+	// either refunds an unattributed charge or calls CommitHWM after
+	// authentication. Committing here would let an unauthenticated frame make
+	// its next duplicate free. The test-only fault restores that unsafe write.
 	peer.budget -= delta
-	peer.lastCounter = counter
-	return Keep
+	if b.disablePendingHWMBugInject.Load() {
+		peer.lastCounter = counter // test-only charge-time watermark fault
+	}
+	return Keep, delta
 }
 
-// Budget returns the remaining token budget for a peer's bucket. It is
-// a test-only accessor (no production caller); it takes the shard lock
-// to read consistently. Not on the hot path.
+// Refund returns a delta previously charged by Accept to a known identity.
+// Relayed frames refund clock, depth, and relay-envelope failures before the
+// relay is authenticated. Batch frames refund directory and origin-signature
+// failures before the origin is authenticated. Rejections after the relevant
+// authentication point keep the charge.
+//
+// The refund is capped at initialBudget. It never rolls back lastCounter: a
+// conditional rollback would be unsafe with interleaved frames, and committed
+// watermarks move only forward. A malformed key, zero delta, or unknown
+// identity is a no-op. Refund takes the shard lock and does not allocate.
+func (b *PeerBucket) Refund(pub []byte, delta uint64) {
+	if len(pub) != 32 || delta == 0 {
+		return
+	}
+	var k PeerBucketKey
+	copy(k[:], pub)
+	s := &b.shards[shardIndex(k)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer := s.m[k]
+	if peer == nil {
+		return // unknown identity: nothing was charged
+	}
+	peer.budget = min(peer.budget+delta, initialBudget)
+}
+
+// CommitHWM advances an identity's watermark after authentication. The
+// receive path calls it for a positive charge returned by Accept, after the
+// relay envelope, batch signature, or hybrid batch signature has verified.
+// Free duplicates need no commit.
+//
+// The update is max(lastCounter, counter) under the shard lock, so concurrent
+// commits cannot move the watermark backward. Two duplicates can both charge
+// before either commits; authenticated duplicates are not refunded, so this
+// conservatively charges the verified work. That excess is bounded by the
+// number of in-flight duplicates. CommitHWM does not allocate.
+func (b *PeerBucket) CommitHWM(pub []byte, counter uint64) {
+	if len(pub) != 32 {
+		return
+	}
+	var k PeerBucketKey
+	copy(k[:], pub)
+	s := &b.shards[shardIndex(k)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer := s.m[k]
+	if peer == nil {
+		return // unreachable behind the caller's charged>0 gate; defensive
+	}
+	if counter > peer.lastCounter {
+		peer.lastCounter = counter
+	}
+}
+
+// Budget returns an identity's remaining counter-advancement allowance. It
+// takes the shard lock for a consistent read. The receiver uses it in
+// rate-drop diagnostics; tests also use it to observe charging and refunds.
 func (b *PeerBucket) Budget(pub []byte) uint64 {
 	if len(pub) != 32 {
 		return 0
@@ -313,8 +283,8 @@ func (b *PeerBucket) Budget(pub []byte) uint64 {
 	return 0
 }
 
-// Rate returns the EWMA of the inbound Counter-delta for a peer. Test-
-// only accessor; takes the shard lock.
+// Rate returns an identity's EWMA of positive counter deltas. It takes the
+// shard lock and is used by tests; a missing or malformed key returns zero.
 func (b *PeerBucket) Rate(pub []byte) float64 {
 	if len(pub) != 32 {
 		return 0

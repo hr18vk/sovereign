@@ -4,31 +4,12 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — Version-Gate & Wire-Integrity Guards.
+// CRDTDeltaEvent version and payload-integrity tests.
 //
-// This file closes the two honest limitations self-flagged during bring-up:
-//
-//	(a) The version tag's mismatch branch in decodeCRDTDeltaEvent (the
-//
-// refusal to silently fall through to zero-received fields — the
-// C5 guard) was structurally present but exercised only on
-// the happy path. Test 1 fires that branch and asserts it fatals.
-//
-//	(b) CRDTDeltaEvent's payload and payloadDigest are carried independently
-//
-// on the wire; nothing on the decode path cross-validates
-// payloadDigest == SHA-256(payload). I named this gap (a buggy
-// peer could send a mismatched pair and Join would accept it) but did
-// not address it. Test 2 proves the integrity-check technique works on
-// a mismatched pair via a TEST-LOCAL helper. It does NOT add a
-// production-side check: the location of production enforcement
-// (decode-time vs Join-time) is a contract decision deliberately left open
-// here (no production enforcement is wired).
-//
-// Scope discipline: this file ADDS tests only. It touches no production wire
-// code (crdt.go / hamt_arena.go / decodeCRDTDeltaEvent are untouched). The
-// existing assertion battery in crdt_capnp_roundtrip_test.go is
-// not modified — that file's diff is empty.
+// The version test runs the decoder in a child process to check that a version
+// mismatch reaches t.Fatalf rather than continuing with zero-valued fields.
+// The integrity test exercises a local helper that compares PayloadDigest with
+// SHA-256(payload); production validation is implemented by ReconstructEntry.
 package sync
 
 import (
@@ -45,32 +26,24 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// versionMismatchFiresEnv is the sentinel env var the parent test sets
-// when it re-execs go test to run the inner "expectFatal" subtest. The inner
-// subtest is the one that is EXPECTED to call t.Fatalf via the decoder's
-// version-mismatch branch; the parent asserts the child exited non-zero with
-// the exact fatal message. This is the repo's existing os/exec subprocess
-// idiom — see internal/chaos/survival_test.go — applied to asserting a
-// Go testing t.Fatalf actually fires (Goexit, which recover() cannot catch on
-// go1.26.1, so a bare defer-recover pattern would not work).
+// versionMismatchFiresEnv selects the child-process subtest that is expected
+// to call t.Fatalf. A subprocess is required because testing.T.Fatalf invokes
+// runtime.Goexit, which recover cannot intercept.
 const versionMismatchFiresEnv = "CRDT_WIRE_VERSION_MISMATCH_FIRES"
 
-// buildCRDTDeltaEventFrame is the frame builder. It is a SMALL,
-// self-contained builder (it does not route through
-// encodeEntryToCRDTDeltaEvent) so Test 2 can inject a deliberately
-// INCONSISTENT payloadDigest without disturbing the roundtrip-test's canonical
-// builder, and so Test 1 can inject a deliberately wrong version tag. The
-// payload string is carried verbatim so the integrity check (Test 2) can
-// recompute SHA-256 and compare.
+// buildCRDTDeltaEventFrame builds a CRDTDeltaEvent frame. It is a self-contained
+// builder (it does not route through encodeEntryToCRDTDeltaEvent) so the
+// version-mismatch test can inject a wrong version tag, and the integrity
+// test can inject a deliberately inconsistent payloadDigest without disturbing
+// the roundtrip test's canonical builder. The payload string is carried
+// verbatim so the integrity check can recompute SHA-256 and compare.
 //
-// version: the value stamped as the frame's version tag (Test 1 uses a value
+// version: the value stamped as the frame's version tag (the version-mismatch
+// test uses a value != CRDTDeltaEventWireVersion to drive the mismatch).
 //
-//	!= CRDTDeltaEventWireVersion to drive the mismatch).
-//
-// digest: the value stamped into the PayloadDigest field. For Test 2 this is
-//
-//	deliberately NOT SHA-256(payload) to surface the wire-integrity
-//	gap; the test-local helper re-hashes and catches it.
+// digest:  the value stamped into the PayloadDigest field. For the integrity
+// test this is deliberately not SHA-256(payload) to surface the wire-integrity
+// gap; the test-local helper re-hashes and catches it.
 //
 // payload: the value stamped into the Payload Text field.
 func buildCRDTDeltaEventFrame(t *testing.T, version uint16, digest [32]byte, payload string) []byte {
@@ -113,45 +86,33 @@ func buildCRDTDeltaEventFrame(t *testing.T, version uint16, digest [32]byte, pay
 	return data
 }
 
-// ----------------------------------------------------------------------------
-// TEST 1 — Version-Mismatch Refusal (mandated, no escalation possible).
-// ----------------------------------------------------------------------------
+// Version-mismatch refusal.
 
-// TestVersionMismatchRefusal is the parent: it re-execs go test with
-// the sentinel env var set and asserts the inner subtest called t.Fatalf
-// (child failed with the exact version-mismatch message). The mechanism is
-// the repo's existing os/exec subprocess idiom — see
-// internal/chaos/survival_test.go. Go's testing.T.Fatalf invokes
-// runtime.Goexit, which recover() cannot catch (confirmed on go1.26.1), so a
-// recover()-in-the-parent pattern would not work; the subprocess pattern is
-// the smallest repo-conventional way to assert a t.Fatalf actually fires.
-//
-// GUARDS: if a future engineer removes the version check from
-// decodeCRDTDeltaEvent, the inner subtest stops calling t.Fatalf, the child
-// exits 0, and this parent's "child exit code != 0" assertion fails → the test
-// FAILS, proving the silent-fall-through path is not merely structurally dead
-// but provably dead.
+// TestVersionMismatchRefusal runs the decoder in a child test process and
+// checks both its nonzero exit and version-mismatch diagnostic. If the decoder
+// stops rejecting mismatched versions, the child reaches its return guard or
+// exits successfully and the parent fails.
 func TestVersionMismatchRefusal(t *testing.T) {
 	if os.Getenv(versionMismatchFiresEnv) == "1" {
-		// --- INNER SESSION: this invocation is the re-exec'd child. ---
+		// The decoder must terminate this subtest on a version mismatch.
 		t.Run("expectFatal", func(t *testing.T) {
 			wrongVersion := CRDTDeltaEventWireVersion + 1
 			frame := buildCRDTDeltaEventFrame(t, wrongVersion, rtPayloadDigest, rtPayload)
-			// decodeCRDTDeltaEvent MUST t.Fatalf here: the on-wire version
+			// decodeCRDTDeltaEvent must t.Fatalf here: the on-wire version
 			// (wrongVersion) != the compiled-in CRDTDeltaEventWireVersion.
 			// If this returns at all, the refusal branch was removed.
 			_ = decodeCRDTDeltaEvent(t, frame)
-			t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: decodeCRDTDeltaEvent returned on a version mismatch (got %d, want %d) instead of calling t.Fatalf — the silent-fall-through path the C5 guard requires dead is ALIVE",
+			t.Fatalf("decodeCRDTDeltaEvent returned on a version mismatch (got %d, want %d) instead of calling t.Fatalf",
 				wrongVersion, CRDTDeltaEventWireVersion)
 		})
 		return
 	}
 
-	// --- OUTER (parent) session: spawn the child and assert it fatal'd. ---
+	// Run only the child subtest in a fresh process.
 	if testing.Short() {
-		t.Skip("Version-mismatch refusal spawns a child `go test`; skip in -short")
+		t.Skip("version-mismatch refusal spawns a child `go test`; skip in -short")
 	}
-	moduleRoot := moduleRoot(t)
+	moduleRoot := crdtCapnpModuleRoot(t)
 	args := []string{
 		"test",
 		"-run", "^TestVersionMismatchRefusal/expectFatal$",
@@ -161,50 +122,38 @@ func TestVersionMismatchRefusal(t *testing.T) {
 	}
 	cmd := exec.Command("go", args...)
 	cmd.Dir = moduleRoot
-	// Propagate the host env so the child `go test` resolves the module + GOTOOLCHAIN
-	// identically to the parent. The sentinel flips the child into the inner session.
+	// Preserve module and toolchain settings and select the child subtest.
 	cmd.Env = append(os.Environ(), versionMismatchFiresEnv+"=1")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	// The child is EXPECTED to FAIL (non-zero exit) because the inner subtest
-	// called t.Fatalf via the decoder's mismatch branch — that is exactly the
-	// assertion.
+	// A nonzero exit is expected from the decoder's version-mismatch fatal.
 	if err := cmd.Run(); err == nil {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: child go test exited 0 — decodeCRDTDeltaEvent did NOT refuse the mismatched version. Expected non-zero (fatal). Child output:\n%s", out.String())
+		t.Fatalf("invariant broken: child go test exited 0 — decodeCRDTDeltaEvent did not refuse the mismatched version. Expected non-zero (fatal). Child output:\n%s", out.String())
 	}
 	combined := out.String()
 	exitCode := cmd.ProcessState.ExitCode()
 	if exitCode == 0 {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: child exit code 0; the version-mismatch fatal did not fire.\nchild output:\n%s", combined)
+		t.Fatalf("invariant broken: child exit code 0; the version-mismatch fatal did not fire.\nchild output:\n%s", combined)
 	}
-	// The child MUST have printed the exact version-mismatch fatal string from
-	// decodeCRDTDeltaEvent. The literal pin is the GUARDS: if a future engineer
-	// swaps the t.Fatalf for a t.Logf (instead of removing it), the child would
-	// exit 0 and the exit-code assertion above catches that; if they replace
-	// it with a DIFFERENT t.Fatalf message, this string assertion catches the
-	// semantic drift.
+	// Match the decoder's diagnostic as well as the exit status so an unrelated
+	// child failure cannot satisfy the test.
 	const want = "CRDTDeltaEvent wire version mismatch"
 	if !strings.Contains(combined, want) {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: child failed (exit code %d) but did NOT emit the version-mismatch fatal message containing %q. Child output:\n%s",
+		t.Fatalf("invariant broken: child failed (exit code %d) but did not emit the version-mismatch fatal message containing %q. Child output:\n%s",
 			exitCode, want, combined)
 	}
-	// Similarly, the child must NOT have hit the inner return-guard message —
-	// the fatal must come from decodeCRDTDeltaEvent, not the guard. (If the
-	// refusal branch is removed, the guard message would appear and the
-	// exit-code check above would already have failed; this is a belt-and-
-	// braces pin that the fatal source is the decoder.)
-	const guardStr = "CAPNP-INTEGRITY INVARIANT BROKEN: decodeCRDTDeltaEvent returned"
+	// Also reject the legacy return-guard wording as the source of failure.
+	const guardStr = "wire-integrity guard failed: decodeCRDTDeltaEvent returned"
 	if strings.Contains(combined, guardStr) {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: child printed the return-guard message, meaning decodeCRDTDeltaEvent returned instead of fataling. Child output:\n%s", combined)
+		t.Fatalf("invariant broken: child printed the return-guard message, meaning decodeCRDTDeltaEvent returned instead of fataling. Child output:\n%s", combined)
 	}
-	t.Logf("Version-mismatch Test 1 GREEN: child exited %d and emitted the version-mismatch fatal (refusal-to-silently-fallthrough is provably dead).", exitCode)
+	t.Logf("child exited %d with the expected version-mismatch diagnostic", exitCode)
 }
 
-// moduleRoot walks up from cwd to find go.mod. pkg/sync is two levels
-// under the module root (pkg/sync -> pkg -> root), so a small bounded walk is
-// sufficient and avoids hard-coding a path. Mirrors internal/chaos.moduleRoot.
-func moduleRoot(t *testing.T) string {
+// crdtCapnpModuleRoot finds go.mod with a bounded upward walk so the child
+// process runs from the module root without a hard-coded path.
+func crdtCapnpModuleRoot(t *testing.T) string {
 	t.Helper()
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -225,27 +174,14 @@ func moduleRoot(t *testing.T) string {
 	return ""
 }
 
-// ----------------------------------------------------------------------------
-// TEST 2 — Wire-Integrity Cross-Validation (Form B: Green, test-local check).
-// ----------------------------------------------------------------------------
+// Payload-digest cross-validation.
 
-// decodeCRDTDeltaEventWithIntegrity is a TEST-LOCAL helper: it delegates the
-// version-gated decode to the existing decodeCRDTDeltaEvent (preserving the
-// refusal-to-silently-fall-through guard) and then adds the wire-integrity
-// check described above — it recomputes SHA-256(payload) off the wire and
-// compares to the on-wire PayloadDigest. On mismatch it returns a typed
-// *wireIntegrityError (NOT a t.Fatalf) so a caller can assert the rejection.
-//
-// IMPORTANT — SCOPE DISCIPLINE: this is a TEST-LOCAL helper, NOT a production
-// change. The real production enforcement (where in the engine the integrity
-// check should live) is an architectural decision deliberately left open here.
-// The options are decode-time (cheap, rejects before Join sees the entity ID —
-// loses diagnostic context) vs Join-time (couples integrity to merge
-// semantics) vs a new ReconstructEntry stage (cleanest seam, new code path).
-// Form B proves the technique works without picking any of them.
+// decodeCRDTDeltaEventWithIntegrity decodes a version-checked event and
+// compares its payload with SHA-256(payload). It returns *wireIntegrityError
+// on mismatch so the test can inspect the rejection.
 func decodeCRDTDeltaEventWithIntegrity(t *testing.T, data []byte) (capnp_schema.CRDTDeltaEvent, error) {
 	t.Helper()
-	ev := decodeCRDTDeltaEvent(t, data) // preserves version gate + guards
+	ev := decodeCRDTDeltaEvent(t, data) // preserves version gate
 	gotPayload, err := ev.Payload()
 	if err != nil {
 		return ev, err
@@ -264,10 +200,8 @@ func decodeCRDTDeltaEventWithIntegrity(t *testing.T, data []byte) (capnp_schema.
 	return ev, nil
 }
 
-// wireIntegrityError is the typed error Test 2 asserts on; a typed error
-// (rather than a sentinel string) keeps the guards specific to the integrity
-// failure and avoids depending on an error string match for the pass/fail
-// signal — the string is reported only for diagnostics.
+// wireIntegrityError identifies payload-digest mismatches independently of
+// unrelated decode failures. Its text is used only for diagnostics.
 type wireIntegrityError struct {
 	recomputed [32]byte
 	onWire     []byte
@@ -277,27 +211,18 @@ func (e *wireIntegrityError) Error() string {
 	return "wire-integrity violation: SHA-256(payload) does not equal PayloadDigest"
 }
 
-// TestWireIntegrityCrossValidation proves the SHA-256 cross-validation
-// technique works on both a consistent and a mismatched pair. It does NOT add a
-// production-side check; production enforcement is a future phase.
-//
-// GUARDS: if a future engineer regresses the test-local integrity check (e.g.,
-// removes the sha256 recompute, drops the bytes.Equal, or makes the helper
-// always return nil), the mismatched-pair case returns no error and the
-// "expected wireIntegrityError" assertion fails → the test FAILS.
+// TestWireIntegrityCrossValidation checks acceptance of a consistent pair and
+// rejection of a mismatched pair with the specific integrity error type.
 func TestWireIntegrityCrossValidation(t *testing.T) {
-	// --- Case 1: consistent pair. Helper MUST accept (no error). ---
+	// Case 1: consistent pair. Helper must accept (no error).
 	consistent := buildCRDTDeltaEventFrame(
 		t, CRDTDeltaEventWireVersion, rtPayloadDigest, rtPayload)
 	if _, err := decodeCRDTDeltaEventWithIntegrity(t, consistent); err != nil {
 		t.Fatalf("consistent pair: helper rejected a valid (payload, digest) pair: %v — the integrity check must pass when SHA-256(payload)==PayloadDigest", err)
 	}
 
-	// --- Case 2: mismatched pair. Helper MUST reject (wireIntegrityError). ---
-	// A buggy peer could stamp PayloadDigest with SHA-256 of SOME OTHER bytes.
-	// Here the digest is SHA-256(rtPayload + suffix) while the payload is
-	// still rtPayload — exactly the wire-integrity gap named above:
-	// payloadDigest != SHA-256(payload), a mismatched pair Join would accept.
+	// Case 2: the digest hashes different bytes from the payload, so the helper
+	// must return wireIntegrityError.
 	wrongDigest := sha256.Sum256([]byte(rtPayload + "tampered-by-a-buggy-peer"))
 	if wrongDigest == rtPayloadDigest {
 		// Astronomically improbable for SHA-256, but a test must be
@@ -311,17 +236,16 @@ func TestWireIntegrityCrossValidation(t *testing.T) {
 		t, CRDTDeltaEventWireVersion, wrongDigest, rtPayload)
 	_, err := decodeCRDTDeltaEventWithIntegrity(t, mismatched)
 	if err == nil {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: helper accepted a mismatched (payload, payloadDigest) pair — wire-integrity gap is LIVE: SHA-256(payload) != PayloadDigest but the helper returned nil")
+		t.Fatalf("invariant broken: helper accepted a mismatched (payload, payloadDigest) pair — wire-integrity gap is live: SHA-256(payload) != PayloadDigest but the helper returned nil")
 	}
 	var wie *wireIntegrityError
 	if !errors.As(err, &wie) {
-		t.Fatalf("CAPNP-INTEGRITY INVARIANT BROKEN: helper rejected the mismatched pair with the wrong error type %T; expected *wireIntegrityError so the guards are specific to the integrity failure", err)
+		t.Fatalf("invariant broken: helper rejected the mismatched pair with the wrong error type %T; expected *wireIntegrityError so the error is specific to the integrity failure", err)
 	}
-	// Diagnostic-only string check: the rejection must be the integrity
-	// message, not the version-mismatch fatal (which would mean the frame was
-	// malformed in an unrelated way and Case 2 tested the wrong property).
+	// Confirm that the rejection is the integrity error rather than an
+	// unrelated version failure.
 	if !strings.Contains(err.Error(), "wire-integrity violation") {
 		t.Fatalf("rejection error message is not the wire-integrity violation: %q", err.Error())
 	}
-	t.Logf("Version-mismatch Test 2 GREEN: helper rejects a mismatched (payload, payloadDigest) pair with %q (technique proven; production enforcement is a future phase).", err.Error())
+	t.Logf("mismatched payload and digest rejected with %q", err.Error())
 }

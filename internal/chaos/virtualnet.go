@@ -5,54 +5,41 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §3 — The Chaos VirtualNet (in-memory partition simulation).
+// The Chaos VirtualNet (in-memory partition simulation).
 // ---------------------------------------------------------------------------
 //
-// Ruthless Go Engine Verification Blueprint, §3 ("Simulating Network
-// Partitions and Cryptographic Merkle Roots"):
+// The virtual network simulates an N-node ledger cluster with randomized
+// latency, forced packet duplication, and simulated routing blackholes.
+// Despite extreme chaos in the ingestion sequence, the laws of δ-CRDTs
+// dictate that once all nodes eventually receive all deltas, their final
+// state matrices must converge. The convergence assertion is:
+// Node[i].MerkleRoot() == Node[j].MerkleRoot().
 //
-//	"A comprehensive state machine test must construct a virtual network of N
+// This is the in-memory half of the mandate. The other half is the
+// OS-level Chaos Mesh prong (IOChaos and NetworkChaos CRDs), outside this
+// in-memory package, which drives the same node set under real filesystem
+// delays and packet loss when a cluster is available. The in-memory
+// VirtualNet runs on any machine without a kubelet and exercises the same
+// convergence property (Merkle-root equality after the partition heals)
+// that the OS-level prong asserts — only the failure-injection locus
+// differs (transport fabric vs. filesystem/TCP).
 //
-// independent ledger nodes. A central chaos orchestrator generates...
-// mutations... dispatched to the virtual nodes with randomized latency,
-// forced packet duplication, and simulated routing blackholes. Despite the
-// extreme chaos in the ingestion sequence, the laws of δ-CRDTs dictate that
-// once all nodes eventually receive all deltas, their final state matrices
-// must perfectly converge.... assert Node[i].MerkleRoot() ==
-// Node[j].MerkleRoot()."
+// The convergence claim of a δ-CRDT over a join-semilattice does not depend
+// on transport politeness; it depends on (1) every element eventually
+// reaching every node and (2) join being commutative, associative, and
+// idempotent (already proven by property tests). A virtual
+// transport that drops, duplicates, reorders, and delays messages cannot
+// break convergence — it can only delay it. That is the whole point of the
+// §3 exercise: prove the math holds under the chaos that real networks
+// guarantee. Convergence-after-heal is the load-bearing assertion; nothing
+// about latency or duplication during the partition is asserted.
 //
-// PHYSICS (what this file is, and what it deliberately is NOT):
-//
-//	This is the "entirely within memory" half of §3's two-prong mandate. The
-//	OTHER half (OS-level Chaos Mesh IOChaos + NetworkChaos CRDs) lives in the
-//	manifests under chaos-mesh/ and the IOChaos/NewtorkChaos gate drives the
-//	same node set under real fs-delays / real packet loss when a cluster is
-//	available. The in-memory VirtualNet here is the piece CI can run on ANY
-//	machine without a kubelet, and it exercises the SAME convergence property
-//	(Merkle-root equality after the partition heals) that the OS-level prong
-//	asserts — only the failure-injection locus differs (transport fabric vs.
-//	filesystem / TCP).
-//
-// WHY THIS PROVES the design doc'S INTENT, NOT A STUNT:
-//
-//	The convergence claim of a δ-CRDT over join-semilattice does NOT depend on
-//	transport politeness; it depends on (1) every element eventually reaching
-//	every node and (2) join being commutative/associative/idempotent (already
-//	proven by 's property tests). A virtual transport that drops,
-//	duplicates, reorders, and delays messages therefore cannot BREAK
-//	convergence — it can only delay it. That is the whole point of the §3
-//	exercise: prove the math holds under the chaos that planetary networks
-//	guarantee. Convergence-after-heal is the load-bearing assertion; nothing
-//	about latency or duplication during the partition is asserted.
-//
-// MESSAGING MODEL (compact for CI; blueprint names millions of events):
-//
-//	the design doc's 1.4e9-record / millions-of-events scale would make a live
-//	MerkleRoot() sweep (O(N) per node) take hours in unit-test time, so the
-//	gate runs a REPRESENTATIVE population (32 nodes × bounded entities), exactly
-//	as the multi-node convergence tests do. The §3 property is the
-//	same at any scale — the math is scale-free — and scaling up is an infra
-//	concern, not a correctness concern.
+// A 1.4e9-record scale would make a live MerkleRoot() sweep (O(N) per
+// node) take hours in unit-test time, so the gate runs a representative
+// population (32 nodes × bounded entities), exactly as the multi-node
+// convergence tests do. The property is the same at any scale — the math
+// is scale-free — and scaling up is an infrastructure concern, not a
+// correctness concern.
 package chaos
 
 import (
@@ -70,7 +57,7 @@ import (
 // NetNode is one ledger node in the virtual network: a nodeID + the receiver
 // callback invoked when a (possibly duplicated, reordered, delayed) message
 // arrives at this node. The callback's contract is pure ingestion: apply the
-// element to its local CRDT and return; it MUST NOT block on the net.
+// element to its local CRDT and return; it must not block on the net.
 type NetNode struct {
 	ID      [16]byte
 	Receive func(msg NetMessage)
@@ -80,7 +67,7 @@ type NetNode struct {
 
 // NetMessage is a unit of cross-node traffic. Bytes is opaque to the net; the
 // sender and receiver agree on its encoding (the chaos test uses CRDT deltas in
-// a compact in-memory encoding, NOT cap'n-proto across processes).
+// a compact in-memory encoding, not cap'n-proto across processes).
 type NetMessage struct {
 	From   [16]byte
 	To     [16]byte
@@ -90,12 +77,12 @@ type NetMessage struct {
 }
 
 // Partition is a directional reachability rule applied by the orchestrator:
-// (from → to) is BLACKHOLED while the partition is active. A symmetric
-// partition is expressed as two Partition entries (from→to AND to→from). We
-// model partitions explicitly rather than as random packet-loss because the
-// blueprint's named failure mode is "network partition" (a topology event),
-// not "background packet loss" (a Bernoulli event) — GateCmp distinguishes
-// them.
+// (from → to) is blackholed while the partition is active. A symmetric
+// partition is expressed as two Partition entries (from→to and to→from). We
+// model partitions explicitly rather than as random packet loss because the
+// named failure mode is "network partition" (a topology event), not
+// "background packet loss" (a Bernoulli event). The structured-loss
+// discriminator distinguishes them.
 type Partition struct {
 	From [16]byte
 	To   [16]byte
@@ -108,14 +95,14 @@ func (p *Partition) IsPartitioned(from, to [16]byte) bool {
 
 // ChaosProfile tunes the virtual transport's misbehavior. A zero value is a
 // polite, ordered, lossless net (useful as a negative control). Every field is
-// a PROBABILITY or a bound; nil RNGs default to math/rand seeded from
+// a probability or a bound; nil RNGs default to math/rand seeded from
 // crypto/rand at construction.
 type ChaosProfile struct {
 	// Drop is the per-message probability of a one-way loss during delivery
-	// (before duplication). When the message also crosses an ACTIVE partition
+	// (before duplication). When the message also crosses an active partition
 	// it is dropped unconditionally; Drop governs only the ambient loss.
 	Drop float64
-	// Duplicate is the probability that a delivered message is ALSO copied to
+	// Duplicate is the probability that a delivered message is also copied to
 	// the receiver a second time (forcing the CRDT's idempotence path).
 	Duplicate float64
 	// ReorderMaxJitter is the maximum randomized wall delay (0 = no jitter)
@@ -125,6 +112,14 @@ type ChaosProfile struct {
 	// DeliveryBase is the deterministic portion of delivery latency; the net
 	// always delivers after at least this long so receivers see realistic gaps.
 	DeliveryBase time.Duration
+	// LinkLatency, when non-nil, adds a per-link delivery delay: the return
+	// value is added to this (src,dst) message's delivery time on top of
+	// DeliveryBase+jitter. This models a cross-region / per-link latency
+	// asymmetry the global DeliveryBase cannot (the per-link latency
+	// asymmetry hypothesis). nil = uniform latency (byte-identical prior
+	// existing caller leaves it nil). Test-only knob; the production mesh
+	// transport does not use VirtualNet.
+	LinkLatency func(from, to [16]byte) time.Duration
 	// Seed, when non-nil, fixes the RNG so a failing run is reproducible.
 	Seed *mrand.Rand
 }
@@ -184,15 +179,15 @@ func (vn *VirtualNet) AddNode(id [16]byte, recv func(NetMessage)) *NetNode {
 	vn.mu.Lock()
 	vn.nodes[id] = n
 	vn.mu.Unlock()
-	// Track the per-node delivery goroutine in vn.wg so Stop's
-	// wg.Wait() JOINS it — a delivery that outlives Stop would call the engine's
-	// Join AFTER the test has Closed the engine (an arena use-after-free).
+	// Track the per-node delivery goroutine in vn.wg so Stop's wg.Wait()
+	// joins it — a delivery that outlives Stop would call the engine's Join
+	// after the test has closed the engine (the arena use-after-free).
 	vn.wg.Add(1)
 	go func() {
 		defer vn.wg.Done()
 		for {
-			// Prioritize stop over a queued message — after Stop
-			// begins, no further Receive may run (the engine is being torn down).
+			// Prioritize stop over a queued message — after Stop begins, no
+			// further Receive may run (the engine is being torn down).
 			select {
 			case <-vn.stop:
 				return
@@ -228,10 +223,10 @@ func (vn *VirtualNet) Send(src, dst [16]byte, payload []byte) error {
 	// Partition check (unconditional drop).
 	if vn.partitionedLocked(src, dst) {
 		vn.mu.Unlock()
-		// Dropped by partition; not recorded for delivery. the design doc's
-		// model is "routing blackhole" so the sender never gets an ACK and
-		// the receiver never sees the message until the partition heals AND
-		// the origin retransmits/gossips. The orchestrator's gossip loop
+		// Dropped by partition; not recorded for delivery. The model is
+		// "routing blackhole" so the sender never gets an ACK and the
+		// receiver never sees the message until the partition heals and the
+		// origin retransmits/gossips. The orchestrator's gossip loop
 		// handles retransmit.
 		return nil
 	}
@@ -254,21 +249,27 @@ func (vn *VirtualNet) Send(src, dst [16]byte, payload []byte) error {
 		jitter := time.Duration(vn.profile.Seed.Int63n(int64(vn.profile.ReorderMaxJitter)))
 		deliverAt = deliverAt.Add(jitter)
 	}
+	// Per-link latency asymmetry (the cross-region hypothesis). Added
+	// after the base+jitter so a cross-region link can be deterministically
+	// slower than an intra-region one. nil = byte-identical prior behavior.
+	if vn.profile.LinkLatency != nil {
+		deliverAt = deliverAt.Add(vn.profile.LinkLatency(src, dst))
+	}
 	vn.mu.Unlock()
 
 	// Schedule the primary delivery.
 	vn.scheduleLocked(deliverAt, msg)
 	// Schedule a duplicate with independent jitter so duplicates arrive out of
-	// order too (the design doc's "aggressively duplicated by retries").
+	// order too ("aggressively duplicated by retries").
 	if vn.profile.Duplicate > 0 && vn.profile.Seed.Float64() < vn.profile.Duplicate {
 		dupAt := deliverAt
 		if vn.profile.ReorderMaxJitter > 0 {
 			dupAt = dupAt.Add(time.Duration(vn.profile.Seed.Int63n(int64(vn.profile.ReorderMaxJitter))))
 		}
 		dup := msg
-		// A duplicate carries the SAME SeqNo so the receiver's dedup can
-		// recognize it — EXERCISING the dedup path that chaos would otherwise
-		// hide. We deliberately exercise BOTH paths in the gate: with dedup
+		// A duplicate carries the same SeqNo so the receiver's dedup can
+		// recognize it — exercising the dedup path that chaos would otherwise
+		// hide. We deliberately exercise both paths in the gate: with dedup
 		// enabled and disabled, see mesh_test.go.
 		vn.scheduleLocked(dupAt, dup)
 	}
@@ -383,7 +384,7 @@ func (vn *VirtualNet) partitionedLocked(from, to [16]byte) bool {
 }
 
 // SetPartitions atomically replaces the active partition set. Pass nil to heal
-// ALL partitions (the design doc's "the microsecond connectivity is restored").
+// all partitions ("the microsecond connectivity is restored").
 func (vn *VirtualNet) SetPartitions(parts []Partition) {
 	vn.mu.Lock()
 	defer vn.mu.Unlock()
@@ -431,8 +432,8 @@ type GossipRound func(ctx context.Context, from [16]byte, to [16]byte) ([]byte, 
 
 // RunGossipRound drives one full anti-entropy sweep across the net. For each
 // ordered pair (i, j), i != j, it invokes makeDelta(i, j) and ships the bytes.
-// Deltas are computed SYNCHRONOUSLY in this call (the engine is in the same
-// process for the in-memory net) but DELIVERED asynchronously by the fabric.
+// Deltas are computed synchronously in this call (the engine is in the same
+// process for the in-memory net) but delivered asynchronously by the fabric.
 // Returns the number of bytes shipped and any makeDelta error (stops on first
 // error since a broken delta source means the test setup is wrong, not the net).
 func (vn *VirtualNet) RunGossipRound(ctx context.Context, makeDelta GossipRound) (shipped int, err error) {

@@ -4,40 +4,20 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package chaos — in-process Byzantine interceptor.
+// Package chaos — in-process Byzantine fault injection.
 //
-// This file is the SEMANTIC Byzantine-attack generator — the counterpart to
-// AWS FIS that FIS structurally CANNOT be:
+// InjectByzantineFaults takes a sync.CRDTDelta, ratchets DotCounter toward
+// MaxUint64, and re-signs the modified material with circl Ed25519 so the
+// resulting frame is cryptographically valid while exceeding normal logical
+// counter progression.
 //
-//	"Out-of-process tools like AWS FIS can introduce latency, drop packets,
-//
-// and sever connections, but they cannot intelligently synthesize a
-// cryptographically valid Byzantine payload. FIS cannot forge a
-// DotCounter, manipulate a causal graph, or craft an Ed25519 signature
-// that passes the initial mathematical verification but violates the
-// semantic rules of the CRDT."
-//
-// InjectByzantineFaults takes a REAL sync.CRDTDelta, ratchets DotCounter
-// toward MaxUint64 (the A2 "incremental ratchet" attack vector), and re-signs
-// the tampered material with circl Sign so the resulting frame is
-// CRYPTOGRAPHICALLY VALID but SEMANTICALLY MALICIOUS — exactly the class FIS
-// cannot synthesize. The acceptance test then proves the admission stack
-// drops it before it reaches Join.
-//
-// ADMISSION-LAYER NOTE (which layer catches the ratchet). The A2 ratchet is a
-// LOGICAL-counter attack, and the two admission layers are distinct:
-// - the physical-clock cap IngressHLCScalarCap.Admit
-// (pkg/clock/admission.go:97) rejects on physical-clock drift: reject if
-// incomingPhysicalUSec - localPhysicalUSec > maxDriftEpsilon. A2 inflates
-// DotCounter (a LOGICAL counter), NOT the physical clock — so a frame with
-// a MaxUint64 DotCounter but a valid physical timestamp PASSES that cap.
-// - the per-peer EWMA budget PeerBucket.Accept (pkg/admission/ewma.go:187) IS
-// the catch: delta = counter - lastCounter; if delta >= peer.budget { Drop }.
-// A MaxUint64 ratchet on a fresh peer (budget = 1<<20) drains the budget
-// to 0 in ONE admit => Drop.
-//
-// The acceptance test asserts PeerBucket.Accept returns Drop; the physical-clock
-// cap is independent of DotCounter and does not catch a logical-counter ratchet.
+// In the admission pipeline:
+//   - IngressHLCScalarCap.Admit (pkg/clock/admission.go) checks physical-clock
+//     drift (incomingPhysicalUSec - localPhysicalUSec > maxDriftEpsilon), so
+//     a valid physical timestamp with an inflated logical DotCounter passes.
+//   - PeerBucket.Accept (pkg/admission/ewma.go) tracks per-peer DotCounter
+//     advancement against an EWMA token budget (initial budget 1<<20),
+//     dropping frames whose logical counter jump exhausts the peer's budget.
 package chaos
 
 import (
@@ -50,93 +30,42 @@ import (
 	mrandv2 "math/rand/v2"
 )
 
-// circl ed25519.Sign go-doc citation (the Sign symbol is cited from source, not assumed).
-// Verified from circl@v1.6.4/sign/ed25519/ed25519.go:283:
-//
-//	func Sign(privateKey PrivateKey, message []byte) []byte
-// Sign signs the message with privateKey and returns a signature.
-// This function supports the signature variant defined in RFC-8032:
-// Ed25519, also known as the pure version of EdDSA. It will panic if
-// len(privateKey) is not PrivateKeySize.
-//
-// Related symbols (same file, go-doc-cited):
-// - ed25519.go:178 func GenerateKey(rand io.Reader) (PublicKey, PrivateKey, error)
-// - ed25519.go:396 func Verify(public PublicKey, message, signature []byte) bool
-// - ed25519.go:56 PublicKeySize = 32
-// - ed25519.go:58 PrivateKeySize = 64
-// - ed25519.go:60 SignatureSize = 64
-// - ed25519.go:95 type PrivateKey []byte
-//
-// The bridge's Sign is circl's ed25519.Sign (NOT stdlib crypto/ed25519 —
-// stdlib is not used for CRDT signing). The private key passed is circl's
-// PrivateKey ([]byte, 64 bytes).
+// circl ed25519.Sign uses pure RFC 8032 Ed25519 with a 64-byte PrivateKey
+// ([]byte, distinct from Go stdlib crypto/ed25519).
 
-// RatchetProfile selects the A2 attack shape InjectByzantineFaults applies.
+// RatchetProfile selects the counter-inflation profile InjectByzantineFaults applies.
 type RatchetProfile int
 
 const (
-	// RatchetMax sets DotCounter = math.MaxUint64 in one shot — the maximal
-	// single-shot A2 demonstration. It drains 3.1's per-peer budget in
-	// exactly 1 admit (delta = MaxUint64 >> initialBudget = 1<<20). This is
-	// the deterministic happy path the acceptance test exercises.
+	// RatchetMax sets DotCounter = math.MaxUint64 in one step, draining a fresh
+	// peer's 1<<20 EWMA token budget on the first admission check.
 	RatchetMax RatchetProfile = iota
 
-	// RatchetIncremental steps DotCounter by a geometric+rand/v2-jittered
-	// delta over N sequential admits, eventually exhausting the 1<<20 budget
-	// in a BOUNDED number of admits — the realistic A2 vector ("a single
-	// Byzantine peer can artificially inflate the clock" over passing
-	// frames). The incremental test asserts the bucket reaches Drop within a
-	// small bound.
+	// RatchetIncremental advances DotCounter by a jittered geometric step over
+	// sequential frames so the cumulative advance drains the 1<<20 budget within
+	// a bounded number of admissions.
 	RatchetIncremental
 )
 
-// entryWireLen is the canonical on-wire size of a sync.CRDTEntry: 120 bytes
-// (the struct is exactly 120 bytes with zero internal padding per
-// pkg/sync/hamt.go:28). It MUST equal crdtEntryWireLen in codec.go:31 and
-// sizeof(sync.CRDTEntry); the canonical-layout test asserts byte-
-// equality against the codec's encodeCRDTEntry so the signed material is
-// provably the same layout the production wire path uses.
+// entryWireLen is the on-wire size of sync.CRDTEntry (120 bytes, matching
+// crdtEntryWireLen in codec.go).
 const entryWireLen = 120
 
-// InjectByzantineFaults is the in-process Byzantine interceptor:
+// InjectByzantineFaults takes a sync.CRDTDelta, inflates each entry's
+// DotCounter according to profile, and signs the serialized entries with priv.
 //
-//	func InjectByzantineFaults(delta *sync.CRDTDelta, priv ed25519.PrivateKey)
-//
-// (*sync.CRDTDelta, []byte, error)
-//
-// It takes a REAL sync.CRDTDelta carrying honest sync.CRDTEntry{DotNodeID,
-// DotCounter,...} entries, ratchets each entry's DotCounter toward
-// MaxUint64 (the A2 attack), and re-signs the tampered material with circl
-// Sign so the resulting frame is CRYPTOGRAPHICALLY VALID but SEMANTICALLY
-// MALICIOUS — the class FIS cannot synthesize.
-//
-// OWNERSHIP CONTRACT: the caller owns the input delta's lifecycle. The
-// injector does NOT call Release() on the input and does NOT assume EBR
-// lifecycle ownership — it DRAINS the input's Entries Seq into a heap
-// []CRDTEntry COPY (the partition.go:151 drain idiom), mutates the COPY, and
-// builds a NEW *sync.CRDTDelta with a FRESH Seq that yields the mutated
-// copies. The new delta is a heap CRDTDelta (only the exported Entries /
-// OriginNodeID / MerkleRoot fields are set; the unexported EBR fields are
-// zero-valued), so it carries no arena backing and needs no Release. The
-// input delta is left byte-identical (the no-in-place-mutation regression
-// guard asserts this behaviorally).
-//
-// Returns (mutatedDelta, signature, err). signature is the circl.Sign(priv,
-// signedMaterial) [64]byte over the canonical serialized mutated entries.
-// err is non-nil iff the input delta is malformed (Entries nil) — never a
-// panic; the production harness is the test, and the test is deterministic.
+// The caller retains ownership of the input delta. InjectByzantineFaults drains
+// input.Entries into a fresh heap slice without mutating the input delta and
+// returns a new heap-backed *sync.CRDTDelta, its 64-byte Ed25519 signature,
+// and an error if the input delta is nil or empty.
 func InjectByzantineFaults(delta *engsync.CRDTDelta, priv ed25519.PrivateKey, profile RatchetProfile) (*engsync.CRDTDelta, []byte, error) {
 	if delta == nil || delta.Entries == nil {
 		return nil, nil, errors.New("chaos/byzantine: nil delta or nil Entries")
 	}
 
-	// DRAIN-AND-COPY (the safe seam, mirroring partition.go:151). The append
-	// copies each CRDTEntry (a 120-byte value type) into a heap slice; the
-	// arena-backed iterator is now drained. We never mutate the input
-	// delta's arena-backed fields in place — that would (i) write into
-	// mmap'd C-space the GC does not scan, (ii) race the persist worker / a
-	// concurrent InsertLocal CAS, (iii) corrupt the EBR amortization the
-	// zero-GC design depends on. The no-in-place-mutation guard bans it.
+	// Copy each 120-byte CRDTEntry value out of the arena-backed iterator onto
+	// the heap so the input delta remains unmodified and EBR pinning is not
+	// held across mutation.
 	var entries []engsync.CRDTEntry
 	var entityIDs []string
 	delta.Entries(func(entityID string, entry engsync.CRDTEntry) bool {
@@ -149,38 +78,27 @@ func InjectByzantineFaults(delta *engsync.CRDTDelta, priv ed25519.PrivateKey, pr
 		return nil, nil, errors.New("chaos/byzantine: delta carries no entries")
 	}
 
-	// RATCHET each copied entry's DotCounter toward MaxUint64 (the A2
-	// attack). The honest DotCounter is recorded for the test's "was
-	// ratcheted" assertion; the ratchet magnitude is profile-dependent.
+	// Inflate each copied entry's DotCounter according to the selected profile.
 	for i := range entries {
 		entries[i].DotCounter = ratchetCounter(entries[i].DotCounter, profile, i)
 	}
 
-	// Build a NEW *sync.CRDTDelta with a FRESH Seq that yields the mutated
-	// copies. Only the exported fields are set; the unexported EBR fields
-	// stay zero-valued (a heap delta, not arena-backed — safe, no Release).
+	// Build a heap-backed *sync.CRDTDelta with zero arena ownership so callers do
+	// not need Release().
 	mutated := &engsync.CRDTDelta{
 		Entries:      makeSeq(entityIDs, entries),
 		OriginNodeID: delta.OriginNodeID,
 		MerkleRoot:   delta.MerkleRoot,
 	}
 
-	// SIGN the canonical serialization of the mutated entries with circl
-	// Sign. The signed material is the concatenation of each entry's 120-
-	// byte canonical layout (encodeCRDTEntry field order, BigEndian). The
-	// signature is cryptographically valid over the tampered material —
-	// exactly the FIS-cannot-synthesize property.
+	// Sign the canonical 120-byte serialization of the modified entries.
 	signedMaterial := canonicalDeltaBytes(entries)
 	sig := ed25519.Sign(priv, signedMaterial)
 
 	return mutated, sig, nil
 }
 
-// makeSeq returns a fresh Seq yielding the (entityID, entry) pairs in order.
-// It captures the slices by reference (the mutated delta owns them for its
-// lifetime); the iterator is a plain closure over the heap slices, not an
-// arena-backed iterator, so it is safe to consume after the generator
-// returns without EBR pinning.
+// makeSeq returns a heap-slice iterator yielding (entityID, entry) pairs in order.
 func makeSeq(entityIDs []string, entries []engsync.CRDTEntry) engsync.Seq {
 	return func(yield func(entityID string, entry engsync.CRDTEntry) bool) {
 		for i := range entries {
@@ -191,28 +109,19 @@ func makeSeq(entityIDs []string, entries []engsync.CRDTEntry) engsync.Seq {
 	}
 }
 
-// ratchetCounter returns the A2-ratcheted DotCounter for one entry under the
-// given profile. RatchetMax pins the counter at MaxUint64 (the maximal
-// single-shot). RatchetIncremental steps the counter by a geometric+
-// rand/v2-jittered delta so a sequence of admits exhausts the 1<<20 budget
-// in a bounded number of frames (the realistic A2). The index seeds the
-// rand/v2 jitter deterministically per-entry within a single injector call
-// (math/rand/v2's top-level source is process-seeded; no deprecated
-// rand.Seed is used).
+// ratchetCounter computes the inflated DotCounter for one entry under profile.
+// RatchetMax returns math.MaxUint64; RatchetIncremental adds a jittered step
+// of at least 1<<18 per frame (saturating at math.MaxUint64).
 func ratchetCounter(honest uint64, profile RatchetProfile, idx int) uint64 {
 	switch profile {
 	case RatchetMax:
 		return math.MaxUint64
 	case RatchetIncremental:
-		// Geometric step: each entry advances by a large, jittered delta so
-		// the cumulative drain exceeds the 1<<20 budget within a bounded
-		// number of entries. base = 1<<18 (256K) per step; jitter in
-		// [0, 1<<16) via rand/v2.IntN. 4 such steps drain > 1<<20.
+		// Step by 256K + [0, 64K) per entry so 4 steps exceed the 1<<20 budget.
 		base := uint64(1 << 18)
 		jitter := uint64(mrandv2.IntN(1 << 16))
 		step := base + jitter
-		// Saturating add so the incremental path never wraps past MaxUint64
-		// (a wrap would un-ban the attacker).
+		// Saturate rather than wrapping around MaxUint64.
 		if honest > math.MaxUint64-step {
 			return math.MaxUint64
 		}
@@ -222,13 +131,8 @@ func ratchetCounter(honest uint64, profile RatchetProfile, idx int) uint64 {
 	}
 }
 
-// canonicalEntryBytes writes one sync.CRDTEntry into a 120-byte destination
-// using the SAME field order and BigEndian endianness as the production
-// codec's encodeCRDTEntry (codec.go:119-141): PayloadDigest, OriginNodeID,
-// DotNodeID, DotCounter, SystemTime, ValidTimeStart, ValidTimeEnd,
-// AssertionTime, DecisionTime, H3Index. The canonical-layout test asserts
-// byte-equality against the codec so the signed material is provably the
-// production wire layout (no fabricated serializer).
+// canonicalEntryBytes encodes one sync.CRDTEntry into a 120-byte BigEndian
+// buffer matching encodeCRDTEntry field order.
 func canonicalEntryBytes(dst []byte, e engsync.CRDTEntry) {
 	off := 0
 	copy(dst[off:off+32], e.PayloadDigest[:])

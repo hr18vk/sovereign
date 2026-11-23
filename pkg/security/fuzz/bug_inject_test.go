@@ -15,59 +15,30 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// bug_inject_test.go is the proof — the Law 5 /
-// mold. It PROVES the harness is NOT a
-// tautology: a fuzz that could NOT catch an INJECTED panic is a no-op runner.
+// The fuzzbuginject build tag limits this fault-injection control to explicit
+// test runs; default builds exclude both the modified unmarshaler and its test.
+// Run the deterministic control with:
 //
-// BUILD TAG (load-bearing). This ENTIRE file is behind the `fuzzbuginject` build
-// tag. The DEFAULT build (`go test ./pkg/security/fuzz/`, no -tags) does NOT
-// compile the bug-injected unmarshaler copy NOR the proof guard — a buggy
-// unmarshaler must NEVER ship in the production binary, and the opt-in tag is
-// the gate. The operator runs the proof explicitly:
+//	go test -tags fuzzbuginject -run '^TestBugInjectControlProof$' ./pkg/security/fuzz/
 //
-//	go test -tags fuzzbuginject -run TestBugInjectControlProof ./pkg/security/fuzz/
-//	go test -tags fuzzbuginject -fuzz=FuzzBugInjectControl -fuzztime=30s ./pkg/security/fuzz/
-//
-// THE CONTRAST (the load-bearing shape). On a SHORT IBLT seed (a valid 'IBL1'
-// magic + numBuckets=3 + k=3 + a zero seed + NO bucket body — just the 18-byte
-// header):
-//
-//   - the REAL sync.UnmarshalIBLT returns ErrMalformedDigest (NO panic). The
-//     bounds guard `len(wire) < 18 + 3*20 == 78` HOLDS (the seed is 18 bytes <
-//     78) → the guard rejects the short bucket array cleanly. This is the
-//     coverage behavior the fuzz asserts.
-//
-//   - a BUG-INJECTED copy (bugInjectUnmarshalIBLT) that SKIPS the bounds guard
-//     reads bucket bytes PAST the wire's 18-byte end → an out-of-bounds slice
-//     index panic (the classic fuzz catch, recoverable).
-//
-// The contrast IS the proof: a real out-of-bounds panic on a real input,
-// catchable by a real recover, that the REAL unmarshaler does NOT produce on the
-// same input. A fuzz that finds NO panic on the real unmarshalers is therefore a
-// genuine "no crash found" result, NOT a no-op runner.
+// The input is an 18-byte IBLT header with numBuckets=3, k=3, and no bucket
+// body. sync.UnmarshalIBLT rejects it because three 20-byte buckets require 78
+// bytes in total. bugInjectUnmarshalIBLT omits the header and body length checks,
+// so its first bucket read passes the end of the slice and panics. The test
+// recovers that panic and requires the real unmarshaler to return an error,
+// demonstrating that the two paths behave differently on the same input.
 
-// bugInjectUnmarshalIBLT is a COPY of sync.UnmarshalIBLT with the bounds guard
-// DELETED (the bug). It is build-tagged `fuzzbuginject` so it is ONLY compiled
-// when the operator opts into the fault-injection proof — it can NEVER reach the
-// production binary. The bug: it reads numBuckets from the wire, then reads
-// bucket bytes at offset `18 + i*20` WITHOUT checking the wire is long enough →
-// an out-of-bounds slice index panic on a short seed.
-//
-// It does NOT construct a real eng.IBLT (the point is the PANIC, not a usable
-// struct — constructing one would need a SetBucket helper that does not exist,
-// and adding one would touch non-test pkg/sync source, breaking). It reads
-// the bucket Count field into a throwaway uint32 so the read happens + panics.
+// bugInjectUnmarshalIBLT retains sync.UnmarshalIBLT's bucket-read offsets but
+// omits its length checks. A short input therefore causes an out-of-bounds slice
+// panic. It returns no usable IBLT: the discarded Count read is sufficient to
+// trigger the fault without adding a test-only bucket setter to pkg/sync.
 func bugInjectUnmarshalIBLT(wire []byte) (_ *eng.IBLT, _ error) {
-	// BUG: NO length check on the header (real UnmarshalIBLT returns
-	// ErrMalformedDigest on a short header; this copy reads past the end). The
-	// real guard at iblt_wire.go:263 is the one this copy deletes.
+	// Omit the header-length check and read numBuckets directly.
 	n := int(binary.LittleEndian.Uint32(wire[4:8])) //nolint:staticcheck // the BUG — no bounds guard
 	if n > 4 {
 		n = 4 // cap so the loop bounds are small (a longer loop would also panic, just slower)
 	}
-	// BUG: read bucket bytes PAST the wire's end (real UnmarshalIBLT guards
-	// `len(wire) < 18 + n*20` BEFORE this loop at iblt_wire.go:277; this copy
-	// does NOT — the deleted guard is the injected bug).
+	// Omit the corresponding bucket-array length check as well.
 	for i := 0; i < n; i++ {
 		off := 18 + i*20
 		_ = binary.LittleEndian.Uint32(wire[off : off+4]) // out-of-bounds on a short seed
@@ -75,33 +46,25 @@ func bugInjectUnmarshalIBLT(wire []byte) (_ *eng.IBLT, _ error) {
 	return nil, nil
 }
 
-// TestBugInjectControlProof is the DETERMINISTIC, OPT-IN proof that the harness
-// is NOT a tautology. It runs a short IBLT seed
-// through the REAL unmarshaler (asserts NO panic — returns an error) AND
-// through the BUG-INJECTED copy (asserts a PANIC — recovered). The contrast
-// proves a real panic IS catchable on a real input shape.
-//
-// OPT-IN (build-tagged): `go test -tags fuzzbuginject -run TestBugInjectControlProof ./pkg/security/fuzz/`
+// TestBugInjectControlProof requires the real unmarshaler to reject shortSeed
+// without a panic and the modified copy to panic on the same input.
 func TestBugInjectControlProof(t *testing.T) {
-	t.Log("bug-inject control: proving the harness is NOT a tautology")
-	// The short seed: a valid 'IBL1' header (18 bytes) declaring numBuckets=3
-	// but carrying NO bucket body. The REAL unmarshaler's bounds guard rejects
-	// it (len 18 < 18 + 3*20 == 78); the BUG copy's deleted guard reads past.
+	t.Log("fault-injection control: checking the short-seed contrast")
+	// The header declares three buckets but carries no bucket body.
 	shortSeed := make([]byte, 18)
 	binary.LittleEndian.PutUint32(shortSeed[0:4], 0x49424C31) // 'IBL1'
-	binary.LittleEndian.PutUint32(shortSeed[4:8], 3)          // numBuckets=3, NO body
+	binary.LittleEndian.PutUint32(shortSeed[4:8], 3)          // numBuckets=3, no body
 	binary.LittleEndian.PutUint16(shortSeed[8:10], 3)         // k=3
 	binary.LittleEndian.PutUint64(shortSeed[10:18], 0)        // seed
 
-	// 1. The REAL unmarshaler on the short seed: NO panic (returns error).
+	// The real unmarshaler rejects the 18-byte input before reading buckets.
 	_, err := eng.UnmarshalIBLT(shortSeed)
 	if err == nil {
-		t.Fatal("bug-inject control: real UnmarshalIBLT should reject the short seed (an error), got nil — the bounds guard should fire")
+		t.Fatal("real UnmarshalIBLT returned nil error for the short seed; want a bounds rejection")
 	}
-	t.Logf("bug-inject control: real UnmarshalIBLT(shortSeed) -> error (NO panic): %v", err)
+	t.Logf("real UnmarshalIBLT(shortSeed) returned an error without a panic: %v", err)
 
-	// 2. The BUG-INJECTED copy on the SAME short seed: PANIC (the deleted bounds
-	//    guard lets the loop read past the wire's 18-byte end).
+	// The modified copy reads the first bucket beyond the same 18-byte input.
 	var panicked bool
 	var panicVal any
 	func() {
@@ -114,57 +77,36 @@ func TestBugInjectControlProof(t *testing.T) {
 		_, _ = bugInjectUnmarshalIBLT(shortSeed)
 	}()
 	if !panicked {
-		t.Fatal("bug-inject control: bug-injected UnmarshalIBLT should PANIC on the short seed (the deleted bounds guard lets the loop read past the wire) — the harness is a TAUTOLOGY if it cannot catch this injected panic")
+		t.Fatal("fault-injected UnmarshalIBLT did not panic on the short seed; want an out-of-bounds read")
 	}
-	t.Logf("bug-inject control: bug-injected UnmarshalIBLT(shortSeed) -> PANIC (recovered): %v — the harness IS load-bearing (a real panic is catchable on a real input shape)", sprintAny(panicVal))
+	t.Logf("fault-injected UnmarshalIBLT(shortSeed) panic recovered: %v", sprintAny(panicVal))
 }
 
-// FuzzBugInjectControl is the OPT-IN fuzz target that catches the injected bug
-// under a real fuzzer (the manual proof the harness is load-bearing). Run:
+// FuzzBugInjectControl exercises the modified unmarshaler with mutated inputs.
+// Its closure recovers panics so ordinary tagged test runs can execute the seed
+// corpus. Consequently, TestBugInjectControlProof is the deterministic control;
+// this target is exploratory rather than a pass/fail panic oracle. Run it with:
 //
 //	go test -tags fuzzbuginject -run='^$' -fuzz=FuzzBugInjectControl -fuzztime=30s ./pkg/security/fuzz/
-//
-// The fuzzer mutates the short-seed shape; the deleted bounds guard in
-// bugInjectUnmarshalIBLT yields an out-of-bounds panic within seconds — the
-// proof a real fuzzer catches a real injected panic (the
-// KEM-CLASSICAL-CONTROL mold). The default build (no tag) does NOT compile this
-// target, so it NEVER runs in CI's default `go test ./...`.
 func FuzzBugInjectControl(f *testing.F) {
 	for _, s := range bugInjectSeeds() {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		// RECOVER: this is the BUG-INJECT target — its seeds are DELIBERATELY
-		// shaped to PANIC the bug-injected copy (the deleted bounds guard). Unlike
-		// the 6 real-unmarshaler fuzz targets (which assert NO-panic), this target's
-		// PURPOSE is to panic. In `go test` corpus-only mode (no -fuzz flag) the
-		// panic would propagate as a test FAILURE; recovering here makes
-		// corpus-only mode pass (the panic is EXPECTED for this target) so
-		// `go test -tags fuzzbuginject ./pkg/security/fuzz/` is GREEN. The OPERATOR
-		// runs the actual fuzzing with `-fuzz=FuzzBugInjectControl`, where the
-		// fuzzer reports a panic as "found a failing input" (the success signal —
-		// the proof the harness catches real panics). The recover does NOT mask a
-		// production crash — the bug-injected copy is build-tagged
-		// fuzzbuginject + NEVER ships in the production binary; this recover is in
-		// a TEST closure only. The deterministic no-panic-vs-panic CONTRAST proof
-		// is TestBugInjectControlProof (which asserts the panic fired); this
-		// fuzz target is the operator's exploratory tool, not the proof.
+		// The modified unmarshaler is expected to panic on short inputs. Recover
+		// here so corpus-only execution and fuzz exploration can continue. This
+		// recovery also means the fuzzer does not report that panic as a finding;
+		// TestBugInjectControlProof checks the expected panic explicitly.
 		defer func() { _ = recover() }()
 		_, _ = bugInjectUnmarshalIBLT(wire)
 	})
 }
 
-// bugInjectSeeds is the FuzzBugInjectControl seed corpus (the SINGLE SOURCE OF
-// TRUTH — the desync discipline: the f.Add calls AND the on-disk
-// testdata/fuzz/FuzzBugInjectControl/ corpus files both derive from this list,
-// so the byte-equality guard TestSeedCorpusMatchesBuilders can re-derive the
-// corpus from this list + assert the on-disk files match byte-for-byte). The 6
-// seeds: the short header shape (panics under the bug), a second short header
-// (a different numBuckets — the bug also OOB-reads here), the valid IBLT (does
-// NOT panic — the bug copy's loop reads in-bounds on a well-formed body), the
-// length-bomb (capped here so it's an OOB not OOM), + the tiny shapes. The list
-// ORDER is the on-disk file order (seed-0.txt..seed-5.txt) — the byte-equality
-// guard asserts byte-identity in this order, so a reordered corpus fails it.
+// bugInjectSeeds returns two short headers, a valid IBLT, an excessive bucket
+// count, and empty or one-byte inputs. The valid IBLT remains in bounds; the
+// short and excessive-count inputs reach out-of-bounds reads in the modified
+// copy. TestSeedCorpusMatchesBuilders requires the six corpus files to match
+// this list in order.
 func bugInjectSeeds() [][]byte {
 	return [][]byte{
 		makeShortIBLTHeader(3),
@@ -176,19 +118,15 @@ func bugInjectSeeds() [][]byte {
 	}
 }
 
-// bugInjectSeedsOrNil is the build-tagged override of the default-build nil stub
-// in bug_inject_default_test.go (the !fuzzbugbuild exclusion there + the
-// fuzzbuginject tag here ensure only ONE compiles per build — no redeclaration).
-// Under -tags fuzzbuginject it returns the real bugInjectSeeds so the
-// byte-equality guard TestSeedCorpusMatchesBuilders enforces builder↔corpus
-// byte-identity for the fault-injection target too; in the default build the stub
-// returns nil → the guard skips it (the opt-in discipline).
+// bugInjectSeedsOrNil is the tagged counterpart of the nil stub in
+// bug_inject_default_test.go. Returning the actual list enables corpus byte
+// comparison for FuzzBugInjectControl in this build.
 func bugInjectSeedsOrNil() [][]byte {
 	return bugInjectSeeds()
 }
 
-// makeShortIBLTHeader builds a valid 'IBL1' header declaring numBuckets buckets
-// but carrying NO bucket body — the shape that panics under the bug-injected
+// This function builds a valid 'IBL1' header declaring numBuckets buckets
+// but carrying no bucket body — the shape that panics under the fault-injection
 // copy (deleted bounds guard) and is cleanly rejected by the real unmarshaler.
 func makeShortIBLTHeader(numBuckets int) []byte {
 	out := make([]byte, 18)

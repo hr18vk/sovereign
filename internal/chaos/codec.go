@@ -5,21 +5,21 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §2 — exported IPC codec wrappers + payload encode/decode.
+// Exported IPC codec wrappers + payload encode/decode.
 // ---------------------------------------------------------------------------
 //
 // protocol.go defines the wire frame and the unexported writeFrame/readFrame,
 // deliberately keeping the framing logic private to this package. The
 // chaos-worker child process (cmd/chaos-worker) and the supervisor
-// (supervisor.go) both reach the protocol ONLY through these exported
-// helpers, so the wire layout lives in exactly one place.
+// (supervisor.go) both reach the protocol through these exported helpers,
+// so the wire layout lives in exactly one place.
 //
 // PAYLOAD LAYOUTS (all big-endian, fixed-size where noted):
 //
-//	OpHello payload = nodeID(16) + lamport(8) + merkleRoot(32) = 56 bytes
-//	OpSubmitOK payload = nodeID(16) + counter(8) + merkleRoot(32) = 56 bytes
-//	OpSubmit payload = entityIDLen(4) + entityID + CRDTEntry(120)
-//	OpQuery payload = entityIDLen(4) + entityID (resp = OpSubmitOK shape)
+//	OpHello      payload = nodeID(16) + lamport(8) + merkleRoot(32) = 56 bytes
+//	OpSubmitOK   payload = nodeID(16) + counter(8) + merkleRoot(32) = 56 bytes
+//	OpSubmit     payload = entityIDLen(4) + entityID + CRDTEntry(120)
+//	OpQuery      payload = entityIDLen(4) + entityID            (resp = OpSubmitOK shape)
 //	OpBye/OpPoke/OpCrashProbe payload = empty
 package chaos
 
@@ -31,9 +31,8 @@ import (
 )
 
 // crdtEntryWireLen is the on-wire size of a sync.CRDTEntry carried inside an
-// OpSubmit frame. It MUST equal sizeof(sync.CRDTEntry) (120 bytes per the
-// struct comment in pkg/sync/hamt.go). A compile-time check lives in
-// consumeCRDTEntry that guards against silent layout drift.
+// OpSubmit frame. It must equal sizeof(sync.CRDTEntry) (120 bytes per the
+// struct comment in pkg/sync/hamt.go).
 const crdtEntryWireLen = 120
 
 // ReadFrameFromReader is the exported read seam. It returns io.EOF on a clean
@@ -102,7 +101,7 @@ func EncodeSubmit(entityID string, entry sync.CRDTEntry) []byte {
 }
 
 // DecodeSubmit deserializes an OpSubmit payload into the entry + entityID. The
-// DotNodeID/DotCounter fields in the decoded entry are HONORED by the worker
+// DotNodeID/DotCounter fields in the decoded entry are honored by the worker
 // for the merkle-root equality contract on replay; on a fresh submit they are
 // overwritten by InsertLocal's NextDot(), which is the intended live path.
 func DecodeSubmit(p []byte) (entry sync.CRDTEntry, entityID string, ok bool) {

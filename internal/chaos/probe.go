@@ -5,57 +5,42 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §2 — Worker crash probe: the deliberate off-heap SIGSEGV.
+// Worker crash probe: the deliberate off-heap SIGSEGV.
 // ---------------------------------------------------------------------------
 //
 // The supervisor sends OpCrashProbe to ask the worker to self-destruct in the
-// exact way §2 must recover from: a raw SIGSEGV in off-heap C-space
-// that recover() CANNOT catch and that kills the whole worker process. A
+// exact way the crash probe must recover from: a raw SIGSEGV in off-heap C-space
+// that recover() cannot catch and that kills the whole worker process. A
 // successful probe "response" is the silence of the worker's stdout pipe — the
 // supervisor observes EOF (not an OpBye) and triggers WAL recovery.
 //
-// HONESTY ON THE CRASH MECHANISM (pre-mortem review):
+// Crash mechanism:
 //
-//	recover() cannot catch SIGSEGV, but on Linux a dereference of a totally
-//	unmapped address such as 0xDEADDEADDEADDEAD raises SIGSEGV and Go's default
-//	handler prints a panic + stack trace and exits nonzero. The key property we
-//	need is: the worker process DIES and its stdout closes, so the supervisor's
-//	blocking ReadFrameFromReader returns io.EOF. We do NOT rely on the crash
-//	being "truly unrecoverable" in a philosophical sense — we rely on the
-//	process dying and the pipe closing, which is the observable contract the
-//	supervisor's recovery loop keys off.
+//	recover() cannot catch SIGSEGV; on Linux, dereferencing an unmapped
+//	address such as 0xDEADDEADDEADDEAD raises SIGSEGV and Go's default signal
+//	handler terminates the worker process. The observable contract the
+//	supervisor keys on is that the worker exits and its stdout closes, so the
+//	supervisor's blocking ReadFrameFromReader returns io.EOF.
 //
-// HOW WE FAULT (deterministic, no probabilistic fuzzing required for the gate):
-// 1. Take the engine's current HAMT root *HAMT and its off-arena root NodePtr.
-// 2. If the engine has at least one inserted entity, the root node's bitmap is
-// non-zero and its childrenPtr points to a live children array. We corrupt
-// the FIRST child NodePtr slot in that array to 0xDEADDEADDEADDEAD, then
-// call State().Get(forThatChildEntity) so the traversal dereferences the
-// poisoned pointer → SIGSEGV.
-// 3. If the engine is empty (no live children array to poison), we instead
-// synthesize the crash by writing 0xDEADDEADDEADDEAD into an arbitrary
-// within-arena uint64 slot that is NOT the root wrapper, then dereference
-// that address directly. The fuzzer's CorruptOffHeapPointer already
-// handles the out-of-range fallback; here we additionally guarantee a
-// dereference so the fault is observed THIS call, not eventually.
+// How the probe faults deterministically:
+//  1. Take the engine's current HAMT root and its off-arena root NodePtr.
+//  2. If the engine has at least one inserted entity, the root node's bitmap is
+//     non-zero and its childrenPtr points to a live children array. We corrupt
+//     the first child NodePtr slot in that array via CorruptOffHeapPointer,
+//     read the poisoned value, and dereference it directly with
+//     derefDeadPointer -> SIGSEGV.
+//  3. If the engine is empty or has no live children array (bitmap == 0), we
+//     dereference the unmapped address 0xDEADDEADDEADDEAD directly.
+//     CorruptOffHeapPointer also ORs the top bit when the pointer is in range.
 //
-// PRE-MORTEM (3 catastrophic failure modes for THIS function):
-// 1. We poison a slot that is NOT subsequently dereferenced by Get → the probe
-// "succeeds without crashing" → the worker exits nonzero via the
-// "probe did not SIGSEGV" path instead of via a real crash. The supervisor
-// must treat BOTH as "worker dead, recover" to be safe — and it does: any
-// stdout closure (EOF OR clean exit) triggers recovery.
-// 2. The poisoned child slot happens to still land inside the arena mapping
-// (e.g. corruption produced a value < base+size). Then Get does NOT fault;
-// same fallback as (1). Mitigated by always or-ing the top bit, which on
-// aarch64/Graviton user-space is unmapped.
-// 3. A concurrent InsertLocal rewrites root beneath us between corruption
-// and dereference, swapping in a fresh child array → we dereference the
-// OLD (now-dead) pointer, which may have been re-allocated. To avoid
-// racing the live fast path, the probe snapshots a single root HAMT and
-// operates ONLY on that snapshot; it does not touch the atomic engine
-// state. The corrupted pointer is in the snapshot's arena region, and EBR
-// keeps it resident for the duration of this call.
+// Failure modes:
+//  1. If a poisoned slot is not subsequently dereferenced, the worker still
+//     exits nonzero so any stdout closure (EOF or exit) triggers recovery.
+//  2. If a poisoned child slot still falls inside the arena mapping, setting
+//     the top bit moves it into unmapped arm64 user-space.
+//  3. To avoid racing concurrent InsertLocal rewrites of the root, the probe
+//     snapshots a single root HAMT under an EBR epoch pin so the underlying
+//     arena region stays resident for the duration of this call.
 package chaos
 
 import (
@@ -68,7 +53,7 @@ import (
 // WorkerExecuteCrashProbe deliberately corrupts an off-heap child pointer in
 // the worker's engine and then dereferences it, raising a SIGSEGV that kills
 // the worker process. The supervisor observes the resulting stdout EOF and
-// triggers WAL recovery. This function does NOT return under normal operation;
+// triggers WAL recovery. This function does not return under normal operation;
 // if control returns the probe failed to fault and the caller exits nonzero.
 func WorkerExecuteCrashProbe(eng *sync.DeltaCRDTEngine) {
 	if eng == nil {
@@ -77,25 +62,16 @@ func WorkerExecuteCrashProbe(eng *sync.DeltaCRDTEngine) {
 		derefDeadPointer(unmappedFaultAddr)
 		return
 	}
-	// Use-after-free fix: snapshot the HAMT state INSIDE an EBR epoch
-	// pin. The previous revision read state:= eng.State() with no pin and
-	// then dereferenced an off-heap child pointer that a concurrent
-	// InsertLocal/DeleteLocal CAS could have DecRef'd to 0, retired, and freed
-	// via a racing AdvanceEpoch -- surfacing as a NON-DETERMINISTIC SIGSEGV
-	// (a use-after-free) rather than the deterministic one the probe intends
-	// to raise at the poisoned pointer. Pinning holds freeRetiredList back
-	// for the structural read up to the deliberate fault, so the only SIGSEGV
-	// the probe triggers is the one it asks for.
-	//
-	// Leak on the death paths: the probe is designed to terminate the worker
-	// process via SIGSEGV. On the no-op-return path we Release() the
-	// participant; on every fault path the process dies and the epoch is
-	// irrelevant, with the participant slot reaped by OS teardown.
+	// Snapshot the HAMT state inside an EBR epoch pin so a concurrent
+	// InsertLocal/DeleteLocal CAS cannot decrement and free the child array via
+	// AdvanceEpoch while this structural read prepares the fault. On any early
+	// return that does not fault, release the participant; on the fault path
+	// the process terminates via SIGSEGV and OS teardown reaps the slot.
 	ebr := eng.EBR()
 	participant := ebr.Acquire()
 	hasFaulted := false
 	defer func() {
-		// On any path that did NOT take the deliberate SIGSEGV, drop the pin.
+		// On any path that did not take the deliberate SIGSEGV, drop the pin.
 		if !hasFaulted {
 			ebr.Release(participant)
 		}
@@ -155,7 +131,7 @@ func WorkerExecuteCrashProbe(eng *sync.DeltaCRDTEngine) {
 	}
 	// Force the dereference of the poisoned child pointer. We only need to
 	// *read* the now-poisoned uint64 as a NodePtr; the actual SIGSEGV fires on
-	// the next pointer chase. To make the fault observable THIS call, we read
+	// the next pointer chase. To make the fault observable this call, we read
 	// the corrupted value and dereference it directly.
 	poisoned := uintptr(*firstChildSlot)
 	// This deref is the deliberate, deterministic SIGSEGV the probe is

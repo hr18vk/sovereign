@@ -6,24 +6,23 @@
 
 package durability
 
-//putlocals_split_test.go — V2(a): DECOMPOSE THE
-// COMMIT WINDOW. PutLocals (gossip.go:1101's batch path) = N × (sha256 +
-// InsertLocal) + ONE AppendMutations (N writes + ONE fsync). This test measures
-// each term at the gate's shape (10 workers × 100-key batches, 10,000 keys):
+// TestPutLocalsSplit separates the batch commit path into engine work, WAL
+// append work, and the filesystem sync cost. With 10 workers and 100-key
+// batches, it measures:
 //
-//	A = PutLocals total per-call wall (the production seam, measured directly)
-//	B = AppendMutations-only per-call wall (prebuilt mutations, same concurrency)
-//	C = the engine+encode term = A − B (DERIVED — stated as derived, not measured)
-//	D = the raw fsync floor on the same filesystem (write 20 KB + Sync)
+//	A: total PutLocals latency.
+//	B: AppendMutations latency for prebuilt mutations at the same concurrency.
+//	C: engine and encoding time, derived as A minus B rather than measured.
+//	D: sync latency after writing a 20 KB file on the same filesystem.
 //
-// The WAL/engine dir is_SPLIT_DIR (default t.TempDir()): on this box /tmp
-// is tmpfs (fsync is a no-op), so the test is run twice — tmpfs and the ext4
-// repo filesystem — and BOTH are reported; the fsync term is only real on ext4.
-// A claim about "fsync-dominated" without naming the filesystem is not a number.
+// SOVEREIGN_TEST_SPLIT_DIR selects the WAL and engine directory; the default
+// is t.TempDir(). Sync behavior depends on the filesystem, so measurements from
+// different filesystems must be reported separately. On tmpfs, for example,
+// fsync does not represent persistent-disk latency.
 //
-// Run: go test -run TestPutLocalsSplit -v -count=1./pkg/durability/
-//_SPLIT_DIR=/path/to/an/ext4/dir \
-// go test -run TestPutLocalsSplit -v -count=1./pkg/durability/
+// Run: go test -run TestPutLocalsSplit -v -count=1 ./pkg/durability/
+//      SOVEREIGN_TEST_SPLIT_DIR=/path/to/filesystem/tmp \
+//        go test -run TestPutLocalsSplit -v -count=1 ./pkg/durability/
 
 import (
 	"fmt"
@@ -37,9 +36,9 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-func splitTestDir(t *testing.T) string {
+func splitDir(t *testing.T) string {
 	t.Helper()
-	if d := os.Getenv("PUTLOCALS_SPLIT_DIR"); d != "" {
+	if d := os.Getenv("SOVEREIGN_TEST_SPLIT_DIR"); d != "" {
 		p := filepath.Join(d, fmt.Sprintf("split-%d", time.Now().UnixNano()))
 		if err := os.MkdirAll(p, 0o755); err != nil {
 			t.Fatalf("MkdirAll %s: %v", p, err)
@@ -51,8 +50,8 @@ func splitTestDir(t *testing.T) string {
 }
 
 func TestPutLocalsSplit(t *testing.T) {
-	dir := splitTestDir(t)
-	const workers, callsPerWorker, batchSize = 10, 10, 100 // the gate's shape: 10,000 keys
+	dir := splitDir(t)
+	const workers, callsPerWorker, batchSize = 10, 10, 100 // 10,000 keys total
 
 	engDir := filepath.Join(dir, "eng")
 	if err := os.MkdirAll(engDir, 0o755); err != nil {
@@ -106,14 +105,14 @@ func TestPutLocalsSplit(t *testing.T) {
 		return walls
 	}
 
-	// ── A: the full PutLocals seam ───────────────────────────────────────────
+	// A: full PutLocals calls.
 	wallA := runPar(func(call int) {
 		if _, _, err := bridge.PutLocals(mkItems(fmt.Sprintf("a-%d", call), batchSize)); err != nil {
 			t.Errorf("PutLocals call %d: %v", call, err)
 		}
 	})
 
-	// ── B: AppendMutations only (prebuilt mutations; no engine work) ────────
+	// B: AppendMutations alone, excluding engine work.
 	prebuilt := make([][]WALMutation, workers*callsPerWorker)
 	for c := range prebuilt {
 		ms := make([]WALMutation, batchSize)
@@ -131,7 +130,7 @@ func TestPutLocalsSplit(t *testing.T) {
 		}
 	})
 
-	// ── D: the raw fsync floor on THIS filesystem ───────────────────────────
+	// D: raw sync latency on this filesystem.
 	var fsyncWalls []time.Duration
 	floorPath := filepath.Join(dir, "fsync-floor.bin")
 	for i := 0; i < 100; i++ {
@@ -151,25 +150,25 @@ func TestPutLocalsSplit(t *testing.T) {
 		_ = f.Close()
 	}
 
-	pA := durStatsOf(wallA)
-	pB := durStatsOf(wallB)
-	pD := durStatsOf(fsyncWalls)
-	t.Logf("V2(a) COMMIT-WINDOW SPLIT — dir=%s (filesystem per `df`), shape=%d workers × %d calls × %d keys:", dir, workers, callsPerWorker, batchSize)
-	t.Logf(" A PutLocals total: p50=%s p99=%s max=%s (n=%d)", pA.p50, pA.p99, pA.max, len(wallA))
-	t.Logf(" B AppendMutations only: p50=%s p99=%s max=%s (n=%d)", pB.p50, pB.p99, pB.max, len(wallB))
-	t.Logf(" C engine+encode (A−B, DERIVED): p50=%s p99=%s", pA.p50-pB.p50, pA.p99-pB.p99)
-	t.Logf(" D raw fsync floor (20KB write+Sync): p50=%s p99=%s max=%s", pD.p50, pD.p99, pD.max)
-	t.Logf(" VERDICT HINT: if B≈A the window is WAL/fsync-dominated; if C≈A it is engine/CPU-dominated. State the filesystem next to the number.")
+	pA := collectSplitStats(wallA)
+	pB := collectSplitStats(wallB)
+	pD := collectSplitStats(fsyncWalls)
+	t.Logf("commit-window split — dir=%s (filesystem per `df`), shape=%d workers × %d calls × %d keys:", dir, workers, callsPerWorker, batchSize)
+	t.Logf("  A PutLocals total:        p50=%s p99=%s max=%s (n=%d)", pA.p50, pA.p99, pA.max, len(wallA))
+	t.Logf("  B AppendMutations only:   p50=%s p99=%s max=%s (n=%d)", pB.p50, pB.p99, pB.max, len(wallB))
+	t.Logf("  C engine+encode (A−B, derived): p50=%s p99=%s", pA.p50-pB.p50, pA.p99-pB.p99)
+	t.Logf("  D raw fsync floor (20KB write+Sync): p50=%s p99=%s max=%s", pD.p50, pD.p99, pD.max)
+	t.Logf("  interpretation: B near A indicates WAL/sync dominance; C near A indicates engine/CPU dominance. Report the filesystem with these timings.")
 }
 
-type durStats struct{ p50, p99, max time.Duration }
+type splitStat struct{ p50, p99, max time.Duration }
 
-func durStatsOf(d []time.Duration) durStats {
+func collectSplitStats(d []time.Duration) splitStat {
 	if len(d) == 0 {
-		return durStats{}
+		return splitStat{}
 	}
 	s := make([]time.Duration, len(d))
 	copy(s, d)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-	return durStats{p50: s[len(s)/2], p99: s[(len(s)*99)/100], max: s[len(s)-1]}
+	return splitStat{p50: s[len(s)/2], p99: s[(len(s)*99)/100], max: s[len(s)-1]}
 }

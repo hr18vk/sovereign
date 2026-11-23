@@ -35,8 +35,8 @@ func batchTestSeed(t *testing.T) (seed []byte, pub ed25519.PublicKey, nodeID [Or
 // CRDTDeltaBatch capnp wire. The BatchEnvelope carries the batch wire verbatim
 // and the origin signature covers it directly; the envelope never re-serializes
 // the batch, so a fixed buffer is a faithful stand-in that exercises the
-// envelope without importing pkg/sync (the cross-package determinism guard
-// lives in pkg/mesh/batch_test.go, where the real capnp wire is built).
+// envelope without importing pkg/sync (the cross-package determinism regression
+// test lives in pkg/mesh/batch_test.go, where the real capnp wire is built).
 func fakeBatchWire(n int) []byte {
 	w := make([]byte, n)
 	for i := range w {
@@ -45,10 +45,9 @@ func fakeBatchWire(n int) []byte {
 	return w
 }
 
-// signBatch signs the batch wire with the origin seed via the PRODUCTION
-// identity.SignCRDTFrame (the hedged Ed25519 symbol the receiver verifies with
-// the UNCHANGED VerifyCRDTFrame). It returns the 64-byte signature as the
-// [OriginSigSize]byte the envelope header carries.
+// signBatch signs the batch wire with the origin seed via
+// identity.SignCRDTFrame (randomized-nonce Ed25519 verified by
+// VerifyCRDTFrame). It returns the 64-byte signature stored in the envelope header.
 func signBatch(t *testing.T, seed, batchWire []byte) [OriginSigSize]byte {
 	t.Helper()
 	sig, err := identity.SignCRDTFrame(seed, batchWire)
@@ -60,11 +59,9 @@ func signBatch(t *testing.T, seed, batchWire []byte) [OriginSigSize]byte {
 	return arr
 }
 
-// TestBatchEnvelopeRoundTrip proves marshal/unmarshal preserves the batchWire
-// byte-identical: the wire the origin signs is the wire the receiver hands to
-// ApplyCRDTDeltaBatch (the no-hash-then-reconstruct-gap property). A round-trip
-// that mutated a single batchWire byte would re-open the wire-tamper
-// opportunity the crypto-minimal design closes by signing the wire directly.
+// TestBatchEnvelopeRoundTrip checks every header field and verifies that the
+// parsed batchWire is byte-identical to the signed input. Those are the bytes
+// the receiver later passes to ApplyCRDTDeltaBatch.
 func TestBatchEnvelopeRoundTrip(t *testing.T) {
 	seed, _, nodeID := batchTestSeed(t)
 	batchWire := fakeBatchWire(256)
@@ -88,17 +85,14 @@ func TestBatchEnvelopeRoundTrip(t *testing.T) {
 		t.Errorf("BatchCount: got %d, want 7", env.BatchCount())
 	}
 	if !bytes.Equal(env.BatchWire(), batchWire) {
-		t.Fatalf("BatchWire NOT byte-identical after round-trip — the wire the origin signs must be the wire the receiver applies (the no-hash-then-reconstruct-gap property)")
+		t.Fatalf("BatchWire not byte-identical after round-trip — the wire the origin signs must be the wire the receiver applies (the no-hash-then-reconstruct-gap property)")
 	}
 }
 
-// TestOneSigCoversBatch proves a single tampered byte in batchWire makes
-// VerifyCRDTFrame return false — the ONE Ed25519 signature covers the WHOLE
-// batch (the one-sig-covers-the-batch binding). This is the SAME
-// reject-before-Apply guard as the per-frame DropVerify: a tampered batch is
-// dropped at verify, never reaching ApplyCRDTDeltaBatch (the S1a atomic-reject
-// guarantee is therefore never exercised on a tampered batch — verify catches
-// it first).
+// TestOneSigCoversBatch checks that changing one batchWire byte makes
+// VerifyCRDTFrame return false. The origin signature covers the complete
+// batch, so verification rejects the modification before the receiver reaches
+// ApplyCRDTDeltaBatch.
 func TestOneSigCoversBatch(t *testing.T) {
 	seed, pub, nodeID := batchTestSeed(t)
 	batchWire := fakeBatchWire(256)
@@ -110,26 +104,25 @@ func TestOneSigCoversBatch(t *testing.T) {
 		t.Fatalf("UnmarshalBatchEnvelope: %v", err)
 	}
 
-	// The honest batch verifies under the origin's public key.
+	// The batch verifies under the origin's public key.
 	parsedSig := env.OriginSig()
 	if !identity.VerifyCRDTFrame(pub, env.BatchWire(), parsedSig[:]) {
-		t.Fatalf("VerifyCRDTFrame rejected an HONEST batch — the wire the origin signed must verify")
+		t.Fatalf("VerifyCRDTFrame rejected a valid batch — the wire the origin signed must verify")
 	}
 
-	// Tamper ONE byte in the batch wire the receiver would apply. The signature
+	// Tamper one byte in the batch wire the receiver would apply. The signature
 	// covers the wire directly, so a single flipped byte breaks the verify.
 	tampered := make([]byte, len(env.BatchWire()))
 	copy(tampered, env.BatchWire())
 	tampered[100] ^= 0x01
 	if identity.VerifyCRDTFrame(pub, tampered, parsedSig[:]) {
-		t.Fatalf("VerifyCRDTFrame ACCEPTED a tampered batch — the one-sig-covers-the-batch binding is broken (a single flipped byte must fail verify)")
+		t.Fatalf("VerifyCRDTFrame accepted a tampered batch — the one-sig-covers-the-batch binding is broken (a single flipped byte must fail verify)")
 	}
 }
 
-// TestVersionGateRejects_v0 proves the version field is honored: a version !=
-// WireV1Version is an ErrMalformed (no silent downgrade to a different wire
-// layout). A receiver that silently accepted a v0 frame would parse the header
-// at the wrong offsets — a wire-tamper / silent-downgrade footgun.
+// TestVersionGateRejects_v0 checks that an unsupported version returns
+// ErrBatchMalformed instead of being interpreted using the v1 header layout.
+// The test changes the version byte to WireV1Version + 1.
 func TestVersionGateRejects_v0(t *testing.T) {
 	seed, _, nodeID := batchTestSeed(t)
 	batchWire := fakeBatchWire(64)
@@ -144,7 +137,7 @@ func TestVersionGateRejects_v0(t *testing.T) {
 }
 
 // TestZeroOriginSigRejected proves a zero originSig is rejected pre-verify —
-// no unsigned batch is accepted (the unsigned-batch guard, mirroring
+// no unsigned batch is accepted (the unsigned-batch regression test, mirroring
 // envelope.go's zero-originSig rule). A batch that failed to sign produces a
 // wire the receiver drops, never a silent accept.
 func TestZeroOriginSigRejected(t *testing.T) {
@@ -158,16 +151,14 @@ func TestZeroOriginSigRejected(t *testing.T) {
 	}
 }
 
-// TestBatchEnvelopeHeaderOnlyOpaquesBatchWire proves Unmarshal does NOT decode
-// batchWire — the parser touches ONLY the header. A malformed batchWire (here,
-// a zero-length batch wire) is deferred to the post-verify apply, NOT rejected
-// at the header parse. This is the reject-before-Verify discipline: the cheap
-// gate stack parses the header only; the batch wire is opaque until verify
-// passes, then the frozen ApplyCRDTDeltaBatch decodes it.
+// TestBatchEnvelopeHeaderOnlyOpaquesBatchWire checks that the parser accepts
+// an empty batchWire when the header is valid. The envelope parser does not
+// decode that payload; ApplyCRDTDeltaBatch handles payload errors after
+// signature verification.
 func TestBatchEnvelopeHeaderOnlyOpaquesBatchWire(t *testing.T) {
 	seed, _, nodeID := batchTestSeed(t)
 	// A zero-length batch wire is a malformed CRDTDeltaBatch (the capnp decode
-	// inside ApplyCRDTDeltaBatch would reject it), but the HEADER parse must
+	// inside ApplyCRDTDeltaBatch would reject it), but the header parse must
 	// succeed — the parser does not touch the batch wire.
 	batchWire := []byte{}
 	originSig := signBatch(t, seed, batchWire)
@@ -175,19 +166,17 @@ func TestBatchEnvelopeHeaderOnlyOpaquesBatchWire(t *testing.T) {
 	wire := MarshalBatchEnvelope(nodeID, originSig, 1, 0, batchWire)
 	env, err := UnmarshalBatchEnvelope(wire)
 	if err != nil {
-		t.Fatalf("UnmarshalBatchEnvelope with empty batchWire: got %v, want nil (the header parse must NOT decode the batch wire — it is opaque until verify)", err)
+		t.Fatalf("UnmarshalBatchEnvelope with empty batchWire: got %v, want nil (the header parse must not decode the batch wire — it is opaque until verify)", err)
 	}
 	if len(env.BatchWire()) != 0 {
 		t.Errorf("BatchWire len: got %d, want 0 (the empty batch wire is carried verbatim)", len(env.BatchWire()))
 	}
 }
 
-// TestIsBatchFrameDispatch proves the dispatch discriminator routes a batch
-// frame to the batch path and a relay frame to the relay path with zero
-// ambiguity. A RelayEnvelope begins with a uint16 little-endian version (2 or
-// 3); its first 4 bytes never equal WireV1Magic (big-endian), so the peek is
-// unambiguous. A misroute would hand a batch to the frozen RelayEnvelope parser
-// (DropMalformed — a silent throughput collapse).
+// TestIsBatchFrameDispatch checks recognition of a batch frame, rejection of
+// a relay version prefix, and rejection of a frame too short to contain the
+// four-byte magic. These cases keep batch and relay frames on their respective
+// parser paths.
 func TestIsBatchFrameDispatch(t *testing.T) {
 	seed, _, nodeID := batchTestSeed(t)
 	batchWire := fakeBatchWire(32)
@@ -200,7 +189,7 @@ func TestIsBatchFrameDispatch(t *testing.T) {
 
 	// A RelayEnvelope's first 2 bytes are its uint16 LE version (2 or 3). Build
 	// a stand-in relay frame whose first bytes are 0x03 0x00 (version 3 LE) and
-	// assert the dispatch routes it to the relay path (NOT a batch).
+	// assert the dispatch routes it to the relay path (not a batch).
 	relayFrame := make([]byte, 16)
 	relayFrame[0] = 0x03 // version 3 low byte (little-endian)
 	relayFrame[1] = 0x00 // version 3 high byte
@@ -208,7 +197,7 @@ func TestIsBatchFrameDispatch(t *testing.T) {
 		t.Fatalf("IsBatchFrame accepted a relay frame (version 3 LE prefix) — the dispatch would misroute a relay frame to HandleBatchFrame")
 	}
 
-	// A too-short frame (fewer than 4 bytes) is NOT a batch (the peek cannot
+	// A too-short frame (fewer than 4 bytes) is not a batch (the peek cannot
 	// read the magic); it routes to the relay path, which will DropMalformed it.
 	if IsBatchFrame([]byte{0x53, 0x42}) {
 		t.Fatalf("IsBatchFrame accepted a too-short frame — the peek must require 4 bytes")

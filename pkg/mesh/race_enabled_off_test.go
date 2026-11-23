@@ -8,5 +8,5 @@
 
 package mesh_test
 
-// raceEnabled is false in clean builds (the pkg/metrics precedent).
+// raceEnabled is false in builds without race detector instrumentation.
 const raceEnabled = false

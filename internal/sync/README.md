@@ -1,22 +1,20 @@
-# Home-Shard SEC Allocator
+# Sharded Elimination and Combining allocator
 
-**Code-Locality Architecture Document**
-*Reference: `docs/architecture/1_ARCHITECTURE.md`*
+**Code-locality architecture document**
+*Reference: [Architecture](../../docs/architecture/1_ARCHITECTURE.md)*
 
-This directory contains the Sharded Elimination & Combining (SEC) Stack implementation for the Sovereign Engine (`sharded.go`, `reclamation.go`, `crdt.go`).
+This directory contains only this note. The implementation is in `pkg/sync/`: [`sharded.go`](../../pkg/sync/sharded.go), [`reclamation.go`](../../pkg/sync/reclamation.go), and [`crdt.go`](../../pkg/sync/crdt.go).
 
-## Multi-Locus Sharded Topology
+## Multi-locus sharded topology
 
-As identified in analysis, standard Treiber stacks or Flat-Combining funnels mathematically collapse at high concurrency (32+ Neoverse-V1 cores) due to cache-line saturation at the Home Node (HN-F). 
+`ShardedStack` distributes stack heads and pool free-list traffic across shards so contenders do not all update the same cache line.
 
-Our `ShardedStack` defeats this physics bottleneck by implementing a multi-locus topology:
-- **128-Byte Stride:** Each shard (`secShard`) is strictly padded to 128 bytes. This physically isolates shards into separate Cache Line pairs, defeating the Neoverse-V1 L2 adjacent spatial prefetcher.
-- **Per-Goroutine Deep Cache:** The global `ElimNodePool` is protected by `secDeepCache`. It draws indices in bulk (128 at a time) ensuring that continuous burst-pushes resolve locally in the goroutine without touching a shared atomic. 
-- **Scatter/Gather Home-Shard Routing:** Indices are scattered back to their "home" shards (`idx % 64`) during pops, mathematically balancing consumer/producer skew.
+- **128-byte stride:** Each `secShard` is 128 bytes, checked by `TestShardedShardSize`. Adjacent stack heads therefore sit 128 bytes apart, matching Neoverse-V1's adjacent-cache-line prefetch pair.
+- **Per-goroutine deep cache:** A `secDeepCache` holds up to `DeepCacheCap` node indices. Refills and drains move up to `DeepCacheCap/2` indices at a time, with refills limited by available pool slots. This keeps common bursts goroutine-local while retaining a bounded path to the shared pool.
+- **Local routing:** `deepAlloc` refills from the caller's local pool shard, and `deepFreeLocal` drains to the same shard. A pop first probes its selected stack shard, then later shards until it finds a value or exhausts the stack.
 
-## `runtime.procPin` Go Scheduler Evasion
+## `runtime.procPin` and shard selection
 
-To guarantee absolute cache-locality, `sharded.go` uses `//go:linkname` to invoke `runtime.procPin()`. 
+`pkg/sync/sharded.go` calls `runtime.procPin` and `runtime.procUnpin` through `//go:linkname`. The P ID selects a shard, and the pin covers only the yield-free stack-head probe and CAS sequence.
 
-1. **Deterministic Hashing:** The `P-ID` maps perfectly to a discrete shard index.
-2. **Preemption Immunity:** Pushing `mp.locks > 0` blocks the Go `sysmon` thread from injecting `SIGURG` preemption signals midway through our Compare-And-Swap (CAS) sequence.
+Pool operations happen outside the pin because they can call `runtime.Gosched`. While the pin is held, `mp.locks > 0` blocks asynchronous preemption; the goroutine is not pinned for its lifetime.

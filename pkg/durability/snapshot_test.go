@@ -6,17 +6,10 @@
 
 package durability
 
-// guards — the LSM↔DURABILITY seam (bounded recovery). Each guard is
-// written so the RED state is reproducible by toggling the snapshot store off
-// (the back-compat RecoverEngine path), then GREEN with the store on. A guard
-// that cannot be driven RED on the pre-fix code is a fabrication.
-//
-// The headline guards:
-// T1 — bounded recovery: the M-witness drops from (pre+post) to (post).
-// T2 — missing-snapshot fallback: a torn/absent image degrades to full replay.
-// T3 — determinism pre/post-ckpt: bounded MerkleRoot() == full replay == live.
-// T4 — concurrent PutLocal+ckpt: snapshot extract is EBR-safe under -race.
-// T5 — bench bounded vs full: the ratio, integrated + unit (honesty law).
+// Tests for bounded recovery from a checkpoint image and its WAL tail.
+// Full-replay controls omit the snapshot store while using the same WAL. The
+// suite covers replay counts, missing and corrupt images, root equality,
+// concurrent checkpoint capture, foreign dots, and comparative recovery cost.
 
 import (
 	"context"
@@ -34,23 +27,18 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// utf8EntityID is a UTF-8-clean entity ID derived from an int counter. The
-// shared stagedEntityID helper (bridge_test.go) emits a 4-byte BIG-ENDIAN
-// suffix that is NOT valid UTF-8 (embedded NULs), which the LSM MemTable
-// rejects at Write (memtable.go Override 8.3). Production entity IDs are
-// hex/UUID strings (UTF-8); the binary suffix is a test-only artifact. The Day
-// 11 guards use utf8EntityID so the HAMT string keys are exercised (the engine
-// accepts arbitrary bytes as a key — the constraint is the LSM tier's, not the
-// CRDT's) without tripping the index's UTF-8 validation. stagedEntityID (shared
-// by the/8.5 green guards) is left untouched.
+// utf8EntityID derives a UTF-8 entity ID from an integer. The binary suffix in
+// stagedEntityID can contain NUL bytes, which MemTable.Write rejects, while the
+// CRDT engine itself accepts arbitrary string keys. These tests use valid UTF-8
+// so both the HAMT and the query index can store the IDs.
 func utf8EntityID(i int) string {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(i))
 	return "entity-" + hex.EncodeToString(b[:])
 }
 
-// newSnapshotStore builds a LocalFS in a fresh temp dir + returns it (and the
-// dir for cleanup). It is the snapshot store for the guards.
+// newSnapshotStore builds a LocalFS in a fresh temp dir and returns it (and the
+// dir for cleanup). It is the snapshot store for these tests.
 func newSnapshotStore(t *testing.T) *LocalFS {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "snapstore")
@@ -62,17 +50,10 @@ func newSnapshotStore(t *testing.T) *LocalFS {
 	return lfs
 }
 
-// buildWorkload builds a live bridge over a FRESH WAL, writes `pre` mutations,
-// takes a checkpoint (writing the snapshot when lfs != nil), then writes `post`
-// mutations, closes the live bridge, and returns the WAL path + the live root +
-// the live LamportHigh. This is the shared setup for T1/T2/T3/T5.
-// buildWorkload writes a live bridge over a FRESH WAL: `pre` mutations, a
-// checkpoint (writing the snapshot when lfs != nil), `post` mutations, then
-// kills the live engine+WAL like a crash. Returns the WAL path, the FINAL live
-// Merkle root (after pre+post — recovery replays everything, so this is the
-// root recovery must reproduce), the checkpoint watermark (the snapshot's
-// "ckpt/<N>" key + the seed for bounded recovery), and the FINAL LamportHigh
-// (the recovered clock's expected value).
+// buildWorkload writes pre mutations, a checkpoint, and post mutations before
+// closing the engine and WAL. It returns the WAL path, final live root,
+// checkpoint watermark, and final Lamport counter. The snapshot is written when
+// lfs is non-nil.
 func buildWorkload(t *testing.T, pre, post int, lfs *LocalFS) (walPath string, liveRoot [32]byte, ckptLamport, finalLamport uint64) {
 	t.Helper()
 	walPath = filepath.Join(t.TempDir(), "workload.wal")
@@ -107,7 +88,7 @@ func buildWorkload(t *testing.T, pre, post int, lfs *LocalFS) (walPath string, l
 	return walPath, liveRoot, ckptLamport, finalLamport
 }
 
-// recoverBounded recovers via the bounded path + closes the recovered
+// recoverBounded recovers via the bounded path and closes the recovered
 // engine/scratch on test cleanup.
 func recoverBounded(t *testing.T, walPath string, store SnapshotStore) (*eng.DeltaCRDTEngine, *RecoveryWitness) {
 	t.Helper()
@@ -132,21 +113,14 @@ func recoverFull(t *testing.T, walPath string) (*eng.DeltaCRDTEngine, *RecoveryW
 	return engine, witness
 }
 
-// TestRecovery_BoundedReplay_MWitness is T1 — the headline. With a snapshot
-// image present at the checkpoint, bounded recovery replays ONLY the
-// post-checkpoint tail (witness.ReplayedRecords == post), NOT the full
-// pre+post log. The RED control (RecoverEngine, snapshot ignored) replays all.
-//
-// T1 witness:
-//
-//	GREEN (bounded): witness.Bounded==true, witness.ReplayedRecords==post.
-//	RED (store=nil): witness.Bounded==false, witness.ReplayedRecords==pre+post.
-//
-// Both recover to the SAME MerkleRoot == liveRoot (correctness preserved).
+// TestRecovery_BoundedReplay_MWitness verifies that a checkpoint image reduces
+// ReplayedRecords from pre+post to just the post-checkpoint tail. A nil store
+// forces full replay as the control. Both paths must reproduce the live root,
+// and bounded recovery must also resume at the final Lamport counter.
 func TestRecovery_BoundedReplay_MWitness(t *testing.T) {
 	const pre, post = 512, 16
 
-	t.Run("GREEN_bounded", func(t *testing.T) {
+	t.Run("bounded", func(t *testing.T) {
 		lfs := newSnapshotStore(t)
 		walPath, liveRoot, ckptLamport, finalLamport := buildWorkload(t, pre, post, lfs)
 		engine, witness := recoverBounded(t, walPath, lfs)
@@ -159,24 +133,22 @@ func TestRecovery_BoundedReplay_MWitness(t *testing.T) {
 				witness.ReplayedRecords, post, pre)
 		}
 		if witness.ReplayedRecords == pre+post {
-			t.Fatalf("RED-not-fixed: witness replayed the FULL log (%d) — the snapshot was not used", pre+post)
+			t.Fatalf("bounded recovery replayed all %d records instead of using the snapshot", pre+post)
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("bounded recovery Merkle mismatch:\n live=%x\n got =%x", liveRoot, got)
+			t.Fatalf("bounded recovery Merkle mismatch:\n  live=%x\n  got =%x", liveRoot, got)
 		}
 		if got := engine.LamportCounter(); got != finalLamport {
 			t.Fatalf("bounded recovery Lamport mismatch: live=%d got=%d", finalLamport, got)
 		}
 	})
 
-	// RED control: the back-compat RecoverEngine path (store == nil) ignores the
-	// snapshot and replays the FULL log — witness.ReplayedRecords == pre+post.
-	// Same WAL + snapshot image; only the store toggle differs. This is the
-	// pre-fix behavior made observable, proving the GREEN path is a real change.
-	t.Run("RED_full_replay_control", func(t *testing.T) {
+	// With a nil store, the same WAL and on-disk image must take the full-replay
+	// path and report every mutation in ReplayedRecords.
+	t.Run("full_replay_control", func(t *testing.T) {
 		lfs := newSnapshotStore(t) // image exists on disk...
 		walPath, liveRoot, _, _ := buildWorkload(t, pre, post, lfs)
-		//...but recovered WITHOUT the store — the image is ignored.
+		// ...but recovered WITHOUT the store — the image is ignored.
 		engine, witness := recoverFull(t, walPath)
 
 		if witness.Bounded {
@@ -187,16 +159,14 @@ func TestRecovery_BoundedReplay_MWitness(t *testing.T) {
 				witness.ReplayedRecords, pre+post)
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("full-replay control Merkle mismatch:\n live=%x\n got =%x", liveRoot, got)
+			t.Fatalf("full-replay control Merkle mismatch:\n  live=%x\n  got =%x", liveRoot, got)
 		}
 	})
 }
 
-// TestRecovery_MissingSnapshot_FallbackFullReplay is T2 — the honest
-// degradation. A checkpoint is in the WAL but NO snapshot image exists at
-// "ckpt/N" (mid-flush crash before the image landed, or snapshot never written).
-// Recovery MUST still rebuild — by falling back to full replay — and report the
-// reason. No image is NOT an error.
+// TestRecovery_MissingSnapshot_FallbackFullReplay covers a checkpoint whose
+// image is absent or cannot be decoded. Recovery must rebuild through full WAL
+// replay and report why the snapshot was not used.
 func TestRecovery_MissingSnapshot_FallbackFullReplay(t *testing.T) {
 	const pre, post = 256, 16
 
@@ -220,13 +190,13 @@ func TestRecovery_MissingSnapshot_FallbackFullReplay(t *testing.T) {
 			t.Fatalf("witness.Bounded=true, want false (image absent → must fall back)")
 		}
 		if witness.FallbackReason == "" {
-			t.Fatalf("witness.FallbackReason empty — the fallback reason must be reported (honesty law)")
+			t.Fatalf("witness.FallbackReason empty — the fallback reason must be reported")
 		}
 		if witness.ReplayedRecords != pre+post {
 			t.Fatalf("fallback ReplayedRecords=%d, want %d (full replay)", witness.ReplayedRecords, pre+post)
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("fallback Merkle mismatch:\n live=%x\n got =%x", liveRoot, got)
+			t.Fatalf("fallback Merkle mismatch:\n  live=%x\n  got =%x", liveRoot, got)
 		}
 	})
 
@@ -250,18 +220,15 @@ func TestRecovery_MissingSnapshot_FallbackFullReplay(t *testing.T) {
 			t.Fatalf("witness.FallbackReason empty — corrupt-image fallback must be reported")
 		}
 		if got := engine.State().MerkleRoot(); got != liveRoot {
-			t.Fatalf("fallback Merkle mismatch (corrupt image):\n live=%x\n got =%x", liveRoot, got)
+			t.Fatalf("fallback Merkle mismatch (corrupt image):\n  live=%x\n  got =%x", liveRoot, got)
 		}
 	})
 }
 
-// TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual is T3 — the
-// determinism proof. Engine A recovers via the bounded path (snapshot Join +
-// post-ckpt replay), engine B recovers via full replay, both from the SAME WAL
-// + snapshot. Assert A.MerkleRoot() == B.MerkleRoot() == live.MerkleRoot().
-// This is the §4 seed-by-trace proof made executable: the snapshot's recorded
-// dots + the re-minted post-ckpt dots == the live dot set, for origin-only
-// state (the foreign case is the bounded-wins case, A ⊋ B, out of T3 scope).
+// TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual compares bounded and
+// full recovery over the same origin-only WAL. Their roots must both equal the
+// live root even though bounded recovery replays only the post-checkpoint
+// records. Foreign-dot recovery is covered separately below.
 func TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual(t *testing.T) {
 	const pre, post = 256, 24
 
@@ -278,7 +245,7 @@ func TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual(t *testing.T) {
 	if witnessB.Bounded {
 		t.Fatalf("engineB (full) witness.Bounded=true, want false")
 	}
-	// A replays ONLY post; B replays pre+post. Same dot set, different cost.
+	// A replays only post; B replays pre+post. Same dot set, different cost.
 	if witnessA.ReplayedRecords != post {
 		t.Fatalf("engineA ReplayedRecords=%d, want %d", witnessA.ReplayedRecords, post)
 	}
@@ -289,27 +256,23 @@ func TestSnapshot_Determinism_PreVsPostCheckpoint_MerkleEqual(t *testing.T) {
 	rootA := engineA.State().MerkleRoot()
 	rootB := engineB.State().MerkleRoot()
 	if rootA != rootB {
-		t.Fatalf("T3 determinism BROKEN: bounded root != full-replay root\n A(bounded)=%x\n B(full) =%x\n"+
-			"The snapshot Join + post-ckpt replay diverged from full replay — the seam is data-lossy.",
+		t.Fatalf("bounded root %x differs from full-replay root %x\n"+
+			"The snapshot Join and post-checkpoint replay diverged from full replay.",
 			rootA, rootB)
 	}
 	if rootA != liveRoot {
-		t.Fatalf("T3 determinism BROKEN: bounded root != live root\n live=%x\n A =%x", liveRoot, rootA)
+		t.Fatalf("live root %x differs from bounded root %x", liveRoot, rootA)
 	}
 	if got := engineA.LamportCounter(); got != finalLamport {
 		t.Fatalf("bounded recovery Lamport mismatch: live=%d got=%d", finalLamport, got)
 	}
 }
 
-// TestSnapshot_ConcurrentPutLocalAndCheckpoint_EBRSafe is T4 — the snapshot
-// extract is safe under concurrent PutLocal + AppendCheckpoint with the
-// snapshotter wired. State() does NOT pin EBR (crdt.go:1316 documents a
-// bare-State use-after-free); SnapshotToLSM pins the epoch around State() +
-// ForEach via explicit Acquire()+Enter()/Release(). Under -race + concurrency a
-// missing pin produces a race report / panic; a correct pin stays clean. The
-// guard asserts: (1) no panic, (2) the recovered root equals the live root at
-// quiescence (the dot set is not corrupted by the concurrent extract). It runs
-// unconditionally — fast enough for plain CI, doubly-covered under -race.
+// TestSnapshot_ConcurrentPutLocalAndCheckpoint_EBRSafe overlaps PutLocal with
+// AppendCheckpoint. AppendCheckpoint holds the EBR pin while capturing the
+// shards and writing their image; SnapshotToLSM receives that captured state
+// and does not perform a second State walk. After the writers stop, full replay
+// must reproduce the live root without a race report or panic.
 func TestSnapshot_ConcurrentPutLocalAndCheckpoint_EBRSafe(t *testing.T) {
 	runConcurrentCheckpoint(t)
 }
@@ -368,7 +331,7 @@ func runConcurrentCheckpoint(t *testing.T) {
 	}()
 
 	// Let the churn run long enough to overlap extract with writes, bounded by
-	// wall time so the guard is deterministic in duration. 100ms is enough to
+	// wall time so the test is deterministic in duration. 100ms is enough to
 	// trip a missing EBR pin under -race (the detector needs one overlapping
 	// access) and fast enough for the plain-CI line.
 	time.Sleep(100 * time.Millisecond)
@@ -385,9 +348,9 @@ func runConcurrentCheckpoint(t *testing.T) {
 	if writes.Load() == 0 || ckpts.Load() == 0 {
 		t.Fatalf("no churn happened: writes=%d ckpts=%d", writes.Load(), ckpts.Load())
 	}
-	t.Logf("T4 churn: %d writes, %d checkpoints (snapshot extracts) overlapped", writes.Load(), ckpts.Load())
+	t.Logf("overlapped %d writes with %d checkpoints", writes.Load(), ckpts.Load())
 
-	// Quiesce: stop writers, take a final snapshot-free checkpoint so the LAST WAL
+	// Quiesce: stop writers, take a final snapshot-free checkpoint so the last WAL
 	// record is a clean anchor with no post-ckpt mutations, then recover via full
 	// replay and assert the recovered root equals the live root (the concurrent
 	// extracts must not have corrupted the durable dot set).
@@ -405,21 +368,19 @@ func runConcurrentCheckpoint(t *testing.T) {
 
 	recovered, _ := recoverFull(t, walPath)
 	if got := recovered.State().MerkleRoot(); got != liveRoot {
-		t.Fatalf("T4 post-churn Merkle mismatch: a concurrent snapshot extract corrupted the dot set\n live=%x\n got =%x", liveRoot, got)
+		t.Fatalf("live root %x differs from root after concurrent checkpoints %x", liveRoot, got)
 	}
 }
 
-// BenchmarkRecovery_BoundedVsFull is T5 — the integrated headline. Same WAL +
-// snapshot; "Full" recovers via store==nil, "Bounded" via the snapshot store.
-// The headline is the §4 cost ratio: witness.ReplayedRecords (post vs pre+post),
-// reported alongside ns/op + allocs/op. Per the honesty law the integrated
-// call is the production headline; the M-witness is the formula-independent
-// ground truth (ns/op reflects replay machinery, not the bound).
+// BenchmarkRecovery_BoundedVsFull compares full and bounded recovery over the
+// same WAL and snapshot. Timing and allocations measure the full recovery call;
+// ReplayedRecords independently checks that the bounded path processes only the
+// post-checkpoint tail.
 func BenchmarkRecovery_BoundedVsFull(b *testing.B) {
 	const pre, post = 8192, 64 // pre large, post small → the ratio is stark
 
-	// Build the WAL + snapshot ONCE (outside the timed loop). Each iteration
-	// recovers from the SAME durable state (the WAL is read-only across
+	// Build the WAL and snapshot once (outside the timed loop). Each iteration
+	// recovers from the same durable state (the WAL is read-only across
 	// recoveries; recoveries append nothing).
 	walPath := filepath.Join(b.TempDir(), "bench.wal")
 	storeRoot := filepath.Join(b.TempDir(), "snapstore")
@@ -456,7 +417,7 @@ func BenchmarkRecovery_BoundedVsFull(b *testing.B) {
 				b.Fatalf("bounded path not taken (snapshot missing?)")
 			}
 			if witness.ReplayedRecords != post {
-				b.Fatalf("bounded ReplayedRecords=%d want %d (the M-witness is the headline)", witness.ReplayedRecords, post)
+				b.Fatalf("bounded ReplayedRecords = %d, want post-checkpoint count %d", witness.ReplayedRecords, post)
 			}
 			_ = engine.State().MerkleRoot()
 			_ = wal.Close()
@@ -498,80 +459,29 @@ func buildWorkloadBench(b *testing.B, walPath string, pre, post int, lfs *LocalF
 	}
 }
 
-// ============================================================================
-// — CLOSURE: the hidden assumption-proving guard
-// ============================================================================
-// The commit (1c7ed86) shipped the bounded-recovery seam with a
-// headline claim — "strictly better than full replay (captures foreign dots
-// the WAL never records)" — that was correct-by-construction but UNTESTED.
-// The root-equality assertion in recovery.go:358 GATES on len(rep.Advances)==0,
-// so the existing T3 determinism guard (snapshot_test.go:258, origin-only)
-// deliberately excludes the foreign case (its own comment at snapshot_test.go:
-// 258 admits it: "the foreign case is the bounded-wins case... out of T3
-// scope"). Without a foreign-dot guard, the entire reason bounded beats
-// full — capturing foreign state the origin-only WAL cannot — is a
-// hypothesis, not a proof. This guard closes it.
+// TestRecoveryForeignAdvance_BoundedRestoresForeignDots verifies the state that
+// full replay cannot reconstruct. A foreign Join adds entries to the engine and
+// advances its clock, but the WAL records only local mutations and that clock
+// advance. A checkpoint image contains both local and foreign dots, so bounded
+// recovery must reproduce the live root and clock. With the store omitted, full
+// replay must instead produce a different root because the foreign entries are
+// absent until they arrive through gossip again.
 //
-// ARCHITECTURAL DESIGN (the mirror of ):
-//
-//	: real foreign Join → RecordClockAdvance → checkpoint → crash →
-//
-// FULL replay → DISCOVERS the honest origin-only divergence
-// (recovered root != live root). That guard proves the WAL's LIMIT.
-//
-//	This guard: the SAME foreign Join → RecordClockAdvance → checkpoint+snapshot
-//
-// → crash → BOUNDED recovery → ASSERTS the divergence is now
-// REVERSED: bounded recovery restores the foreign dots the snapshot
-// captured (SnapshotToLSM emits one SnapshotRecord PER CRDTEntry —
-// the FULL dot set, not latest-per-entity, verified V4), so the
-// loaded engine's Join reproduces origin+foreign → the rebuilt
-// root EQUALS the live root. The RED control flips the store off:
-// the bounded path degenerates to full replay, and the honest
-// origin-only divergence (recovered != live) returns — the original
-// physics. "A ⊋ B" made observable.
-//
-// THE LOAD-BEARING ASSERTIONS (NOT a false victory):
-//
-//	(1) CLOCK: recovered.LamportCounter() == liveLamport (the watermark resumes).
-//	(2) RED control: bounded==false → recovered root != live root (the DIV
-//
-// HONEST physics — full replay is origin-only; foreign state regossips).
-//
-//	(3) GREEN: bounded==true → recovered root == live root (root+foreign, the
-//
-// ONE thing full replay physically CANNOT do without WAL-capturing
-// foreign deltas as mutations — a protected-core crdt.go edit does not
-// make). THIS is the load-bearing proof: foreign dots survive crash
-// ONLY because SnapshotToLSM persisted them and the load-path Join
-// restored them. Equality here is the honest victory, not a fabrication.
-//
-//	(4) WITNESS: bounded path replays ONLY the post-checkpoint tail (the
-//
-// trailing origin mutation), NOT pre + the foreign advance — the
-// boundedness claim is observable alongside the correctness claim.
-//
-// RED→GREEN: the RED control subtest fails the (3) equality on the CURRENT
-// code's full-replay path (it MUST diverge, per 's physics); the GREEN
-// subtest passes (3) ONLY because the snapshot is wired and loaded. Running
-// them in the same guard makes the difference (bounded vs full) the ONLY
-// variable — same WAL, same snapshot image on disk, only the store toggle
-// differs. This is the A/B RED/GREEN the spec mandated.
+// The trailing local mutation occurs before AppendCheckpoint. Consequently the
+// checkpoint's CutSeq covers the entire WAL and bounded recovery replays zero
+// records; the image supplies every mutation.
 func TestRecoveryForeignAdvance_BoundedRestoresForeignDots(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "foreign-bounded.wal")
 	const K = 8 // origin mutations (counters 2..9, seed=1, NextDot Add(1))
 
-	// Build the live workload ONCE: origin mutations, a REAL foreign Join
+	// Build the live workload once: origin mutations, a real foreign Join
 	// (advances clock + merges foreign state), RecordClockAdvance, a checkpoint
-	// WITH a snapshot image, then one trailing origin mutation. The live root
+	// with a snapshot image, then one trailing origin mutation. The live root
 	// is origin+foreign; the live clock is post-trailing-mutation. Crash.
 	live := newLiveBridge(t, walPath, 0)
 
-	// Wire the snapshotter BEFORE any writes so AppendCheckpoint writes the
-	// dot-bearing image to the LocalFS at "ckpt/<LamportHigh>". (buildWorkload
-	// calls SetSnapshotter for the origin-only guards; this guard mirrors that
-	// but interleaves a foreign Join — the workload helper does not allow that,
-	// so we build the workload inline for surgical control.)
+	// The snapshotter must be active before the checkpoint. This workload is
+	// built inline because buildWorkload does not interleave a foreign Join.
 	lfs := newSnapshotStore(t)
 	live.SetSnapshotter(lfs, true)
 
@@ -584,9 +494,8 @@ func TestRecoveryForeignAdvance_BoundedRestoresForeignDots(t *testing.T) {
 		t.Fatalf("pre-Join lamport %d != %d (origin mint assumption wrong)", got, K+1)
 	}
 
-	// REAL FOREIGN JOIN (the physics, NOT a synthetic clock jump).
-	// The foreign engine has a DISTINCT nodeID so its entries carry a foreign
-	// DotNodeID; Join both advances the live clock AND merges foreign entries.
+	// Join entries from a distinct node ID. This advances the live clock and
+	// adds dots that the origin-only WAL does not record as mutations.
 	const F = 5
 	eng.DataDir = t.TempDir()
 	foreign, err := eng.NewDeltaCRDTEngine(foreignNodeID(), 100, testArenaSize)
@@ -599,7 +508,7 @@ func TestRecoveryForeignAdvance_BoundedRestoresForeignDots(t *testing.T) {
 	}
 	liveDigest := live.Engine().GenerateDigest()
 	delta := foreign.GenerateDelta(liveDigest)
-	defer delta.Release() // MUST Release (crdt.go:1595): Exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
+	defer delta.Release() // must release (crdt.go documents the EBR participant exit): exits the carried EBR participant so foreign.Close's Quiesce doesn't hang on the leak
 	live.Engine().Join(*delta)
 	// Record the foreign clock advance at the receive seam so the
 	// WAL carries it — without this, the clock advance is un-recorded and the
@@ -608,22 +517,21 @@ func TestRecoveryForeignAdvance_BoundedRestoresForeignDots(t *testing.T) {
 		t.Fatalf("RecordClockAdvance: %v", err)
 	}
 
-	// One trailing origin mutation AFTER the foreign Join — its counter must
-	// re-mint identically on EITHER recovery path (the seed is exact).
+	// One trailing origin mutation after the foreign Join — its counter must
+	// re-mint identically on either recovery path (the seed is exact).
 	if _, err := live.PutLocal(utf8EntityID(K), stagedPayload(K), stagedEntry(K)); err != nil {
 		t.Fatalf("trailing PutLocal: %v", err)
 	}
 	liveRoot := live.Engine().State().MerkleRoot() // origin + foreign
 	liveLamport := live.Engine().LamportCounter()
 
-	// Checkpoint WITH the snapshot image (SetSnapshotter above) — this is what
-	// bounded recovery loads. The recovery image's SnapshotRecords capture the
-	// FULL dot set incl. the foreign dots (SnapshotToLSM V4 verification).
+	// AppendCheckpoint writes one SnapshotRecord per entry, including the
+	// foreign dots, at the current checkpoint watermark.
 	if err := live.AppendCheckpoint(); err != nil {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
 
-	// The ckpt watermark (the snapshot's LamportHigh) — the LIVE clock AT the
+	// The ckpt watermark (the snapshot's LamportHigh) — the live clock at the
 	// checkpoint, which the snapshot's image + the recovery Join must land on.
 	ckptLamport := live.Engine().LamportCounter()
 	_ = ckptLamport // captured for the witness assert below (the pre-crash value)
@@ -636,92 +544,70 @@ func TestRecoveryForeignAdvance_BoundedRestoresForeignDots(t *testing.T) {
 		t.Fatalf("live engine close: %v", err)
 	}
 
-	// ───────────────────────── GREEN: BOUNDED recovery (snapshot loaded) ──
-	t.Run("GREEN_bounded_restores_foreign_dots", func(t *testing.T) {
+	// Bounded recovery joins the image, which includes foreign dots.
+	t.Run("bounded_restores_foreign_dots", func(t *testing.T) {
 		recovered, witness := recoverBounded(t, walPath, lfs)
 
 		if !witness.Bounded {
 			t.Fatalf("bounded: witness.Bounded=false, want true (snapshot image at ckpt/%d)", ckptLamport)
 		}
-		// (4) BOUNDEDNESS — EXACT (the repair: the pre-form only
-		// LOGGED on ReplayedRecords > 1, a guard that could not fail). The cut
-		// is the RECORD SEQUENCE (ADR-0045 the V2 checkpoint carries
-		// the pre-walk CutSeq horizon): every mutation AND the advance record
-		// landed before the checkpoint, so the tail is EMPTY and the replay
-		// count is EXACTLY 0. A regression that replays pre-checkpoint records
-		// (a cut-predicate bug) fires here; one that DROPS the tail is caught
-		// by the root/count assertions in the sibling tests.
+		// The checkpoint's pre-walk CutSeq follows every mutation and the
+		// clock-advance record, so the replay tail is empty. Replaying any
+		// record here would re-apply state already absorbed by the image.
 		if witness.ReplayedRecords != 0 {
-			t.Errorf("bounded: ReplayedRecords=%d, want EXACTLY 0 (the whole log sits below the checkpoint's CutSeq horizon — a nonzero count means the bounded path re-applied absorbed records)", witness.ReplayedRecords)
+			t.Errorf("bounded ReplayedRecords = %d, want 0 below the checkpoint CutSeq", witness.ReplayedRecords)
 		}
 
-		// (1) CLOCK: the watermark resumes at the live high-watermark.
+		// The checkpoint watermark restores the live Lamport counter.
 		if got := recovered.LamportCounter(); got != liveLamport {
-			t.Fatalf("bounded clock BROKEN:\n recovered lamport = %d\n live lamport = %d\n"+
-				"The snapshot load + watermark nail did not resume the clock at the live high-watermark.",
+			t.Fatalf("recovered Lamport counter = %d, want live counter %d\n"+
+				"The snapshot load and checkpoint watermark did not resume the live clock.",
 				got, liveLamport)
 		}
 
-		// (3) THE LOAD-BEARING PROOF: the recovered root EQUALS the live root
-		// (origin + foreign). This is the ONE assertion full replay CANNOT
-		// pass (see the RED control below): the snapshot captured the foreign
-		// dots, the load-path Join restored them, and the rebuilt HAMT ->
-		// MerkleRoot folds the FULL dot set (origin + foreign). Equality here
-		// is the honest bounded-wins proof, NOT a fabrication.
+		// Joining the image restores both local and foreign dots, so the root
+		// covers the same state as the live engine.
 		recoveredRoot := recovered.State().MerkleRoot()
 		if recoveredRoot != liveRoot {
-			t.Fatalf("bounded-wins CLAIIM BROKEN:\n recovered root = %x\n live root = %x\n"+
-				"Bounded recovery was supposed to restore the foreign dots the snapshot captured, "+
-				"reproducing the origin+foreign merged state. Instead it diverged — either the snapshot "+
-				"image did NOT carry the full dot set (V4 verification false), or the load-path Join "+
-				"dropped the foreign entries, or the watermark seed mis-resumed. This is the proof the "+
-				"'strictly better than full replay' headline rests on; it must hold.",
+			t.Fatalf("bounded recovery root %x differs from live root %x\n"+
+				"Bounded recovery did not restore the foreign dots captured by the snapshot. "+
+				"The recovered state should include both origin and foreign entries. "+
+				"Check that the image carries the full dot set, that Join restores those entries, "+
+				"and that the checkpoint watermark resumes correctly. "+
+				"The recovered root must equal the live root.",
 				recoveredRoot, liveRoot)
 		}
 	})
 
-	// ─────────────────────── RED control: FULL replay (no snapshot loaded) ─
-	// Same WAL + same snapshot image on disk — but recovered WITHOUT the store
-	// (store==nil → the back-compat RecoverEngine full-replay path). The live
-	// workload is identical; only the store toggle differs. This subtest is
-	// the RED control: full replay is ORIGIN-ONLY (the WAL records origin
-	// mutations + clock advances, NOT the foreign entries' Dot payloads), so
-	// the recovered root MUST diverge from the live root (origin+foreign).
-	// This is the physics reproduced as the A/B control: the GREEN
-	// path passes (3) ONLY because the snapshot is wired; the RED path fails
-	// (3) because full replay physically cannot restore foreign dots.
-	t.Run("RED_full_replay_control_diverges", func(t *testing.T) {
+	// Omitting the store leaves the same WAL but prevents the image from being
+	// loaded. The WAL carries local mutations and clock advances, not foreign
+	// entries, so this full-replay control must produce a different root.
+	t.Run("full_replay_control_diverges", func(t *testing.T) {
 		recovered, witness := recoverFull(t, walPath)
 
 		if witness.Bounded {
-			t.Fatalf("RED control: witness.Bounded=true, want false (store==nil must full-replay)")
+			t.Fatalf("full-replay control reports Bounded=true with a nil store")
 		}
 
-		// The clock still resumes correctly (the WAL recorded the advance; the
-		// seed is exact). This proves the RED control's recovery is not
-		// broken — it just can't capture foreign state.
+		// The recorded clock advance restores the live counter even though the
+		// foreign entries themselves are absent from the WAL.
 		if got := recovered.LamportCounter(); got != liveLamport {
-			t.Fatalf("RED control clock: recovered=%d live=%d (the seed must hold even without snapshot)",
-				got, liveLamport)
+			t.Fatalf("full-replay control clock = %d, want live counter %d", got, liveLamport)
 		}
 
-		// THE HONEST DIVERGENCE: full replay is origin-only, live is origin+
-		// foreign, hence they MUST differ. Asserting equality here would be a
-		// false-victory (the guard was built precisely to catch this
-		// class of dishonest assertion). We assert the divergence — it IS the
-		// "A ⊋ B" physics' observable signature, the load-bearing counterpoint
-		// to the GREEN subtest's equality.
+		// Full replay restores only local mutations, so its root must differ
+		// from the live root that also includes the foreign Join. Equal roots
+		// would mean the test did not establish that distinction.
 		recoveredRoot := recovered.State().MerkleRoot()
 		if recoveredRoot == liveRoot {
-			t.Fatalf("RED control PHYSICS INVERSION: recovered(origin-only) root == live(origin+foreign) root (%x).\n"+
-				"Full replay physically CANNOT restore foreign dots (the WAL carries origin mutations + clock advances,\n"+
-				"not the foreign CRDTEntries). Equality here means either the foreign Join did not merge state (the\n"+
-				"test is synthetic, not a real Join) or the WAL captured foreign deltas (it does not). The GREEN\n"+
-				"subtest's equality is only meaningful BECAUSE this RED control diverges — if both pass, the foreign\n"+
-				"Join was a no-op and the whole guard is a false proof.",
+			t.Fatalf("full-replay root %x unexpectedly equals the live root\n"+
+				"Full replay cannot restore foreign dots because the WAL carries local mutations and clock advances, "+
+				"not foreign CRDTEntries. Equal roots mean either the foreign Join did not merge state or the WAL "+
+				"captured foreign deltas. The bounded-recovery comparison depends on this control diverging. "+
+				"If both roots are equal, the fixture did not establish "+
+				"the distinction between replay and image recovery.",
 				recoveredRoot)
 		}
-		t.Logf("RED control honest physics: full-replay root=%x != live root=%x (foreign state regossips on rejoin; the protected-core crdt.go limit) — the bounded path's victory is ONLY meaningful against this divergence.",
-			recoveredRoot, liveRoot)
+		t.Logf("full-replay root %x differs from live root %x because foreign entries are absent from the WAL", recoveredRoot, liveRoot)
 	})
 }

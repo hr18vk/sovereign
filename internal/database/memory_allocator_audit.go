@@ -6,30 +6,14 @@
 
 package database
 
-// Heap-audit diagnostic instrument for the jemalloc allocator.
+// Heap-audit instrument for the jemalloc allocator.
 //
-// ARMED only when SUPREMUM_JEMALLOC_AUDIT is set in the environment. In
-// production (env unset) every hook is a single never-taken package-bool branch
-// with ZERO allocation — the hot-path gate is unaffected.
+// Armed only when SUPREMUM_JEMALLOC_AUDIT is set in the environment. When unset,
+// every hook is a single predictable branch with zero allocation.
 //
-// WHY THIS INSTRUMENT: the fault is an intermittent jemalloc heap corruption
-// (SIGSEGV addr=0x30 on the 64KB size class) that (a) a -race run cannot see
-// (cgo/jemalloc memory is outside the Go data-race model) and (b) the jemalloc
-// redzone cannot see (this 5.3.0 build REJECTS redzone:true). Isolated repros of
-// the flush path are CLEAN, so the corruption is SEEDED by one suite test and
-// DETONATES in another (the process-global jemalloc heap is shared across every
-// JemallocAllocator instance in one `go test` process). To catch the CULPRIT
-// (not the victim) we register every live block and validate every Free:
-//
-//	INVALID FREE    — Free of a ptr jemalloc never handed out here (or interior).
-//	DOUBLE FREE     — Free of a ptr already freed (still-registered => live).
-//	WRONG-SIZE FREE — Free with a len != the usable size recorded at alloc
-//	                  (the size-accounting contract; a mismatch feeds sdallocx a
-//	                  wrong size class => heap metadata corruption at a later op).
-//
-// It adds NO guard bands and does NOT change any size passed to mallocx/sdallocx,
-// so it does NOT perturb the heap layout or mask the size contract under test.
-// (OOB-write / UAF-write detection is the separate guard-band variant.)
+// Records live allocations and checks Free calls for invalid/double frees and
+// caller length mismatches against malloc_usable_size without altering size
+// classes or allocator layout.
 
 import (
 	"fmt"
@@ -106,13 +90,9 @@ func auditReallocHook(oldPtr, newPtr unsafe.Pointer, newUsable int) {
 	jemallocAuditReg.mu.Unlock()
 }
 
-// auditFreeHook runs BEFORE the free (call-site gated on jemallocAuditOn). It is
-// a DETECTOR: a DOUBLE or INVALID free (the pointer is not a live registered
-// block) is a hard panic with the culprit stack — the sized-free fix does NOT make
-// double-free safe (malloc_usable_size on a freed block is UB), so this stays a
-// guard. A WRONG-SIZE free call (callerLen != the usable size recorded at alloc)
-// is now HARMLESS (Free derives the size from malloc_usable_size, not len(b)),
-// but is logged as a caller bug — a resliced free is always a mistake.
+// auditFreeHook validates a Free call before deallocation: an unregistered
+// pointer panics with the stack trace, while a resliced length mismatch is
+// logged before Free frees the recorded usable size.
 func auditFreeHook(ptr unsafe.Pointer, callerLen int) {
 	p := uintptr(ptr)
 	jemallocAuditReg.mu.Lock()
@@ -138,7 +118,7 @@ func auditReportFatal(kind string, ptr uintptr, size int, rec *auditRec) {
 		fmt.Fprintf(os.Stderr, "[JEMALLOC-AUDIT] recorded_usable_size=%d (%#x)\n[JEMALLOC-AUDIT] alloc stack:%s\n",
 			rec.size, rec.size, auditFormatStack(rec.stack))
 	}
-	// Panic (not os.Exit) so the Go runtime dumps ALL goroutine stacks — the
+	// Panic (not os.Exit) so the Go runtime dumps all goroutine stacks — the
 	// concurrent context that -race could not attribute.
 	panic("JEMALLOC-AUDIT: " + kind)
 }

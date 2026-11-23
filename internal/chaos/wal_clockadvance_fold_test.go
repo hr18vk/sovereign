@@ -6,16 +6,14 @@
 
 package chaos
 
-// ADR-0045 — the clock-advance-fold regression test: a 0x03
-// clock-advance record MUST fold its value into ReplayWAL's out.LamportHigh
-// (monotone max), EXACTLY as the mutation cases (wal.go:882-884,:892-894) and
-// the checkpoint cases (:912-914,:927-929) already do. The recovery clock nail
-// (recovery.go's final AdvanceLamportTo + the constructor seed) reads ONLY
-// rep.LamportHigh, so a 0x03 record that does not fold is a clock the recovery
-// never learns — the under-shoot.
+// A 0x03 clock-advance record must fold its value into ReplayWAL's
+// out.LamportHigh (monotone max), exactly as the mutation and checkpoint
+// cases already do. Recovery's constructor seed and final AdvanceLamportTo
+// call read rep.LamportHigh, so a 0x03 record that does not fold leaves the
+// recovery clock below the advance.
 //
-// RED on the pre-fix tree: rep.LamportHigh == 100 (the checkpoint watermark),
-// NOT 7,000,000 (the advance). GREEN post-fix.
+// Without that fold, rep.LamportHigh would remain 100 (the checkpoint
+// watermark) instead of 7,000,000 (the advance).
 
 import (
 	"path/filepath"
@@ -43,7 +41,7 @@ func TestReplayWAL_ClockAdvanceFoldsIntoLamportHigh(t *testing.T) {
 			t.Fatalf("AppendMutation %d: %v", i, err)
 		}
 	}
-	// The clock advance: far above every mutation counter AND the checkpoint
+	// The clock advance: far above every mutation counter and the checkpoint
 	// watermark below.
 	const advanceTo = uint64(7_000_000)
 	if err := wal.AppendClockAdvance(advanceTo); err != nil {
@@ -62,16 +60,17 @@ func TestReplayWAL_ClockAdvanceFoldsIntoLamportHigh(t *testing.T) {
 		t.Fatalf("ReplayWAL: %v", err)
 	}
 
-	// THE FOLD — the assertion the fix must turn green.
+	// The replay high-water mark must include the advance so recovery resumes
+	// at the correct Lamport clock.
 	if rep.LamportHigh != advanceTo {
-		t.Fatalf("R2 FOLD ABSENT: rep.LamportHigh=%d, want %d. The 0x03 decode never folded the advance — the recovery clock nail reads only rep.LamportHigh, so a below-cut advance is a clock the recovery never learns (Blocker 1).", rep.LamportHigh, advanceTo)
+		t.Fatalf("the 0x03 decode did not fold the advance: rep.LamportHigh=%d, want %d", rep.LamportHigh, advanceTo)
 	}
-	// The advance must ALSO remain in the ordered stream — the tail replay's
+	// The advance must also remain in the ordered stream — the tail replay's
 	// advance case still applies it on the full-replay path.
 	if len(rep.Advances) != 1 || rep.Advances[0] != advanceTo {
 		t.Fatalf("the 0x03 record vanished from the replay stream: Advances=%v (want [7000000])", rep.Advances)
 	}
-	// CONTROL (GREEN both sides): the mutation + checkpoint folds are untouched.
+	// Control: the mutation and checkpoint folds are untouched.
 	if len(rep.Mutations) != 2 {
 		t.Fatalf("control: want 2 mutations, got %d", len(rep.Mutations))
 	}

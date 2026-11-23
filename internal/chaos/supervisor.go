@@ -5,39 +5,35 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §2 — The Supervisor process.
+// The Supervisor process.
 // ---------------------------------------------------------------------------
 //
-// the design doc's §2 invariant, restated:
-//
-//	"The engine CANNOT execute in the same failure domain as the HTTP API.
-//
-// A SIGSEGV in off-heap C-space kills the whole process; recover() cannot
-// catch it. The listening socket therefore lives in the supervisor; a
-// worker SIGSEGV is recovered from the WAL WITHOUT dropping a single
-// active connection."
+// The engine cannot execute in the same failure domain as the HTTP API. A
+// SIGSEGV in off-heap C-space kills the whole process; recover() cannot catch
+// it. The listening socket therefore lives in the supervisor; a worker SIGSEGV
+// is recovered from the WAL without dropping a single active connection.
 //
 // This file implements that supervisor. It is deliberately minimal and testable
 // independent of a real TCP listener: the survival test uses an in-process
-// "connection" abstraction (a held channel that stays open across the crash +
-// recovery cycle) so the gate proves the connection is NOT dropped without
+// "connection" abstraction (a held channel that stays open across the crash and
+// recovery cycle) so the gate proves the connection is not dropped without
 // pulling a real network into the unit test. The same Supervisor type drives a
 // real net.Listener in production.
 //
-// RESPONSIBILITIES:
-// 1. Own the WAL path and the worker node-ID (sent to the child as env so a
-// recovered worker reboots from the SAME identity + lamport high-water).
-// 2. Spawn the worker child process (cmd/chaos-worker) with piped stdin/
-// stdout. The worker reads OpSubmit frames, applies + WAL-logs + fsyncs
-// before replying OpSubmitOK.
-// 3. Submit a mutation: send OpSubmit, block until OpSubmitOK (durability-
-// before-ACK), return the post-commit Merkle root.
-// 4. Detect worker death via stdout EOF (the silence of the pipe is the
-// crash signal). On EOF: close the dead child's pipes, spawn a PRISTINE
-// worker that boots by replaying the WAL, and replay the last
-// unacknowledged Submit (if any) onto the fresh worker.
-// 5. CrashProbe: send OpCrashProbe, watch the worker die, recover, and
-// verify the recovered Merkle root equals the pre-crash root.
+// Responsibilities:
+//  1. Own the WAL path and the worker node-ID (sent to the child as env so a
+//     recovered worker reboots from the same identity and lamport high-water).
+//  2. Spawn the worker child process (cmd/chaos-worker) with piped stdin/
+//     stdout. The worker reads OpSubmit frames, applies + WAL-logs + fsyncs
+//     before replying OpSubmitOK.
+//  3. Submit a mutation: send OpSubmit, block until OpSubmitOK (durability-
+//     before-ACK), return the post-commit Merkle root.
+//  4. Detect worker death via stdout EOF (the silence of the pipe is the
+//     crash signal). On EOF: close the dead child's pipes, spawn a pristine
+//     worker that boots by replaying the WAL, and replay the last
+//     unacknowledged Submit (if any) onto the fresh worker.
+//  5. CrashProbe: send OpCrashProbe, watch the worker die, recover, and
+//     verify the recovered Merkle root equals the pre-crash root.
 package chaos
 
 import (
@@ -58,12 +54,13 @@ import (
 var WorkerBinEnv = "CHAOS_WORKER_BIN"
 
 // Supervisor owns the WAL path, the worker node-ID, and the live worker child.
-// It is safe for concurrent Submit/Probe calls (protected by mu). The
-// connection-survival property does NOT live here directly: this type only
-// guarantees the worker process is recovered; the survival TEST proves that an
+// Supervisor state fields are guarded by mu, but a single Submit/Probe's pipe
+// I/O and frameSeq are not serialized against concurrent callers. The
+// connection-survival property does not live here directly: this type only
+// guarantees the worker process is recovered; the survival test proves that an
 // externally-held connection (in prod: a net.Conn accepted on the supervisor's
-// own listener) is NOT closed during recovery, because the supervisor never
-// hands its listener/sockets to the child.
+// own listener) is not closed during recovery, because the supervisor never
+// hands its listener or sockets to the child.
 type Supervisor struct {
 	mu        sync.Mutex
 	walPath   string
@@ -102,7 +99,7 @@ type SupervisorConfig struct {
 	WorkerBin string // optional override; defaults resolved by resolveWorkerBin.
 }
 
-// NewSupervisor constructs a supervisor. It does NOT spawn the worker yet;
+// NewSupervisor constructs a supervisor. It does not spawn the worker yet;
 // call Start to boot the first worker (which replays any existing WAL).
 func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 	if cfg.WALPath == "" {
@@ -127,7 +124,7 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 
 // resolveWorkerBin returns the path to the chaos-worker binary. In prod this is
 // the daemon's install layout; in tests it is driven by CHAOS_WORKER_BIN so the
-// supervisor spawns a binary the test built with `go build./cmd/chaos-worker`.
+// supervisor spawns a binary the test built with `go build ./cmd/chaos-worker`.
 func resolveWorkerBin() string {
 	if b := os.Getenv(WorkerBinEnv); b != "" {
 		return b
@@ -311,7 +308,7 @@ func (s *Supervisor) ensureAlive() error {
 }
 
 // markWorkerDead closes the dead child's streams and clears s.worker so the
-// next ensureAlive/recover spawns a fresh one. It does NOT wait on the corpse;
+// next ensureAlive or recover spawns a fresh one. It does not wait on the corpse;
 // the OS reaps it via Wait() inside killWorkerLocked (best-effort).
 func (s *Supervisor) markWorkerDead() {
 	s.mu.Lock()
@@ -322,7 +319,7 @@ func (s *Supervisor) markWorkerDead() {
 	}
 }
 
-// recover spawns a PRISTINE worker that boots by replaying the WAL (the worker
+// recover spawns a pristine worker that boots by replaying the WAL (the worker
 // main does this internally — it reads CHAOS_WORKER_NODEFX + argv WAL path,
 // calls ReplayWAL, rebuilds the engine, emits OpHello). The supervisor reads
 // that hello and verifies the recovered root equals the WAL's last checkpoint
@@ -365,8 +362,7 @@ func (s *Supervisor) recover() error {
 }
 
 // CrashProbe instructs the worker to self-destruct via OpCrashProbe, then
-// recovers a pristine worker and returns the recovered Merkle root + lamport.
-// This is the §2 end-to-end gate driver.
+// recovers a pristine worker and returns the recovered Merkle root and lamport.
 func (s *Supervisor) CrashProbe() (recoveredRoot [32]byte, recoveredLamport uint64, err error) {
 	if err := s.ensureAlive(); err != nil {
 		return recoveredRoot, 0, err
@@ -390,9 +386,9 @@ func (s *Supervisor) CrashProbe() (recoveredRoot [32]byte, recoveredLamport uint
 	return s.recoveredRoot, s.recoveredLamport, nil
 }
 
-// CurrentRoot returns the most recently acknowledged Merkle root, or the
-// recovered root if no submit has succeeded on the current worker. Used by the
-// survival test to compare pre-crash vs post-recovery roots.
+// CurrentRoot returns the most recently acknowledged Merkle root, or the zero
+// root until a submit has been acknowledged. Used by the survival test to
+// compare pre-crash vs post-recovery roots.
 func (s *Supervisor) CurrentRoot() [32]byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()

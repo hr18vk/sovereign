@@ -4,39 +4,19 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-//read_your_writes_test.go (ADR-0032) — the REAL-engine + REAL-*LocalFS
-// read-your-writes integration guards.
+// These integration tests connect Resolver's live source to a real CRDT engine
+// and LocalFS (ADR-0032). An entry inserted with InsertLocal must be visible to
+// AsOf before a checkpoint writes it to L0. After an equivalent durable row is
+// flushed, the query must return the same digest.
 //
-// The live read-your-writes guard: the load-bearing end-to-end proof. A POST /v1/insert
-// places an entry in the live δ-CRDT HAMT (engine.InsertLocal CAS-spins the
-// per-shard root, crdt.go:983). WITHOUT the live-source seam, the entry is
-// INVISIBLE to /v1/query until the bridge's periodic AppendCheckpoint flushes
-// SnapshotToLSM → L0 (bridge.go:213, gated by checkpointInterval default 1000)
-// — so an IMMEDIATE /v1/query → 404 (empirically confirmed;
-// --wal-checkpoint-interval=1 was REQUIRED for the durable read path to work).
-// WITH the seam, the resolver consults the live HAMT AFTER its durable scan +
-// merges the live dominant under the SAME bitemporal dominance → the entry is
-// visible IMMEDIATELY, before ANY checkpoint. This guard drives the REAL
-// engine + a REAL *LocalFS (newLocalFS) + a test-local adapter that mirrors
-// the production engineHAMTAdapter (cmd/sovereign-node/main.go) EXACTLY (EBR
-// Acquire/Enter/Release + State().Get + Filter2) — the import-cycle precedent
-// (an internal/database test cannot import pkg/durability, AND the production
-// adapter lives in cmd/sovereign-node which a test cannot import).
+// TestLiveReadYourWritesEBRRace runs concurrent AsOf and InsertLocal calls.
+// LiveRead holds an EBR pin while iterating State().Get results so replacement
+// of a shard root cannot reclaim memory still in use. Run this test with -race.
 //
-// The live EBR-race guard: the concurrent-read proof. 100 AsOf (live source ON) +
-// 250 engine.InsertLocal under -race — the EBR pin (snapshot.go:391-394) holds
-// the live store for the LiveRead duration so a concurrent InsertLocal's CAS
-// CANNOT retire+free a shard root the LiveRead iterates. Under -race a
-// use-after-free would surface as a DATA RACE / fatal. This guard runs -race
-// (the production-grade guard the SnapshotToLSM precedent proves; runs in the
-// per-pkg -race gate, NOT the combined 3-pkg -race that OOMs the 4-core box —
-// the §5 contract).
-//
-// The related in-package and telemetry guards — byte-identity, merge-equivalence,
-// counter-fires, range, defensive-filter, no-protected-core-touch, and the counter guard —
-// live in internal/database and internal/telemetry (the merge logic tested in
-// isolation from the engine via a synthetic LiveSource). This file holds the
-// REAL-engine guards that need pkg/durability + pkg/sync symbols.
+// The adapter mirrors engineHAMTAdapter in cmd/sovereign-node. It is duplicated
+// here because package main cannot be imported and internal/database cannot
+// import pkg/sync. Pure live-merge and telemetry behavior is tested in those
+// packages.
 
 package durability
 
@@ -56,27 +36,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testLiveAdapter mirrors the production engineHAMTAdapter (cmd/sovereign-node/
-// main.go) EXACTLY — EBR Acquire/Enter/Release (the snapshot.go:391-394
-// concurrent-read guard) + engine.State().Get (the FULL dot set, hamt.go:170) +
-// Filter2 (SystemTime <= txTimeNs, the visibility bound). It implements
-// database.LiveSource so the REAL Resolver can merge the live dominant. It is
-// test-local because (a) the production adapter lives in package main (a test
-// cannot import it) + (b) an internal/database test cannot import pkg/sync.
-// The byte-faithfulness to the production adapter is the load-bearing premise:
-// if this mirror diverges, the guard proves the MIRROR not the production path.
-// The mirror is therefore kept STRUCTURALLY IDENTICAL (same EBR sequence, same
-// Filter2 bound, same CRDTEntry→LiveEvent field carry) — auditors compare the
-// two.
+// testLiveAdapter implements database.LiveSource with the same EBR sequence,
+// State().Get lookup, system-time visibility check, and field mapping as
+// engineHAMTAdapter in cmd/sovereign-node. Keeping those operations aligned is
+// essential: divergence would test the adapter rather than production behavior.
 //
-// SCALE BOUND (mirrors the production adapter docstring): engine.State() is
-// O(total entries) + EBR-retires the prior merged view (freed after 3 epochs) —
-// see crdt.go:1348/1362. The live read-your-writes guard (small live set) is
-// unaffected; the live EBR-race guard keeps its working set + iteration counts
-// SMALL so the State()-per-read cost + the grace-window accumulation do NOT
-// pressure the 64MiB arena (the race guard's GOAL is the EBR-pin correctness
-// property, NOT arena-pressure). crdt.go is protected-core, so the O(1) per-entity
-// alternative (routeShard → Load().Get) is a SEPARATE fork, NOT this one.
+// State materializes an O(total entries) merged view and retires the previous
+// view through EBR. The tests use small working sets because concurrent readers
+// can retain several such views during the grace period.
 type testLiveAdapter struct {
 	engine *eng.DeltaCRDTEngine
 }
@@ -98,7 +65,7 @@ func (a *testLiveAdapter) LiveRead(_ context.Context, entityID string, txTimeNs 
 	out := make([]database.LiveEvent, 0, len(entries))
 	for i := range entries {
 		e := entries[i]
-		// Filter2: SystemTime <= txTimeNs — the visibility bound (STRICT <=).
+		// Entries after txTimeNs are not visible to this query.
 		if e.SystemTime > txTimeNs {
 			continue
 		}
@@ -109,55 +76,37 @@ func (a *testLiveAdapter) LiveRead(_ context.Context, entityID string, txTimeNs 
 			AssertionTime:  e.AssertionTime,
 			H3Index:        e.H3Index,
 			PayloadDigest:  e.PayloadDigest,
-			// Payload: nil — CRDTEntry carries no payload body (ADR 10); the
-			// digest is the no-recompute identity.
+			// CRDTEntry stores the payload digest, not the payload body.
 		})
 	}
 	return out, nil
 }
 
 // ---------------------------------------------------------------------------
-// live read-your-writes — the load-bearing end-to-end proof.
+// Read-your-writes over live and durable state.
 // ---------------------------------------------------------------------------
 
-// TestLiveReadYourWrites is the live read-your-writes guard — the
-// load-bearing end-to-end proof over a REAL engine + REAL *LocalFS.
-//
-// The proof: insert a live entry via engine.InsertLocal (the live HAMT), then
-// query via the resolver with the live source BEFORE any checkpoint → the entry
-// is visible (resolves, NOT 404). Then force a checkpoint (AppendCheckpoint →
-// SnapshotToLSM → L0) + re-query → the SAME digest (the live entry IS the
-// durable entry's seed; byte-identical post-flush — Law II.
-//
-// The setup deliberately uses a checkpointInterval that NEVER auto-fires during
-// the guard (the bridge is constructed with interval=0 at bridge_test.go:83 —
-// "no periodic checkpoint"), so the durable tier stays EMPTY until the explicit
-// AppendCheckpoint call. This isolates the read-your-writes seam: the
-// IMMEDIATE query (before AppendCheckpoint) finds ZERO durable rows → WITHOUT
-// the live source it would 404 (the:306 early-exit); WITH the live source the
-// :306 guard skips the early-exit + the merge seeds the dominant from the live
-// HAMT → resolves.
+// TestLiveReadYourWrites inserts into the live HAMT and resolves the entry
+// before any durable files exist. It repeats the query without a live source as
+// a negative control, then flushes an equivalent L0 row and verifies that the
+// live and durable results carry the same digest (ADR-0032).
 func TestLiveReadYourWrites(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
 	alloc := database.NewJemallocAllocator()
 	const entity = "live-rw-entity"
 
-	// A REAL engine (the live HAMT). No WAL — the live path is in-memory; the
-	// durable tier is the *LocalFS the resolver reads. The engine is the source
-	// the adapter wraps.
+	// The engine supplies live state; LocalFS is initially empty and supplies
+	// durable state after the explicit flush below.
 	engine, err := eng.NewDeltaCRDTEngine(testNodeID(), 1, testArenaSize)
 	require.NoError(t, err, "NewDeltaCRDTEngine: the live HAMT")
 
-	// The live payload + its digest (the no-recompute identity — sha256 of the
-	// payload, the SAME way the write path stamps it).
+	// The write path identifies the payload by its SHA-256 digest.
 	payload := []byte("live-row")
 	digest := sha256.Sum256(payload)
 
-	// The tri-temporal CRDTEntry the write path would build (control.go:302
-	// stamps SystemTime/ValidTime/AssertionTime; InsertLocal stamps the dot
-	// fields). sysTime = baseSysNs (visible at any txTime >= baseSysNs); valid
-	// window [baseSysNs, openEnd) so the row qualifies at validTime = baseSysNs+50.
+	// Build the temporal fields normally supplied by the write path. The valid-
+	// time interval includes baseSysNs+50; InsertLocal supplies the dot fields.
 	const baseSysNs int64 = 1_700_000_000_000_000_000
 	const openEnd int64 = 9_000_000_000_000_000_000
 	entry := eng.CRDTEntry{
@@ -168,104 +117,67 @@ func TestLiveReadYourWrites(t *testing.T) {
 		AssertionTime:  baseSysNs,
 		H3Index:        0x89283082803ffff,
 	}
-	// Insert the live entry (the live HAMT — NOT yet durable; NO checkpoint).
+	// Insert locally without creating a checkpoint or WAL entry.
 	dot := engine.InsertLocal(entity, entry)
 	if dot == (eng.CausalDot{}) {
-		t.Fatalf("live read-your-writes: InsertLocal returned a zero dot (the engine refused the write)")
+		t.Fatalf("InsertLocal returned a zero dot (the engine refused the write)")
 	}
 
-	// Build the resolver over the REAL *LocalFS (the durable tier — EMPTY so far;
-	// NO checkpoint has run). Wire the live source (the test-local adapter
-	// mirroring the production engineHAMTAdapter). EnableFirstSysSkip=false to
-	// isolate the live-source seam (no file-skip noise on the empty durable tier).
+	// Disable firstSys skipping to isolate live-source behavior; no durable
+	// objects exist yet.
 	cfg := database.ResolverConfig{MaxL0Files: 1000, EnableFirstSysSkip: false}
 	cfg.LiveSource = &testLiveAdapter{engine: engine}
 	resolver := database.NewResolver(lfs, lfs, alloc, "ryw-bucket", cfg)
 
-	// (1) THE LOAD-BEARING ASSERTION: an IMMEDIATE query (BEFORE any checkpoint)
-	// resolves the live entry — NOT 404. The durable tier is EMPTY (no L0/L1
-	// files); WITHOUT the live source the:306 zero-durable early-exit would fire
-	// → ErrEntityNotFound (the behavior). WITH the live source the:306
-	// guard skips the early-exit (r.liveSource != nil) + the merge seeds the
-	// dominant from the live HAMT → resolves.
+	// With no durable files, a nil live source returns ErrEntityNotFound. The
+	// configured live source instead supplies the dominant from the HAMT.
 	live, err := resolver.AsOf(ctx, entity, time.Unix(0, baseSysNs+50), time.Unix(0, baseSysNs+999))
-	require.NoErrorf(t, err, "live read-your-writes: the IMMEDIATE query (BEFORE any checkpoint) MUST resolve the live entry — NOT 404 (the read-your-writes seam; the:306 zero-durable early-exit is guarded on liveSource!=nil)")
-	require.NotNilf(t, live, "the live dominant must be non-nil (the merge seeded it from the live HAMT)")
-	assert.Equalf(t, baseSysNs, live.SystemTime, "the live dominant sysTime == baseSysNs (the live entry's sysTime)")
-	assert.Equalf(t, digest, live.PayloadDigest, "the live dominant carries the live entry's digest (the no-recompute identity — byte-identical to what the write path stamped)")
+	require.NoErrorf(t, err, "immediate query could not resolve the live entry")
+	require.NotNilf(t, live, "immediate query returned no dominant")
+	assert.Equalf(t, baseSysNs, live.SystemTime, "live dominant has a different SystemTime")
+	assert.Equalf(t, digest, live.PayloadDigest, "live dominant carries a different payload digest")
 
-	// (2) RED control: the SAME query WITHOUT the live source (nil) → 404 (the
-	// behavior — the durable tier is EMPTY, the:306 early-exit fires).
-	// This proves the live source is LOAD-BEARING: without it, the immediate
-	// query 404s; with it, it resolves. The contrast is the proof.
+	// Without LiveSource, the same empty durable store cannot answer the query.
 	cfgNoLive := database.ResolverConfig{MaxL0Files: 1000, EnableFirstSysSkip: false}
 	resolverNoLive := database.NewResolver(lfs, lfs, alloc, "ryw-nolive-bucket", cfgNoLive)
 	_, errNoLive := resolverNoLive.AsOf(ctx, entity, time.Unix(0, baseSysNs+50), time.Unix(0, baseSysNs+999))
-	assert.Errorf(t, errNoLive, "RED control: WITHOUT the live source, the IMMEDIATE query over the EMPTY durable tier returns 404 (the:306 zero-durable early-exit fires — the behavior; the live source is LOAD-BEARING)")
+	assert.Errorf(t, errNoLive, "query without LiveSource unexpectedly resolved an empty durable store")
 
-	// (3) Force a checkpoint: the bridge's AppendCheckpoint → SnapshotToLSM
-	// writes the live HAMT's dot set to the *LocalFS as an L0 Arrow file (the
-	// durable tier). The bridge needs a WAL (the checkpoint record is fsync'd
-	// FIRST, bridge.go:237) — but the guard can drive the SnapshotToLSM path
-	// directly via the L0Flusher (the SAME flusher insertRowInterval uses
-	// to write a durable L0), mirroring what AppendCheckpoint does to the live
-	// HAMT. Write the live entry's row to the durable tier.
+	// Flush an equivalent durable L0 row. L0Flusher exercises the storage half
+	// of AppendCheckpoint without requiring a WAL for this resolver test.
 	flusher := database.NewL0Flusher(alloc, lfs, "ryw-bucket")
 	sl := database.NewSkipListArena(alloc, 2*1024*1024)
-	// Build the row the SAME way insertRowInterval does (the 40-byte key
-	// + the packed value). Use the live entry's fields so the durable row IS the
-	// live row's twin (byte-identical digest).
+	// Build the same 40-byte key and packed value as the compaction fixtures,
+	// using the live entry's fields and digest.
 	fullHash := sha256.Sum256([]byte(entity))
 	key := make([]byte, 40)
 	copy(key[0:16], fullHash[:16])
 	putBE64(key[16:24], uint64(baseSysNs)) // sysNs
 	putBE64(key[24:32], uint64(baseSysNs)) // validStartNs
 	putBE64(key[32:40], uint64(baseSysNs)) // assertNs == sysNs
-	// The packed value (makePackedValue carries entityID + H3 + validEnd +
-	// digest + payload). Reuse the helper's value shape via the same
-	// constructor the guards use.
+	// Pack entity ID, H3 cell, valid-time end, digest, and payload.
 	val := makePackedValue(entity, 0x89283082803ffff, openEnd, digest, payload)
 	err = sl.Put(key, len(val), func(buf []byte) { copy(buf, val) })
 	require.NoError(t, err)
 	_, err = flusher.FlushFromArena(ctx, sl)
-	require.NoError(t, err, "the durable L0 flush (the AppendCheckpoint→SnapshotToLSM path the bridge drives)")
+	require.NoError(t, err, "durable L0 flush failed")
 	sl.Free()
 
-	// (4) Re-query over the NOW-durable tier. The durable scan finds the row; the
-	// live merge finds the SAME row (live ⊇ durable — the live HAMT still holds
-	// it). The AsOf dominance (STRICT >) keeps the durable dominant (the live
-	// entry AT the SAME sysTime does NOT displace it). The digest is byte-
-	// identical to the live entry's (Law II — the live entry IS the durable
-	// entry's seed).
+	// The durable scan and live merge now find equal system times. Strict
+	// dominance keeps the durable result, whose digest must match the live one.
 	durable, err := resolver.AsOf(ctx, entity, time.Unix(0, baseSysNs+50), time.Unix(0, baseSysNs+999))
-	require.NoErrorf(t, err, "the post-checkpoint query resolves (the durable tier now holds the row)")
-	require.NotNilf(t, durable, "the post-checkpoint dominant must be non-nil")
-	assert.Equalf(t, digest, durable.PayloadDigest, "post-checkpoint: the dominant digest is byte-identical to the live entry's (Law II — the live entry IS the durable entry's seed)")
-	assert.Equalf(t, live.PayloadDigest, durable.PayloadDigest, "the pre-checkpoint (live) + post-checkpoint (durable) digests are byte-identical (read-your-writes round-trip closed)")
-	t.Logf("live read-your-writes PASS: insert→IMMEDIATE query→200 (NOT 404, the live-source seam; RED control: nil-live→404); post-checkpoint the SAME digest (Law II — round-trip closed)")
+	require.NoErrorf(t, err, "post-flush query failed")
+	require.NotNilf(t, durable, "post-flush query returned no dominant")
+	assert.Equalf(t, digest, durable.PayloadDigest, "durable dominant carries a different digest")
+	assert.Equalf(t, live.PayloadDigest, durable.PayloadDigest, "live and durable digests differ")
+	t.Logf("live entry resolved before and after the durable flush with the same digest")
 }
 
-// ---------------------------------------------------------------------------
-// live EBR-race — the concurrent-read guard (100 AsOf + 250 InsertLocal).
-// ---------------------------------------------------------------------------
-
-// TestLiveReadYourWritesEBRRace is the live EBR-race guard — the concurrent-read
-// guard under -race. The LiveRead pins the live store with the EBR
-// Acquire/Enter/Release (the snapshot.go:391-394 pattern): Enter() sets
-// active=true, epoch=globalEpoch (reclamation.go:120), which holds freeRetiredList
-// back, so a concurrent InsertLocal's CAS CANNOT retire+free a shard root the
-// LiveRead is iterating. Under -race a use-after-free (a retired+freed root the
-// LiveRead still holds) would surface as a DATA RACE / fatal.
-//
-// The guard runs 100 AsOf (live source ON, each LiveRead EBR-pinned) concurrent
-// with 10k engine.InsertLocal (each CAS-spins a shard root, retiring the old)
-// across GOMAXPROCS goroutines. The assertion: NO panic, NO data race, NO 500
-// (the resolver errors NEVER surface on the live path — a live miss is a
-// redundancy). This is the production-grade guard the SnapshotToLSM precedent
-// proves, carried to the live-source read path.
-//
-// Runs -race (the per-pkg -race gate; the 4-core-box contract — the combined
-// 3-pkg -race OOMs, per-pkg -race with -timeout 900s is the discipline).
+// TestLiveReadYourWritesEBRRace runs 100 AsOf calls concurrently with 250
+// InsertLocal calls. LiveRead holds an EBR pin from Acquire/Enter until
+// Release, preventing reclamation of shard roots being iterated while writers
+// replace them. Run with -race to detect unsynchronized access or premature
+// reclamation (ADR-0032). All reads of the seeded entity must succeed.
 func TestLiveReadYourWritesEBRRace(t *testing.T) {
 	ctx := context.Background()
 	lfs := newLocalFS(t)
@@ -282,9 +194,8 @@ func TestLiveReadYourWritesEBRRace(t *testing.T) {
 	cfg.LiveSource = &testLiveAdapter{engine: engine}
 	resolver := database.NewResolver(lfs, lfs, alloc, "ryw-race-bucket", cfg)
 
-	// Seed ONE live entry on seedEntity so the AsOf goroutines have a row to
-	// read (the seed is NEVER overwritten — the writers below hit DISTINCT
-	// entities, so the seed's leaf is stable; the readers always resolve it).
+	// Seed a distinct entity that writers do not modify, giving every reader a
+	// stable live row to resolve.
 	seedDigest := sha256.Sum256([]byte("seed"))
 	engine.InsertLocal(seedEntity, eng.CRDTEntry{
 		PayloadDigest:  seedDigest,
@@ -295,31 +206,12 @@ func TestLiveReadYourWritesEBRRace(t *testing.T) {
 		H3Index:        0x89283082803ffff,
 	})
 
-	// The writers spread across a SMALL set of DISTINCT entities (NOT one giant
-	// leaf — a single entity's HAMT leaf grows its []CRDTEntry backing array per
-	// insert; spreading across entities keeps each leaf small). The working set
-	// + the iteration counts are kept SMALL because engine.State() — the
-	// production read API handleGet uses (control.go:356) — is O(total entries):
-	// it materializes a FULL merged view of every entity's dot set into a fresh
-	// HAMT on EACH call (crdt.go:1348, documented O(total entries)), AND the
-	// previously-built merged view is EBR-retired (freed after 3 epoch advances,
-	// crdt.go:1362-1370) — so HIGH read concurrency accumulates retired merged
-	// views across the grace window + pressures the 64MiB arena. The guard's
-	// GOAL is the EBR-pin-under-concurrent-CAS proof (the correctness property —
-	// a retired+freed shard root the LiveRead still holds would trip the race
-	// detector), NOT arena-pressure; a small realistic-scale working set
-	// isolates the concurrency surface (the per-shard CAS that retires+replaces
-	// a shard root while an in-flight LiveRead holds the EBR pin). The O(total-
-	// entries) State() cost + the EBR-grace-window accumulation are KNOWN
-	// production characteristics disclosed in the adapter docstring (the §0.b
-	// class) — they do NOT affect read-your-writes correctness, only the
-	// live-set scale + read-concurrency at which the State()-backed read path is
-	// economical. A future O(1) per-entity live-Get seam (routeShard→Load().Get,
-	// the InsertLocal path at crdt.go:984) is a SEPARATE fork — crdt.go is
-	// protected-core (md5 5cebad26), so this fork does NOT add it; it stays faithful to the
-	// production handleGet read path (State().Get) + discloses the scale bound.
+	// Spread writes across entities to keep each HAMT leaf small. Each State
+	// call materializes an O(total entries) merged view, and concurrent readers
+	// can retain earlier views until EBR reclaims them. The small working set
+	// isolates root replacement during LiveRead rather than arena pressure.
 	const nReaders = 20
-	const readsPer = 5 // 100 AsOf total (enough to interleave under -race)
+	const readsPer = 5 // 100 AsOf calls total
 	const nWriters = 5
 	const writesPer = 50 // 250 InsertLocal total
 	const entitiesPerWriter = 20
@@ -327,22 +219,18 @@ func TestLiveReadYourWritesEBRRace(t *testing.T) {
 	var wg sync.WaitGroup
 	var readErrs atomic.Int64
 	var readOK atomic.Int64
-	// Readers: 100 AsOf (live source ON), concurrent with the writers. Each
-	// reads the seedEntity (guaranteed live; never overwritten by the writers).
-	// The counters are atomic (the readers run across goroutines; a plain int64
-	// would race at the increment — a TEST bug, NOT an EBR-pin bug, caught by
-	// -race at the first guard run).
+	// Readers resolve the seeded entity while writers replace other roots.
+	// Atomic counters avoid introducing a data race in the test itself.
 	for r := 0; r < nReaders; r++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < readsPer; i++ {
-				// txTime ABOVE baseSysNs so the seed (sysTime=baseSysNs) qualifies.
+				// Query above the seed's system time so it is visible.
 				_, qerr := resolver.AsOf(ctx, seedEntity, time.Unix(0, baseSysNs+50), time.Unix(0, baseSysNs+999999))
 				if qerr != nil {
-					// A live miss is a redundancy, NOT a correctness loss — but under
-					// the EBR pin the read should NOT error (the seed is live). Count
-					// it; assert NONE below.
+					// The seed should remain visible throughout the test; count any
+					// unexpected resolver error for the assertions below.
 					readErrs.Add(1)
 					continue
 				}
@@ -350,16 +238,14 @@ func TestLiveReadYourWritesEBRRace(t *testing.T) {
 			}
 		}()
 	}
-	// Writers: 250 InsertLocal across ~100 distinct entities, each CAS-
-	// spinning a shard root (retiring the old — the EBR pin must hold the old
-	// root for any in-flight LiveRead on the seed or a sibling entity).
+	// Writers replace shard roots while readers hold EBR pins.
 	for w := 0; w < nWriters; w++ {
 		wg.Add(1)
 		go func(wid int) {
 			defer wg.Done()
 			for i := 0; i < writesPer; i++ {
-				// A distinct entity per write (spread the load across shards; keep
-				// each leaf at ONE entry so the arena does NOT pressure).
+				// Reuse a small set of distinct entities to distribute writes
+				// without growing one large leaf.
 				ent := fmt.Sprintf("race-w%d-%d", wid, i%entitiesPerWriter)
 				dig := sha256.Sum256([]byte(ent))
 				engine.InsertLocal(ent, eng.CRDTEntry{
@@ -375,10 +261,10 @@ func TestLiveReadYourWritesEBRRace(t *testing.T) {
 	}
 	wg.Wait()
 
-	// The assertion: NO read errors (the EBR pin held — the seed was live for
-	// every read; a use-after-free of a retired root would also surface as a read
-	// error or a race-detector trip), + the race detector did NOT fire.
-	assert.Zerof(t, readErrs.Load(), "live EBR-race: %d/%d AsOf errored under concurrent InsertLocal — the EBR pin MUST hold the live store for the LiveRead duration (a use-after-free would also trip the race detector)", readErrs.Load(), nReaders*readsPer)
-	assert.Equalf(t, int64(nReaders*readsPer), readOK.Load(), "all %d AsOf resolved (the seed was visible under the EBR pin across %d concurrent InsertLocal)", nReaders*readsPer, nWriters*writesPer)
-	t.Logf("live EBR-race PASS: %d AsOf (live source ON) concurrent with %d InsertLocal across ~%d distinct entities — 0 read errors, 0 data races (the EBR pin held the live store for every LiveRead; the SnapshotToLSM precedent's concurrent-read guard carried to the live-source path)", nReaders*readsPer, nWriters*writesPer, entitiesPerWriter)
+	// Every seeded read must succeed; premature root reclamation would surface
+	// as an error, panic, or race-detector report.
+	assert.Zerof(t, readErrs.Load(), "%d/%d AsOf calls failed during concurrent InsertLocal", readErrs.Load(), nReaders*readsPer)
+	assert.Equalf(t, int64(nReaders*readsPer), readOK.Load(), "resolved %d AsOf calls during %d InsertLocal calls", nReaders*readsPer, nWriters*writesPer)
+	t.Logf("%d AsOf calls concurrent with %d InsertLocal calls across %d entities completed without read errors",
+		nReaders*readsPer, nWriters*writesPer, entitiesPerWriter)
 }

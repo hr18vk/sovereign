@@ -6,29 +6,19 @@
 
 package chaos
 
-// ---------------------------------------------------------------------------
-// §2 — WAL recovery determinism gate.
-// ---------------------------------------------------------------------------
+// WAL recovery determinism test.
 //
-// Ruthless Go Engine Verification Blueprint, §2, mandates crash-
-// consistency: a worker that dies mid-flight and restarts from the WAL MUST
-// rebuild an engine whose MerkleRoot() equals the root the WAL's last
-// checkpoint recorded. "Survival is not enough if the acknowledged state
-// diverges." This test enforces that single property directly, deterministically,
+// Recovery must rebuild an engine whose MerkleRoot equals the root recorded
+// in the WAL's last checkpoint. This test checks that property directly,
 // without spawning a process.
 //
-// WHAT IS PROVEN HERE (and what is NOT):
-// PROVEN: identical (localNodeID, initialLamport) + identical mutation replay
-// order ⟹ identical MerkleRoot(). This is the engine's determinism contract:
-// MerkleRoot() folds ONLY DotNodeID + DotCounter (see HAMT.MerkleRoot in
-// pkg/sync/hamt.go), and both are reproduced exactly when the recovered
-// engine is constructed with the same nodeID and the same initial lamport
-// high-water as the crashed worker, and mutations are re-applied in WAL order.
-// The maphash.Seed (which Go documents as non-serializable across processes)
-// DOES NOT affect MerkleRoot, so a fresh seed in the recovered process does
-// not perturb the root.
-// NOT PROVEN HERE: end-to-end process-crash recovery (that is survival_test.go).
-// ---------------------------------------------------------------------------
+// This test checks that restoring the recorded entries in WAL order reproduces
+// the checkpoint root. HAMT.MerkleRoot folds only DotNodeID and DotCounter, and
+// NewWALMutation preserves both from the live engine. The recovered engine uses
+// the same node ID, but its initial counter is immaterial because Join restores
+// each recorded dot rather than minting a new one. A fresh maphash.Seed does not
+// affect the root. Process-crash recovery is covered separately by
+// survival_test.go.
 
 import (
 	"crypto/sha256"
@@ -41,11 +31,11 @@ import (
 	"github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// TestWALRecoveryDeterminism appends N mutations + a checkpoint to a WAL,
-// replays it into a FRESH engine seeded with the same (nodeID, lamportHigh),
-// and asserts the replayed MerkleRoot() equals the checkpointed root. This is
-// the single property §2's "crash-consistency, not liveness" rule keys
-// off. A failure means recovery is silently data-lossy.
+// TestWALRecoveryDeterminism appends mutations and a checkpoint, then restores
+// them into a fresh engine with the same node ID. It compares the recovered
+// Merkle root with the live root and checks that Join advances the recovered
+// Lamport clock to the replay high-water mark. The initial counter passed to
+// the recovered engine does not affect the result because no dots are re-minted.
 func TestWALRecoveryDeterminism(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "det.wal")
 	wal, err := OpenWAL(walPath)
@@ -78,8 +68,8 @@ func TestWALRecoveryDeterminism(t *testing.T) {
 		entry := stagedEntry(i)
 		dot := live.InsertLocal(entityID, entry)
 		liveDots = append(liveDots, dot)
-		// NewWALMutation (ADR-0045): stamps the engine-returned dot + origin
-		// into the persisted 120-byte entry — the safe construction.
+		// NewWALMutation (ADR-0045 §4): stamps the engine-returned dot + origin
+		// into the persisted 120-byte entry.
 		if err := wal.AppendMutation(NewWALMutation(entityID, dot, entry)); err != nil {
 			t.Fatalf("AppendMutation %d: %v", i, err)
 		}
@@ -92,11 +82,11 @@ func TestWALRecoveryDeterminism(t *testing.T) {
 		t.Fatalf("AppendCheckpoint: %v", err)
 	}
 
-	// Recovery: fresh engine seeded from the WAL (same nodeID + lamportHigh).
-	// In production the worker main does this at boot (CHAOS_WORKER_NODEFX +
-	// Lookahead from ReplayWAL); here we exercise the exact same logic against
-	// the same engine constructor so the determinism contract is proven in
-	// isolation, without the process layer.
+	// Construct the recovered engine with the live engine's node ID. Production
+	// recovery uses ReplayWAL at worker boot; this test exercises the same engine
+	// constructor without the process layer. Join below restores the recorded dots
+	// and advances the Lamport clock, so the constructor's initial counter is not
+	// derived from the log.
 	rep, err := ReplayWAL(walPath)
 	if err != nil {
 		t.Fatalf("ReplayWAL: %v", err)
@@ -106,24 +96,20 @@ func TestWALRecoveryDeterminism(t *testing.T) {
 	}
 	recoverDir := t.TempDir()
 	sync.DataDir = recoverDir
-	// DETERMINISM CONTRACT (ADR-0045 — the seed-formula class is refuted):
-	// recovery RESTORES the recorded dots; it never re-mints. The two historical
-	// seed derivations (rebuiltInitial = LamportHigh - len(Mutations);
-	// Mutations[0].Counter - 1) are refuted under concurrent mint/append
-	// reordering and appear nowhere here. This test is the INDEPENDENT
-	// in-package check: an exact-dot rebuild via a synthetic-delta Join (Join
-	// honors the recorded Dot() verbatim — a duplicate is a no-op under Join),
-	// the same law the production recovery path (pkg/durability) implements.
-	// The seed counter is irrelevant — nothing is re-minted — so the live
-	// engine's initialCounter=7 start needs no derivation.
+	// Recovery restores the recorded dots; it never mints replacements
+	// (ADR-0045 §4). Deriving a seed from LamportHigh-len(Mutations) or the
+	// first mutation counter is invalid when concurrent counter minting and WAL
+	// appends reorder records. The synthetic delta below uses Join, as production
+	// recovery does, and Join preserves each entry's recorded Dot. Duplicates are
+	// no-ops, and the live engine's initialCounter=7 needs no inverse calculation.
 	recovered, err := sync.NewDeltaCRDTEngine(nodeID, 1, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("NewDeltaCRDTEngine recovered: %v", err)
 	}
 	t.Cleanup(func() { _ = recovered.Close() })
 
-	// Cross-check: the WAL must carry the live-minted dots VERBATIM (a
-	// persisted zero-dot is the defect this guard exists to catch).
+	// Check that the WAL preserved the live-minted dots rather than persisting
+	// zero values or minting replacements during replay.
 	for i, m := range rep.Mutations {
 		if m.NodeID != liveDots[i].NodeID || m.Counter != liveDots[i].Counter {
 			t.Fatalf("record %d carries dot (%x,%d), want the live-minted (%x,%d) — the WAL did not record the stamped dot",
@@ -133,7 +119,7 @@ func TestWALRecoveryDeterminism(t *testing.T) {
 	muts := rep.Mutations
 	delta := sync.CRDTDelta{Entries: func(yield func(string, sync.CRDTEntry) bool) {
 		for i := range muts {
-			// Full carries the engine-stamped dot (NewWALMutation, ADR-0045); Join
+			// Full carries the engine-stamped dot (NewWALMutation, §6); Join
 			// honors it verbatim — no re-mint, no seed arithmetic.
 			if !yield(muts[i].EntityID, muts[i].Full) {
 				return
@@ -144,23 +130,21 @@ func TestWALRecoveryDeterminism(t *testing.T) {
 
 	recoveredRoot := recovered.State().MerkleRoot()
 	if recoveredRoot != liveRoot {
-		t.Fatalf("WAL recovery determinism BROKEN:\n checkpoint root = %x\n recovered root = %x\n"+
-			"Replayer built a different state than the live engine. Recovery is data-lossy.",
+		t.Fatalf("WAL recovery root mismatch:\n  checkpoint root = %x\n  recovered root = %x\n"+
+			"Replay built different state from the live engine.",
 			liveRoot, recoveredRoot)
 	}
-	// Also assert the checkpoint's LamportHigh matches the replayed engine's
-	// counter: the recovered lamport clock resumes at exactly the checkpoint's
-	// high-water mark, which is why the very NextDot reproduces the right Counter.
+	// Join must also advance the recovered Lamport clock to the replay high-water
+	// mark, so a subsequent NextDot cannot reuse an earlier counter.
 	if recovered.LamportCounter() != rep.LamportHigh {
 		t.Fatalf("recovered lamport %d != checkpoint lamportHigh %d",
 			recovered.LamportCounter(), rep.LamportHigh)
 	}
 }
 
-// TestWALTornTailTruncation proves a crash mid-record leaves a REPLAYABLE
-// log. A torn final byte sequence must NOT corrupt the valid prefix; ReplayWAL
-// truncates and returns the good records. This is the standard WAL tail-tear
-// guarantee §2 leans on so a crash during an append is recoverable.
+// TestWALTornTailTruncation checks that a crash during a record append leaves
+// a replayable prefix. ReplayWAL ignores the incomplete suffix and returns the
+// complete records; OpenWAL truncates that suffix before a later append.
 func TestWALTornTailTruncation(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "torn.wal")
 	wal, err := OpenWAL(walPath)
@@ -178,8 +162,8 @@ func TestWALTornTailTruncation(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Corrupt the LAST record by appending a partial header (3 bytes < 13), as
-	// if the worker was killed mid-write of its 6th append. Open append-ONLY
+	// Corrupt the last record by appending a partial header (3 bytes < 13), as
+	// if the worker was killed mid-write of its 6th append. Open append-only
 	// (no O_TRUNC) so the valid 5-record prefix is preserved.
 	appendPartial := func(p string, b []byte) {
 		f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0o644)
@@ -202,19 +186,13 @@ func TestWALTornTailTruncation(t *testing.T) {
 	}
 }
 
-// TestWALOversizedPayloadRejected (ADR-0045): a
-// record whose 4-byte length field claims a payload beyond maxRecordPayloadLen
-// must be HARD-REJECTED at replay with the "exceeds max" error — never a
-// multi-GiB make([]byte, payloadLen) allocation cliff, never a silent skip. The
-// length field is corruption-controlled (a flipped byte can claim up to 4 GiB),
-// so the bound is enforced BEFORE the allocation (wal.go: the payloadLen >
-// maxRecordPayloadLen guard precedes the make).
-//
-// RED (bug-inject): remove the `payloadLen > maxRecordPayloadLen` guard and this
-// test FAILS — replay then falls through to make([]byte, maxRecordPayloadLen+1)
-// and a short read, returning the TORN-TAIL path (err == nil, the crafted record
-// silently dropped), so the `err == nil` assertion below fires. The guard is the
-// only thing standing between a corrupt length byte and a multi-MiB/GiB make().
+// TestWALOversizedPayloadRejected checks that ReplayWAL rejects a record length
+// above maxRecordPayloadLen before allocating its payload (ADR-0045). A damaged
+// uint32 length could otherwise request almost 4 GiB. The crafted record has no
+// payload, so without the guard it would take the torn-tail path and return no
+// error; the err == nil assertion makes that missing guard visible. Replay checks
+// the length before sequence contiguity, so the deliberately skipped sequence
+// number in this fixture does not mask the expected length error.
 func TestWALOversizedPayloadRejected(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "huge.wal")
 	wal, err := OpenWAL(walPath)
@@ -231,17 +209,17 @@ func TestWALOversizedPayloadRejected(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Hand-craft a header claiming payloadLen = maxRecordPayloadLen+1 with NO
-	// payload bytes — the length field ALONE is the attack (the guard must fire
-	// before any allocation).
+	// Append only a header whose length is maxRecordPayloadLen+1. The sequence
+	// deliberately skips 1 because replay must reject the length before checking
+	// contiguity; no large payload allocation should occur.
 	f, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		t.Fatalf("open append: %v", err)
 	}
 	rec := make([]byte, 13)                                              // header only, no payload
-	binary.BigEndian.PutUint64(rec[0:8], 2)                              // seq
-	rec[8] = byte(WALRecMutationV2)                                      // a real record type
-	binary.BigEndian.PutUint32(rec[9:13], uint32(maxRecordPayloadLen)+1) // the lie
+	binary.BigEndian.PutUint64(rec[0:8], 2)                              // skip seq 1; the length check runs first
+	rec[8] = byte(WALRecMutationV2)                                      // a valid record type
+	binary.BigEndian.PutUint32(rec[9:13], uint32(maxRecordPayloadLen)+1) // exceeds the replay bound
 	if _, err := f.Write(rec); err != nil {
 		t.Fatalf("write crafted record: %v", err)
 	}
@@ -249,16 +227,16 @@ func TestWALOversizedPayloadRejected(t *testing.T) {
 
 	_, err = ReplayWAL(walPath)
 	if err == nil {
-		t.Fatalf("T-C6: a record claiming payloadLen=%d (> maxRecordPayloadLen=%d) must be REJECTED, not silently replayed", uint32(maxRecordPayloadLen)+1, maxRecordPayloadLen)
+		t.Fatalf("a record claiming payloadLen=%d (> maxRecordPayloadLen=%d) must be rejected, not silently replayed", uint32(maxRecordPayloadLen)+1, maxRecordPayloadLen)
 	}
 	if !strings.Contains(err.Error(), "exceeds max") {
-		t.Fatalf("T-C6: error = %v, want the 'exceeds max' payload-length refusal — a different error means the bound did not fire FIRST", err)
+		t.Fatalf("error = %v, want the 'exceeds max' payload-length refusal — a different error means the bound did not fire first", err)
 	}
 }
 
-// TestWALSequenceMonotonic proves OpenWAL on an existing log keeps
-// nextSeq monotonic across reopen — so a recovered worker's subsequent appends
-// never collide with pre-crash seq numbers (the durability ordering invariant).
+// TestWALSequenceMonotonic proves OpenWAL on an existing log keeps nextSeq
+// monotonic across reopen — so a recovered worker's subsequent appends never
+// collide with pre-crash seq numbers (the durability ordering invariant).
 func TestWALSequenceMonotonic(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "seq.wal")
 	wal, _ := OpenWAL(walPath)
@@ -286,7 +264,7 @@ func TestWALSequenceMonotonic(t *testing.T) {
 	_ = wal2.Close()
 }
 
-// TestWALForeignFileRejected proves a foreign / corrupt header is rejected
+// TestWALForeignFileRejected proves a foreign or corrupt header is rejected
 // explicitly rather than being silently misinterpreted on recovery (the no-
 // silent-misinterpretation rule in the WAL header docs).
 func TestWALForeignFileRejected(t *testing.T) {
@@ -325,8 +303,9 @@ func stagedEntityID(i int) string {
 	return "entity-" + string(buf)
 }
 
-// openForAppend opens path for append+write, failing the test if the OS denies
-// it. Used only by the torn-tail test to splice partial bytes onto the log.
+// openForAppend creates or truncates path for writing and fails the test on an
+// OS error. Tests use it to install invalid file contents before calling OpenWAL
+// or ReplayWAL.
 func openForAppend(t *testing.T, p string) *os.File {
 	t.Helper()
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)

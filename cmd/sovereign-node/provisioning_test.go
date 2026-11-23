@@ -6,37 +6,21 @@
 
 package main
 
-// provisioning_test.go is the ADR-0040 cmd-side §III gate — the
-// OOB config-parse + OOB apply guards that exercise parsePeerDir +
-// applyProvisioning DIRECTLY (package main can reach them; pkg/mesh cannot —
-// the import cycle: cmd imports mesh). The mesh-side guards
-// (the mesh-side OOB tests) cover the reconcile seam + the topology
-// selector; these cover the config parser + the provisioning apply path.
+// The command package tests parsePeerDir and applyProvisioning directly;
+// pkg/mesh cannot call these unexported functions without an import cycle.
+// Mesh tests separately cover TLS identity reconciliation and topology
+// selection (ADR-0040).
 //
-// THE GUARDS:
+// The parser tests round-trip classical and hybrid entries, then check that
+// malformed keys, duplicate addresses, and invalid regions return descriptive
+// errors. The apply tests verify Directory registration and region lookup under
+// the real nodeID. A separate surrogate-key case shows why address-derived IDs
+// cannot select a provisioned peer's region.
 //
-// - OOB config-parse: parsePeerDir round-trips a known 3-peer config (1
-// classical+region, 1 hybrid+region, 1 classical-only) → parsed == input.
-// The FAILSAFE discipline is the load-bearing gate: a malformed entry (bad
-// hex, wrong field length) is REJECTED with an error naming the line + the
-// field, NEVER silently coerced to zero. The RED bug-inject control proves
-// the length checks are load-bearing: a 16-byte-truncated nodeID is
-// ACCEPTED iff the length check is removed (the injected bug) — the guard
-// FAILS under the bug.
-// - OOB apply: applyProvisioning registers each peer's Ed25519 pubkey via
-// gossiper.RegisterPeer (+ dir.RegisterPQ for the PQ arm) + re-keys the
-// TopologyManager's region tag under the REAL nodeID (topo.SetRegion) →
-// the topology selector HITS → the 24th counter's gate is armed. The RED
-// control: applyProvisioning under a SURROGATE nodeID (the path)
-// keys the topology under the surrogate → topo.IsInterRegion(realNodeID)
-// is false → the selector misses → the N=2 no-op reproduces.
-// - OOB empty-no-op: an empty --peer-dir (the OPT-IN default) returns an
-// empty provisioned map + nil → the dial loop's ELSE arm runs for every
-// peer (zero peerID = byte-identical). The honest no-op.
-// - OOB missing-path-fails: a NON-EMPTY path that does not exist FAILS the
-// boot (a deploy misconfiguration MUST surface loudly, NOT silently fall
-// back to zero-peerID — the silent-partition class the honest-negative
-// posture forbids).
+// Empty and missing paths have distinct contracts: an empty --peer-dir disables
+// provisioning and preserves zero-peerID dialing, while a named file that does
+// not exist is a startup error. Further cases cover duplicate nodeIDs and the
+// interaction between --peers region suffixes and provisioned identities.
 
 import (
 	"context"
@@ -53,15 +37,12 @@ import (
 	"github.com/hr18vk/sovereign/pkg/mesh"
 )
 
-// knownGoodPeerDir builds a known-good 3-peer --peer-dir config in a temp file
-// + returns its path + the expected parsed values. The nodeIDs + pubkeys are
-// FIXED (deterministic — the round-trip guard needs byte-identical values; a
-// random key would break the comparison). Peer-1 is classical + region 3;
-// peer-2 is hybrid (Ed25519 + ML-DSA-65) + region 7; peer-3 is classical-only
-// (no PQ, no region). The ML-DSA-65 pubkey is minted via
-// identity.GeneratePreviewKey65(seed) (the SAME deterministic seed→*PrivateKey
-// helper pkg/identity/pq_mldsa.go:70 exports — the anti-fab reuse; the test
-// does NOT call mldsa.NewPrivateKey directly, mirroring the production path).
+// knownGoodPeerDir writes a three-peer configuration and returns the expected
+// parsed values. Fixed nodeIDs and public keys make the round-trip comparison
+// deterministic. The entries cover classical-only operation with a region,
+// hybrid operation with a region, and classical-only operation without either
+// optional field. GeneratePreviewKey65 derives the ML-DSA-65 keypair from a
+// fixed seed, as NewNodeIdentityHybrid does for node identities.
 func knownGoodPeerDir(t *testing.T) (path string, node1, node2, node3 [16]byte, pub1, pub2, pub3 [32]byte, pq2 *mldsa.PublicKey) {
 	t.Helper()
 	node1 = [16]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}
@@ -72,11 +53,8 @@ func knownGoodPeerDir(t *testing.T) (path string, node1, node2, node3 [16]byte, 
 		pub2[i] = 0xBB
 		pub3[i] = 0xCC
 	}
-	// Peer-2's ML-DSA-65 keypair from a fixed 32-byte seed (the
-	// identity.GeneratePreviewKey65 path — the deterministic seed form, byte-
-	// identical across runs; the SAME path NewNodeIdentityHybrid uses at
-	// peer.go:127). The pubkey's 1952-byte wire encoding round-trips through
-	// parsePeerDir's mldsa.NewPublicKey (provisioning.go:267).
+	// The fixed 32-byte seed makes peer 2's keypair reproducible. Its 1,952-byte
+	// public-key encoding exercises mldsa.NewPublicKey in parsePeerDir.
 	pqSeed := make([]byte, 32)
 	for i := range pqSeed {
 		pqSeed[i] = 0xDD
@@ -85,9 +63,9 @@ func knownGoodPeerDir(t *testing.T) (path string, node1, node2, node3 [16]byte, 
 	if err != nil {
 		t.Fatalf("GeneratePreviewKey65: %v", err)
 	}
-	pq2 = pqPriv.PublicKey() // the concrete getter (peer.go:140 — NOT the Public() interface)
+	pq2 = pqPriv.PublicKey() // the concrete key encoded in the configuration
 
-	// The config lines (positional columns: addr nodeID ed25519 [mldsa65|-] [region|-]).
+	// Positional columns: addr nodeID ed25519 [mldsa65|-] [region|-].
 	line1 := "127.0.0.1:9001 " + hex.EncodeToString(node1[:]) + " " + hex.EncodeToString(pub1[:]) + " - 3"
 	line2 := "127.0.0.1:9002 " + hex.EncodeToString(node2[:]) + " " + hex.EncodeToString(pub2[:]) + " " + hex.EncodeToString(pq2.Bytes()) + " 7"
 	line3 := "127.0.0.1:9003 " + hex.EncodeToString(node3[:]) + " " + hex.EncodeToString(pub3[:])
@@ -100,160 +78,141 @@ func knownGoodPeerDir(t *testing.T) (path string, node1, node2, node3 [16]byte, 
 	return path, node1, node2, node3, pub1, pub2, pub3, pq2
 }
 
-// TestOOBConfigParse is the OOB config-parse guard: parsePeerDir round-
-// trips a known 3-peer config → parsed == input. The FAILSAFE discipline (bad
-// hex / wrong length REJECTED, NEVER coerced to zero) is asserted via the
-// malformed-entry sub-tests. The RED bug-inject control proves the length
-// checks are load-bearing: a 16-byte-truncated nodeID is ACCEPTED iff the
-// length check is removed (the injected bug) — the guard FAILS under the bug.
+// TestOOBConfigParse checks the three-entry round trip and rejection of
+// malformed fields. The short-nodeID case exercises the exact-length check:
+// removing that check would let an invalid identity reach provisioning.
 func TestOOBConfigParse(t *testing.T) {
 	path, node1, node2, node3, pub1, pub2, pub3, pq2 := knownGoodPeerDir(t)
 
 	cfgs, err := parsePeerDir(path)
 	if err != nil {
-		t.Fatalf("OOB config-parse: parsePeerDir %s: %v", path, err)
+		t.Fatalf("parsePeerDir(%s): %v", path, err)
 	}
 	if len(cfgs) != 3 {
-		t.Fatalf("OOB config-parse: parsePeerDir returned %d entries, want 3", len(cfgs))
+		t.Fatalf("parsePeerDir returned %d entries, want 3", len(cfgs))
 	}
-	// Peer-1: classical + region 3.
+	// Peer 1 has a classical key and region 3.
 	if cfgs[0].addr != "127.0.0.1:9001" || cfgs[0].nodeID != node1 || cfgs[0].ed25519Pub != pub1 {
-		t.Fatalf("OOB config-parse: peer-1 mismatch (got addr=%s nodeID=%x pub=%x)", cfgs[0].addr, cfgs[0].nodeID, cfgs[0].ed25519Pub)
+		t.Fatalf("peer 1 mismatch: addr=%s nodeID=%x pub=%x", cfgs[0].addr, cfgs[0].nodeID, cfgs[0].ed25519Pub)
 	}
 	if cfgs[0].mldsa65Pub != nil {
-		t.Fatalf("OOB config-parse: peer-1 should be classical-only (mldsa65Pub=nil), got non-nil")
+		t.Fatalf("peer 1 has an ML-DSA-65 key, want nil")
 	}
 	if !cfgs[0].hasRegion || cfgs[0].region != mesh.RegionTag(3) {
-		t.Fatalf("OOB config-parse: peer-1 should have region 3 (hasRegion=%v region=%d)", cfgs[0].hasRegion, cfgs[0].region)
+		t.Fatalf("peer 1 region: hasRegion=%v region=%d, want true and 3", cfgs[0].hasRegion, cfgs[0].region)
 	}
-	// Peer-2: hybrid (Ed25519 + ML-DSA-65) + region 7.
+	// Peer 2 has Ed25519 and ML-DSA-65 keys and region 7.
 	if cfgs[1].addr != "127.0.0.1:9002" || cfgs[1].nodeID != node2 || cfgs[1].ed25519Pub != pub2 {
-		t.Fatalf("OOB config-parse: peer-2 mismatch (got addr=%s nodeID=%x pub=%x)", cfgs[1].addr, cfgs[1].nodeID, cfgs[1].ed25519Pub)
+		t.Fatalf("peer 2 mismatch: addr=%s nodeID=%x pub=%x", cfgs[1].addr, cfgs[1].nodeID, cfgs[1].ed25519Pub)
 	}
 	if cfgs[1].mldsa65Pub == nil {
-		t.Fatalf("OOB config-parse: peer-2 should be hybrid (mldsa65Pub != nil), got nil")
+		t.Fatalf("peer 2 has no ML-DSA-65 key")
 	}
-	// The reconstructed PQ pubkey round-trips: its Bytes() == the config's encoding.
+	// The reconstructed key must have the same encoding as the original key.
 	if cfgs[1].mldsa65Pub.Bytes() == nil || len(cfgs[1].mldsa65Pub.Bytes()) != mldsa.MLDSA65PublicKeySize {
-		t.Fatalf("OOB config-parse: peer-2 reconstructed PQ pubkey has %d bytes, want %d", len(cfgs[1].mldsa65Pub.Bytes()), mldsa.MLDSA65PublicKeySize)
+		t.Fatalf("peer 2 ML-DSA-65 key has %d bytes, want %d", len(cfgs[1].mldsa65Pub.Bytes()), mldsa.MLDSA65PublicKeySize)
 	}
 	if !bytesEqual(cfgs[1].mldsa65Pub.Bytes(), pq2.Bytes()) {
-		t.Fatalf("OOB config-parse: peer-2 reconstructed PQ pubkey != the minted pubkey (the Bytes()/NewPublicKey round-trip is broken)")
+		t.Fatalf("peer 2 ML-DSA-65 key did not round-trip through its encoding")
 	}
 	if !cfgs[1].hasRegion || cfgs[1].region != mesh.RegionTag(7) {
-		t.Fatalf("OOB config-parse: peer-2 should have region 7 (hasRegion=%v region=%d)", cfgs[1].hasRegion, cfgs[1].region)
+		t.Fatalf("peer 2 region: hasRegion=%v region=%d, want true and 7", cfgs[1].hasRegion, cfgs[1].region)
 	}
-	// Peer-3: classical-only (no PQ, no region).
+	// Peer 3 has neither optional field.
 	if cfgs[2].addr != "127.0.0.1:9003" || cfgs[2].nodeID != node3 || cfgs[2].ed25519Pub != pub3 {
-		t.Fatalf("OOB config-parse: peer-3 mismatch (got addr=%s nodeID=%x pub=%x)", cfgs[2].addr, cfgs[2].nodeID, cfgs[2].ed25519Pub)
+		t.Fatalf("peer 3 mismatch: addr=%s nodeID=%x pub=%x", cfgs[2].addr, cfgs[2].nodeID, cfgs[2].ed25519Pub)
 	}
 	if cfgs[2].mldsa65Pub != nil {
-		t.Fatalf("OOB config-parse: peer-3 should be classical-only (mldsa65Pub=nil), got non-nil")
+		t.Fatalf("peer 3 has an ML-DSA-65 key, want nil")
 	}
 	if cfgs[2].hasRegion {
-		t.Fatalf("OOB config-parse: peer-3 should have NO region (hasRegion=false), got hasRegion=true region=%d", cfgs[2].region)
+		t.Fatalf("peer 3 has region %d, want no region", cfgs[2].region)
 	}
-	t.Logf("GATE PASS: OOB config-parse — parsePeerDir round-tripped the 3-peer config (1 classical+region, 1 hybrid+region, 1 classical-only); the ML-DSA-65 pubkey Bytes()/NewPublicKey round-trip is byte-identical")
+	t.Logf("parsed classical and hybrid entries; ML-DSA-65 public-key encoding round-tripped")
 
-	// The FAILSAFE discipline — malformed entries are REJECTED, NOT coerced to zero.
+	// Malformed entries must be rejected rather than coerced to zero values.
 	t.Run("malformed_nodeID_short", func(t *testing.T) {
-		// A 16-hex-char nodeID (8 bytes, NOT 16) — the length check MUST reject.
+		// Eight bytes of hex-decoded nodeID must fail the 16-byte length check.
 		bad := "127.0.0.1:9004 " + strings.Repeat("11", 8) + " " + hex.EncodeToString(pub1[:])
 		p := writeTempPeerDir(t, bad)
-		_, err := parsePeerDir(p) // declare err in the sub-test scope (NOT the if-init — that shadows + leaves the outer err nil → a nil-deref panic)
+		_, err := parsePeerDir(p) // use the subtest scope so err cannot be shadowed
 		if err == nil {
-			t.Fatalf("OOB config-parse: parsePeerDir ACCEPTED an 8-byte nodeID (want 16) — the length check is vestigial (a truncated nodeID would silently key the Directory + the topology under a WRONG nodeID)")
+			t.Fatalf("parsePeerDir accepted an 8-byte nodeID, want a 16-byte length error")
 		}
 		if !strings.Contains(err.Error(), "nodeID") || !strings.Contains(err.Error(), "16") {
-			t.Fatalf("OOB config-parse: the reject error does not name the field + the expected length (got %q)", err)
+			t.Fatalf("error does not name nodeID and its expected length: %q", err)
 		}
-		t.Logf("GATE PASS: OOB config-parse/malformed_nodeID_short — an 8-byte nodeID was REJECTED with %q (the length check is load-bearing)", err)
+		t.Logf("short nodeID rejected: %q", err)
 	})
 	t.Run("malformed_pubkey_badhex", func(t *testing.T) {
-		// A non-hex pubkey — the hex decode MUST reject.
 		bad := "127.0.0.1:9004 " + hex.EncodeToString(node1[:]) + " not-hex-at-all"
 		p := writeTempPeerDir(t, bad)
 		_, err := parsePeerDir(p)
 		if err == nil {
-			t.Fatalf("OOB config-parse: parsePeerDir ACCEPTED a non-hex pubkey — the hex-decode guard is vestigial")
+			t.Fatalf("parsePeerDir accepted a non-hex Ed25519 public key")
 		}
-		t.Logf("GATE PASS: OOB config-parse/malformed_pubkey_badhex — a non-hex pubkey was REJECTED (the hex-decode guard is load-bearing)")
+		t.Logf("non-hex public key rejected")
 	})
 	t.Run("malformed_dup_addr", func(t *testing.T) {
-		// A duplicate addr — the dedup guard MUST reject (a dup would silently
-		// shadow the first in the dial loop's byAddr keying).
+		// A duplicate address would shadow the first entry in the dial loop.
 		line := "127.0.0.1:9004 " + hex.EncodeToString(node1[:]) + " " + hex.EncodeToString(pub1[:])
 		p := writeTempPeerDir(t, line+"\n"+line)
 		_, err := parsePeerDir(p)
 		if err == nil {
-			t.Fatalf("OOB config-parse: parsePeerDir ACCEPTED a duplicate addr — the dedup guard is vestigial")
+			t.Fatalf("parsePeerDir accepted a duplicate peer address")
 		}
 		if !strings.Contains(err.Error(), "duplicate") {
-			t.Fatalf("OOB config-parse: the dup-addr reject error does not name the conflict (got %q)", err)
+			t.Fatalf("duplicate-address error does not name the conflict: %q", err)
 		}
-		t.Logf("GATE PASS: OOB config-parse/malformed_dup_addr — a duplicate addr was REJECTED with %q (the dedup guard is load-bearing)", err)
+		t.Logf("duplicate address rejected: %q", err)
 	})
 	t.Run("malformed_region_oor", func(t *testing.T) {
-		// An out-of-range region (256 — exceeds uint8) — ParseUint(_, 10, 8) MUST reject.
 		bad := "127.0.0.1:9004 " + hex.EncodeToString(node1[:]) + " " + hex.EncodeToString(pub1[:]) + " - 256"
 		p := writeTempPeerDir(t, bad)
 		_, err := parsePeerDir(p)
 		if err == nil {
-			t.Fatalf("OOB config-parse: parsePeerDir ACCEPTED an out-of-range region 256 — the uint8 guard is vestigial")
+			t.Fatalf("parsePeerDir accepted region 256, which exceeds uint8")
 		}
-		t.Logf("GATE PASS: OOB config-parse/malformed_region_oor — an out-of-range region was REJECTED (the uint8 guard is load-bearing)")
+		t.Logf("out-of-range region rejected")
 	})
 }
 
-// TestOOBApply is the OOB apply guard: applyProvisioning registers each
-// peer's Ed25519 pubkey via gossiper.RegisterPeer (+ dir.RegisterPQ for the PQ
-// arm) + re-keys the TopologyManager's region tag under the REAL nodeID
-// (topo.SetRegion) → the topology selector HITS. The guard builds a minimal
-// gossiper (NewGossiper is nil-peers-safe — gossip.go:305 — RegisterPeer only
-// touches g.domains, NOT g.peers) + a real Directory + a real TopologyManager,
-// applies the known-good config, + asserts:
+// TestOOBApply checks Ed25519 and ML-DSA-65 registration in a real Directory
+// and region registration in a real TopologyManager. RegisterPeer only needs
+// the Directory inside Gossiper, so the other Gossiper dependencies can be nil.
+// Both provisioned cross-region peers must satisfy IsInterRegion; the peer with
+// no region must remain local to the topology's conservative default.
 //
-// - the Directory resolves each peer's nodeID → its Ed25519 pubkey (Register);
-// - the Directory resolves the hybrid peer's nodeID → BOTH pubkeys (LookupBoth);
-// - the TopologyManager's region tag is keyed under the REAL nodeID (the
-// retirement) → IsInterRegion(realNodeID) returns true for the cross-region peer.
-//
-// The RED control (the surrogate path): keying the topology under a
-// SURROGATE nodeID → IsInterRegion(realNodeID) is false → the selector misses →
-// the N=2 no-op reproduces (proving the re-keying is load-bearing).
+// A separate surrogate-key case verifies that IsInterRegion(realNodeID) fails
+// when only peerIDForAddr(addr) is registered, demonstrating why provisioning
+// must use the real nodeID.
 func TestOOBApply(t *testing.T) {
 	path, node1, node2, node3, pub1, pub2, pub3, pq2 := knownGoodPeerDir(t)
 
 	dir := identity.NewDirectory()
 	topo := mesh.NewTopologyManager(mesh.RegionTag(1)) // self-region 1
-	// A minimal gossiper: NewGossiper is nil-peers-safe (gossip.go:305; the
-	// /v1/insert path constructs one with a nil PeerSet). RegisterPeer only
-	// touches g.domains (gossip.go:598), so a nil PeerSet + nil engine + nil
-	// owner are safe for the APPLY guard (which never dials / signs / sweeps).
+	// RegisterPeer only touches the Directory held by the Gossiper. This test
+	// never dials, signs, or sweeps, so the other dependencies can be nil.
 	gossiper := mesh.NewGossiper(nil, nil, nil, dir)
 
-	// Refactor note: applyProvisioning now takes the pre-parsed
-	// cfgs (the main.go surrogate-pollution fix parses --peer-dir ONCE before
-	// the region loop). The guards mirror main.go: parsePeerDir(path) →
-	// applyProvisioning(cfgs). parsePeerDir surfaces the missing-file FAILSAFE
-	// error + the malformed-entry named-line error the guards assert.
+	// The command parses the file before applying entries so the surrogate-region
+	// pass can identify addresses that already have real nodeIDs.
 	cfgs, perr := parsePeerDir(path)
 	if perr != nil {
-		t.Fatalf("OOB apply: parsePeerDir(%q): %v", path, perr)
+		t.Fatalf("parsePeerDir(%q): %v", path, perr)
 	}
-	provisioned, err := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches NO peerdir entry, so these pre-existing guards stay byte-identical (nothing is skipped)*/)
+	provisioned, err := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches no configured peer */)
 	if err != nil {
-		t.Fatalf("OOB apply: applyProvisioning: %v", err)
+		t.Fatalf("applyProvisioning: %v", err)
 	}
-	// The provisioned map keys addr → real nodeID for the dial loop's branch.
+	// The dial loop uses this address-to-nodeID mapping.
 	if len(provisioned) != 3 {
-		t.Fatalf("OOB apply: provisioned map has %d entries, want 3", len(provisioned))
+		t.Fatalf("provisioned map has %d entries, want 3", len(provisioned))
 	}
 	if provisioned["127.0.0.1:9001"] != node1 || provisioned["127.0.0.1:9002"] != node2 || provisioned["127.0.0.1:9003"] != node3 {
-		t.Fatalf("OOB apply: provisioned map mismatch (got %+v)", provisioned)
+		t.Fatalf("provisioned map mismatch: %+v", provisioned)
 	}
-	// The Directory resolves each peer's nodeID → its Ed25519 pubkey (the
-	// verification anchor the receiver's Directory.Lookup reads).
+	// Each real nodeID must resolve to the configured Ed25519 public key.
 	for _, c := range []struct {
 		node [16]byte
 		pub  [32]byte
@@ -262,124 +221,108 @@ func TestOOBApply(t *testing.T) {
 	} {
 		got, ok := dir.Lookup(c.node)
 		if !ok {
-			t.Fatalf("OOB apply: Directory.Lookup(%x) MISSED — RegisterPeer did not register the peer's pubkey", c.node)
+			t.Fatalf("Directory.Lookup(%x) returned no key after RegisterPeer", c.node)
 		}
 		if !bytesEqual(got, c.pub[:]) {
-			t.Fatalf("OOB apply: Directory.Lookup(%x) returned %x, want %x — the pubkey did not round-trip", c.node, got, c.pub)
+			t.Fatalf("Directory.Lookup(%x) returned %x, want %x", c.node, got, c.pub)
 		}
 	}
-	// The hybrid peer resolves to BOTH pubkeys (the LookupBoth seam).
+	// The hybrid peer must resolve to both registered public keys.
 	edPub, pqPub, ok := dir.LookupBoth(node2)
 	if !ok {
-		t.Fatalf("OOB apply: Directory.LookupBoth(%x) MISSED — RegisterPQ did not register the PQ pubkey", node2)
+		t.Fatalf("Directory.LookupBoth(%x) returned no entry after RegisterPQ", node2)
 	}
 	if !bytesEqual(edPub, pub2[:]) {
-		t.Fatalf("OOB apply: LookupBoth(%x) edPub=%x, want %x", node2, edPub, pub2)
+		t.Fatalf("LookupBoth(%x) Ed25519 key is %x, want %x", node2, edPub, pub2)
 	}
 	if pqPub == nil || !bytesEqual(pqPub.Bytes(), pq2.Bytes()) {
-		t.Fatalf("OOB apply: LookupBoth(%x) pqPub does not match the minted PQ pubkey", node2)
+		t.Fatalf("LookupBoth(%x) ML-DSA-65 key does not match the configured key", node2)
 	}
-	// Peer-1 + peer-2 are NOT PQ-registered → LookupBoth returns a nil pqPub
-	// (the classical-only STRICT mode — Register was called, RegisterPQ was NOT).
+	// Peer 1 has no PQ key, so LookupBoth must leave that result nil.
 	if _, pq1, ok1 := dir.LookupBoth(node1); ok1 && pq1 != nil {
-		t.Fatalf("OOB apply: peer-1 (classical-only) should have a nil pqPub, got non-nil — RegisterPQ was called for a classical-only peer (a bug)")
+		t.Fatalf("classical-only peer 1 has an ML-DSA-65 key, want nil")
 	}
-	// The TopologyManager's region tag is keyed under the REAL nodeID (the
-	// retirement). Peer-2 is region 7 (cross-region vs self-region 1) →
-	// IsInterRegion(node2)=true → the inter-region arm fires. Peer-1 is region 3
-	// (also cross-region) → IsInterRegion(node1)=true.
+	// Peers 1 and 2 have regions 3 and 7 respectively, both different from the
+	// local region 1. Region lookup must use their real nodeIDs.
 	if !topo.IsInterRegion(node2) {
-		t.Fatalf("OOB apply: topo.IsInterRegion(%x)=false after applyProvisioning (peer-2 is region 7, self is region 1 — should be cross-region) — the topology was keyed under a SURROGATE, NOT the real nodeID; the retirement is broken", node2)
+		t.Fatalf("IsInterRegion(%x)=false for peer 2 in region 7; local region is 1", node2)
 	}
 	if !topo.IsInterRegion(node1) {
-		t.Fatalf("OOB apply: topo.IsInterRegion(%x)=false after applyProvisioning (peer-1 is region 3, self is region 1)", node1)
+		t.Fatalf("IsInterRegion(%x)=false for peer 1 in region 3; local region is 1", node1)
 	}
-	// Peer-3 has NO region (hasRegion=false) → applyProvisioning did NOT call
-	// SetRegion for it → IsInterRegion(node3)=false (untagged = intra = the
-	// conservative default).
+	// Peer 3 has no region, so applyProvisioning must not call SetRegion for it.
 	if topo.IsInterRegion(node3) {
-		t.Fatalf("OOB apply: topo.IsInterRegion(%x)=true after applyProvisioning (peer-3 has NO region — applyProvisioning should NOT have called SetRegion for it)", node3)
+		t.Fatalf("IsInterRegion(%x)=true for peer 3, which has no configured region", node3)
 	}
-	t.Logf("GATE PASS: OOB apply — applyProvisioning registered 3 pubkeys (1 hybrid via RegisterPQ) + re-keyed the topology under the REAL nodeIDs → IsInterRegion fires for the cross-region peers (the surrogate path retired); peer-3 (no region) stays intra")
+	t.Logf("registered three Ed25519 keys and one ML-DSA-65 key; region lookup uses real nodeIDs")
 
-	// The RED control: the surrogate path. Key the topology under a
-	// SURROGATE nodeID (peerIDForAddr(addr) — a SHA-256 surrogate; here a fixed
-	// stand-in) → IsInterRegion(realNodeID) is false → the selector misses →
-	// the N=2 no-op reproduces (proving the re-keying is load-bearing).
+	// Negative control: a topology keyed only by a fixed address surrogate has
+	// no region entry for the real nodeID.
 	surrogate := [16]byte{0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55}
 	topoRed := mesh.NewTopologyManager(mesh.RegionTag(1))
-	topoRed.SetRegion(surrogate, mesh.RegionTag(7)) // the surrogate keying
+	topoRed.SetRegion(surrogate, mesh.RegionTag(7)) // register only the surrogate
 	if topoRed.IsInterRegion(node2) {
-		t.Fatalf("OOB apply RED: the surrogate path made topo.IsInterRegion(real %x) TRUE — the RED did NOT reproduce the no-op (the surrogate == the real nodeID by accident — a build bug in the RED)", node2)
+		t.Fatalf("IsInterRegion(real %x)=true with only a surrogate region key", node2)
 	}
-	t.Logf("GATE PASS: OOB apply RED — the surrogate path MISSES (topo.IsInterRegion(real %x)=false when the region is keyed under the surrogate %x) — the N=2 no-op reproduces, proving the re-keying is load-bearing", node2, surrogate)
+	t.Logf("IsInterRegion(real %x)=false when region is keyed by surrogate %x", node2, surrogate)
 }
 
-// TestOOBEmptyNoOp is the OOB empty-no-op guard: an empty --peer-dir
-// (the OPT-IN default) returns an empty provisioned map + nil → the dial
-// loop's ELSE arm runs for every peer (zero peerID = byte-identical).
-// The honest no-op — distinct from a NON-EMPTY path that does not exist (the
-// missing-path guard below).
+// TestOOBEmptyNoOp verifies that the default empty --peer-dir path produces no
+// registrations and an empty provisioned map. The caller treats ErrPeerDirEmpty
+// as a disabled feature rather than a startup failure.
 func TestOOBEmptyNoOp(t *testing.T) {
 	dir := identity.NewDirectory()
 	topo := mesh.NewTopologyManager(mesh.RegionTag(1))
 	gossiper := mesh.NewGossiper(nil, nil, nil, dir)
-	// parsePeerDir("") returns ErrPeerDirEmpty (the OPT-IN no-op) — mirror
-	// main.go: treat ErrPeerDirEmpty as empty cfgs + nil (NOT a boot error).
+	// Mirror the command's handling of ErrPeerDirEmpty as an empty config.
 	cfgs, perr := parsePeerDir("")
 	if perr != nil && !errors.Is(perr, ErrPeerDirEmpty) {
-		t.Fatalf("OOB empty-no-op: parsePeerDir(\"\") returned err=%v (want ErrPeerDirEmpty or nil — the empty path is the OPT-IN no-op)", perr)
+		t.Fatalf("parsePeerDir with an empty path returned %v, want ErrPeerDirEmpty or nil", perr)
 	}
-	provisioned, err := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches NO peerdir entry, so these pre-existing guards stay byte-identical (nothing is skipped)*/)
+	provisioned, err := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches no configured peer */)
 	if err != nil {
-		t.Fatalf("OOB empty-no-op: applyProvisioning(\"\") returned err=%v (want nil — the empty path is the OPT-IN no-op, NOT a boot error)", err)
+		t.Fatalf("applyProvisioning with no entries returned %v", err)
 	}
 	if len(provisioned) != 0 {
-		t.Fatalf("OOB empty-no-op: applyProvisioning(\"\") returned %d entries (want 0 — the empty path provisions NOTHING; the dial loop keeps the zero peerID)", len(provisioned))
+		t.Fatalf("empty configuration returned %d provisioned peers, want 0", len(provisioned))
 	}
 	if dir.Len() != 0 {
-		t.Fatalf("OOB empty-no-op: Directory.Len()=%d after applyProvisioning(\"\") (want 0 — the empty path registers NOTHING)", dir.Len())
+		t.Fatalf("Directory.Len()=%d after empty configuration, want 0", dir.Len())
 	}
-	t.Logf("GATE PASS: OOB empty-no-op — applyProvisioning(\"\") returned an empty map + nil (the OPT-IN no-op; the dial loop's ELSE arm runs for every peer = zero peerID = byte-identical)")
+	t.Logf("empty path disabled provisioning and left the Directory empty")
 }
 
-// TestOOBMissingPathFails is the OOB missing-path-fails guard: a NON-EMPTY
-// path that does not exist FAILS the boot (a deploy misconfiguration MUST
-// surface loudly, NOT silently fall back to zero-peerID — the silent-partition
-// class the honest-negative posture forbids). Distinct from the empty-path
-// no-op: an operator who NAMES a file that is absent has
-// misconfigured the deploy; the boot MUST fail.
+// TestOOBMissingPathFails distinguishes a named but absent file from the
+// default empty path. The open error must include the path and must not be
+// mistaken for ErrPeerDirEmpty or suppressed by applyProvisioning.
 func TestOOBMissingPathFails(t *testing.T) {
 	dir := identity.NewDirectory()
 	topo := mesh.NewTopologyManager(mesh.RegionTag(1))
 	gossiper := mesh.NewGossiper(nil, nil, nil, dir)
 	missing := filepath.Join(t.TempDir(), "does-not-exist.conf")
-	// parsePeerDir surfaces the missing-file FAILSAFE error (the deploy
-	// misconfiguration MUST be loud — the silent-partition class the honest-
-	// negative posture forbids). NOT ErrPeerDirEmpty (the path is non-empty).
+	// A non-empty missing path must return an open error, not ErrPeerDirEmpty.
 	cfgs, err := parsePeerDir(missing)
 	if err == nil {
-		t.Fatalf("OOB missing-path-fails: parsePeerDir(%q) returned nil err (want non-nil — a named-but-absent --peer-dir is a deploy misconfiguration that MUST fail loudly, NOT silently fall back to zero-peerID)", missing)
+		t.Fatalf("parsePeerDir(%q) returned no error for an absent file", missing)
 	}
 	if cfgs != nil {
-		t.Fatalf("OOB missing-path-fails: parsePeerDir(%q) returned non-nil cfgs (want nil on error)", missing)
+		t.Fatalf("parsePeerDir(%q) returned entries after an open failure", missing)
 	}
 	if errors.Is(err, ErrPeerDirEmpty) {
-		t.Fatalf("OOB missing-path-fails: parsePeerDir(%q) returned ErrPeerDirEmpty (want a missing-file error — the path is non-empty, NOT the OPT-IN no-op)", missing)
+		t.Fatalf("parsePeerDir(%q) returned ErrPeerDirEmpty for a non-empty path", missing)
 	}
-	// applyProvisioning with nil cfgs (the parse failed) is a no-op that returns
-	// an empty map + nil — the missing-path error is the PARSE's responsibility
-	// (mirroring main.go: parsePeerDir surfaces it before applyProvisioning).
-	provisioned, applyErr := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches NO peerdir entry, so these pre-existing guards stay byte-identical (nothing is skipped)*/)
+	// The command handles the parse error before applyProvisioning. With nil
+	// configs, applyProvisioning itself has no entries to register.
+	provisioned, applyErr := applyProvisioning(gossiper, dir, topo, cfgs, [16]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} /* a self nodeID that matches no configured peer */)
 	_ = provisioned
 	_ = applyErr
 	if !strings.Contains(err.Error(), missing) {
-		t.Fatalf("OOB missing-path-fails: the error does not name the path (got %q)", err)
+		t.Fatalf("missing-file error does not name the path: %q", err)
 	}
-	t.Logf("GATE PASS: OOB missing-path-fails — applyProvisioning(%q) FAILED loudly (%q) — a deploy misconfiguration surfaces, NOT a silent zero-peerID fallback", missing, err)
+	t.Logf("parsePeerDir(%q) returned the missing-file error: %q", missing, err)
 }
 
-// writeTempPeerDir writes a single content string to a temp peer-dir config + returns its path.
+// writeTempPeerDir writes content to a temporary peer-directory file.
 func writeTempPeerDir(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -390,9 +333,7 @@ func writeTempPeerDir(t *testing.T, content string) string {
 	return p
 }
 
-// bytesEqual is a small helper to avoid importing bytes.Equal (the test compares
-// []byte slices from the Directory + the mldsa pubkey); a direct loop is the
-// zero-dependency form the provisioning.go parser itself uses.
+// bytesEqual compares Directory and ML-DSA-65 public-key encodings.
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -405,66 +346,54 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// TestOOBSurrogateRetirement is the OOB surrogate-retirement guard — the
-// The surrogate-pollution fix. A
-// peer tagged @region in --peers AND provisioned in --peer-dir must have its
-// region keyed under the REAL nodeID (applyProvisioning's SetRegion), NOT the
-// peerIDForAddr(addr) surrogate — so topology.Select does NOT carry a dead
-// surrogate (no live peerConn keys it) that would consume an inter-region
-// fan-out slot + evict a real cross-region peer.
+// TestOOBSurrogateRetirement covers a peer that has both an @region suffix in
+// --peers and an identity in --peer-dir. applySurrogateRegions must skip the
+// address-derived ID so applyProvisioning can register the region under the
+// real nodeID. Otherwise Select can spend an inter-region slot on an ID with no
+// live peer connection.
 //
-// The guard calls applySurrogateRegions (the REAL helper main.go calls, NOT a
-// re-implementation) + simulates applyProvisioning's SetRegion(realNodeID,
-// region) on the SAME topo, then asserts:
-// - the REAL nodeID IS in the registry (region keyed) + IsInterRegion=true;
-// - the surrogate peerIDForAddr(addr) is NOT in the registry (the gate
-// skipped it — the dead-surrogate pollution is retired).
-//
-// RED control: applySurrogateRegions with an EMPTY provisionedAddr (no --peer-dir)
-// → the surrogate IS keyed (the path) → the dead surrogate pollutes
-// the registry. This proves the gate is load-bearing: remove the
-// `if provisionedAddr[addr] { continue }` and the RED would re-key the
-// surrogate, failing the GREEN assertion.
+// The test uses the same applySurrogateRegions helper as the command, followed
+// by the SetRegion call made by applyProvisioning. The no-directory control
+// retains surrogate registration; the provisioned case must omit it and select
+// the real nodeID.
 func TestOOBSurrogateRetirement(t *testing.T) {
 	selfRegion := mesh.RegionTag(1)
-	peerAddr := "10.0.0.2:7430"
+	peerAddr := "192.0.2.2:7430"
 	peerRegion := mesh.RegionTag(3)
 	peerNodeID := [16]byte{0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44}
-	surrogate := peerIDForAddr(peerAddr) // the SHA-256 surrogate
+	surrogate := peerIDForAddr(peerAddr) // SHA-256 address surrogate
 	if surrogate == peerNodeID {
-		t.Fatalf("OOB surrogate-retirement: the surrogate == the real nodeID by construction (a test bug — pick a distinct peerNodeID)")
+		t.Fatalf("test surrogate equals the real nodeID; choose a distinct peerNodeID")
 	}
 
-	// RED — the path (EMPTY provisionedAddr = no --peer-dir). The
-	// surrogate IS keyed → the dead surrogate pollutes the registry.
+	// Without a peer directory, applySurrogateRegions registers the surrogate.
 	topoRed := mesh.NewTopologyManager(selfRegion)
 	applySurrogateRegions(topoRed, peerAddr+"@3", map[string]bool{})
 	if !topoRed.IsInterRegion(surrogate) {
-		t.Fatalf("OOB surrogate-retirement RED: the path (empty provisionedAddr) did NOT key the surrogate %x — the RED did NOT reproduce the pollution (topo.IsInterRegion(surrogate)=false, want true)", surrogate)
+		t.Fatalf("IsInterRegion(surrogate %x)=false without a peer directory, want true", surrogate)
 	}
-	t.Logf("GATE PASS: OOB surrogate-retirement RED — the path keys the surrogate %x (the dead-surrogate pollution reproduces) → the gate is load-bearing", surrogate)
+	t.Logf("address surrogate %x registered when no peer directory is present", surrogate)
 
-	// THE RETIREMENT — the path (provisionedAddr carries the peer's
-	// addr). applySurrogateRegions SKIPS the surrogate; applyProvisioning's
-	// SetRegion(realNodeID, region) keys the real nodeID instead.
+	// A provisioned address suppresses surrogate registration; the real nodeID
+	// receives the region instead.
 	topo := mesh.NewTopologyManager(selfRegion)
 	applySurrogateRegions(topo, peerAddr+"@3", map[string]bool{peerAddr: true})
-	topo.SetRegion(peerNodeID, peerRegion) // the applyProvisioning SetRegion under the REAL nodeID
+	topo.SetRegion(peerNodeID, peerRegion) // applyProvisioning uses the real nodeID
 	if topo.IsInterRegion(surrogate) {
-		t.Fatalf("OOB surrogate-retirement: the surrogate %x IS in the registry after applySurrogateRegions with the provisionedAddr gate — the dead-surrogate pollution was NOT retired (the gate `if provisionedAddr[addr] { continue }` is missing or broken)", surrogate)
+		t.Fatalf("surrogate %x remains registered for a provisioned address", surrogate)
 	}
 	if !topo.IsInterRegion(peerNodeID) {
-		t.Fatalf("OOB surrogate-retirement: the REAL nodeID %x is NOT in the registry after applyProvisioning's SetRegion — the region was keyed under neither the surrogate NOR the real nodeID (topo.IsInterRegion(real)=false, want true; self=%d peer=%d)", peerNodeID, selfRegion, peerRegion)
+		t.Fatalf("IsInterRegion(real %x)=false after provisioning; self=%d peer=%d", peerNodeID, selfRegion, peerRegion)
 	}
-	t.Logf("GATE PASS: OOB surrogate-retirement — the surrogate %x is NOT in the registry (the gate skipped it) + the REAL nodeID %x IS keyed + IsInterRegion=true → topology.Select carries NO dead surrogate → the inter-region fan-out slot is NOT wasted", surrogate, peerNodeID)
+	t.Logf("surrogate %x omitted and real nodeID %x registered", surrogate, peerNodeID)
 
-	// The load-bearing assertion: Select returns the REAL nodeID, NOT the
-	// surrogate (the dead surrogate does NOT consume a fan-out slot).
+	// Select must return the real nodeID rather than spending a slot on the
+	// surrogate, which has no corresponding peer connection.
 	topo.SetSeed(1)
 	sel := topo.Select(context.Background())
 	for _, id := range sel {
 		if id == surrogate {
-			t.Fatalf("OOB surrogate-retirement: Select returned the DEAD surrogate %x (a fan-out slot wasted on a peer no live peerConn keys) — the pollution was NOT retired", surrogate)
+			t.Fatalf("Select returned surrogate %x, which has no peer connection", surrogate)
 		}
 	}
 	foundReal := false
@@ -474,63 +403,47 @@ func TestOOBSurrogateRetirement(t *testing.T) {
 		}
 	}
 	if !foundReal {
-		t.Fatalf("OOB surrogate-retirement: Select did NOT return the REAL nodeID %x (got %d peerIDs) — the inter-region arm lost its only cross-region peer", peerNodeID, len(sel))
+		t.Fatalf("Select did not return real nodeID %x; got %d peerIDs", peerNodeID, len(sel))
 	}
-	t.Logf("GATE PASS: OOB surrogate-retirement — Select returns the REAL nodeID %x (NOT the dead surrogate) → no fan-out slot wasted → convergence + the 24th counter are not degraded by dead surrogates", peerNodeID)
+	t.Logf("Select returned real nodeID %x and omitted the address surrogate", peerNodeID)
 }
 
-// TestOOBNodeIDDedup is the OOB nodeID-dedup guard — the
-// A review finding: parsePeerDir MUST reject
-// two config lines with the SAME nodeID but DIFFERENT addrs (a multi-homed
-// peer OR a copy-paste deploy error). The PRE-EXISTING addr-only dedup
-// (provisioning.go:210 `seen[cfg.addr]`) let both pass → applyProvisioning's
-// second RegisterPeer/RegisterPQ silently OVERWROTE the first's Directory
-// binding (directory.go d.m[nodeID]=canonical, no error) → the first peer's
-// deltas (signed under the first peer's seed) DROPPED as forged → a silent
-// partition the FAILSAFE parser must catch.
+// TestOOBNodeIDDedup rejects two addresses that share a nodeID. Address-only
+// deduplication would allow both entries, and the later RegisterPeer or
+// RegisterPQ call would replace the first Directory binding. The first peer's
+// deltas would then fail signature verification under its own key.
 //
-// The guard builds a 2-line config with the same nodeID + different addrs +
-// asserts parsePeerDir REJECTS it with a duplicate-nodeID error. RED control:
-// a 2-line config with DIFFERENT nodeIDs + different addrs is ACCEPTED (the
-// dedup is nodeID-specific, not a false reject).
+// The distinct-nodeID control confirms that valid multi-peer files still parse.
 func TestOOBNodeIDDedup(t *testing.T) {
-	// Two distinct addrs sharing ONE nodeID — the deploy error the dedup catches.
-	// The nodeID column is 32 hex chars (16 bytes); the ed25519 pubkey is 64 hex
-	// chars (32 bytes). Both lines carry the SAME 32-char nodeID + different
-	// addrs so the dedup (NOT the length check) is the gate that rejects.
+	// Both entries are well formed and differ only in address, so rejection must
+	// come from the duplicate-nodeID check rather than key-length validation.
 	nodeID := [16]byte{0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44}
 	nodeHex := strings.Repeat("44", 16) // 16-byte nodeID (32 hex chars)
 	edHex := strings.Repeat("44", 32)   // 32-byte Ed25519 pubkey (64 hex chars)
-	dupCfg := "10.0.0.2:7430 " + nodeHex + " " + edHex + "\n" +
-		"10.0.0.3:7430 " + nodeHex + " " + edHex + "\n"
+	dupCfg := "192.0.2.2:7430 " + nodeHex + " " + edHex + "\n" +
+		"192.0.2.3:7430 " + nodeHex + " " + edHex + "\n"
 	dupPath := writeTempPeerDir(t, dupCfg)
 	cfgs, err := parsePeerDir(dupPath)
 	if err == nil {
-		t.Fatalf("OOB nodeID-dedup: parsePeerDir accepted two lines with the SAME nodeID %x but DIFFERENT addrs (the addr-only dedup let both pass → the second RegisterPeer would silently overwrite the first's Directory binding → the first peer's deltas dropped as forged — a silent partition the FAILSAFE parser must reject)", nodeID)
+		t.Fatalf("parsePeerDir accepted duplicate nodeID %x at different addresses", nodeID)
 	}
-	// The rejection MUST be the nodeID-dedup (NOT the length check — both lines
-	// are well-formed). Assert the error names the duplicate nodeID so the guard
-	// cannot pass on a wrong-reason rejection.
 	if !strings.Contains(err.Error(), "duplicate peer nodeID") {
-		t.Fatalf("OOB nodeID-dedup: parsePeerDir rejected the dup-nodeID config but the error does NOT name the duplicate (got %q — want a 'duplicate peer nodeID' error, NOT a length/decode error — the dedup is the gate that fired)", err.Error())
+		t.Fatalf("error does not identify the duplicate peer nodeID: %q", err.Error())
 	}
 	_ = cfgs
-	t.Logf("GATE PASS: OOB nodeID-dedup — parsePeerDir REJECTED two lines with the same nodeID %x + different addrs via the nodeID-dedup (the error names the duplicate → the silent-shadow deploy error is caught)", nodeID)
+	t.Logf("duplicate nodeID %x at different addresses rejected", nodeID)
 
-	// RED control — two DISTINCT nodeIDs + distinct addrs MUST be accepted (the
-	// dedup is nodeID-specific, NOT a false reject of a legitimate multi-peer
-	// config). Without this control the dedup could reject ALL multi-line
-	// configs + the GREEN above would be vacuous. The nodeID column is 32 hex
-	// chars (16 bytes); the ed25519 pubkey column is 64 hex chars (32 bytes).
-	distinctCfg := "10.0.0.2:7430 " + strings.Repeat("44", 16) + " " + edHex + "\n" +
-		"10.0.0.3:7430 " + strings.Repeat("55", 16) + " " + strings.Repeat("55", 32) + "\n"
+	// Distinct nodeIDs and addresses must remain valid; otherwise the duplicate
+	// check would reject every multi-peer file rather than this specific error.
+	distinctCfg := "192.0.2.2:7430 " + strings.Repeat("44", 16) + " " + edHex + "\n" +
+		"192.0.2.3:7430 " + strings.Repeat("55", 16) + " " + strings.Repeat("55", 32) + "\n"
 	distinctPath := writeTempPeerDir(t, distinctCfg)
 	dcfgs, derr := parsePeerDir(distinctPath)
 	if derr != nil {
-		t.Fatalf("OOB nodeID-dedup RED-control: parsePeerDir rejected a LEGITIMATE 2-peer config with distinct nodeIDs (got %v) — the dedup is a false-positive, NOT a nodeID-specific guard", derr)
+		t.Fatalf("parsePeerDir rejected distinct nodeIDs: %v", derr)
 	}
 	if len(dcfgs) != 2 {
-		t.Fatalf("OOB nodeID-dedup RED-control: parsePeerDir returned %d cfgs (want 2) — a legitimate 2-peer config was not fully parsed", len(dcfgs))
+		t.Fatalf("parsePeerDir returned %d entries for two distinct peers, want 2", len(dcfgs))
 	}
-	t.Logf("GATE PASS: OOB nodeID-dedup RED-control — a legitimate 2-peer config with distinct nodeIDs is ACCEPTED (the dedup is nodeID-specific, NOT a false reject)")
+	t.Logf("two entries with distinct nodeIDs parsed successfully")
 }

@@ -4,35 +4,32 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package mesh — batch.go is the SEND-side batch builder + the gossip
-// ShipBatch path (the arithmetic unlock).
+// Package mesh builds and ships signed batches of CRDT deltas.
 //
-// THE AMORTIZATION (load-bearing): the per-frame shipDelta path (gossip.go:262)
-// signs ONE Ed25519 per delta — 60.19 us/delta at 32c, a 533K/sec ceiling.
-// This change adds a SECOND ship path (ShipBatch) that accumulates up to --batch-size
-// self-originated deltas, builds ONE CRDTDeltaBatch wire, signs ONCE, and
-// publishes ONCE. The verify cost amortizes from 60.19 us/delta to 60.19/N
-// us/delta — the arithmetic unlock for the >=1M/sec headline.
+// The per-frame shipDelta path signs every delta separately: 60.19 µs per
+// signature in the 32-core benchmark, a ceiling of 533,000 signatures per
+// second. ShipBatch accumulates up to --batch-size self-originated deltas into
+// one CRDTDeltaBatch, signs once, and publishes once. The per-entry signature
+// cost is therefore 60.19/N µs before decode and apply costs.
 //
-// THE SELF-ORIGIN BOUNDARY (encode it, do NOT hide it): ShipBatch covers ONLY
-// self-originated deltas (a node batching its OWN N writes). A relayer
-// forwarding a FOREIGN delta holds ONLY its own relay seed — it NEVER holds the
-// foreign ORIGIN's seed, so it CANNOT re-origin-sign a foreign delta. Relay-
-// chained foreign deltas STAY per-frame (the frozen RelayEnvelope v3 hop chain
-// in envelope.go — UNTOUCHED). A batch that relayer-signs foreign origins is a
-// FORGERY. The per-frame shipDelta is RETAINED as the low-rate / fallback /
-// relay path (NOT deleted).
+// ShipBatch signs only the node's own writes. A relayer does not hold the
+// origin's seed, so it re-publishes the retained origin-signed envelope instead
+// of creating a new batch signature. The per-frame shipDelta path remains
+// available for low-rate traffic, fallback, and per-frame relay.
 //
-// THE CRYPTO-MINIMAL DESIGN: Ed25519 signs the MARSHALED CRDTDeltaBatch WIRE
-// DIRECTLY (no SHA-256 batch root). The wire the origin signs is the wire the
-// receiver's ApplyCRDTDeltaBatch decodes — the bytes Verify checks ARE the bytes
-// the engine Joins (the no-hash-then-reconstruct-gap property, ADR-0010 §2).
+// Ed25519 signs the marshaled CRDTDeltaBatch directly, without an intermediate
+// SHA-256 batch root. The receiver verifies those bytes before
+// ApplyCRDTDeltaBatch decodes and joins them (ADR-0010 §2).
 package mesh
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
+	"slices"
+	"strings"
+	"time"
 
 	capnp "capnproto.org/go/capnp/v3"
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
@@ -42,55 +39,75 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// MaxBatchSize is the upper bound on the number of deltas a single batch
-// carries. It is bounded by the capnp CRDTDeltaBatch list length (int32) and by
-// the honest amortization floor: a batch larger than the verify/apply crossover
-// N* pays more in decode than it saves in verify (the bench table reveals the
-// sweet spot). 256 is the conservative ceiling the --batch-size flag enforces;
-// the default is 100 (the deliverable's headline N).
+// MaxBatchSize bounds the number of deltas in one batch. The Cap'n Proto list
+// length permits more, but batches past the verify/apply crossover spend more
+// on decoding than they save on verification. The --batch-size flag enforces
+// this ceiling; the default is 100.
 const MaxBatchSize = 256
 
-// DefaultBatchSize is the --batch-size default. 100 is the N the
-// arithmetic unlock targets: 60.19us/100 ~= 0.60 us/delta verify, amortized
-// against the ~36 ns/entry apply floor. A --batch-size of 1 selects the
-// per-frame shipDelta path (batching disabled — the back-compat default for a
-// node that has not opted into the batch path).
+// DefaultBatchSize is the --batch-size default. At 100 events, the 60.19 µs
+// signature cost is 0.60 µs per event before the approximately 36 ns/entry
+// apply cost. Setting --batch-size=1 selects the per-frame shipDelta path.
 const DefaultBatchSize = 100
 
-// BuiltEvent is the (entityID, payload, entry) triple ShipBatch accumulates
-// before building one CRDTDeltaBatch wire. It carries exactly the fields the
-// capnp CRDTDeltaEvent setter surface stamps (the 12 contract fields + the
-// version tag), so BuildCRDTDeltaBatch assembles the batch LIST directly via the
-// generated capnp API (NewRootCRDTDeltaBatch + NewEvents(n) + the ev.At(i).Set*
-// loop) — mirroring the crdt_apply_batch_test.go:buildBatchWireFrame reference
-// pattern. It does NOT call BuildCRDTDeltaEvent per event (that would build N
-// independent single-event messages and discard them; assembling the batch list
-// directly builds ONE message with N events in one arena).
+// BuiltEvent is the (entityID, payload, entry) triple accumulated by ShipBatch.
+// It supplies every CRDTDeltaEvent contract field and the wire version.
+// BuildCRDTDeltaBatch writes these triples directly into one Cap'n Proto event
+// list rather than constructing and discarding a separate message per event.
 type BuiltEvent struct {
 	EntityID string
 	Payload  string
 	Entry    eng.CRDTEntry
 }
 
-// BuildCRDTDeltaBatch assembles a CRDTDeltaBatch containing N CRDTDeltaEvent
-// frames (one per BuiltEvent), MARSHALS it to capnp bytes, and returns the
-// []byte — exactly the shape an inbound batched transport frame hands to the
-// frozen ApplyCRDTDeltaBatch (crdt_apply_batch.go:118). It mirrors the
-// crdt_apply_batch_test.go:buildBatchWireFrame reference pattern:
+// shipBuildCapture records the post-sort buffer, its destination peer, and the
+// walk+accumulate+sort duration. On the shared-build path the buffer content is
+// peer-independent, but peer identifies the first peer that triggered the
+// build.
+type shipBuildCapture struct {
+	// Pointer fields come first so the GC's scanned prefix ends after the
+	// slice's pointer slot at offset 0. The remaining fields are scalar.
+	buf      []BuiltEvent
+	peer     [16]byte
+	walkSort time.Duration
+}
+
+// snapshotBuiltEvents makes an owned copy of a capture's buffer. EntityID and
+// Payload are unsafe.String views into arena storage; tests can inspect the
+// snapshot after sharedDelta.Release drops the EBR pin. Call sites invoke this
+// only behind probe nil checks, so the unarmed path does not allocate here.
+func snapshotBuiltEvents(batch []BuiltEvent) []BuiltEvent {
+	cp := make([]BuiltEvent, len(batch))
+	for i := range batch {
+		cp[i] = batch[i]
+		cp[i].EntityID = strings.Clone(batch[i].EntityID)
+		cp[i].Payload = strings.Clone(batch[i].Payload)
+	}
+	return cp
+}
+
+// shipBuildMetric records {peer, n, walkSort} without a buffer reference. At
+// the 700,000-event shape, content captures would retain roughly 106.4 MB for
+// each of 35 per-peer buffers.
+type shipBuildMetric struct {
+	peer     [16]byte
+	n        int
+	walkSort time.Duration
+}
+
+// BuildCRDTDeltaBatch assembles one CRDTDeltaEvent per BuiltEvent and returns
+// the marshaled Cap'n Proto batch consumed by ApplyCRDTDeltaBatch. It follows
+// the buildBatchWireFrame reference pattern in crdt_apply_batch_test.go:
 //
 //	capnp.NewMessage(capnp.SingleSegment(nil))
 //	NewRootCRDTDeltaBatch(seg)
 //	batch.NewEvents(int32(len(events)))
 //	for i, ev := range events { events.At(i).Set* ... }
-//	msg.Marshal
+//	msg.Marshal()
 //
-// Every CRDTDeltaEvent contract field is stamped from the BuiltEvent's CRDTEntry
-// (the 12 fields + the version tag), exactly as BuildCRDTDeltaEvent
-// (crdt_capnp_wire.go:66) stamps them for the per-frame path — so the batched
-// wire and the per-frame wire carry the SAME per-event bytes, and the two paths
-// converge to the SAME engine state (the cross-path MerkleRoot determinism
-// guard, ADR-0010 §3). It does NOT invent fields; the setter surface is the
-// generated capnp API (schema.capnp.go:187-318).
+// It stamps the same 12 contract fields and version tag as
+// BuildCRDTDeltaEvent. The batched and per-frame paths therefore carry the same
+// event data and converge to the same engine state (ADR-0010 §3).
 func BuildCRDTDeltaBatch(events []BuiltEvent) ([]byte, error) {
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
 	if err != nil {
@@ -102,8 +119,8 @@ func BuildCRDTDeltaBatch(events []BuiltEvent) ([]byte, error) {
 	}
 	if len(events) == 0 {
 		// An empty batch is a valid wire frame: the events pointer is left unset
-		// (HasEvents == false) and batch.Events returns a zero-length list
-		// — the frozen ApplyCRDTDeltaBatch Case 3 fixture (a no-op Join).
+		// (HasEvents() == false) and batch.Events() returns a zero-length list
+		// — the ApplyCRDTDeltaBatch Case 3 fixture (a no-op Join).
 		data, err := msg.Marshal()
 		if err != nil {
 			return nil, fmt.Errorf("mesh: BuildCRDTDeltaBatch: marshal empty: %w", err)
@@ -147,25 +164,18 @@ func BuildCRDTDeltaBatch(events []BuiltEvent) ([]byte, error) {
 	return data, nil
 }
 
-// ShipBatch builds ONE CRDTDeltaBatch wire from the accumulated self-originated
-// events, signs it ONCE (identity.SignCRDTFrame(g.owner.Seed, batchWire) — the
-// hedged Ed25519 symbol, eddsa_hedge.go:84), wraps it in a BatchEnvelope
-// (attribution.MarshalBatchEnvelope — the crypto-minimal envelope, wire_v1.go),
-// length-prefixes it (receive.LengthPrefixFrame — forward.go:104), and publishes
-// it to peerID (peers.Publish — the TransmitTLSFrame copy-mode writer).
-// It returns the per-batch counters (one batch shipped, N entries shipped).
+// ShipBatch marshals self-originated events into one CRDTDeltaBatch, signs it
+// once with identity.SignCRDTFrame, wraps it in a BatchEnvelope, adds a length
+// prefix, and publishes it to peerID. It returns one shipped batch and the
+// number of entries it carried.
 //
-// THE ONE SIGNATURE: a single Ed25519 over the marshaled CRDTDeltaBatch wire
-// covers ALL N deltas — the 60.19us that now amortizes to 60.19/N us/delta. The
-// receiver's HandleBatchFrame verifies this ONE signature (VerifyCRDTFrame)
-// then ApplyCRDTDeltaBatch decodes the wire and Joins all N in one decode +
-// one Join (the frozen engine path, crdt_apply_batch.go:118).
+// HandleBatchFrame verifies the signature before ApplyCRDTDeltaBatch decodes
+// and joins the events. The per-entry signature cost is 60.19/N µs for N
+// entries, excluding decode and apply.
 //
-// SELF-ORIGIN ONLY: the events MUST be this node's own writes (the owner's seed
-// signs them). A caller that forwards foreign deltas here commits a FORGERY
-// (the relay has no foreign origin seed). The per-frame shipDelta is the path
-// for relay-chained foreign deltas; ShipBatch is the self-originated high-rate
-// path.
+// The events must be this node's own writes because g.owner.Seed signs them.
+// Relays re-publish retained origin-signed envelopes rather than passing
+// foreign events to ShipBatch.
 func (g *Gossiper) ShipBatch(ctx context.Context, peerID [16]byte, events []BuiltEvent) (shippedBatches, shippedEntries int, err error) {
 	if len(events) == 0 {
 		return 0, 0, nil
@@ -177,35 +187,27 @@ func (g *Gossiper) ShipBatch(ctx context.Context, peerID [16]byte, events []Buil
 		return 0, 0, ctx.Err()
 	}
 
-	// Build + sign + mint the seq ONCE PER SWEEP,
-	// then ship the SAME envelope bytes to every selected peer. Measured licence
-	// (pkg/mesh/sweep_phase_bench_test.go): per-peer build+sign
-	// was 164.42 ms of a 167.28 ms sweep = 98.3% of the compute, at 3,500 signatures
-	// per sweep (35 peers x 100 batches). After this change it is 100 — a 35x cut —
-	// and the origin's OriginSeq advances by the number of BATCHES rather than
-	// batches x peers.
+	// Build, sign, and allocate the sequence once per sweep, then publish the
+	// same envelope to every selected peer. In the benchmark, per-peer build+sign
+	// took 164.42 ms of a 167.28 ms sweep (98.3%) for 3,500 signatures: 35 peers
+	// times 100 batches. Sharing produces 100 signatures and advances OriginSeq
+	// by the number of distinct batches rather than batches times peers.
 	//
-	// WHY THIS IS SOUND ON THE BYTES (verified before coding):
-	//   - attribution/wire_v1.go's layout is magic/version/originSeq/batchCount/
-	//     originNodeID/originSig/batchWire — there is NO RECIPIENT FIELD, so a signed
-	//     batch envelope is PEER-AGNOSTIC by construction;
-	//   - the signature covers batchWire ONLY (identity.SignCRDTFrame(seed, batchWire));
-	//   - peerID was already used SOLELY as the Publish target.
-	// WHY IT IS SAFE UNDER: the receiver's rate gate keys on
-	// (originNodeID, OriginSeq). Sending the SAME OriginSeq to N peers means each peer
-	// sees a monotone per-origin sequence with no interleave, which is the BEST case
-	// for the high-water-mark discipline. Under the PRE-code this change would
-	// have been dangerous (a repeated seq was a delta-0 that Dropped once the budget
-	// hit zero); made delta-0 an unconditional Keep, so it is safe now and was
-	// not before.
+	// A BatchEnvelope contains no recipient field, and its signature covers only
+	// batchWire, so the bytes are peer-independent. The receiver's rate gate keys
+	// on (originNodeID, OriginSeq); each peer sees the same monotonic per-origin
+	// sequence without interleaving. A repeated sequence has delta zero and is
+	// retained rather than consuming the admission budget.
 	//
-	// The cache is keyed by the sweep round + the batch's ordinal within that round,
-	// so a second sweep re-signs (fresh content, fresh seq) while every peer inside
-	// ONE sweep shares one envelope. It is reset per sweep by AntiEntropySweep, so it
-	// cannot grow.
+	// The cache key is the sweep round and the batch's ordinal within it. Every
+	// peer in one sweep shares an envelope, while the next sweep signs fresh
+	// content with a fresh sequence. AntiEntropySweep resets the cache each round.
 	if pre, ok := g.sweepEnvelope(len(events)); ok {
 		if err := g.peers.Publish(peerID, pre); err != nil {
 			return 0, 0, fmt.Errorf("mesh: ShipBatch: Publish to %x: %w", peerID, err)
+		}
+		if !g.bytesBlind.Load() {
+			g.sweepShipBytes += int64(len(pre))
 		}
 		return 1, len(events), nil
 	}
@@ -215,8 +217,7 @@ func (g *Gossiper) ShipBatch(ctx context.Context, peerID [16]byte, events []Buil
 		return 0, 0, fmt.Errorf("mesh: ShipBatch: %w", err)
 	}
 
-	// THE ONE SIGNATURE — the amortization. One Ed25519 over the marshaled
-	// CRDTDeltaBatch wire covers all N deltas.
+	// One Ed25519 signature covers every delta in the marshaled batch.
 	sig, err := identity.SignCRDTFrame(g.owner.Seed, batchWire)
 	if err != nil {
 		return 0, 0, fmt.Errorf("mesh: ShipBatch: SignCRDTFrame: %w", err)
@@ -224,65 +225,45 @@ func (g *Gossiper) ShipBatch(ctx context.Context, peerID [16]byte, events []Buil
 	var sigArr [attribution.OriginSigSize]byte
 	copy(sigArr[:], sig)
 
-	// The origin's MONOTONIC per-batch sequence — the rate-gate counter. It
-	// advances by 1 per DISTINCT batch (no longer once per peer, so the
-	// churn is divided by the fan-out) so the receiver's PeerBucket.Accept drains on
-	// the delta between successive batches (a burst of batches drains the
-	// origin's budget). It is NOT the BatchCount (a static count would produce
-	// a zero delta between same-size batches and the budget would never drain).
-	// AntiEntropySweep is single-goroutine (the SweepLoop), so the increment is
-	// race-free.
+	// OriginSeq advances once per distinct batch, not once per peer.
+	// PeerBucket.Accept drains its budget by the delta between successive
+	// sequences. BatchCount cannot serve this purpose because equal-sized
+	// batches would produce zero deltas. The single sweep goroutine makes the
+	// increment race-free.
 	g.batchSeq++
 	originSeq := g.batchSeq
 
-	// The crypto-minimal envelope: the wire the origin signs is the wire the
-	// receiver applies (no SHA-256 batch root — sign the wire directly).
+	// Sign and apply the same batch bytes; there is no intermediate batch root.
 	env := attribution.MarshalBatchEnvelope(g.owner.NodeID, sigArr, originSeq, uint16(len(events)), batchWire)
 	prefixed := receive.LengthPrefixFrame(env)
 	g.cacheSweepEnvelope(len(events), prefixed)
 	if err := g.peers.Publish(peerID, prefixed); err != nil {
 		return 0, 0, fmt.Errorf("mesh: ShipBatch: Publish to %x: %w", peerID, err)
 	}
+	if !g.bytesBlind.Load() {
+		g.sweepShipBytes += int64(len(prefixed))
+	}
 	return 1, len(events), nil
 }
 
-// ShipBatchHybrid is the (ADR-0037) hybrid-SIGN sibling of ShipBatch:
-// it builds ONE CRDTDeltaBatch wire from the accumulated self-originated
-// events, signs it ONCE under BOTH Ed25519 + ML-DSA-65 via
-// identity.SignCRDTFrame_Hybrid (the [64] edSig + the [3309] pqSig over the
-// SAME 120-byte SHAKE256 pad of batchWire), wraps it in a HybridEnvelope
-// (attribution.MarshalHybridFrame — the crypto-minimal hybrid envelope,
-// wire_v1.go), length-prefixes it (receive.LengthPrefixFrame), and publishes it
-// to peerID. It returns the per-batch counters (one batch shipped, N entries
-// shipped). It is the SEND-side complement to the receiver's HandleHybridFrame
-// (the BOTH-verify gate).
+// ShipBatchHybrid is the opt-in hybrid-signing counterpart of ShipBatch
+// (ADR-0037). It signs one CRDTDeltaBatch with both Ed25519 and ML-DSA-65 via
+// identity.SignCRDTFrame_Hybrid: a [64]byte classical signature and a
+// [3309]byte post-quantum signature over the same 120-byte SHAKE256 pad. The
+// resulting HybridEnvelope is length-prefixed and published to peerID. It
+// returns one batch and its entry count.
 //
-// THE TWO SIGNATURES: a single Ed25519 + a single ML-DSA-65 over the 120-byte
-// SHAKE256 pad of the marshaled CRDTDeltaBatch wire cover ALL N deltas — the
-// 60.19us classical SIGN + the 585.8us ML-DSA-65 SIGN (4c loopback, NOT silicon
-// — the SIGN cost, NOT the verify; the 73.7us number is the ML-DSA-65 VERIFY
-// bench BenchmarkMLDSA65_Verify_120B-4, a DIFFERENT operation — see the
-// /verify-audit honesty fix below) amortize to (60.19 + 585.8)/N us/delta.
-// The receiver's HandleHybridFrame verifies BOTH sigs (VerifyBatchHybrid — the
-// both-required gate, the ~60us classical verify + the ~73.7us PQ verify, BOTH
-// over the SAME pad) then ApplyCRDTDeltaBatch decodes the wire and Joins all
-// N in one decode + one Join (the frozen engine path, crdt_apply_batch.go:118 —
-// the SAME apply path ShipBatch uses).
+// The four-core loopback measurements are 60.19 µs for Ed25519 signing and
+// 585.8 µs for ML-DSA-65 signing, or (60.19+585.8)/N µs per entry. The separate
+// BenchmarkMLDSA65_Verify_120B-4 result of 73.7 µs measures verification, not
+// signing. HandleHybridFrame requires both verifications before the same
+// ApplyCRDTDeltaBatch path used by ShipBatch decodes and joins the events.
 //
-// SELF-ORIGIN ONLY: the events MUST be this node's own writes (the owner's seed
-// + the owner's PQ key sign them). A caller that forwards foreign deltas here
-// commits a FORGERY (the relay has no foreign origin seed + no foreign origin
-// PQ key — it can ADD a relay hop-sig but CANNOT re-origin-sign a foreign delta
-// under EITHER sig). The per-frame shipDelta is the path for relay-chained
-// foreign deltas; ShipBatchHybrid is the self-originated high-rate hybrid path,
-// the SAME boundary ShipBatch enforces.
-//
-// ARMED guard: a Gossiper whose owner has NO PQ key (owner.PQPriv == nil —
-// NewNodeIdentity, NOT NewNodeIdentityHybrid) returns an error here (the PQ half
-// has no signer); the caller (shipBatchedDelta) logs + skips the batch, NOT a
-// panic — the v1 batch path + the relay/foreign path are unaffected. The
-// deploy discipline: --hybrid-sign arms the gossiper ONLY when the owner was
-// constructed via NewNodeIdentityHybrid (cmd wiring).
+// Only the owner's keys can produce these origin signatures. Relays re-publish
+// retained origin-signed envelopes rather than forwarding foreign events here.
+// If owner.PQPriv is nil, ShipBatchHybrid returns an error and shipBatchedDelta
+// skips the batch without panicking; v1 and relay shipping remain available.
+// Command wiring enables --hybrid-sign only for NewNodeIdentityHybrid owners.
 func (g *Gossiper) ShipBatchHybrid(ctx context.Context, peerID [16]byte, events []BuiltEvent) (shippedBatches, shippedEntries int, err error) {
 	if len(events) == 0 {
 		return 0, 0, nil
@@ -295,27 +276,27 @@ func (g *Gossiper) ShipBatchHybrid(ctx context.Context, peerID [16]byte, events 
 	}
 	if g.owner.PQPriv == nil {
 		// ARMED guard: the owner has no ML-DSA-65 signer. The hybrid arm was
-		// armed (--hybrid-sign) but the owner was NOT constructed via
-		// NewNodeIdentityHybrid — a deploy misconfiguration. Return an honest
-		// error (logged + the batch skipped by the caller); the v1 batch path
-		// + the relay/foreign path are unaffected. NOT a panic — a misconfigured
+		// armed (--hybrid-sign) but the owner was not constructed via
+		// NewNodeIdentityHybrid — a deploy misconfiguration. Return an error
+		// (logged + the batch skipped by the caller); the v1 batch path
+		// + the relay/foreign path are unaffected. Not a panic — a misconfigured
 		// flag must not crash the sweep.
 		return 0, 0, fmt.Errorf("mesh: ShipBatchHybrid: owner has no ML-DSA-65 private key — construct the owner via NewNodeIdentityHybrid before --hybrid-sign")
 	}
 
-	// for the hybrid path (/): consult the
-	// per-round memo BEFORE the per-peer build+sign. ShipBatchHybrid previously
-	// re-ran BuildCRDTDeltaBatch + SignCRDTFrame_Hybrid (60.19us Ed25519 +
-	// 585.8us ML-DSA-65) PER PEER — 3,500 hybrid signs ≈ 2.26s per sweep round
-	// at the 35-peer gate shape, while the v1 path memoized. The helpers carry
-	// the stratified guard + the batchLen content check, so under
-	// --stratified-anti-entropy this consult is always a miss and every peer
-	// gets its own build+sign. The memo is shared with the v1 path; a node
-	// never mixes the two (shipBatchedDelta routes on the construction-time
-	// hybridSign flag), so no position can hold the other frame shape.
+	// Consult the per-round memo before building and signing for another peer.
+	// At 35 peers and 100 batches, separate hybrid signatures for every peer
+	// would mean 3,500 signing operations and about 2.26 s per sweep. The memo
+	// helpers include the batch length and reject sharing under
+	// --stratified-anti-entropy, where each peer has different content. The v1
+	// and hybrid paths share storage but cannot occupy the same position because
+	// shipBatchedDelta selects one frame shape for the Gossiper's lifetime.
 	if pre, ok := g.sweepEnvelope(len(events)); ok {
 		if err := g.peers.Publish(peerID, pre); err != nil {
 			return 0, 0, fmt.Errorf("mesh: ShipBatchHybrid: Publish to %x: %w", peerID, err)
+		}
+		if !g.bytesBlind.Load() {
+			g.sweepShipBytes += int64(len(pre))
 		}
 		return 1, len(events), nil
 	}
@@ -325,231 +306,326 @@ func (g *Gossiper) ShipBatchHybrid(ctx context.Context, peerID [16]byte, events 
 		return 0, 0, fmt.Errorf("mesh: ShipBatchHybrid: %w", err)
 	}
 
-	// THE TWO SIGNATURES — the hybrid amortization. One Ed25519 + one ML-DSA-65
-	// over the 120-byte SHAKE256 pad of batchWire covers all N deltas (the SAME
-	// pad the receiver recomputes via VerifyBatchHybrid — the symmetric contract).
+	// One Ed25519 and one ML-DSA-65 signature cover the same 120-byte SHAKE256
+	// pad that VerifyBatchHybrid recomputes for every delta in the batch.
 	edSig, pqSig, err := identity.SignCRDTFrame_Hybrid(g.owner.Seed, g.owner.PQPriv, batchWire, "")
 	if err != nil {
 		return 0, 0, fmt.Errorf("mesh: ShipBatchHybrid: SignCRDTFrame_Hybrid: %w", err)
 	}
 
-	// The origin's MONOTONIC per-batch sequence — the rate-gate counter. The
-	// SAME g.batchSeq ShipBatch advances (the hybrid frame + the v1 frame share
-	// the origin's monotonic sequence space — a peer's rate gate sees a hybrid
-	// batch + a v1 batch from the SAME origin as successive originSeq values, so
-	// the budget drains correctly across frame shapes). AntiEntropySweep is
-	// single-goroutine (the SweepLoop), so the increment is race-free.
+	// Hybrid and v1 frames share g.batchSeq, so an origin presents one monotonic
+	// sequence to each peer's rate gate across frame shapes. The single sweep
+	// goroutine makes the increment race-free.
 	g.batchSeq++
 	originSeq := g.batchSeq
 
-	// The crypto-minimal hybrid envelope: the wire the origin signs (under BOTH
-	// sigs, via the pad) is the wire the receiver applies (no SHA-256 batch root
-	// — sign the wire directly via the pad; the apply path consumes the verbatim
-	// batchWire, NOT the pad, so Join sees the real bytes).
+	// Both signatures cover a pad derived from batchWire, while the apply path
+	// consumes the original batchWire bytes rather than the pad.
 	env := attribution.MarshalHybridFrame(g.owner.NodeID, edSig, pqSig, originSeq, uint16(len(events)), batchWire)
 	prefixed := receive.LengthPrefixFrame(env)
-	g.cacheSweepEnvelope(len(events), prefixed) //: memoize for the remaining peers of THIS round (no-op under stratified — the guard)
+	g.cacheSweepEnvelope(len(events), prefixed) // memoize for the remaining peers of this round (no-op under stratified — the V3b guard)
 	if err := g.peers.Publish(peerID, prefixed); err != nil {
 		return 0, 0, fmt.Errorf("mesh: ShipBatchHybrid: Publish to %x: %w", peerID, err)
+	}
+	if !g.bytesBlind.Load() {
+		g.sweepShipBytes += int64(len(prefixed))
 	}
 	return 1, len(events), nil
 }
 
-// shipBatchedDelta is the batched sibling of shipDelta (gossip.go:262). It
-// drains a CRDTDelta's Entries into MaxBatchSize-sized BuiltEvent slices and
-// ships each slice as one signed batch via ShipBatch. A payload miss skips that
-// entry (logged, never panicked) — the receiver would DropVerify a mismatched
-// payload, so skipping is the honest choice, not a fabrication (the same
-// discipline as shipDelta). It returns per-delta counters for the sweepState.
+// shipBatchedDelta ships self-originated entries in signed batches and
+// re-publishes retained foreign envelopes. A payload miss skips that entry
+// because the receiver would reject a mismatched payload. AntiEntropySweep uses
+// this path when --batch-size > 1; shipDelta remains the per-frame path.
 //
-// This is the path AntiEntropySweep switches to when --batch-size > 1 (the
-// self-originated delta path). The per-frame shipDelta is RETAINED as the
-// low-rate / fallback / relay path (NOT deleted).
+// Counter semantics (ADR-0045 §2 and §7):
+//   - entries counts self entries actually published, not entries walked.
+//     Together with pending, misses, relayMisses, and foreign deduplication, it
+//     accounts for every deliverable entry without double-counting.
+//   - foreignEnv counts distinct foreign envelopes re-published to this peer;
+//     foreignRecv sums their decoded element counts. lookupBatchCounted supplies
+//     the retained count, not the unsigned informational header. Per-frame relay
+//     contributes one. Envelope sizes vary, so foreignRecv cannot be derived
+//     from foreignEnv or the self batch size.
+//   - misses counts orphaned self entries: the state has a dot but no payload
+//     and no commit is in flight. This can result from an unretried WAL failure
+//     and should be zero at steady state.
+//   - relayMisses counts foreign entries with no retained frame. It is separate
+//     from misses because receipt and retention are different conditions; a
+//     later retention can make the entry publishable on the next sweep.
+//   - pending counts self entries withheld while a commit is in flight.
 //
-// COUNTER SEMANTICS (ADR-0045/§15.19):
-//   - entries — SELF entries actually PUBLISHED in batches (the flush's
-//
-// ShipBatch return), NOT entries walked. The pre-code ALSO
-//
-//	  counted every walked entry (the deleted `entries++` at the walk top),
-//	  double-counting every shipped entry and making the gate identity
-//	  "entries + pending == deliverable set" a tautology. Walked-but-unshipped
-//	  entries now break that identity loudly — which is its purpose.
-//	- misses — ORPHANED SELF entries only (state carries the dot, no payload
-//	  recorded, NO commit in flight): a WAL-failed batch the client never
-//	  retried. A real defect; zero at steady state.
-//	- relayMisses — FOREIGN entries whose retained relay frame was absent.
-//
-// Split out of `misses` : the pre-split counter conflated the
-//
-//	  orphan defect class with the relay-retention class, and a counter that
-//	  means two things means nothing. NOT necessarily a defect (the delta
-//	  propagates one hop; a relay holding the frame ships it next sweep).
-//	- pending — SELF entries withheld because a commit was IN FLIGHT
-//
-// (commitInFlight > 0): the honest non-defect class.
-func (g *Gossiper) shipBatchedDelta(ctx context.Context, peerID [16]byte, delta *eng.CRDTDelta, batchSize int) (shipped, entries, misses, relayMisses, pending int) {
+// shipStats uses named fields for the per-peer sweep result. Callers must not
+// confuse adjacent counts such as foreignEnv and foreignRecv when checking the
+// received-cost budget.
+type shipStats struct {
+	shipped     int // self batch flushes plus foreign envelope publishes
+	entries     int // self entries published in batches; on the per-frame path, elements in re-published foreign batches (keep gossip.go CommitStats in sync)
+	foreignEnv  int // distinct retained foreign envelope re-publishes
+	foreignRecv int // decoded elements in those envelopes: one per per-frame hit, retained batch count otherwise; bounds the received-cost budget
+	misses      int // orphaned self payloads: dot present, payload absent, no commit in flight
+	relayMisses int // foreign entries with no retained frame
+	pending     int // self entries withheld behind an in-flight commit
+	pubErrs     int // peer-Publish failures; prevents defer-window advancement
+}
+
+// foreignResolveStatus describes whether a foreign entry can be published and
+// how its retained cost should be charged.
+type foreignResolveStatus uint8
+
+const (
+	frMiss foreignResolveStatus = iota // no retained frame; nothing ships or is received
+	frSeen                             // this batch was already published to the peer in this sweep
+	frOK                               // publishable frame with its decoded element count
+)
+
+// foreignResolve holds one resolution of a foreign entry's retained envelope.
+// lookupBatchCounted supplies the decoded count; the envelope header is unsigned
+// and cannot describe a hybrid frame. dot keys the one-slot memo shared by the
+// walk's cost pre-charge and immediate publish callback, avoiding a second
+// unsynchronized lookup between them.
+type foreignResolve struct {
+	dot       relayKey
+	frame     []byte
+	originSeq uint64
+	count     int
+	status    foreignResolveStatus
+	perFrame  bool // per-frame cache hit: one element, no originSeq, and no seenBatch mark; the walk deduplicates each dot once per sweep
+}
+
+func (g *Gossiper) shipBatchedDelta(ctx context.Context, peerID [16]byte, delta *eng.CRDTDelta, batchSize int) shipStats {
 	if batchSize < 1 {
 		batchSize = DefaultBatchSize
 	}
 	if batchSize > MaxBatchSize {
 		batchSize = MaxBatchSize
 	}
+	// Start the walk+sort timer only when a probe is armed. The post-sort
+	// capture uses this timestamp; an unarmed production walk takes the nil fast
+	// path and records no time.
+	var probeT0 time.Time
+	if g.shipBuildProbe.Load() != nil || g.shipBuildMetrics.Load() != nil {
+		probeT0 = time.Now()
+	}
+	var ss shipStats // the named-result struct (see its doc)
 	batch := make([]BuiltEvent, 0, batchSize)
-	// The batch dedup (ADR-0045): a per-sweep seen-set keyed on
-	// batchKey{origin, originSeq} so the foreign branch Publishes each DISTINCT
-	// batch exactly ONCE per peer per sweep — the no-oversend directive.
-	// Without it the foreign branch would Publish the same batch frame once PER
-	// ENTRY in it (a batch of N foreign entries from the SAME origin+originSeq
-	// → N Publishes of the SAME batch envelope per sweep = N× oversend). The
-	// map is local to this shipBatchedDelta call (one per peer per sweep); a
-	// batch already published to THIS peer THIS sweep is a dedup-skip (counted
-	// as shipped ONCE for the first element, then skipped for the rest — NOT a
-	// miss, NOT a re-Publish). The seen-set is checked BEFORE lookupBatch so a
-	// repeated element short-circuits without a second map read.
+	// Deduplicate foreign batches by (origin, originSeq) for this peer and sweep
+	// (ADR-0045). Otherwise every element of an N-element batch would publish
+	// the same envelope again, producing N-fold oversend. The first element
+	// publishes and counts the envelope; later elements are dedup-skips, not
+	// misses. Resolution consults seenBatch before another batch-cache lookup.
 	seenBatch := make(map[batchRelayKey]bool)
-	// : rewind the sweep-envelope memo cursor for THIS
-	// peer. The cache is keyed by BATCH POSITION within the round, so every peer must
-	// start reading at position 0. Without this rewind, peer 1 would leave the cursor
-	// at 100 and peer 2 would look up slot 100, MISS, re-sign, and overwrite the memo
-	// at the wrong index — silently defeating the whole optimization AND corrupting
-	// later peers' lookups. (Found by reading the call structure before trusting the
-	// build: `go build` was clean, which proves nothing about index discipline.)
+	// walkDeferWindow owns the only per-round received-cost budget, charged
+	// through costOf up to deferSliceMaxEntries. A second ship-path budget would
+	// both truncate disabled-handler traffic and add to the window's cap.
+	// forEachShipEntry calls costOf only on escalation rounds, so other rounds
+	// have no additional gating here.
+	//
+	// resolveForeign runs once per offered entry on those rounds. costOf stores
+	// its result in memoRes and the callback consumes it immediately, ensuring
+	// the charge and publish use the same frame and decoded count without a
+	// second lock pair or a concurrent-retain window. Self entries cost one. A
+	// foreign batch costs its decoded element count, not the unsigned header
+	// count outside the signed batchWire; hybrid envelopes cannot be decoded by
+	// UnmarshalBatchEnvelope. A miss or already-published batch costs zero
+	// because it adds no received elements.
+	resolveForeign := func(entry eng.CRDTEntry) foreignResolve {
+		dot := relayKey{entry.OriginNodeID, entry.DotCounter}
+		frame, originSeq, count, ok := g.relay.lookupBatchCounted(entry.OriginNodeID, entry.DotCounter)
+		if !ok {
+			// A per-frame origin stores its envelope in relay.m, which the batch-layer lookup cannot see (ADR-0067).
+			// Fall back to that cache for mixed --batch-size deployments.
+			// A hit carries one element, has no originSeq, and needs no seenBatch
+			// mark because the walk already visits each dot once.
+			if pf, ok2 := g.relay.lookup(entry.OriginNodeID, entry.DotCounter); ok2 {
+				return foreignResolve{dot: dot, frame: pf, count: 1, status: frOK, perFrame: true}
+			}
+			return foreignResolve{dot: dot, status: frMiss}
+		}
+		if seenBatch[batchRelayKey{originNodeID: entry.OriginNodeID, originSeq: originSeq}] {
+			return foreignResolve{dot: dot, originSeq: originSeq, status: frSeen}
+		}
+		return foreignResolve{dot: dot, frame: frame, originSeq: originSeq, count: count, status: frOK}
+	}
+	var memoRes foreignResolve
+	costOf := func(entityID string, entry eng.CRDTEntry) int {
+		if entry.OriginNodeID == g.owner.NodeID {
+			return 1 // one self-originated element
+		}
+		memoRes = resolveForeign(entry)
+		if memoRes.status != frOK {
+			return 0 // relay miss or dedup-skip: nothing is received for it
+		}
+		return memoRes.count
+	}
+	// The envelope memo is keyed by batch position within the round, so every
+	// peer starts at position zero. Otherwise one peer's final cursor would
+	// index past the next peer's entries, causing fresh signatures and writes
+	// to the wrong memo positions.
 	g.sweepEnvIdx = 0
-	flush := func() {
-		if len(batch) == 0 {
+	// Count failed flushes as peer-Publish failures during the walk.
+	publishErrs := 0
+	// The post-walk loop supplies DotCounter-sorted chunks; flush does not
+	// consume the shared self buffer during the walk.
+	flush := func(events []BuiltEvent) {
+		if len(events) == 0 {
 			return
 		}
-		// (ADR-0037): --hybrid-sign switches the self-originated batch
-		// from the v1 ShipBatch (one Ed25519) to ShipBatchHybrid (one Ed25519 +
-		// one ML-DSA-65 over the SAME 120-byte SHAKE256 pad, carried in a
-		// HybridEnvelope). The relay/foreign path stays per-frame regardless
-		// (the self-origin boundary — a relayer holds ONLY its own PQ key;
-		// ShipBatchHybrid is self-origin-only, the SAME boundary ShipBatch
-		// enforces). A false hybridSign (the DEFAULT) keeps the v1 ShipBatch
-		// path byte-identical (— NO
-		// hybrid frame is produced). A misconfigured --hybrid-sign on a
-		// non-PQ owner returns an error from ShipBatchHybrid (the nil-pqPriv
-		// guard) — logged + the batch skipped, NOT a panic (the v1 path + the
-		// relay path are unaffected).
+		// --hybrid-sign selects ShipBatchHybrid for self-originated batches;
+		// otherwise ShipBatch produces the v1 envelope (ADR-0037). Foreign relay
+		// re-publishes retained envelopes separately and never uses the owner's
+		// keys. A missing PQ key returns an error and skips only this batch.
 		var b, e int
 		var err error
 		if g.hybridSign {
-			b, e, err = g.ShipBatchHybrid(ctx, peerID, batch)
+			b, e, err = g.ShipBatchHybrid(ctx, peerID, events)
 		} else {
-			b, e, err = g.ShipBatch(ctx, peerID, batch)
+			b, e, err = g.ShipBatch(ctx, peerID, events)
 		}
 		if err != nil {
-			log.Printf("mesh: shipBatchedDelta to %x: %v — batch skipped this round (oversend converges it next sweep)", peerID, err)
-			batch = batch[:0]
+			publishErrs++ // prevent the defer window from advancing past an unpublished batch
+			if !g.deferHandler || publishErrs <= g.effectiveMissLogCap() {
+				// Cap repeated per-chunk failures on a congested edge.
+				log.Printf("mesh: shipBatchedDelta to %x: %v — batch skipped this round (oversend converges it next sweep)", peerID, err)
+			}
 			return
 		}
-		shipped += b
-		entries += e // entries = SELF entries actually PUBLISHED (the ONLY add —; the walk-top `entries++` that double-counted every shipped entry is deleted)
-		batch = batch[:0]
+		ss.shipped += b
+		ss.entries += e // count self entries only after successful publication
 	}
-	delta.Entries(func(entityID string, entry eng.CRDTEntry) bool {
+	// forEachShipEntry shares defer-window policy with shipDelta. costOf carries
+	// the batch received-cost calculation, and publishErrs bounds failure logs.
+	g.forEachShipEntry(peerID, delta, costOf, func(entityID string, entry eng.CRDTEntry) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		// entries is NOT incremented here: a walked entry is
-		// not a shipped entry. The identity the gate reads — entries + pending
-		// == deliverable set — has guards only if every walked entry lands in
-		// EXACTLY ONE of {entries (shipped), pending, misses, relayMisses,
-		// foreign-dedup (counted once per batch in shipped)}.
-		// (ADR-0045): branch on origin. SELF → the batch-
-		// build path below (the existing shipBatchedDelta behavior, byte-identical
-		// for self entries). FOREIGN → relay the retained origin-signed BATCH
-		// envelope onward (the self-origin boundary — batch.go:11-18 + the
-		// note at :324: a relayer holds ONLY its own relay seed, NEVER the foreign
-		// ORIGIN's seed, so it CANNOT re-origin-sign a foreign delta into the
-		// batch; a batch that relayer-signs foreign origins is a FORGERY. Foreign
-		// deltas STAY in their origin's batch — the relayer re-publishes the
-		// WHOLE retained BatchEnvelope byte-identical, the SAME boundary shipDelta
-		// enforces per-frame). This mirrors shipDelta's foreign branch
-		// (gossip.go:1176-1190) but on the BATCH path: lookupBatch resolves the
-		// foreign entry's (origin, dotCounter) → its batch's OriginSeq → the
-		// retained BatchEnvelope bytes, then LengthPrefixFrame + Publish (the SAME
-		// re-publish byte-identical shape). The DEDUP (the no-oversend
-		// requirement, NON-NEGOTIABLE): a per-sweep seen-set (seenBatch, keyed on
-		// batchKey{origin, originSeq}) Publishes each DISTINCT batch exactly ONCE
-		// per peer per sweep — without it the foreign branch would Publish the
-		// same batch frame once PER ENTRY in it (N Publishes of the SAME batch per
-		// sweep = N× oversend). The seen-set is checked BEFORE lookupBatch so a
-		// repeated element short-circuits without a second map read. This closes
-		// the one-hop-relay defect on the BATCH path (the path AntiEntropySweep uses when
-		// --batch-size > 1, the production default 100). PRE-FIX this closure
-		// routed the WHOLE delta (self + foreign) through cache.lookup (the
-		// SELF-only payloadCache), so a receiver sweeping a FOREIGN delta missed
-		// every entry, shipped 0, + the foreign delta never propagated past one
-		// hop — the silicon-found 100-node convergence blocker (relay_miss=0 on
-		// every node; the 3-node shipDelta test passed because it exercised the
-		// per-frame path, NOT this batch path).
+		// A walked entry is not necessarily shipped. Every entry must be
+		// accounted for as shipped, pending, a payload miss, a relay miss, or a
+		// foreign dedup-skip.
+		//
+		// Self entries are accumulated for a new origin-signed batch. Foreign
+		// entries instead resolve (origin, dotCounter) to a retained BatchEnvelope
+		// and re-publish those signed bytes; the relayer cannot sign for the
+		// origin (ADR-0045). lookupBatchCounted supplies the frame, OriginSeq, and
+		// decoded count, while the per-frame fallback handles mixed batch-size
+		// deployments. seenBatch prevents N entries in one batch from causing N
+		// publishes to the same peer in one sweep.
+		//
+		// Looking up foreign payloads in the self-only payloadCache would drop
+		// every foreign entry and stop propagation after one hop. This separate
+		// relay lookup is therefore required on the default batched path as well
+		// as on shipDelta's per-frame path.
 		if entry.OriginNodeID != g.owner.NodeID {
-			flush() // ship any pending SELF batch first so the foreign batch
-			// Publish does not interleave a foreign frame into a SELF batch
-			// (the batch is self-origin-only by the boundary above).
-			// Resolve the foreign entry's (origin, dotCounter) → its batch's
-			// OriginSeq + the retained BatchEnvelope bytes. lookupBatch does the
-			// reverse-index (relayKey{origin, dotCounter}→originSeq) then the
-			// forward-map (batchKey{origin, originSeq}→frame) read. A miss means
-			// this node never received that foreign batch → skip this round (the
-			// delta propagates one hop, not zero; a relay that DID retain it ships
-			// it next sweep).
-			frame, originSeq, ok := g.relay.lookupBatch(entry.OriginNodeID, entry.DotCounter)
-			if !ok {
-				relayMisses++ //: the relay-retention class, split OUT of misses (which is orphan-only now)
-				if relayMisses <= missLogCap {
-					log.Printf("mesh: relay miss for %s origin=%x dotCounter=%d — foreign delta skipped this round: NO RETAINED FRAME in the relayCache. This node may well have Joined this dot; retention is what is missing, NOT receipt. If EVERY foreign entry misses, the relay retainer is likely UNWIRED (use Gossiper.WireRelayHooks, which installs the per-frame AND batch hooks) — a genuinely-never-received dot is the other cause, and a relay that holds the frame ships it next sweep.", entityID, entry.OriginNodeID, entry.DotCounter)
+			// Self batches are sorted and flushed after the walk, so a foreign
+			// publish cannot interleave into one.
+			//
+			// On an escalation round, costOf has just resolved this entry and
+			// memoRes makes the charge and publish use the same frame and decoded
+			// count without another lookup or a concurrent-retain window. On other
+			// rounds the zero memo fails the dot check and resolves fresh here. A
+			// memoized miss remains a miss for this round; a frame retained later
+			// can ship on the next sweep but cannot become an uncharged publish.
+			res := memoRes
+			if res.dot != (relayKey{entry.OriginNodeID, entry.DotCounter}) {
+				res = resolveForeign(entry)
+			}
+			if res.status == frMiss {
+				ss.relayMisses++ // relay retention is distinct from an orphaned self payload
+				if ss.relayMisses <= g.effectiveMissLogCap() {
+					log.Printf("mesh: relay miss for %s origin=%x dotCounter=%d — foreign delta skipped this round: no retained frame in per-frame or batch relay cache (if every foreign entry misses, ensure Gossiper.WireRelayHooks is installed)", entityID, entry.OriginNodeID, entry.DotCounter)
 				}
 				return true
 			}
-			// DEDUP: publish each distinct batch exactly once per peer per sweep.
-			// A batch already published to THIS peer THIS sweep (seenBatch hit) is
-			// a dedup-skip — counted as shipped ONCE for the first element (the
-			// Publish below), then the remaining N-1 elements from the same batch
-			// short-circuit here WITHOUT a second Publish. This is NOT a miss (the
-			// batch WAS retained + WAS published this sweep); it is the no-oversend
-			// discipline. The seen-set keys on batchKey{origin, originSeq} so two
-			// DISTINCT batches from the same origin (different originSeq) both ship.
-			bk := batchRelayKey{originNodeID: entry.OriginNodeID, originSeq: originSeq}
-			if seenBatch[bk] {
-				return true // already published this batch to this peer this sweep
-			}
-			prefixed := receive.LengthPrefixFrame(frame) // the retained frame IS the origin-signed BatchEnvelope; re-publish byte-identical (forward.go:104)
-			if err := g.peers.Publish(peerID, prefixed); err != nil {
-				log.Printf("mesh: Publish to %x for foreign %s: %v — skipped", peerID, entityID, err)
+			// The first element publishes a distinct batch; later elements from
+			// that batch are dedup-skips, not misses or additional publishes.
+			// Different OriginSeq values identify different batches from one
+			// origin and are published separately.
+			if res.status == frSeen {
 				return true
 			}
-			seenBatch[bk] = true // mark this batch published to this peer this sweep
-			shipped++
+			bc := res.count                                  // decoded batch count, or one for a per-frame hit
+			prefixed := receive.LengthPrefixFrame(res.frame) // re-publish the origin-signed bytes unchanged
+			if err := g.peers.Publish(peerID, prefixed); err != nil {
+				publishErrs++
+				if !g.deferHandler || publishErrs <= g.effectiveMissLogCap() {
+					log.Printf("mesh: Publish to %x for foreign %s: %v — skipped", peerID, entityID, err)
+				}
+				return true
+			}
+			if !res.perFrame {
+				seenBatch[batchRelayKey{originNodeID: entry.OriginNodeID, originSeq: res.originSeq}] = true
+			}
+			ss.shipped++
+			ss.foreignEnv++
+			ss.foreignRecv += bc // costOf pre-charged the same decoded count
 			return true
 		}
 		payload, ok := g.cache.lookup(entityID, entry.Dot())
 		if !ok {
-			// a SELF lookup miss while ANY commit is in
-			// flight is an entry whose WAL fsync/record has not landed YET — a
-			// pending non-event, NOT a defect (the seed counted its own
-			// in-flight batches as 73 rounds of "misses"). With NO commit in
-			// flight the miss is an ORPHAN: state the origin can never ship (a
-			// WAL-failed batch the client never retried) — the REAL defect the
-			// counter exists to surface. Nothing ships either way.
+			// While a commit is in flight, the payload may not be recorded yet;
+			// count it as pending rather than orphaned. With no commit in flight,
+			// an absent payload can indicate an unretried WAL failure. Neither
+			// case publishes uncommitted or unverifiable state.
 			if g.commitInFlight.Load() > 0 {
-				pending++
+				ss.pending++
 				return true
 			}
-			misses++
-			if misses <= missLogCap {
-				log.Printf("mesh: payload miss for %s dot=%v — ORPHANED entry (state carries it, no payload recorded, NO commit in flight): a WAL-failed batch whose client never retried. This is a REAL defect — it must be ZERO at steady state; the entry cannot ship until a retry re-commits it", entityID, entry.Dot())
+			ss.misses++
+			if ss.misses <= g.effectiveMissLogCap() {
+				log.Printf("mesh: payload miss for %s dot=%v — orphaned entry (state carries it, no payload cached, no commit in flight; likely unretried WAL failure)", entityID, entry.Dot())
 			}
 			return true
 		}
+		// Accumulate the full self diff, then sort by DotCounter before chunking.
+		// Ordered chunks let the receiver's join crawl advance its clock window
+		// chunk by chunk. In the 6,000-dot hierarchical regional-gateway backlog,
+		// this healed in one or two sweeps. Hash-ordered chunks instead had only
+		// (1001/6000)^100 ≈ 10^-77.77 probability of containing 100 in-window
+		// dots, so atomic batch rejection kept the clock stuck and re-sent the
+		// whole backlog.
+		//
+		// The per-peer sort costs O(D log D) off the receive path. The buffer
+		// transiently holds the full self diff: measured sizeof(BuiltEvent) is
+		// 152 bytes, about 912 KB at 6,000 events, and is freed on return.
+		// Deterministic sorting makes position k contain the same chunk for every
+		// peer sharing a delta, preserving envelope-memo behavior for both
+		// ShipBatch and ShipBatchHybrid.
 		batch = append(batch, BuiltEvent{EntityID: entityID, Payload: payload, Entry: entry})
-		if len(batch) >= batchSize {
-			flush()
-		}
 		return true
 	})
-	flush() // ship the trailing partial batch
-	return shipped, entries, misses, relayMisses, pending
+	// Ship the accumulated self buffer in DotCounter order, batchSize events
+	// per batch.
+	slices.SortFunc(batch, func(a, b BuiltEvent) int {
+		return cmp.Compare(a.Entry.DotCounter, b.Entry.DotCounter)
+	})
+	// Probe captures count walk+sort passes and measure their duration. Content
+	// captures support byte-equality and domain-fence checks. The serial sweep
+	// goroutine is the only writer; an unarmed call performs two atomic loads.
+	if p := g.shipBuildProbe.Load(); p != nil {
+		// A zero probeT0 means the probe was armed during this call. Record zero
+		// rather than time.Since(time.Time{}) for the content capture.
+		ws := time.Duration(0)
+		if !probeT0.IsZero() {
+			ws = time.Since(probeT0)
+		}
+		*p = append(*p, shipBuildCapture{peer: peerID, buf: snapshotBuiltEvents(batch), walkSort: ws})
+	}
+	if m := g.shipBuildMetrics.Load(); m != nil {
+		*m = append(*m, shipBuildMetric{peer: peerID, n: len(batch), walkSort: time.Since(probeT0)})
+	}
+	for start := 0; start < len(batch); start += batchSize {
+		if ctx.Err() != nil {
+			// Stop after cancellation instead of attempting every remaining chunk
+			// and logging its context error: 60 chunks at the 6,000-entry backlog,
+			// or about 7,000 at a 700,000-entry diff. The next sweep re-ships.
+			break
+		}
+		end := start + batchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		flush(batch[start:end])
+	}
+	ss.pubErrs = publishErrs
+	return ss
 }

@@ -4,38 +4,19 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package receive implements the INGRESS wire listener that binds the
-// admission gate stack over a real receiving socket. It is the composition
-// point: the last gate-stack module (engine.Join via
-// engine.ApplyCRDTDeltaEvent) gains its first production caller here.
+// Package receive reassembles length-prefixed envelopes and applies their
+// admission, attribution, and integrity checks before merging deltas into the
+// CRDT engine. HandleFrame accepts one relay envelope; HandleBatchFrame and
+// HandleHybridFrame accept their respective batch formats.
 //
-// ADR-0005 closes the wiring gap (ADR-0003 §8): the
-// edge-triggered epoll ingress loop that drives the KernelFanout
-// SO_REUSEPORT socket group into HandleFrame lives in ingress_epoll.go, gated
-// by the `ebpf_kernel` build tag. The default build EXCLUDES it — HandleFrame's
-// gate stack (below) is byte-identical; the wiring is ABOVE HandleFrame
-// (delivery), NOT inside it. Under -tags ebpf_kernel, EpollIngress.Serve drives
-// the eBPF-pinned fds, reassembles each datagram to frame boundaries, and calls
-// HandleFrame per frame — the seam in the engine, not in a test file.
+// For relayed frames, the rate, physical-clock, and hop-depth checks precede
+// signature verification. Successful verification is followed by an apply,
+// optional secondary-index and WAL notifications, and relay retention. A v3
+// header's mirrored dot counter and origin are cross-checked against the signed
+// inner event before it is applied.
 //
-// The receiver wires reassembled frames through the proven
-// ordering (re-derived from the gate packages, not copied from prose):
-//
-//	[socket read -> length-prefixed frame reassembler]
-//
-// -> UnmarshalRelayEnvelope(frameBytes) # parse header, no crypto
-// -> PeerBucket.Accept(lastHopRelayPub, dotCounter) # rate gate, ~36 ns; cheap
-// -> if Keep: IngressHLCScalarCap.Admit(lastHopWallUSec, dotCounter) # clock gate
-// -> if accept: RelayEnvelope.Open(MaxHopsForBudget(budget)) # depth gate
-// -> if open ok: Directory.Lookup(originNodeID) -> originPub
-// -> identity.VerifyCRDTFrame(originPub, innerWire, originSig) # origin verify
-// -> if verify ok: engine.ApplyCRDTDeltaEvent(innerWire) -> Join # first prod caller
-//
-// The cheap gates (rate, clock, depth) run BEFORE the expensive
-// ~60 us Ed25519 Verify: a forged deep / rate / clock frame is dropped
-// in nanoseconds, zero Verifies — the DoS defense. This ordering is
-// executed-instrumented, not prose-asserted: a counting Verify
-// hook proves zero Verify calls fire on each cheap-reject path.
+// The ebpf_kernel build tag adds EpollIngress, an optional UDP delivery adapter
+// for transport.KernelFanout. The default build uses other delivery paths.
 package receive
 
 import (
@@ -46,6 +27,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	capnp "capnproto.org/go/capnp/v3"
@@ -57,65 +39,43 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// frameLenPrefixSize is the size of the length prefix the wire listener
-// frames every envelope with. The on-the-wire shape the receiver
-// reads is [uint32 frameLen][envelope bytes...]: a 4-byte big-endian frame
-// length, then exactly frameLen envelope bytes. The prefix is a pkg/receive
-// framing concern, NOT an envelope concern — envelope.Marshal stays a pure
-// envelope (no outer-length prefix); the prefix belongs to the wire listener
-// and is emitted by the relay-forward path before SendPinnedHeap.
-//
-// Big-endian is chosen for the prefix so a human can read it in a packet
-// capture (network-byte-order convention) and so a future TCP/Unix socket
-// listener is byte-order-stable across mixed-endian peers. The envelope's
-// OWN header fields stay little-endian (envelope.go framing); only the
-// outer pkg/receive prefix is big-endian.
+// frameLenPrefixSize is the size of the big-endian uint32 that precedes each
+// marshaled envelope on stream and datagram delivery paths. Envelope fields
+// retain their own little-endian encoding; only this outer prefix is big-endian.
 const frameLenPrefixSize = 4
 
-// maxFrameSize is the upper bound on a single framed envelope the receiver
-// will reassemble. It is a defensive cap against a forged length prefix
-// claiming a multi-GB frame (the reassembly buffer would grow unbounded). It
-// is a buffer-bound, sized generously over the largest honest envelope (a
-// 15-hop relay chain carrying a 120-byte inner wire is ~1.6 KB; 16 MiB
-// admits envelopes with megabyte-scale inner capnp frames, far beyond any
-// honest CRDT delta).
+// maxFrameSize bounds reassembly so a forged length prefix cannot request an
+// unbounded allocation. It also accommodates Cap'n Proto payloads much larger
+// than an ordinary CRDT delta.
 const maxFrameSize = 16 << 20 // 16 MiB
 
-// Verdict is the typed drop/accept decision HandleFrame returns. A forged
-// frame is a Verdict, never a crash: the receiver NEVER panics on adversarial
-// input (the chaos supervisor's SIGSEGV-isolation path is a different safety
-// net; the receiver's job is to not produce the SIGSEGV). Each non-Accept verdict
-// names the gate that dropped the frame so the caller can attribute the drop.
+// Verdict identifies the gate that accepted or rejected a frame. Malformed
+// input produces a verdict rather than a panic.
 type Verdict int
 
 const (
-	// Accept means the frame crossed every gate and the engine joined the
-	// CRDT delta (ApplyCRDTDeltaEvent returned nil).
+	// Accept means the apply joined at least one delta, or an empty batch was
+	// accepted as a no-op. Accepted reports the number joined.
 	Accept Verdict = iota
-	// DropMalformed means the frame did not parse as a relay envelope or the
-	// inner wire did not decode as a CRDTDeltaEvent (the cheap pre-Open
-	// capnp decode failed). Dropped before any crypto.
+	// DropMalformed means the envelope or a required inner field could not be
+	// decoded before signature verification.
 	DropMalformed
-	// DropRate means the PeerBucket rate cap dropped the frame (the
-	// last relay's per-peer budget was exhausted). Dropped before any
-	// crypto; zero Open Verifies.
+	// DropRate means the applicable PeerBucket rejected the frame's sequence
+	// advance before signature verification.
 	DropRate
-	// DropClock means the IngressHLCScalarCap clock cap dropped the
-	// frame (the last hop's physical timestamp was too far in the future).
-	// Dropped before any crypto; zero Open Verifies.
+	// DropClock means the last hop's physical timestamp exceeded the permitted
+	// future drift. A frame without hops uses the local physical clock.
 	DropClock
-	// DropDepth means the envelope.Open depth check dropped the frame
-	// (the hop count exceeded the budget bound). Dropped before any crypto;
-	// zero Open Verifies.
+	// DropDepth means RelayEnvelope.Open rejected the hop count before doing
+	// signature verification.
 	DropDepth
-	// DropVerify means a cryptographic check failed: an outer relay hop
-	// (Open), the inner origin (VerifyCRDTFrame), an unknown origin
-	// (Directory miss), or ApplyCRDTDeltaEvent rejected the wire integrity.
+	// DropVerify means authentication, origin resolution, header consistency,
+	// or engine integrity validation failed. It also reports a batch held in
+	// full by the Lamport skew bound.
 	DropVerify
 )
 
-// String returns the verdict name for logs/metrics. It is the human-readable
-// form of the typed drop decision.
+// String returns the verdict name for logs and metrics.
 func (v Verdict) String() string {
 	switch v {
 	case Accept:
@@ -135,170 +95,103 @@ func (v Verdict) String() string {
 	}
 }
 
-// AcceptVerdict is the result of HandleFrame: the typed verdict plus the
-// reason (the gate error or a human-readable drop cause) for attribution.
-// Reason is empty on Accept.
+// AcceptVerdict reports the gate result and its reason. Accepted is 1 for an
+// accepted single frame, the joined-element count for an accepted batch, and 0
+// for every drop. Reason is empty on Accept.
 type AcceptVerdict struct {
-	Verdict Verdict
-	Reason  error
+	Verdict  Verdict
+	Reason   error
+	Accepted int
 }
 
-// Receiver is the wire listener that runs the gate-stack composition over a
-// reassembled envelope frame. It holds the bound gate objects (the
-// PeerBucket, the IngressHLCScalarCap, the envelope bound, the
-// identity Directory) and the CRDT engine (called via
-// ApplyCRDTDeltaEvent — the first production caller). It is safe for
-// concurrent use: every gate it composes is concurrency-safe (PeerBucket is
-// sharded-mutex, IngressHLCScalarCap is read-only-on-clock, Open is
-// immutable-envelope, Directory is RWMutex, ApplyCRDTDeltaEvent is the
-// engine's own race-proven path).
+// Receiver applies admission and verification to reassembled frames before
+// passing them to the CRDT engine. Its gates and engine support concurrent
+// handlers. Configuration callbacks must be installed before handlers start.
 //
-// wallClock is the receiver's own WallClock reference (the same clock the
-// IngressHLCScalarCap binds). It is read for the 0-hop origin-frame path,
-// whose physical timestamp is not on the wire (the envelope carries no
-// origin wall time — only the relay hops carry WallUSec). The relay path
-// (hops > 0) is the load-bearing one this change composes; the 0-hop path
-// uses the local clock now as the physical timestamp (a known limitation: the
-// origin's physical time on the wire is a future change).
+// wallClock supplies the physical timestamp for origin frames without relay
+// hops; those envelopes carry no origin wall time. Relayed frames use the last
+// hop's WallUSec instead.
 type Receiver struct {
 	bucket    *admission.PeerBucket
 	cap       *clock.IngressHLCScalarCap
 	wallClock clock.WallClock
 	dir       *identity.Directory
 	engine    *eng.DeltaCRDTEngine
-	budget    int64 // nanoseconds, injected (deploy config); the hop-bound dividend
+	budget    int64 // nanoseconds; converted to maxHops at construction
 
-	// rateDropMu guards rateDropSeen — the per-origin
-	// DropRate emission counter. It is a DEDICATED mutex on the DROP path only
-	// (never taken on an Accept), so it adds nothing to the hot path. The counter
-	// exists because silicon emitted 72,831 IDENTICAL zero-field DropRate
-	// lines per node, which forced the whole root-cause to be reconstructed by
-	// ARITHMETIC instead of read off the logs. A capped, field-carrying reason is
-	// what makes the drain directly observable next run.
+	// rateDropMu guards per-origin DropRate counters. Detailed messages are
+	// capped independently for each origin, and the mutex is only taken while
+	// formatting a drop.
 	rateDropMu   sync.Mutex
 	rateDropSeen map[[16]byte]uint64
-	maxHops      int // MaxHopsForBudget(budget), computed once at construction
+	maxHops      int
 
-	// onClockAdvance is the receive-seam hook for the foreign-advance
-	// seed fix. A peer-driven Join (ApplyCRDTDeltaEvent/ApplyCRDTDeltaBatch)
-	// calls AdvanceLamportTo inside the engine (crdt.go:1028), jumping
-	// the Lamport clock with NO WAL record — the seed-break. On a successful
-	// Accept the hook fires ONLY when the frame actually advanced the clock
-	// (post > pre, captured at function entry) and records the post-Accept
-	// high-water so the WAL is the complete clock history and the recovery
-	// seed is exact. A WAL-append/fsync error is LOGGED loudly (NOT swallowed,
-	// NOT a 503 — a foreign Join is irreversible; see ADR-0013 §7(h) for the
-	// origin/receive asymmetry). Nil by default (the in-memory research path
-	// never sets it → a behavior-preserving no-op); the durability Bridge sets it via
-	// SetClockAdvanceRecorder to wal.AppendClockAdvance. See ADR-0013 §7 for
-	// the slight over-record caveat (post-Accept high-water vs the exact
-	// foreign-but-pre-mint counter).
+	// onClockAdvance records the post-apply Lamport high-water only when a
+	// handler advanced it. This lets the WAL reconstruct the recovery seed after
+	// peer-driven advances. The durability bridge installs the callback; a nil
+	// callback disables recording. See ADR-0013 for the recovery semantics.
 	onClockAdvance func(uint64) error
 
-	// hybridVerify is the ADR-0036 opt-IN seam that switches the two
-	// signature-verify call sites (HandleFrame:350 + HandleBatchFrame:586)
-	// from the classical-only identity.VerifyCRDTFrame to the hybrid
-	// identity.VerifyCRDTFrame_Hybrid (Ed25519 + ML-DSA-65, BOTH-required,
-	// defense-in-depth). false (the DEFAULT) keeps the receive path on the
-	// classical seam — byte-identical (the production default stays
-	// classical-only; the hybrid is an ADD, NOT a replace). Set via
-	// SetHybridVerify once at construction; nil-safe (the
-	// SetClockAdvanceRecorder precedent — a default false is the byte-identical
-	// previous posture). ADR-0037 EXTENDS this seam to the
-	// HandleHybridFrame path: under --hybrid-verify a hybrid frame's BOTH sigs
-	// are verified by VerifyBatchHybrid (the SAME both-required gate, fed the
-	// 120-byte SHAKE256 pad); under the DEFAULT (false) a hybrid frame is
-	// REJECTED (the symmetric STRICT mode — a non-hybrid-verify receiver cannot
-	// fall back to the classical single-sig verify on a BOTH-sig frame). The
-	// byte-identical-default is preserved because --hybrid-sign=false
-	// (the send-side DEFAULT) produces NO hybrid frame on the production path.
-	// A nil pqPub (the Directory does not yet carry a peer's ML-DSA-65 pubkey)
-	// is a DropVerify under --hybrid-verify (the STRICT mode — the
-	// contract applied by the grown Directory.LookupBoth).
+	// hybridVerify selects strict hybrid verification. HandleFrame and
+	// HandleBatchFrame then require both Ed25519 and ML-DSA-65, rejecting
+	// classical-only frames. HandleHybridFrame is rejected immediately when this
+	// is false. The default is classical-only verification; see ADR-0036 and
+	// ADR-0037.
 	hybridVerify bool
 
-	// onHybridAccept is the ADR-0037 opt-IN disclosure seam: a
-	// non-nil callback fires on every hybrid frame ACCEPTED by the BOTH-verify
-	// gate (HandleHybridFrame step 6) — the operator-VISIBLE proof the moat is
-	// in USE, not just wired (the HybridFrameAccepted counter).
-	// nil by default (the SetClockAdvanceRecorder precedent — a
-	// default nil is the byte-identical previous posture; the receiver's
-	// gate-stack behavior is UNCHANGED by the counter). Set via
-	// SetHybridAcceptReporter once at construction; the production node wires
-	// it to telemetry.HybridFrameAccepted.Inc (the SetStratifiedFallbackReporter
-	// + SetPQHandshakeReporter precedent — the counter is the DISCLOSURE, not
-	// the mechanism). The callback is read on the readLoop goroutine;
-	// SetHybridAcceptReporter is called once at construction before the
-	// readLoop starts (the single-writer-before-reader discipline).
+	// onHybridAccept runs after a hybrid batch passes both signature checks and
+	// joins at least one element. The production node uses it to increment
+	// telemetry.HybridFrameAccepted. Nil disables the notification.
 	onHybridAccept func()
 
-	// onAcceptRelay is the ADR-0045 relay-retention
-	// seam. A non-nil callback fires RIGHT BEFORE the Accept verdict returns
-	// from HandleFrame (step 8b/9) — handing the mesh the raw relay-envelope
-	// frameBytes for a FOREIGN delta (originNodeID != this node) the gate stack
-	// just verified + Join'd. The mesh (the Gossiper) retains those bytes in a
-	// relay cache keyed by (originNodeID, dotCounter) so a later shipDelta can
-	// RE-PUBLISH the origin-signed frame ONWARD to a peer that lacks it — the
-	// relay the O(log N) partial-view topology design assumes. Before this hook a
-	// foreign entry reached shipDelta, hit the origin-side payloadCache.lookup
-	// (which holds ONLY self-originated payloads, populated at InsertLocalEvents)
-	// MISSED, and was skipped — so foreign deltas never propagated past one hop
-	// (peers stayed root-zero behind a relay node they DID reach). The retain
-	// callback is the ONLY seam that
-	// hands the mesh the verified foreign frame: HandleFrame otherwise consumes
-	// it (Join) + discards it (no retention). nil by default (the
-	// SetClockAdvanceRecorder precedent — a default nil is byte-identical to the
-	// receive path without this hook: nothing is retained, shipDelta's foreign miss is
-	// the documented honest skip). The Gossiper wires it via SetRelayRetainer
-	// once at construction before the accept loop starts (the
-	// single-writer-before-reader discipline, the SAME as onClockAdvance). The
-	// callback runs on the accept-loop goroutine; the Gossiper's relayCache is
-	// mutex-guarded (the payloadCache precedent). Self-originated frames
-	// (originNodeID == this node) do NOT fire the hook — they are already in the
-	// origin-side payloadCache + need no relay retention (a node re-ships its
-	// OWN deltas from the payload, not a relayed copy).
+	// onAcceptRelay receives every accepted frame and its origin and dot. The
+	// Gossiper's RetainForeign hook keeps only foreign frames, keyed by that
+	// identity, so shipDelta can forward the original signed envelope. Without a
+	// hook, HandleFrame discards the wire bytes after applying the delta.
 	onAcceptRelay func(originNodeID [16]byte, dotCounter uint64, frameBytes []byte)
 
-	// onAcceptRelayBatch is the ADR-0045 BATCH-layer
-	// relay-retention seam — the batch sibling of onAcceptRelay. A non-nil
-	// callback fires RIGHT BEFORE the Accept verdict returns from
-	// HandleBatchFrame (after the batch Join succeeded) — handing the mesh the
-	// WHOLE BatchEnvelope bytes (batchFrameBytes) for a FOREIGN batch
-	// (originNodeID != this node) the gate stack just verified + Join'd, along
-	// with the batch's OriginSeq (env.OriginSeq() — the origin's monotonic per-
-	// batch sequence, INDEPENDENT of the elements' dotCounters) + the per-element
-	// dotCounters (decoded read-only by eng.InspectBatchDots). The mesh (the
-	// Gossiper) retains the batch ONCE in a forward map (batchKey{origin,
-	// originSeq}→frameBytes) + populates a reverse index (relayKey{origin,
-	// dotCounter}→originSeq) so a later shipBatchedDelta foreign branch can find
-	// the batch a foreign entry came in + re-publish the WHOLE envelope ONWARD —
-	// the batch relay the per-frame onAcceptRelay cannot build (a batch is ONE
-	// frame with ONE Ed25519 over the WHOLE batch wire; there is NO per-element
-	// origin-signed frame to retain). Before this hook a batch-received foreign
-	// frame was NEVER retained → the relay was EMPTY → shipBatchedDelta's foreign
-	// branch (already landed in batch.go) relay.lookup missed (the batch-path
-	// relay gap on the production default --batch-size 100). nil by default (the
-	// SetClockAdvanceRecorder / onAcceptRelay precedent — a default nil is byte-
-	// identical to the batch receive path without this hook: nothing is retained,
-	// shipBatchedDelta's foreign miss is the documented honest skip). The
-	// Gossiper wires it via SetRelayRetainerBatch once at construction before the
-	// accept loop starts (the single-writer-before-reader discipline, the SAME as
-	// SetRelayRetainer). The callback runs on the accept-loop goroutine; the
-	// Gossiper's relayCache is mutex-guarded. Self-originated batches
-	// (originNodeID == this node) do NOT fire the hook — they are already in the
-	// origin-side payloadCache (populated at InsertLocalEventsBatch) + need no
-	// relay copy (the Gossiper's RetainForeignBatch filters self).
+	// onAcceptRelayBatch receives an accepted batch's original envelope,
+	// OriginSeq, and joined dot counters. The mesh retains foreign batches by
+	// (origin, OriginSeq) and indexes them by dot for later forwarding. The full
+	// envelope is required because one signature covers the entire batch wire.
+	// Batches with held elements are not retained.
 	onAcceptRelayBatch func(originNodeID [16]byte, originSeq uint64, dotCounters []uint64, frameBytes []byte)
+
+	// onIndexFeed receives entityID, h3Index, and systemTime after a successful
+	// apply. Each handler decodes only those fields and invokes it synchronously;
+	// a nil callback disables secondary-index feeding. The command layer closes
+	// over the index implementation, keeping that dependency out of this package.
+	onIndexFeed func(entityID string, h3Index uint64, systemTime int64)
+
+	// batchSkewHeldTail counts elements held by the Lamport skew bound. It is
+	// diagnostic state, not an admission input.
+	batchSkewHeldTail atomic.Uint64
+	// heldTailLogSeq limits held-tail messages to the first 8 and every 1000th
+	// per Receiver without affecting the exact counter above.
+	heldTailLogSeq atomic.Uint64
+
+	// These flags restore removed behaviors for negative-control tests. Normal
+	// operation leaves them false. advanceDeferFault restores the pre-apply
+	// Lamport advance, and disableRefundFault suppresses pre-verify refunds.
+	advanceDeferFault  atomic.Bool
+	disableRefundFault atomic.Bool
+	// disableRetainOnHoldFault restores retention of partially held batches.
+	disableRetainOnHoldFault atomic.Bool
 }
 
-// NewReceiver binds the gate objects and the engine into a Receiver.
-// budget is the deploy-time admission budget (nanoseconds) the
-// MaxHopsForBudget transform converts to a max hop-count; it is INJECTED,
-// never baked into source (the forbidden-budget guard). wallClock is the
-// WallClock the IngressHLCScalarCap binds (the receiver holds its own
-// reference for the 0-hop physical-timestamp path). The receiver computes
-// maxHops once at construction and reuses it on every HandleFrame (the O(1)
-// depth check reads it without re-deriving).
+// noteHeldTail records held elements and emits a capped diagnostic message
+// shared by the classical and hybrid batch handlers.
+func (r *Receiver) noteHeldTail(kind string, res eng.BatchApplyResult) {
+	r.batchSkewHeldTail.Add(uint64(res.Held))
+	if n := r.heldTailLogSeq.Add(1); n <= 8 || n%1000 == 0 {
+		log.Printf("receive: %s skew-held tail: %d of %d elements over the Lamport skew bound — the in-window subset Joined, the tail is loud (batchSkewHeldTail=%d; log line %d — rate-capped, the counter is exact)", kind, res.Held, res.Joined+res.Held, r.batchSkewHeldTail.Load(), n)
+	}
+}
+
+// NewReceiver binds the admission gates, identity directory, and engine.
+// budget is the verification budget in nanoseconds. MaxHopsForBudget converts
+// it once to the hop bound reused by HandleFrame. wallClock supplies physical
+// time for frames without relay hops.
 func NewReceiver(bucket *admission.PeerBucket, cap *clock.IngressHLCScalarCap, wallClock clock.WallClock, dir *identity.Directory, engine *eng.DeltaCRDTEngine, budget int64) *Receiver {
 	return &Receiver{
 		bucket:    bucket,
@@ -311,128 +204,145 @@ func NewReceiver(bucket *admission.PeerBucket, cap *clock.IngressHLCScalarCap, w
 	}
 }
 
-// SetClockAdvanceRecorder installs the receive-seam hook (the
-// foreign-advance seed fix). After a successful Accept, the Receiver fires the
-// recorder with the engine's post-Join LamportCounter() so the WAL records the
-// peer-driven clock advance. A nil recorder (the default) leaves the Receiver
-// behavior-identical: the in-memory research path never records, so the
-// hot path is untouched. The durability Bridge wires this to
-// wal.AppendClockAdvance; the production node sets it only when --wal-path is
-// set (durability ON). Set once at construction before the accept loop starts
-// (the production boot path is sequential; the recorder is not mutated
-// concurrently with HandleFrame).
+// SetClockAdvanceRecorder installs a callback that records a peer-driven
+// Lamport advance in the WAL. It runs only when the post-apply high-water
+// exceeds the value at handler entry. The durability bridge connects it to
+// wal.AppendClockAdvance when --wal-path is configured; nil disables recording.
+// Install it before starting concurrent handlers.
 func (r *Receiver) SetClockAdvanceRecorder(fn func(uint64) error) {
 	r.onClockAdvance = fn
 }
 
-// SetRelayRetainer installs the ADR-0045 relay-retention
-// hook. After a successful Accept of a FOREIGN delta (originNodeID != this
-// node), HandleFrame fires the retainer with the verified frame's
-// (originNodeID, dotCounter, frameBytes) so the mesh (the Gossiper) retains the
-// origin-signed relay envelope in a relay cache for onward re-publish. A nil
-// retainer (the default) is byte-identical to the receive path without this
-// hook: nothing is retained + shipDelta's foreign payloadCache.lookup miss is
-// the documented honest skip (the foreign delta propagates one hop then stops).
-// The Gossiper wires this once
-// at construction before the accept loop starts (the single-writer-before-reader
-// discipline, the SAME as SetClockAdvanceRecorder). The retainer callback is
-// invoked on the accept-loop goroutine; the Gossiper's relayCache is mutex-
-// guarded (the payloadCache precedent) so the cross-goroutine retain is safe.
-// Self-originated frames do NOT fire the hook (they are already in the origin-
-// side payloadCache + need no relay retention).
+// SetRelayRetainer installs the callback used by the Gossiper to cache foreign
+// relay envelopes for forwarding. HandleFrame invokes it after every accepted
+// apply; RetainForeign discards self-originated frames. Nil leaves foreign
+// frames without a relay copy. Install it before starting concurrent handlers.
 func (r *Receiver) SetRelayRetainer(fn func(originNodeID [16]byte, dotCounter uint64, frameBytes []byte)) {
 	r.onAcceptRelay = fn
 }
 
-// SetRelayRetainerBatch installs the ADR-0045 BATCH-layer
-// relay-retention hook — the batch sibling of SetRelayRetainer. After a
-// successful Accept of a FOREIGN batch (originNodeID != this node),
-// HandleBatchFrame fires the retainer with the verified batch's (originNodeID,
-// originSeq, dotCounters, batchFrameBytes) so the mesh (the Gossiper) retains
-// the WHOLE BatchEnvelope ONCE in a forward map + populates a reverse index
-// (origin, dotCounter)→originSeq for onward re-publish by shipBatchedDelta's
-// foreign branch. A nil retainer (the default) is byte-identical to the
-// batch receive path without this hook: nothing is retained + shipBatchedDelta's
-// foreign relay.lookup miss is the documented honest skip (the foreign batch
-// propagates one hop then stops — the batch-path relay gap on the production
-// default --batch-size 100). The Gossiper wires this
-// once at construction before the accept loop starts (the single-writer-before-
-// reader discipline, the SAME as SetRelayRetainer). The retainer callback is
-// invoked on the accept-loop goroutine; the Gossiper's relayCache is mutex-
-// guarded so the cross-goroutine retain is safe. Self-originated batches do NOT
-// fire the hook's retain (the Gossiper's RetainForeignBatch filters self — they
-// are already in the origin-side payloadCache + need no relay copy).
+// SetRelayRetainerBatch installs the callback used by the Gossiper to cache
+// foreign batch envelopes. After an apply with no held elements, the handler
+// supplies the original frame, OriginSeq, and joined dots. The callback runs
+// for self-originated batches too; RetainForeignBatch filters those out. Nil
+// disables relay retention. Install it before starting concurrent handlers.
 func (r *Receiver) SetRelayRetainerBatch(fn func(originNodeID [16]byte, originSeq uint64, dotCounters []uint64, frameBytes []byte)) {
 	r.onAcceptRelayBatch = fn
 }
 
-// SetHybridVerify installs the ADR-0036 opt-IN seam that switches the
-// two signature-verify call sites (HandleFrame + HandleBatchFrame) from the
-// classical-only identity.VerifyCRDTFrame to the hybrid
-// identity.VerifyCRDTFrame_Hybrid (Ed25519 + ML-DSA-65, BOTH-required,
-// defense-in-depth). enable=false (the DEFAULT) keeps the receive path on the
-// classical seam — byte-identical (the hybrid is an ADD, NOT a replace).
-// Set once at construction before the accept loop starts (the production boot
-// path is sequential; the flag is not mutated concurrently with HandleFrame).
-// The hybrid SIGN (a frame carries BOTH sigs) is a FUTURE change — the verify
-// seam alone is the load-bearing wiring this flag arms; a classical-only frame
-// under --hybrid-verify is REJECTED (the STRICT mode). See ADR-0036.
+// SetHybridVerify selects strict Ed25519 plus ML-DSA-65 verification for
+// HandleFrame and HandleBatchFrame, and enables HandleHybridFrame. With hybrid
+// verification enabled, classical-only frames are rejected. The false default
+// retains classical Ed25519 verification and rejects hybrid frames. Set it
+// before starting concurrent handlers. See ADR-0036 and ADR-0037.
 func (r *Receiver) SetHybridVerify(enable bool) {
 	r.hybridVerify = enable
 }
 
-// SetHybridAcceptReporter installs the ADR-0037 disclosure seam: a
-// non-nil callback fires on every hybrid frame ACCEPTED by the BOTH-verify
-// gate (HandleHybridFrame step 6). The production node wires it to
-// telemetry.HybridFrameAccepted.Inc (the operator-VISIBLE proof the moat is in
-// USE). A nil reporter (the default) leaves the
-// Receiver behavior-identical: the counter does not fire, the gate
-// stack is UNCHANGED (the counter is the DISCLOSURE, not the mechanism — the
-// SetStratifiedFallbackReporter precedent). Set once at construction before
-// the accept loop starts (the production boot path is sequential; the reporter
-// is not mutated concurrently with HandleHybridFrame). See ADR-0037 §5.
+// SetHybridAcceptReporter installs a notification for each accepted hybrid
+// batch. The production node connects it to HybridFrameAccepted; nil disables
+// the notification without changing verification. Install it before starting
+// concurrent handlers. See ADR-0037.
 func (r *Receiver) SetHybridAcceptReporter(fn func()) {
 	r.onHybridAccept = fn
 }
 
-// readGateFields is the cheap pre-Open read of the two gate fields the
-// rate gate and clock gate need (dotCounter, originNodeID). On a v3
-// envelope it is an O(1) HEADER read — two fixed-offset slice
-// reads off the parsed envelope's mirror fields, NO capnp decode — so the
-// reject-path floor is tens of ns, not the ~1 us capnp.Unmarshal+
-// ReadRootCRDTDeltaEvent the v2 path paid (the measured ~300x ratio's
-// floor). On a v2 envelope (forward-compat) the mirrors are absent
-// from the header, so it falls back to a capnp decode of the inner wire (the
-// v2 frame carries the gate fields only inside the inner capnp) — the v2
-// path keeps the v2 cost; the v3 path is the lift.
+// SetIndexFeeder installs a synchronous secondary-index callback. Each handler
+// invokes it once per joined delta before returning, and omits held elements.
+// Nil disables the feed. Install it before starting concurrent handlers.
+func (r *Receiver) SetIndexFeeder(fn func(entityID string, h3Index uint64, systemTime int64)) {
+	r.onIndexFeed = fn
+}
+
+// decodeIndexFields reads only the three fields consumed by the secondary
+// index from an already verified and applied event. It does not repeat payload
+// or digest validation.
+func decodeIndexFields(wire []byte) (entityID string, h3Index uint64, systemTime int64, err error) {
+	msg, err := capnp.Unmarshal(wire)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("receive: index feed decode: unmarshal: %w", err)
+	}
+	defer msg.Release()
+	ev, err := capnp_schema.ReadRootCRDTDeltaEvent(msg)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("receive: index feed decode: read root: %w", err)
+	}
+	id, err := ev.EntityId()
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("receive: index feed decode: entityId: %w", err)
+	}
+	return id, ev.H3Index(), ev.SystemTime(), nil
+}
+
+// batchHeldSet returns the held dots from an apply result, or nil when no
+// element was held. Index and retention paths use it to exclude elements that
+// did not enter state.
 //
-// It returns (dotCounter, originNodeID, error). A v2 capnp-decode failure is
-// a DropMalformed verdict (the inner wire is not a CRDTDeltaEvent at all). A
-// v3 header read never fails (the mirrors are fixed-offset slices already
-// validated for length by UnmarshalRelayEnvelope).
+// decodeIndexFieldsBatch reads index fields directly from the shared Cap'n
+// Proto message, skipping held dots and avoiding an intermediate event slice.
+// The caller releases the message after the feed returns. Decode failures stop
+// the feed; the index is derived state and does not change the apply verdict.
+func batchHeldSet(res eng.BatchApplyResult) map[uint64]struct{} {
+	if res.Held == 0 {
+		return nil
+	}
+	set := make(map[uint64]struct{}, len(res.HeldDots))
+	for _, d := range res.HeldDots {
+		set[d] = struct{}{}
+	}
+	return set
+}
+
+// decodeIndexFieldsBatch feeds secondary-index fields for each joined event.
+// A nil held set avoids filtering and allocation when the entire batch joined.
+func decodeIndexFieldsBatch(wire []byte, held map[uint64]struct{}, feed func(entityID string, h3Index uint64, systemTime int64)) error {
+	msg, err := capnp.Unmarshal(wire)
+	if err != nil {
+		return fmt.Errorf("receive: index feed batch decode: unmarshal: %w", err)
+	}
+	defer msg.Release()
+	batch, err := capnp_schema.ReadRootCRDTDeltaBatch(msg)
+	if err != nil {
+		return fmt.Errorf("receive: index feed batch decode: read root: %w", err)
+	}
+	events, err := batch.Events()
+	if err != nil {
+		return fmt.Errorf("receive: index feed batch decode: events: %w", err)
+	}
+	n := events.Len()
+	for i := 0; i < n; i++ {
+		ev := events.At(i) // alias into the parent arena — no per-element Release
+		if held != nil {
+			if _, isHeld := held[ev.DotCounter()]; isHeld {
+				continue
+			}
+		}
+		id, err := ev.EntityId()
+		if err != nil {
+			return fmt.Errorf("receive: index feed batch decode: element %d: entityId: %w", i, err)
+		}
+		feed(id, ev.H3Index(), ev.SystemTime())
+	}
+	return nil
+}
+
+// readGateFields obtains the dot counter and origin used by the cheap gates.
+// A v3 envelope supplies both from fixed-offset header mirrors without a
+// Cap'n Proto decode. A v2 envelope has no mirrors and falls back to decoding
+// its inner event. That fallback reports malformed input; a validated v3
+// header read cannot fail.
 func readGateFields(env *attribution.RelayEnvelope) (dotCounter uint64, originNodeID [16]byte, err error) {
 	if env.Version() == attribution.RelayEnvelopeVersion() {
-		// v3: O(1) header read. The mirrors were read off the wire by
-		// UnmarshalRelayEnvelope (fixed offsets [72:80] and [80:96]); no
-		// capnp decode, no allocation. This is the reject-path floor.
 		return env.DotCounter(), env.OriginNodeID(), nil
 	}
-	// v2 forward-compat: the header carries no mirrors, so decode the inner
-	// capnp for the gate fields (the v2 cost the v3 lift eliminates). A
-	// decode failure is a DropMalformed (the inner wire is not a
-	// CRDTDeltaEvent). This branch is the honest v2 fallback, NOT a silent
-	// fall-through to zero fields (the silent-fall-through failure mode): the
-	// version is an explicit dispatch and the gate fields come from the capnp decode.
+	// Decode v2 fields explicitly rather than allowing zero values to pass the
+	// gates when the header has no mirrors.
 	return readGateFieldsFromCapnp(env.InnerWire())
 }
 
-// readGateFieldsFromCapnp is the v2-fallback capnp decode of the gate fields
-// (dotCounter, originNodeID) from the inner wire. It is the path the v3 lift
-// REPLACES on the reject path: a v3 frame never reaches it (the header
-// mirrors are O(1)); only a v2 frame (forward-compat) pays it. It is retained
-// (not deleted) so a v2 peer's frames still cross the cheap gates. It is also
-// the decode the accept-path cross-check reuses (crossCheckGateFields) so the
-// v2 fallback and the cross-check share one decode path, not two.
+// readGateFieldsFromCapnp decodes a dot counter and 16-byte origin from an
+// inner CRDTDeltaEvent. V2 admission and the v3 header cross-check share this
+// decoder so both interpret the signed event identically.
 func readGateFieldsFromCapnp(innerWire []byte) (dotCounter uint64, originNodeID [16]byte, err error) {
 	msg, derr := capnp.Unmarshal(innerWire)
 	if derr != nil {
@@ -454,39 +364,27 @@ func readGateFieldsFromCapnp(innerWire []byte) (dotCounter uint64, originNodeID 
 	return ev.DotCounter(), originNodeID, nil
 }
 
-// HandleFrame runs the gate-stack composition over a single reassembled
-// envelope frame (frameBytes is a FULL envelope — the length-prefix
-// reassembler has already stripped the 4-byte prefix and accumulated the full
-// frame). It returns a typed AcceptVerdict; it NEVER panics on adversarial
-// input (a forged frame is a Verdict, never a crash).
-//
-// The ordering is the gate composition: cheap gates (rate, clock,
-// depth) run BEFORE the expensive ~60 us Ed25519 Verify, so a forged
-// deep / rate / clock frame is dropped in nanoseconds with zero Verifies.
+// HandleFrame verifies and applies one complete relay envelope. The length
+// prefix must already be removed. Rate, clock, and hop-depth checks precede
+// signature verification; a successful apply is followed by configured index,
+// clock-advance, and relay callbacks. Invalid input returns a verdict rather
+// than panicking.
 func (r *Receiver) HandleFrame(frameBytes []byte) AcceptVerdict {
-	// preAdvance captures the Lamport high-water at function entry — BEFORE the
-	// clock gate (which itself calls engine.AdvanceLamportTo) and before
-	// the Apply/Join. The receive-seam recorder must fire ONLY when the
-	// frame actually advanced the clock past where it started (a stale or
-	// duplicate delta whose DotCounter <= the current clock leaves the clock
-	// unchanged → no advance → no WAL record). Capturing at entry (not just
-	// before Apply) brackets BOTH the clock gate's advance AND Join's advance,
-	// so post-pre is the cumulative foreign advance the frame produced.
+	// Capture the high-water before any gate or apply work. The clock gate only
+	// checks physical drift; ApplyCRDTDeltaEvent advances Lamport time for joined
+	// entries. Comparing against this value suppresses WAL records for duplicates
+	// and includes every advance made by the apply.
 	preAdvance := r.engine.LamportCounter()
 
-	// 1. Parse the envelope header. No crypto. A malformed frame is a
-	// DropMalformed verdict, never a panic.
+	// Parse the envelope before doing cryptographic work.
 	env, err := attribution.UnmarshalRelayEnvelope(frameBytes)
 	if err != nil {
 		return AcceptVerdict{Verdict: DropMalformed, Reason: err}
 	}
 
-	// 2. Read the last hop's relayPub + wallUSec from the parsed envelope
-	// (cheap, before Open). The last hop is the direct sender the
-	// receiver rate-bounds and clock-bounds. A 0-hop
-	// envelope (origin frame, no relays) has no last hop; the rate gate
-	// is skipped (no relay pub to bound) and the clock gate uses the
-	// local clock now (the origin's physical time is not on the wire).
+	// The last hop identifies the direct sender for rate and clock checks. An
+	// origin frame has no relay key or physical timestamp, so it skips the rate
+	// gate and uses the local clock.
 	hops := env.HopCount()
 	var lastHopPub [32]byte
 	var lastHopWall int64
@@ -497,212 +395,151 @@ func (r *Receiver) HandleFrame(frameBytes []byte) AcceptVerdict {
 		}
 	}
 
-	// 3. Cheap read of the gate fields (dotCounter, originNodeID). On a v3
-	// frame this is an O(1) HEADER read (two fixed-offset slice reads off
-	// the parsed envelope's mirrors, NO capnp decode) — the lift
-	// that drops the reject-path floor from ~1 us (capnp decode) to tens of
-	// ns. On a v2 frame (forward-compat) it falls back to a capnp decode of
-	// the inner wire (the v2 cost). Runs BEFORE Open's expensive verify. A
-	// v2 decode failure is a DropMalformed (the inner wire is not a
-	// CRDTDeltaEvent); a v3 header read never fails.
+	// Read gate fields before Open. V3 uses header mirrors; v2 decodes the inner
+	// event and can therefore reject malformed input here.
 	dotCounter, originNodeID, err := readGateFields(env)
 	if err != nil {
 		return AcceptVerdict{Verdict: DropMalformed, Reason: err}
 	}
 
-	// 4. Rate gate: PeerBucket.Accept(lastHopRelayPub, dotCounter).
-	// ~36 ns; cheap. The source of pub is the last hop's relayPub; the
-	// source of counter is the capnp DotCounter. A 0-hop frame skips the
-	// rate gate (no relay pub to bound).
+	// Charge the last relay for its DotCounter advance. If a pre-verification
+	// gate rejects the frame, the corresponding charge is refunded below. An
+	// uncharged duplicate or dropped frame leaves charged at zero.
+	var charged uint64
 	if hops > 0 {
-		if r.bucket.Accept(lastHopPub[:], dotCounter) == admission.Drop {
+		decision, ch := r.bucket.Accept(lastHopPub[:], dotCounter)
+		charged = ch
+		if decision == admission.Drop {
 			return AcceptVerdict{Verdict: DropRate, Reason: errors.New("receive: rate cap dropped frame (peer budget exhausted)")}
 		}
 	}
 
-	// 5. Clock gate: IngressHLCScalarCap.Admit(lastHopWallUSec,
-	// dotCounter). The physical timestamp is the last hop's WallUSec; the
-	// logical is the capnp DotCounter. On accept, the clock gate calls
-	// engine.AdvanceLamportTo itself. A 0-hop frame uses the local clock
-	// now (the origin's physical time is not on the wire).
+	// Admit checks only physical drift. Lamport advancement belongs to the
+	// engine's apply path, after verification and skew validation.
 	var physUSec int64
 	if hops > 0 {
 		physUSec = lastHopWall
 	} else {
 		physUSec = r.wallClock.PhysicalNowUSec()
 	}
-	if !r.cap.Admit(physUSec, dotCounter) {
-		return AcceptVerdict{Verdict: DropClock, Reason: errors.New("receive: clock cap dropped frame (Byzantine-future physical timestamp)")}
+	if !r.cap.Admit(physUSec) {
+		// Open has not authenticated the relay, so this pre-verify drop refunds
+		// the charge unless a test explicitly disables refunds.
+		if charged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(lastHopPub[:], charged)
+		}
+		return AcceptVerdict{Verdict: DropClock, Reason: errors.New("receive: clock cap dropped frame (physical timestamp too far in the future)")}
 	}
 
-	// 6. Depth + outer-verify gate: RelayEnvelope.Open(maxHops). O(1)
-	// depth check THEN N outer Verifies — the expensive gate; runs only
-	// after the cheap rate/clock rejects pass. ErrHopBoundExceeded is a
-	// DropDepth (zero Verifies); ErrVerify is a DropVerify.
+	// Open checks the hop bound before verifying relay signatures. Both failure
+	// classes occur before the relay is authenticated, so both refund its charge.
+	// Once Open succeeds, later failures keep the charge and commit the watermark.
 	verifiedInner, _, err := env.Open(r.maxHops)
 	if err != nil {
+		if charged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(lastHopPub[:], charged)
+		}
 		if errors.Is(err, attribution.ErrHopBoundExceeded) {
 			return AcceptVerdict{Verdict: DropDepth, Reason: err}
 		}
-		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: Open failed: %w", err)}
+		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: relay envelope open failed: %w", err)}
 	}
 
-	// 7. Resolve originPub via the identity Directory. A miss is a
-	// DropVerify (the receiver cannot verify an unknown origin).
+	// Open authenticated the charged relay, so its pending high-water mark can
+	// now commit. Later origin or integrity failures retain both the charge and
+	// the committed watermark. Uncharged frames and duplicates skip this step.
+	if charged > 0 {
+		r.bucket.CommitHWM(lastHopPub[:], dotCounter)
+	}
+
+	// Resolve the origin key before verifying the signed inner event.
 	originPub, ok := r.dir.Lookup(originNodeID)
 	if !ok {
 		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: identity Directory miss for originNodeID %x", originNodeID)}
 	}
 
-	// 8. Inner origin verify: VerifyCRDTFrame(originPub, innerWire,
-	// originSig). ~60 us; the expensive gate. originSig is ON the
-	// envelope — not test-computed. A zero originSig
-	// (version-1 envelope) fails here (DropVerify).
-	//
-	// ADR-0036: --hybrid-verify switches this to the hybrid
-	// VerifyCRDTFrame_Hybrid (Ed25519 + ML-DSA-65, BOTH-required). The v1
-	// envelope carries ONLY the Ed25519 originSig (NO PQ sig) — so under
-	// --hybrid-verify a v1 frame is REJECTED here (the STRICT mode: a hybrid
-	// verifier NEVER accepts a classical-only frame; BOTH sigs is the
-	// contract). The hybrid SIGN (a frame carries BOTH sigs) is a FUTURE change
-	// — the CRDT-delta wire shape change — disclosed ADR-0036 §6; the verify
-	// seam is the load-bearing wiring this change arms, the sign is the NEXT PQ
-	// change. The Directory does NOT yet carry a peer's ML-DSA-65 pubkey (the
-	// honest NOT-YET — the peer-pubkey provisioning is the FUTURE change), so the
-	// hybrid arm passes a nil pqPub → VerifyCRDTFrame_Hybrid returns false (the
-	// nil-pqPub reject). This is the byte-identical-gate: --hybrid-verify
-	// OFF (the DEFAULT) keeps the classical VerifyCRDTFrame seam UNCHANGED.
+	// Classical mode verifies the envelope's Ed25519 origin signature. Strict
+	// hybrid mode requires an ML-DSA-65 signature and public key as well; a
+	// classical-only envelope supplies neither and is therefore rejected.
 	originSig := env.OriginSig()
 	if r.hybridVerify {
-		// Hybrid verify — BOTH sigs required. The v1 envelope carries NO
-		// PQ sig, so this REJECTS (the STRICT mode) until the hybrid-SIGN change
-		// ships a frame carrying BOTH sigs + the Directory carries the peer's
-		// ML-DSA-65 pubkey. The nil pqPub is the honest NOT-YET (ADR-0036 §6).
 		if !identity.VerifyCRDTFrame_Hybrid(originPub, nil, verifiedInner, originSig[:], nil, "") {
-			return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: 1.1 hybrid origin signature verification failed (BOTH Ed25519 + ML-DSA-65 required; a v1 classical-only frame is rejected under --hybrid-verify — the STRICT mode; the hybrid SIGN is a future change)")}
+			return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: hybrid origin signature verification failed (both Ed25519 and ML-DSA-65 required; classical-only frames are rejected under --hybrid-verify)")}
 		}
 	} else if !identity.VerifyCRDTFrame(originPub, verifiedInner, originSig[:]) {
-		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: 1.1 inner origin signature verification failed")}
+		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: inner origin signature verification failed")}
 	}
 
-	// 8b. SECURITY GUARD — header/inner gate-field cross-check.
-	// A malicious relay can put a DIFFERENT dotCounter / originNodeID in
-	// the v3 header than the inner capnp carries: the cheap gates read the
-	// adversarial HEADER value, pass, and step 9 Join consumes the INNER
-	// capnp value — a gate-bypass (the rate gate bounds the wrong counter,
-	// the clock gate sees the wrong counter, Directory.Lookup keys on the
-	// wrong originNodeID). The v3 header lift is INSECURE without this
-	// cross-check. It runs AFTER the cheap gates AND the expensive
-	// Open+Verify (it only fires for frames that cleared them), so it adds
-	// ZERO cost to the reject path (the whole point of the lift) and a
-	// bounded cost (one capnp decode + one uint64 compare + one 16-byte
-	// compare) to the accept path. A mismatch is a DropVerify ("gate-field
-	// header/inner desync — adversarial or corrupt") BEFORE
-	// ApplyCRDTDeltaEvent, so Join is NOT called on a desync frame.
+	// A relay can alter the unsigned v3 header mirrors without changing the
+	// signed inner event. Cross-check both after authentication so admission and
+	// origin lookup cannot use values different from those applied by the engine.
+	// A mismatch returns DropVerify before ApplyCRDTDeltaEvent.
 	//
-	// BRANCH A (chosen): the cross-check does its OWN capnp
-	// decode of the Open-verified inner wire (the compare-decode), and
-	// ApplyCRDTDeltaEvent then does its internal decode — accept-path
-	// decode is 3x (readGateFields header read = 0x on v3, this compare-
-	// decode = 1x, ApplyCRDTDeltaEvent = 1x). Branch B (reuse the
-	// apply-path decode via the pre-decoded
-	// ReconstructEntryWithSkewBound + an inline CRDTDelta/Join) was
-	// REJECTED: it clones crdt_apply.go's apply logic into pkg/receive,
-	// re-opening the apply-path drift seams crdt_apply.go's own comments warn
-	// against (a bypass here re-opens the live-path apply seam). Branch A does
-	// not touch crdt_apply.go and keeps the apply
-	// path single-sourced there; the accept path is crypto-
-	// dominated (~300 us/frame), so the extra compare-decode (~1 us) is
-	// ~0.3% — a measured, honest cost, not hidden.
-	// On a v2 frame the cross-check is a no-op (the v2 header carries no
-	// mirrors; the gate fields already came from the inner capnp decode in
-	// step 3, so header == inner by construction — there is nothing to
-	// desync).
+	// The comparison decodes the verified inner event, and the apply decodes it
+	// again. With the optional index feed there is a third field decode; without
+	// it there are two. Keeping ApplyCRDTDeltaEvent intact avoids duplicating its
+	// reconstruction and join logic here. V2 needs no comparison because its gate
+	// fields already came from the inner event.
 	if env.Version() == attribution.RelayEnvelopeVersion() {
 		if err := crossCheckGateFields(env, verifiedInner); err != nil {
 			return AcceptVerdict{Verdict: DropVerify, Reason: err}
 		}
 	}
 
-	// 9. Join: ApplyCRDTDeltaEvent(verifiedInner) — the FIRST production
-	// caller of crdt_apply.go:113. A WireIntegrityError (digest
-	// mismatch) is a DropVerify; the engine's Join is not called.
+	// The engine advances Lamport time only while applying an accepted entry.
+	// Advancing here would move the clock before the apply's skew check, allowing
+	// a verified but excessive dot to poison subsequent local dots and be recorded
+	// in the WAL. Leaving advancement to the apply keeps the bound anchored to the
+	// pre-frame clock and leaves an over-bound frame with no clock side effects.
+	//
+	// advanceDeferFault restores the old pre-apply advance solely for a negative
+	// control. It is false in normal operation.
+	if r.advanceDeferFault.Load() {
+		r.cap.Advance(dotCounter)
+	}
+
+	// Integrity or skew errors reject the frame without a successful apply.
 	if err := r.engine.ApplyCRDTDeltaEvent(verifiedInner); err != nil {
 		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: ApplyCRDTDeltaEvent rejected frame: %w", err)}
 	}
-	// receive-seam hook: gate on an ACTUAL foreign clock advance, not
-	// on every Accept. The frame advanced the Lamport clock only if post > pre;
-	// a stale/duplicate delta whose DotCounter <= the entry clock leaves the
-	// clock unchanged (AdvanceLamportTo's guard no-ops at crdt.go:1642), so it
-	// is NOT an advance and must NOT append a WAL record (the fsync
-	// bomb: a spurious no-op record + fsync per Accept). A nil recorder (the
-	// in-memory research path) is a no-op. The clock advance's effect is the
-	// post-entry high-water; recording post (not the raw foreign DotCounter)
-	// is the slight over-record the seed tolerates (ADR-0013 §7(h)).
+	// Feed the derived index after the join. Decode failures are logged but do
+	// not reverse or downgrade an apply that already succeeded.
+	if r.onIndexFeed != nil {
+		if id, h3, sys, derr := decodeIndexFields(verifiedInner); derr != nil {
+			log.Printf("receive: secondary-index feed decode failed (frame Joined; index best-effort): %v", derr)
+		} else {
+			r.onIndexFeed(id, h3, sys)
+		}
+	}
+	// Record only an actual advance. Duplicates leave the high-water unchanged
+	// and must not cause a WAL append and fsync. The recorded post-apply value
+	// can be slightly higher than the foreign dot, as ADR-0013 permits.
 	//
-	// ERROR SURFACING: a WAL-append/fsync failure
-	// on the clock-advance record is LOGGED loudly — NOT swallowed. A foreign
-	// Join is IRREVERSIBLE (crdt.go already merged the entry into
-	// e.shards by the time Apply returned), so this path CANNOT return a
-	// DropVerify style refusal without lying (the state IS merged). Unlike the
-	// ORIGIN /v1/insert path — which can withhold a 503 because the client
-	// write is local and retryable — the receive path cannot un-join. The
-	// operator reads the log; the next checkpoint re-anchors the WAL at the
-	// true high-water; if recovery fires before that checkpoint, the missing
-	// advance is the same residual the engine's foreign-state limit
-	// already documents (foreign state regossips on rejoin). This is honest:
-	// the error is visible (logged), not silently dropped; the asymmetry with
-	// the origin 503 is a consequence of the fixed merge path, recorded verbatim. See
-	// ADR-0013 §7(h) for the surfaced-not-503 contract.
+	// A recording failure is logged rather than returned as a drop: the entry is
+	// already merged and cannot be unjoined. Unlike a local insert, which can
+	// report HTTP 503 for a retry, this handler can only surface the durability
+	// error and rely on the next checkpoint to re-anchor the WAL high-water.
 	if r.onClockAdvance != nil {
 		if post := r.engine.LamportCounter(); post > preAdvance {
 			if err := r.onClockAdvance(post); err != nil {
-				log.Printf("receive: durability WAL clock-advance record failed (post=%d): %v — frame Accepted, state merged, advance NOT durable until next checkpoint", post, err)
+				log.Printf("receive: durability WAL clock-advance record failed (post=%d): %v — frame Accepted, state merged, advance not durable until next checkpoint", post, err)
 			}
 		}
 	}
-	// ADR-0045 relay retention: hand the verified
-	// foreign frame to the mesh so a later shipDelta can re-publish it onward.
-	// The retainer (nil by default = byte-identical to the no-hook skip) decides
-	// foreign-vs-self via the originNodeID it receives (the Gossiper compares
-	// against its own owner.NodeID) — the Receiver stays nodeID-agnostic (no
-	// exported accessor on the engine, no engine change). frameBytes is
-	// the raw relay envelope (origin-signed innerWire + hops); it re-verifies
-	// cleanly on the onward receiver (Open + VerifyCRDTFrame re-check the
-	// origin sig, which is unchanged; the rate/clock/depth gates re-key on the
-	// new last-hop sender). dotCounter + originNodeID are the cheap-gate
-	// mirrors read at step 3 — the CRDT identity the relay cache
-	// keys on. Fires for EVERY Accept (self + foreign); the retainer retains
-	// ONLY foreign (a self-originated frame is already in the origin-side
-	// payloadCache + needs no relay copy). A retain error is NOT a receive
-	// failure — the foreign Join is irreversible (the engine merged it
-	// at step 9); the relay cache is best-effort retention, and a miss there
-	// falls back to the documented honest skip in shipDelta (the delta
-	// propagates one hop, not zero — still a net improvement over the path without this hook).
+	// Offer the original envelope to the relay cache after the apply. The mesh
+	// keeps only foreign frames, keyed by origin and dot, and can forward them
+	// without re-signing. Self-originated payloads already have an origin-side
+	// copy. Retention is best-effort and cannot change the completed apply.
 	if r.onAcceptRelay != nil {
 		r.onAcceptRelay(originNodeID, dotCounter, frameBytes)
 	}
-	return AcceptVerdict{Verdict: Accept}
+	return AcceptVerdict{Verdict: Accept, Accepted: 1}
 }
 
-// rateDropReason builds the DropRate reason: the origin's hex
-// prefix, the offending sequence, and the origin's REMAINING budget — the three
-// fields that let an operator read the drain off the log instead of deriving it.
-//
-// WHY THIS EXISTS: silicon emitted 72,831 byte-identical zero-field DropRate
-// lines on a single node (and 77,838 on the seed). Every line said "origin budget
-// exhausted" and none said WHICH origin, WHICH sequence, or HOW MUCH budget was
-// left, so the sawtooth had to be inferred from accept/drop ratios and timestamps.
-// A gate that cannot explain its own drops costs a silicon run per diagnosis.
-//
-// EMISSION IS CAPPED per origin (the missLogCap pattern from pkg/mesh): the first
-// rateDropLogCap drops carry full fields, then every rateDropLogEvery-th one, so a
-// pathological storm still leaves a trail without reproducing the 72,831-line flood.
-// Suppressed drops still return a reason (the verdict is never silent) — they just
-// carry the running count instead of re-stating the fields.
-//
-// The counter map is keyed by originNodeID and guarded by rateDropMu, taken ONLY on
-// this drop path.
+// rateDropReason reports the origin prefix, sequence, remaining budget, and
+// per-origin drop count. The first 8 drops and every 1000th thereafter include
+// all fields; other drops return only the count to bound log volume. rateDropMu
+// protects the counts, which are updated only on this drop path.
 func (r *Receiver) rateDropReason(kind string, originNodeID [16]byte, offendingSeq uint64, rateKey []byte) error {
 	remaining := r.bucket.Budget(rateKey)
 	r.rateDropMu.Lock()
@@ -713,64 +550,34 @@ func (r *Receiver) rateDropReason(kind string, originNodeID [16]byte, offendingS
 	n := r.rateDropSeen[originNodeID]
 	r.rateDropMu.Unlock()
 	if n <= rateDropLogCap || n%rateDropLogEvery == 0 {
-		return fmt.Errorf("receive: %s rate cap dropped batch: origin=%x seq=%d remaining_budget=%d drop#%d — the gap from this origin's high-water mark exceeds its remaining budget (the HWM never rewinds and only an accepted frame advances it, so this drop means a genuine unfunded advance, NOT a re-charged duplicate)",
+		return fmt.Errorf("receive: %s rate cap dropped batch: origin=%x seq=%d remaining_budget=%d drop#%d — the gap from this origin's high-water mark exceeds its remaining budget (the HWM never rewinds and only an accepted frame advances it, so this drop means a genuine unfunded advance, not a re-charged duplicate)",
 			kind, originNodeID[:4], offendingSeq, remaining, n)
 	}
 	return fmt.Errorf("receive: %s rate cap dropped batch: origin=%x drop#%d (fields suppressed; first %d + every %dth carry full detail)",
 		kind, originNodeID[:4], n, rateDropLogCap, rateDropLogEvery)
 }
 
-// rateDropLogCap / rateDropLogEvery bound the DropRate emission: the first N drops per
-// origin carry full fields, then every Mth. Mirrors pkg/mesh's missLogCap.
+// rateDropLogCap and rateDropLogEvery limit detailed DropRate messages.
 const (
 	rateDropLogCap   uint64 = 8
 	rateDropLogEvery uint64 = 1000
 )
 
-// HandleBatchFrame runs the gate-stack composition over a single reassembled
-// BATCH envelope frame (batchFrameBytes is a FULL BatchEnvelope — the length-
-// prefix reassembler has already stripped the 4-byte prefix and the dispatch
-// peek has already routed it here via attribution.IsBatchFrame). It is the
-// batched sibling of HandleFrame: where HandleFrame verifies ONE Ed25519 over
-// ONE inner wire and ApplyCRDTDeltaEvent-Joins one delta, HandleBatchFrame
-// verifies ONE Ed25519 over the marshaled CRDTDeltaBatch wire and
-// ApplyCRDTDeltaBatch-Joins ALL N deltas in one decode + one Join — the
-// arithmetic unlock (60.19us amortized to 60.19/N us/delta). It returns a
-// typed AcceptVerdict; it NEVER panics on adversarial input.
+// HandleBatchFrame verifies and applies one complete BatchEnvelope. It charges
+// the origin's zero-extended node ID against OriginSeq, verifies one signature
+// over the batch wire, and calls ApplyCRDTDeltaBatch. Strict hybrid mode
+// requires both signature algorithms even for this classical envelope.
 //
-// The ordering (the gate composition, lifted to the batch):
-//
-// 1. Parse the BatchEnvelope header (UnmarshalBatchEnvelope) — O(1), no capnp
-// decode of batchWire. Malformed => DropMalformed; zero originSig =>
-// DropVerify (the unsigned-batch guard, caught inside Unmarshal).
-// 2. Cheap gate: RATE — r.bucket.Accept on the batch's originNodeID, ONCE per
-// batch (the per-origin budget is decremented once per batch, NOT once per
-// delta — the honest amortization of the rate gate). Over-budget => DropRate.
-// 3. Resolve originPub: r.dir.Lookup(originNodeID) => originPub. Miss => DropVerify.
-// 4. THE ONE VERIFY: identity.VerifyCRDTFrame(originPub, batchWire, originSig)
-// => false => DropVerify. (This is the 60.19us that now covers N deltas.)
-// 5. THE BATCH APPLY: r.engine.ApplyCRDTDeltaBatch(batchWire)
-// (crdt_apply_batch.go:118) => on *WireIntegrityError => DropVerify
-// (atomic-reject: zero joined).
-// 6. Verdict: Accept (N deltas joined in one decode + one Join).
-//
-// The per-event clock/depth gates are NOT re-run here: a 0-hop self-originated
-// batch has NO relay hop walls, so the receiver's batch-level cheap gate is
-// RATE only. The per-event clock/Lamport-skew gate is enforced by
-// ApplyCRDTDeltaBatch's ReconstructEntryWithSkewBound-per-element (the
-// engine path, crdt_apply_batch.go:206), NOT re-implemented in the receiver.
-// A batch whose element exceeds the Lamport skew bound is rejected by
-// ApplyCRDTDeltaBatch with a *WireIntegrityError (atomic-reject: zero
-// joined).
+// The engine enforces the per-element Lamport skew bound. In-window elements
+// join while over-bound elements are held; any other integrity error rejects
+// the whole batch. A batch held in full returns DropVerify, while an empty
+// batch is an accepted no-op. Accepted reports the joined count, not BatchCount.
+// Index and relay callbacks omit held elements, and batches with held elements
+// are not retained for relay.
 func (r *Receiver) HandleBatchFrame(batchFrameBytes []byte) AcceptVerdict {
-	// preAdvance brackets the whole batch (clock gate + batch Join) — see the
-	// HandleFrame comment. The recorder fires once per batch only if post>pre.
+	// One high-water comparison covers the whole batch apply.
 	preAdvance := r.engine.LamportCounter()
 
-	// 1. Parse the BatchEnvelope header. O(1); never decodes batchWire. A
-	// malformed header (too short, bad magic, bad version) is a DropMalformed;
-	// a zero originSig is a DropVerify (the unsigned-batch guard, caught
-	// inside UnmarshalBatchEnvelope as ErrBatchUnsigned).
 	env, err := attribution.UnmarshalBatchEnvelope(batchFrameBytes)
 	if err != nil {
 		if errors.Is(err, attribution.ErrBatchUnsigned) {
@@ -779,168 +586,127 @@ func (r *Receiver) HandleBatchFrame(batchFrameBytes []byte) AcceptVerdict {
 		return AcceptVerdict{Verdict: DropMalformed, Reason: err}
 	}
 
-	// 2. Cheap gate: RATE — r.bucket.Accept on the batch's originNodeID, ONCE
-	// per batch. PeerBucket.Accept keys on a 32-byte pubkey; the batch's
-	// originNodeID is 16 bytes, so it is zero-extended to 32 bytes as the
-	// rate-gate key. This is a DISTINCT key space from the 32-byte relay
-	// pubkeys the per-frame path rate-gates on (a real Ed25519 pubkey is
-	// never 16-zero-bytes-padded), so there is no collision in practice; the
-	// choice is documented in ADR-0010 §2. The counter is the batch's
-	// OriginSeq — the origin's MONOTONIC per-batch sequence (advancing by 1
-	// per batch the origin ships). The bucket drains on the DELTA between
-	// successive OriginSeq values from the same origin, so a burst of
-	// batches drains the origin's budget (the Sybil-burst isolation the rate
-	// gate exists to enforce), amortized to one check per batch. It is NOT
-	// the BatchCount: a static count of deltas would produce a zero delta
-	// between same-size batches and the budget would never drain — a dead
-	// rate gate for the dominant steady-state workload (a node shipping its
-	// own N writes/sec in fixed-size batches). It mirrors the per-frame
-	// path's dotCounter (the monotonic per-origin sequence the per-frame
-	// rate gate keys on). The per-origin budget is decremented ONCE per
-	// batch, NOT once per delta — the honest amortization.
+	// Zero-extend the 16-byte origin ID into PeerBucket's 32-byte key space;
+	// trailing zeroes distinguish it from relay public keys (ADR-0010 §2).
+	// OriginSeq advances monotonically per batch, so its delta charges the
+	// origin once per batch. BatchCount would remain constant for fixed-size
+	// batches and would not drain the budget.
 	originNodeID := env.OriginNodeID()
 	var rateKey [32]byte
 	copy(rateKey[:16], originNodeID[:])
-	if r.bucket.Accept(rateKey[:], env.OriginSeq()) == admission.Drop {
+	// Directory and signature failures refund this pre-verification charge.
+	// Once verified, an apply rejection keeps the charge against the origin.
+	batchDecision, batchCharged := r.bucket.Accept(rateKey[:], env.OriginSeq())
+	if batchDecision == admission.Drop {
 		return AcceptVerdict{Verdict: DropRate, Reason: r.rateDropReason("batch", originNodeID, env.OriginSeq(), rateKey[:])}
 	}
 
-	// 3. Resolve originPub via the identity Directory. A miss is a
-	// DropVerify (the receiver cannot verify an unknown origin's signature).
 	originPub, ok := r.dir.Lookup(originNodeID)
 	if !ok {
+		if batchCharged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(rateKey[:], batchCharged)
+		}
 		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: identity Directory miss for batch originNodeID %x", originNodeID)}
 	}
 
-	// 4. THE ONE VERIFY — the amortization. identity.VerifyCRDTFrame over the
-	// marshaled CRDTDeltaBatch wire (the crypto-minimal design: the bytes
-	// Verify checks ARE the bytes ApplyCRDTDeltaBatch decodes — no SHA-256
-	// batch root, no hash-then-reconstruct gap). This is the 60.19us that
-	// now covers N deltas. A tampered batchWire fails here (DropVerify),
-	// never reaching ApplyCRDTDeltaBatch.
+	// Verify exactly the batch bytes that ApplyCRDTDeltaBatch will decode. There
+	// is no intermediate digest whose reconstruction could diverge from the wire.
+	// Strict hybrid mode rejects this classical-only batch because it has no
+	// ML-DSA-65 signature or padding.
 	batchWire := env.BatchWire()
 	originSig := env.OriginSig()
-	// ADR-0036: --hybrid-verify switches this to the hybrid
-	// VerifyCRDTFrame_Hybrid (Ed25519 + ML-DSA-65, BOTH-required). The v1 batch
-	// envelope carries ONLY the Ed25519 originSig (NO PQ sig) — so under
-	// --hybrid-verify a v1 batch is REJECTED here (the STRICT mode: a hybrid
-	// verifier NEVER accepts a classical-only batch; BOTH sigs is the contract).
-	// The hybrid batch SIGN is a FUTURE change; see the HandleFrame comment.
-	// --hybrid-verify OFF (the DEFAULT) keeps the classical VerifyCRDTFrame seam.
 	if r.hybridVerify {
 		if !identity.VerifyCRDTFrame_Hybrid(originPub, nil, batchWire, originSig[:], nil, "") {
-			return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: batch hybrid origin signature verification failed (BOTH Ed25519 + ML-DSA-65 required; a v1 classical-only batch is rejected under --hybrid-verify — the STRICT mode; the hybrid SIGN is a future change)")}
+			if batchCharged > 0 && !r.disableRefundFault.Load() {
+				r.bucket.Refund(rateKey[:], batchCharged)
+			}
+			return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: batch hybrid origin signature verification failed (both Ed25519 and ML-DSA-65 required; classical-only batches are rejected under --hybrid-verify)")}
 		}
 	} else if !identity.VerifyCRDTFrame(originPub, batchWire, originSig[:]) {
+		if batchCharged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(rateKey[:], batchCharged)
+		}
 		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: batch origin signature verification failed (one Ed25519 over the batch wire)")}
 	}
 
-	// 4b. ADR-0045 BATCH-layer relay retention — MOVED to
-	// step 5b, AFTER the Apply (a review caught the ordering): the
-	// earlier order retained before Apply, so a batch that
-	// passed sig-verify but failed the skew gate was pinned in the
-	// relayCache without ever entering state. Retention is now
-	// Join-gated, matching the per-frame path's discipline (HandleFrame
-	// step 8b fires after the engine accepts). See step 5b below.
-	//
-	// 5. THE BATCH APPLY — the engine path (crdt_apply_batch.go:118).
-	// One decode, N reconstructs (each through ReconstructEntryWithSkewBound,
-	// which enforces the per-event clock/Lamport-skew gate the receiver
-	// does NOT re-run), ONE Join. On the FIRST *WireIntegrityError (a
-	// tampered digest, a dot/origin mismatch, or a Lamport skew poisoning on
-	// ANY element) it returns an error and ZERO deltas are joined
-	// (atomic-reject: reconstruct-all-then-join-once). A partial batch is a
-	// batch-level failure, never a partial apply.
-	if err := r.engine.ApplyCRDTDeltaBatch(batchWire); err != nil {
-		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: ApplyCRDTDeltaBatch rejected batch: %w", err)}
+	// Verification authenticates the origin and commits the charged watermark.
+	// An apply failure keeps both the charge and this committed high-water mark.
+	if batchCharged > 0 {
+		r.bucket.CommitHWM(rateKey[:], env.OriginSeq())
 	}
 
-	// 5b. ADR-0045 BATCH-layer relay retention — now
-	// AFTER the Apply (a review caught the ordering). The
-	// earlier order retained BEFORE Apply, so a batch that passed
-	// sig-verify but FAILED Apply (the per-element skew bound —
-	// ReconstructEntryWithSkewBound; Inspect's ReconstructEntry carries no
-	// skew check) was pinned in the relayCache: retained forever, never
-	// Joined, and never re-pointed (the refcount frees a frame only when
-	// a later batch re-points the same dots — these dots never entered
-	// state, so nothing re-points them). Retaining only what we actually
-	// Join'd is also the per-frame path's discipline (HandleFrame step 8b
-	// fires after the engine accepts). Apply-first costs nothing on the
-	// happy path and SKIPS the Inspect decode entirely on a rejected batch.
-	//
-	// Inspect the verified batch wire READ-ONLY (eng.InspectBatchDots —
-	// the read-only sibling of ApplyCRDTDeltaBatch, crdt_apply_batch.go) to
-	// recover the batch's origin + per-element dotCounters WITHOUT a second
-	// Join, then hand the WHOLE BatchEnvelope (batchFrameBytes) + OriginSeq
-	// to the mesh's batch retainer so a later shipBatchedDelta foreign
-	// branch can find the batch a foreign entry came in + re-publish it
-	// onward. This is the BATCH sibling of HandleFrame's step 8b
-	// onAcceptRelay retain — the per-frame retainer cannot build
-	// a batch relay (a batch is ONE frame with ONE Ed25519 over the WHOLE
-	// batch wire; there is NO per-element origin-signed frame to retain),
-	// so the batch path needs a batch-aware retainer.
-	//
-	// If Inspect fails OR the retainer is nil, retention is skipped
-	// (logged) — the Join already happened (the relay cache is best-effort;
-	// a miss there falls back to the documented honest skip in
-	// shipBatchedDelta). Self-originated batches (batchOrigin == this
-	// node) fire the hook too — the Gossiper's RetainForeignBatch filters
-	// self (keeps the batch relay foreign-only, the SAME discipline
-	// RetainForeign keeps for the per-frame layer); the Receiver stays
-	// nodeID-agnostic (no exported accessor on the engine, no engine
-	// change).
-	//
-	// A SECOND decode of the same wire (once by Apply, once by Inspect) is
-	// acceptable: capnp unmarshal is ~1us, the batch is small, the
-	// rate-gate is already O(1)/batch (the single-sourced ReconstructEntry
-	// keeps the decode logic in ONE place — pkg/sync — so no maintenance
-	// hazard). The double-decode's per-element ReconstructEntry cost is
-	// the disclosed known limitation.
-	if r.onAcceptRelayBatch != nil {
-		batchOrigin, dotCounters, inspectErr := eng.InspectBatchDots(batchWire)
-		if inspectErr != nil {
-			// Best-effort-skip: log + do NOT fail the Accept. The Join already
-			// happened (Apply succeeded); retention is the best-effort layer.
-			log.Printf("receive: InspectBatchDots failed for batch origin=%x seq=%d: %v — relay retain skipped (the batch IS Joined; the foreign batch is best-effort retention)", originNodeID, env.OriginSeq(), inspectErr)
-		} else {
-			r.onAcceptRelayBatch(batchOrigin, env.OriginSeq(), dotCounters, batchFrameBytes)
+	// ReconstructEntryWithSkewBound enforces the per-element skew gate. A skew
+	// violation holds only that element; other integrity errors reject the whole
+	// batch without joining any elements.
+	batchRes, err := r.engine.ApplyCRDTDeltaBatch(batchWire)
+	if err != nil {
+		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: ApplyCRDTDeltaBatch rejected batch: %w", err)}
+	}
+	if batchRes.Held > 0 {
+		r.noteHeldTail("batch", batchRes)
+	}
+	if batchRes.Joined == 0 && batchRes.Held > 0 {
+		// Nothing entered state. The sender can re-ship after other joins advance
+		// the window. Empty batches skip this branch and remain accepted no-ops.
+		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: batch held IN FULL: all %d elements over the Lamport skew bound — zero joined, zero side effects, the held tail is loud (batchSkewHeldTail=%d)", batchRes.Held, r.batchSkewHeldTail.Load())}
+	}
+	// Feed only joined elements. Index decode errors do not change the verdict.
+	if r.onIndexFeed != nil {
+		if ferr := decodeIndexFieldsBatch(batchWire, batchHeldSet(batchRes), r.onIndexFeed); ferr != nil {
+			log.Printf("receive: secondary-index batch feed decode failed (batch Joined; index best-effort): %v", ferr)
 		}
 	}
 
-	// 6. Verdict: Accept — N deltas joined in one decode + one Join. The
-	// per-delta verdict counter is incremented by N (not +1) at the CALLER
-	// (the dispatch wrapper in serveConn/readLoop) via BatchAcceptCount +
-	// the existing Recorder seam — the verdict counter is PER-DELTA, so a
-	// batch of N adds N to the Accept label.
+	// Retention follows the apply so rejected or held elements cannot pin a relay
+	// frame whose dots never entered state. InspectBatchDots reads the signed wire
+	// without another join and supplies the identity needed by the relay cache.
+	// This second decode is best-effort and never changes the apply verdict.
 	//
-	// receive-seam hook (the batch sibling of HandleFrame's): gate on
-	// an ACTUAL advance (post > preAdvance), not on every Accept. A stale or
-	// duplicate batch whose elements do not advance the clock beyond the
-	// entry high-water produces zero WAL records (no per-Accept fsync bomb).
-	// Recorded once per batch (NOT once per delta — the advance is the
-	// high-water the replay must reach, recorded once per batch Accept).
-	// Error surfacing mirrors HandleFrame's (logged loudly, not swallowed;
-	// irreversible batch Join cannot be un-done with a 503 — see ADR-0013
-	// §7(h) for the surfaced-not-503 contract).
+	// A partially held batch is not retained: one signature covers the full batch,
+	// so a relayer cannot split off and re-sign only the joined elements. Replaying
+	// the full frame cannot heal the held tail; the sender must re-ship it later.
+	// disableRetainOnHoldFault restores the old retention behavior for a control.
+	if r.onAcceptRelayBatch != nil && !r.disableRetainOnHoldFault.Load() && batchRes.Held > 0 {
+		if n := r.heldTailLogSeq.Add(1); n <= 8 || n%1000 == 0 {
+			log.Printf("receive: Held>0 partial batch: relay retention skipped (Held=%d, Joined=%d) — the full origin-signed frame cannot heal the held tail; the sender must re-ship it (batchSkewHeldTail=%d; log line %d)", batchRes.Held, batchRes.Joined, r.batchSkewHeldTail.Load(), n)
+		}
+	} else if r.onAcceptRelayBatch != nil {
+		batchOrigin, dotCounters, inspectErr := eng.InspectBatchDots(batchWire)
+		if inspectErr != nil {
+			log.Printf("receive: InspectBatchDots failed for batch origin=%x seq=%d: %v — relay retain skipped (the batch is joined; retention is best-effort)", originNodeID, env.OriginSeq(), inspectErr)
+		} else {
+			// The fault-control path can reach this filter with held elements.
+			joinedDots := dotCounters
+			if hs := batchHeldSet(batchRes); hs != nil {
+				joinedDots = make([]uint64, 0, len(dotCounters))
+				for _, d := range dotCounters {
+					if _, isHeld := hs[d]; !isHeld {
+						joinedDots = append(joinedDots, d)
+					}
+				}
+			}
+			r.onAcceptRelayBatch(batchOrigin, env.OriginSeq(), joinedDots, batchFrameBytes)
+		}
+	}
+
+	// The dispatcher records Accepted, so held elements do not inflate the
+	// per-delta accept count. The clock recorder runs once per batch and only
+	// when its post-apply high-water exceeds the entry value. Recording errors
+	// follow HandleFrame's log-only contract because the joins are irreversible.
 	if r.onClockAdvance != nil {
 		if post := r.engine.LamportCounter(); post > preAdvance {
 			if err := r.onClockAdvance(post); err != nil {
-				log.Printf("receive: durability WAL clock-advance record failed (batch post=%d): %v — batch Accepted, state merged, advance NOT durable until next checkpoint", post, err)
+				log.Printf("receive: durability WAL clock-advance record failed (batch post=%d): %v — batch Accepted, state merged, advance not durable until next checkpoint", post, err)
 			}
 		}
 	}
-	return AcceptVerdict{Verdict: Accept}
+	return AcceptVerdict{Verdict: Accept, Accepted: batchRes.Joined}
 }
 
-// crossCheckGateFields is the security guard: it decodes the Open-verified
-// inner capnp CRDTDeltaEvent and asserts the v3 header mirrors equal the inner
-// values — headerDotCounter == ev.DotCounter() AND headerOriginNodeID ==
-// [16]byte(ev.OriginNodeID()). A mismatch is a gate-bypass (a malicious relay
-// put different gate fields in the header than the inner carries) and is
-// rejected as a DropVerify BEFORE ApplyCRDTDeltaEvent (so Join is not called).
-// It reuses readGateFieldsFromCapnp for the inner decode so the v2 fallback
-// and the cross-check share one decode path. It runs only on the ACCEPT path
-// (after Open+Verify), so it adds zero cost to the reject path.
+// crossCheckGateFields compares the v3 header's dot counter and origin with
+// the authenticated inner event. A mismatch means the cheap gates and directory
+// used different values from the apply, so the caller returns DropVerify before
+// joining. readGateFieldsFromCapnp shares the v2 decoder and its validation.
 func crossCheckGateFields(env *attribution.RelayEnvelope, verifiedInner []byte) error {
 	innerDotCounter, innerOriginNodeID, err := readGateFieldsFromCapnp(verifiedInner)
 	if err != nil {
@@ -955,20 +721,10 @@ func crossCheckGateFields(env *attribution.RelayEnvelope, verifiedInner []byte) 
 	return nil
 }
 
-// readLastHop reads the LAST hop's relayPub and wallUSec directly from the
-// raw frame bytes (a cheap O(1) read, no per-hop loop, no crypto). The
-// envelope framing is [2]ver [2]hopCount [4]innerLen [64]originSig (v3 adds
-// [8]dotCounter [16]originNodeID) [innerLen]innerWire then hops of HopSize
-// bytes each; the last hop starts at hdrLen + innerLen + (hops-1)*HopSize,
-// where hdrLen is version-dependent (v3=96, v2=72). The framing offsets are
-// sourced from attribution.HeaderLenForVersion / HopSize / PubSize / SigSize
-// (the single source of truth), NOT re-derived as literals here: the desync
-// guard (TestReceiver_SourceGuard's desync block) fails the build
-// if these references are ever replaced by hardcoded byte-offset literals, so
-// a future envelope layout change propagates by const-reference and the
-// receiver can never disagree with the encoder. Returns an error if the frame
-// is too short for the declared hops (a malformed frame UnmarshalRelayEnvelope
-// should have caught, re-checked here for defense-in-depth).
+// readLastHop locates the final relay public key and WallUSec directly in the
+// frame. Header length depends on the envelope version; attribution supplies
+// that length and all hop field offsets so the decoder cannot drift from the
+// encoder. The declared hop extent is checked again before slicing.
 func readLastHop(frameBytes []byte, hops int) (pub [32]byte, wallUSec int64, err error) {
 	if hops <= 0 {
 		return pub, 0, errors.New("receive: readLastHop called with hops <= 0")
@@ -978,17 +734,9 @@ func readLastHop(frameBytes []byte, hops int) (pub [32]byte, wallUSec int64, err
 	}
 	ver := binary.LittleEndian.Uint16(frameBytes[0:2])
 	innerLen := int(binary.LittleEndian.Uint32(frameBytes[4:8]))
-	// Frame layout constants sourced from the single source of truth
-	// (pkg/attribution), NOT re-derived here. Re-deriving the byte offsets
-	// duplicated the framing layout in two files; drift between the two
-	// silently misattributes a good frame as a DropClock / DropVerify (the
-	// wall-timestamp read drifts into the next hop's relayPub bytes -> a
-	// far-future physical timestamp -> a false clock-cap reject). The
-	// desync guard (TestReceiver_SourceGuard's desync block) fails the
-	// build if these attribution.* references are ever replaced by literals.
-	// The header length is version-dependent (v3=96, v2=72); sourcing it from
-	// attribution.HeaderLenForVersion keeps the v2/v3 offset in lockstep with
-	// the encoder without a re-derived literal.
+	// Use attribution constants rather than duplicating offset arithmetic. A
+	// stale hop size can shift the timestamp read into key material and cause a
+	// false clock rejection. TestReceiver_SourceGuard checks this invariant.
 	hdrLen, ok := attribution.HeaderLenForVersion(ver)
 	if !ok {
 		return pub, 0, fmt.Errorf("receive: readLastHop: unsupported envelope version %d", ver)
@@ -1003,102 +751,28 @@ func readLastHop(frameBytes []byte, hops int) (pub [32]byte, wallUSec int64, err
 	return pub, wallUSec, nil
 }
 
-// HandleHybridFrame runs the gate-stack composition over a single reassembled
-// HYBRID-PQ batch envelope frame (hybridFrameBytes is a FULL HybridEnvelope —
-// the length-prefix reassembler has already stripped the 4-byte prefix + the
-// dispatch peek has routed it here via attribution.IsHybridFrame). It is the
-// ADR-0037 sibling of HandleBatchFrame: where HandleBatchFrame
-// verifies ONE Ed25519 over the batchWire, HandleHybridFrame verifies BOTH the
-// hedged Ed25519 sig AND the ML-DSA-65 sig over the SAME 120-byte SHAKE256 pad
-// of batchWire (the hybrid both-required gate, VerifyBatchHybrid), then
-// ApplyCRDTDeltaBatch-Joins ALL N deltas in one decode + one Join — the SAME
-// arithmetic unlock, with the PQ half added. It returns a typed AcceptVerdict;
-// it NEVER panics on adversarial input.
+// HandleHybridFrame verifies and applies one complete HybridEnvelope. It is
+// enabled only by SetHybridVerify(true); otherwise it returns DropVerify before
+// decoding, reading engine state, charging a budget, or consulting the directory.
+// There is no classical fallback for a frame that carries two signatures.
 //
-// The ordering (the gate composition, lifted to the hybrid batch — the SAME
-// cheap-gates-first discipline HandleBatchFrame uses):
-//
-// 1. Parse the HybridEnvelope header (UnmarshalHybridFrame) — O(1), no capnp
-// decode of batchWire. Malformed => DropMalformed; a zero edSig OR zero
-// pqSig => DropVerify (the unsigned-hybrid guard, caught inside Unmarshal).
-// 2. Cheap gate: RATE — r.bucket.Accept on the batch's originNodeID, ONCE per
-// batch (the per-origin budget decremented once per batch — the SAME
-// amortization HandleBatchFrame uses). Over-budget => DropRate.
-// 3. Resolve BOTH pubkeys: r.dir.LookupBoth(originNodeID) => (edPub, pqPub, ok).
-// A classical miss (ok=false) => DropVerify (the receiver cannot verify an
-// unknown origin under ANY seam). A hybrid miss (ok=true but pqPub=nil —
-// the peer registered ONLY the classical key) => DropVerify under
-// --hybrid-verify (the STRICT mode: a hybrid verifier NEVER accepts a
-// frame from a non-PQ-provisioned origin — the same contract).
-// 4. THE BOTH VERIFY: identity.VerifyBatchHybrid(edPub, pqPub, batchWire,
-// edSig[:], pqSig[:], ctx) => false => DropVerify. VerifyBatchHybrid
-// recomputes the 120-byte SHAKE256 pad + feeds it to the UNCHANGED
-// VerifyCRDTFrame_Hybrid (the both-required gate). This is the ~74us PQ verify
-// that runs only after
-// the ~60us classical verify passes (short-circuit AND) — the SUM is the
-// honest hybrid verify cost, recorded per-op (NOT amortized).
-// 5. THE BATCH APPLY: r.engine.ApplyCRDTDeltaBatch(batchWire) — the SAME
-// engine path HandleBatchFrame calls (crdt_apply_batch.go:118). The
-// receiver applies the ORIGINAL batchWire (NOT the pad) so Join sees the
-// real bytes — the no-hash-then-reconstruct-gap property preserved for the
-// hybrid frame. On the FIRST *WireIntegrityError it returns an error +
-// ZERO deltas are joined (atomic-reject).
-// 6. Verdict: Accept (N deltas joined in one decode + one Join, BOTH sigs
-// verified). The HybridFrameAccepted counter
-// increments here — the operator-VISIBLE proof the moat is in USE.
-//
-// The hybrid frame is OPT-IN on BOTH the send side (--hybrid-sign) AND the
-// receive side (--hybrid-verify). A node with --hybrid-verify=false (the
-// DEFAULT) routes a hybrid frame here via the 4th DispatchFrame arm — but the
-// gate at step 4 calls VerifyBatchHybrid ONLY when r.hybridVerify is true; when
-// false the frame is REJECTED as a hybrid frame a non-hybrid-verify receiver
-// cannot accept (a hybrid frame is NOT a v1 BatchEnvelope — the receiver cannot
-// fall back to the classical single-sig verify on a BOTH-sig frame; the honest
-// posture, disclosed ADR-0037 §5). This keeps the byte-identical-
-// default: --hybrid-verify=false + --hybrid-sign=false => NO hybrid frame is
-// ever produced or accepted (the v1 mesh + the TLS guards run
-// UNCHANGED).
+// VerifyBatchHybrid checks Ed25519 and ML-DSA-65 over the same 120-byte SHAKE256
+// pad. The engine then applies the original batch wire, not the pad, using the
+// same skew and integrity rules as HandleBatchFrame. Accepted reports joined
+// elements. Index and relay callbacks omit held elements; hybrid acceptance and
+// clock-advance notifications follow a successful apply. See ADR-0037.
 func (r *Receiver) HandleHybridFrame(hybridFrameBytes []byte) AcceptVerdict {
-	// 0. CONFIG GATE — reject a hybrid frame on an UNARMED receiver BEFORE ANY
-	// other work (the DoS-amplifier fix). The original ordering
-	// ran the engine.LamportCounter read (preAdvance) + the rate gate
-	// (r.bucket.Accept — which MUTATES the per-origin budget) + the LookupBoth
-	// RLock + two map reads BEFORE the !r.hybridVerify reject, so a
-	// --hybrid-sign peer dialing a --hybrid-verify=OFF (the DEFAULT) peer
-	// drained the origin's rate budget on a GUARANTEED-reject frame — a
-	// mixed-fleet rolling deploy where a hybrid-sign node burns every
-	// not-yet-hybrid-verify peer's budget, converging nothing. Worse, a
-	// SPOOFED hybrid frame with a forged victim originNodeID drained the
-	// VICTIM's budget on a default-config node with ZERO crypto work (the rate
-	// gate keys on the header's originNodeID, not a verified one); + the
-	// preAdvance engine read would nil-deref a receiver constructed without an
-	// engine (the test/posture a receiver that will reject anyway never
-	// needs). Moving the config gate to step 0 (the VERY TOP, before the
-	// unmarshal, the engine read, the rate gate, + the lookup) closes the
-	// amplifier: an unarmed receiver rejects a hybrid frame with zero
-	// side-effects. The honest posture is unchanged (a non-hybrid-verify
-	// receiver NEVER accepts a hybrid frame — the symmetric STRICT mode);
-	// only the ORDERING changes (the reject now precedes ALL the work, not
-	// follows it). The unmarshal is also deferred (an unarmed receiver does
-	// NOT need to parse a frame it will reject — the magic peek the dispatch
-	// already did is enough to route here; the full header parse is the
-	// armed receiver's job).
+	// Reject before decoding or touching any state. In particular, a forged
+	// origin cannot drain its rate budget on a receiver that cannot accept the
+	// frame, and a nil engine is not dereferenced on this path.
 	if !r.hybridVerify {
-		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: hybrid-PQ batch received but --hybrid-verify is OFF — a BOTH-sig frame cannot be verified by a classical-only receiver (the symmetric STRICT mode; rejected at the TOP of HandleHybridFrame before the unmarshal, the engine read, the rate gate, + the Directory lookup so an unarmed receiver does NOT drain the origin's rate budget on a guaranteed-reject frame — the DoS-amplifier fix; --hybrid-sign=false is the byte-identical default so a hybrid frame is never produced on the production path)")}
+		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: hybrid-PQ batch rejected because --hybrid-verify is disabled")}
 	}
 
-	// preAdvance brackets the whole hybrid batch (batch Join) — see the
-	// HandleFrame comment. The recorder fires once per batch only if post>pre.
-	// (Read AFTER the config gate — an unarmed receiver returns at step 0 + never
-	// reaches this read, so a receiver constructed without an engine does NOT
-	// nil-deref on a guaranteed-reject hybrid frame.)
+	// This read follows the configuration gate, so disabled receivers do not
+	// require an engine. One high-water comparison covers the hybrid batch apply.
 	preAdvance := r.engine.LamportCounter()
 
-	// 1. Parse the HybridEnvelope header. O(1); never decodes batchWire. A
-	// malformed header (too short, bad magic, bad version) is a
-	// DropMalformed; a zero edSig OR a zero pqSig is a DropVerify (the
-	// unsigned-hybrid guard, caught inside UnmarshalHybridFrame as
-	// ErrHybridUnsigned).
 	env, err := attribution.UnmarshalHybridFrame(hybridFrameBytes)
 	if err != nil {
 		if errors.Is(err, attribution.ErrHybridUnsigned) {
@@ -1107,114 +781,111 @@ func (r *Receiver) HandleHybridFrame(hybridFrameBytes []byte) AcceptVerdict {
 		return AcceptVerdict{Verdict: DropMalformed, Reason: err}
 	}
 
-	// 2. Cheap gate: RATE — r.bucket.Accept on the batch's originNodeID, ONCE
-	// per batch (the SAME amortization HandleBatchFrame uses). The batch's
-	// originNodeID is 16 bytes, zero-extended to 32 bytes as the rate-gate
-	// key (the DISTINCT key space from the 32-byte relay pubkeys — see the
-	// HandleBatchFrame comment for the collision rationale). The counter is
-	// the batch's OriginSeq — the origin's MONOTONIC per-batch sequence.
+	// Use the same zero-extended origin key and monotonic OriginSeq charging as
+	// the classical batch path. Pre-verification failures refund this charge.
 	originNodeID := env.OriginNodeID()
 	var rateKey [32]byte
 	copy(rateKey[:16], originNodeID[:])
-	if r.bucket.Accept(rateKey[:], env.OriginSeq()) == admission.Drop {
+	hybDecision, hybCharged := r.bucket.Accept(rateKey[:], env.OriginSeq())
+	if hybDecision == admission.Drop {
 		return AcceptVerdict{Verdict: DropRate, Reason: r.rateDropReason("hybrid batch", originNodeID, env.OriginSeq(), rateKey[:])}
 	}
 
-	// 3. Resolve BOTH pubkeys via Directory.LookupBoth. A classical
-	// miss (ok=false) is a DropVerify (the receiver cannot verify an unknown
-	// origin under ANY seam). A hybrid miss (ok=true but pqPub=nil — the peer
-	// registered ONLY the classical key, the earlier default) is a
-	// DropVerify under --hybrid-verify (the STRICT mode — a hybrid verifier
-	// NEVER accepts a frame from a non-PQ-provisioned origin; the
-	// nil-pqPub reject, unchanged). LookupBoth is the grown seam; the
-	// classical Lookup stays byte-identical (the classical-only verify path
-	// still calls it — backward-compat).
+	// LookupBoth requires the classical identity and returns its ML-DSA-65 key
+	// when provisioned. A missing classical identity fails before verification;
+	// VerifyBatchHybrid rejects a missing post-quantum key.
 	originPub, pqPub, ok := r.dir.LookupBoth(originNodeID)
 	if !ok {
+		if hybCharged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(rateKey[:], hybCharged)
+		}
 		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: identity Directory miss for hybrid originNodeID %x", originNodeID)}
 	}
 
-	// 4. THE BOTH VERIFY — the hybrid gate. VerifyBatchHybrid recomputes the
-	// 120-byte SHAKE256 pad of batchWire + feeds it to the UNCHANGED
-	// VerifyCRDTFrame_Hybrid (the both-required gate). This is the ~60us
-	// classical verify + the ~74us PQ verify (short-circuit AND — a classical
-	// reject skips the PQ verify). BOTH sigs over the SAME pad; EITHER reject
-	// => DropVerify. (The --hybrid-verify=OFF reject was hoisted to step 1.5
-	// above — BEFORE the rate gate + the lookup — so this step only runs on an
-	// ARMED receiver; the comment stays to name the gate the armed path runs.)
+	// VerifyBatchHybrid checks both signatures over one SHAKE256 pad. Classical
+	// verification runs first and can reject without doing ML-DSA-65 work.
 	batchWire := env.BatchWire()
 	edSig := env.EdSig()
 	pqSig := env.PQSig()
 	if !identity.VerifyBatchHybrid(originPub, pqPub, batchWire, edSig[:], pqSig[:], "") {
-		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: hybrid-PQ batch signature verification failed (BOTH Ed25519 + ML-DSA-65 required over the SAME 120-byte SHAKE256 pad; either sig corrupt, or the origin's ML-DSA-65 pubkey is not provisioned — the STRICT mode)")}
+		if hybCharged > 0 && !r.disableRefundFault.Load() {
+			r.bucket.Refund(rateKey[:], hybCharged)
+		}
+		return AcceptVerdict{Verdict: DropVerify, Reason: errors.New("receive: hybrid-PQ batch signature verification failed (both Ed25519 and ML-DSA-65 required over the same 120-byte SHAKE256 pad)")}
 	}
 
-	// 5. THE BATCH APPLY — the SAME engine path HandleBatchFrame calls
-	// (crdt_apply_batch.go:118). The receiver applies the ORIGINAL batchWire
-	// (NOT the pad) so Join sees the real bytes — the no-hash-then-reconstruct-
-	// gap property preserved for the hybrid frame. On the FIRST
-	// *WireIntegrityError it returns an error + ZERO deltas are joined
-	// (atomic-reject).
-	if err := r.engine.ApplyCRDTDeltaBatch(batchWire); err != nil {
+	// Both signatures have authenticated the origin, so commit the watermark
+	// charged before verification. Later apply failures retain it.
+	if hybCharged > 0 {
+		r.bucket.CommitHWM(rateKey[:], env.OriginSeq())
+	}
+
+	// Apply the original wire rather than the signature pad. Skew violations hold
+	// individual elements; other integrity errors reject the entire batch.
+	hybRes, err := r.engine.ApplyCRDTDeltaBatch(batchWire)
+	if err != nil {
 		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: ApplyCRDTDeltaBatch rejected hybrid batch: %w", err)}
 	}
-
-	// 5b-HYBRID. A review caught the omission: the
-	// relay-retention hook was wired into HandleFrame and
-	// HandleBatchFrame but NOT here — a hybrid foreign batch was Joined yet
-	// never retained, so the hybrid path's relay silently stopped at one
-	// hop. Fire the SAME batch retainer (onAcceptRelayBatch) with the FULL
-	// HYBRID frame bytes: the onward receiver's DispatchFrame routes by the
-	// envelope's magic byte to ITS HandleHybridFrame, so re-publishing the
-	// hybrid envelope byte-identical preserves the BOTH-sig contract end to
-	// end. Post-Apply like the classical path (the Join-gated discipline —
-	// retain only what we Join'd). Best-effort: an Inspect failure skips
-	// the retain with a log; the Join already happened.
-	if r.onAcceptRelayBatch != nil {
-		batchOrigin, dotCounters, inspectErr := eng.InspectBatchDots(batchWire)
-		if inspectErr != nil {
-			log.Printf("receive: InspectBatchDots failed for HYBRID batch origin=%x seq=%d: %v — relay retain skipped (the batch IS Joined; retention is best-effort)", originNodeID, env.OriginSeq(), inspectErr)
-		} else {
-			r.onAcceptRelayBatch(batchOrigin, env.OriginSeq(), dotCounters, hybridFrameBytes)
+	if hybRes.Held > 0 {
+		r.noteHeldTail("hybrid batch", hybRes)
+	}
+	if hybRes.Joined == 0 && hybRes.Held > 0 {
+		return AcceptVerdict{Verdict: DropVerify, Reason: fmt.Errorf("receive: hybrid batch held IN FULL: all %d elements over the Lamport skew bound — zero joined, zero side effects (batchSkewHeldTail=%d)", hybRes.Held, r.batchSkewHeldTail.Load())}
+	}
+	// Hybrid deltas use the same joined-only index feed as classical batches.
+	if r.onIndexFeed != nil {
+		if ferr := decodeIndexFieldsBatch(batchWire, batchHeldSet(hybRes), r.onIndexFeed); ferr != nil {
+			log.Printf("receive: secondary-index hybrid batch feed decode failed (batch Joined; index best-effort): %v", ferr)
 		}
 	}
 
-	// 6. Verdict: Accept — N deltas joined, BOTH sigs verified. The
-	// HybridFrameAccepted counter increments
-	// here — the operator-VISIBLE proof the moat is in USE (not just wired).
-	// The counter is the operator-facing disclosure; the load-bearing deliverable is the
-	// BOTH-verify ACCEPT itself (the moat is now USEFUL under --hybrid-verify).
+	// Retain the complete hybrid envelope after a successful apply. DispatchFrame
+	// recognizes its magic on the next hop, preserving both signatures end to end.
+	// Partial batches are not retained because a relayer cannot re-sign a joined
+	// subset and replaying the full frame cannot heal the held tail.
+	if r.onAcceptRelayBatch != nil && !r.disableRetainOnHoldFault.Load() && hybRes.Held > 0 {
+		if n := r.heldTailLogSeq.Add(1); n <= 8 || n%1000 == 0 {
+			log.Printf("receive: Held>0 hybrid partial batch: relay retention skipped (Held=%d, Joined=%d) — the full hybrid frame cannot heal the held tail; the sender must re-ship it (batchSkewHeldTail=%d; log line %d)", hybRes.Held, hybRes.Joined, r.batchSkewHeldTail.Load(), n)
+		}
+	} else if r.onAcceptRelayBatch != nil {
+		batchOrigin, dotCounters, inspectErr := eng.InspectBatchDots(batchWire)
+		if inspectErr != nil {
+			log.Printf("receive: InspectBatchDots failed for hybrid batch origin=%x seq=%d: %v — relay retain skipped (the batch is joined; retention is best-effort)", originNodeID, env.OriginSeq(), inspectErr)
+		} else {
+			// The fault-control path can reach this filter with held elements.
+			joinedDots := dotCounters
+			if hs := batchHeldSet(hybRes); hs != nil {
+				joinedDots = make([]uint64, 0, len(dotCounters))
+				for _, d := range dotCounters {
+					if _, isHeld := hs[d]; !isHeld {
+						joinedDots = append(joinedDots, d)
+					}
+				}
+			}
+			r.onAcceptRelayBatch(batchOrigin, env.OriginSeq(), joinedDots, hybridFrameBytes)
+		}
+	}
+
+	// Report hybrid acceptance only after both verification and the apply succeed.
 	if r.onHybridAccept != nil {
 		r.onHybridAccept()
 	}
-	// receive-seam hook (the hybrid-batch sibling of HandleBatchFrame's):
-	// gate on an ACTUAL advance (post > preAdvance), not on every Accept. A
-	// stale or duplicate hybrid batch whose elements do not advance the clock
-	// beyond the entry high-water produces zero WAL records (no per-Accept fsync
-	// bomb). Recorded once per batch. Error surfacing mirrors HandleBatchFrame's
-	// (logged loudly, not swallowed; irreversible batch Join cannot be un-done
-	// with a 503 — see ADR-0013 §7(h) for the surfaced-not-503 contract).
+	// Record one post-apply high-water when the batch advanced Lamport time.
+	// Duplicates produce no record; failures are logged because joins cannot be
+	// reversed (ADR-0013).
 	if r.onClockAdvance != nil {
 		if post := r.engine.LamportCounter(); post > preAdvance {
 			if err := r.onClockAdvance(post); err != nil {
-				log.Printf("receive: durability WAL clock-advance record failed (hybrid batch post=%d): %v — hybrid batch Accepted, state merged, advance NOT durable until next checkpoint", post, err)
+				log.Printf("receive: durability WAL clock-advance record failed (hybrid batch post=%d): %v — hybrid batch Accepted, state merged, advance not durable until next checkpoint", post, err)
 			}
 		}
 	}
-	return AcceptVerdict{Verdict: Accept}
+	return AcceptVerdict{Verdict: Accept, Accepted: hybRes.Joined}
 }
 
-// an io.Reader (a net.Conn or an *os.File over an AF_UNIX socket) and
-// accumulates bytes into a reassembly buffer until a full frame is available,
-// then returns the frame's envelope bytes (the 4-byte prefix stripped). The
-// on-the-wire shape is [uint32 frameLen BE][envelope bytes...].
-//
-// It mirrors the proven reassembly idiom in internal/transport's read loop
-// (capnp_server.go:370-404: accumulate into a buffer, check if enough bytes
-// for the framing header, parse the length, wait for the full frame) but does
-// NOT import internal/transport (that is the client->engine TriTemporalEvent
-// ingest path, a separate track). pkg/receive is a leaf over the gate
-// packages; it imports only stdlib + the gate packages + the capnp schema.
+// FrameReader reads from an io.Reader and returns complete envelope payloads
+// without their 4-byte big-endian length prefixes. It retains trailing bytes
+// for the next call and bounds buffered frames with maxFrameSize.
 type FrameReader struct {
 	r   io.Reader
 	buf []byte // reassembly buffer
@@ -1254,7 +925,7 @@ func (f *FrameReader) ReadFrame() ([]byte, error) {
 		}
 	}
 	// 3. Copy out the envelope bytes (prefix stripped) and compact the
-	// reassembly buffer (keep any trailing bytes for the next frame).
+	//    reassembly buffer (keep any trailing bytes for the next frame).
 	out := make([]byte, frameLen)
 	copy(out, f.buf[frameLenPrefixSize:need])
 	remaining := len(f.buf) - need
@@ -1296,8 +967,6 @@ func (f *FrameReader) fill(target int) error {
 // buffer unbounded).
 var ErrFrameTooLarge = errors.New("receive: frame length prefix exceeds maxFrameSize")
 
-// MaxUint64DotCounter is the MaxUint64 DotCounter value the rate-
-// reject test uses (a Sybil ratcheting DotCounter to MaxUint64). It is a test
-// constant exported so the receiver test can build a MaxUint64-counter frame
-// without re-typing the literal.
+// MaxUint64DotCounter is the largest possible DotCounter. Receiver tests use
+// it to exercise rejection of an excessive sequence advance.
 const MaxUint64DotCounter = math.MaxUint64

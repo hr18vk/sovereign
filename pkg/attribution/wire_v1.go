@@ -4,116 +4,49 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package attribution — wire_v1.go is the crypto-minimal BATCH envelope for
-// self-originated delta transport (the arithmetic unlock).
+// Package attribution also defines batch, digest, and hybrid wire envelopes.
+// This file contains their framing; relay envelopes are in envelope.go.
 //
-// THE PHYSICS THIS ENVELOPE BREAKS (deconstruct to atoms first):
+// BatchEnvelope amortizes signature verification over self-originated deltas.
+// A sequential Ed25519 VerifyCRDTFrame call costs about 60.19 us on the
+// 32-core c8g.8xlarge baseline with circl v1.6.4. One signature per delta
+// cannot reach one million deltas per second on one core. Signing a batch of
+// N deltas reduces the verification component to 60.19/N us per delta, while
+// decoding, applying, and network costs remain (ADR-0014 and ADR-0015).
 //
-//	Ed25519 VerifyCRDTFrame = 60.19 us/frame (32c PROVEN, circl v1.6.4)
-//	=> single-verify ceiling = 1 / 60.19e-6 ~= 533,000 verifies/sec
-//	=> 1M/sec is ARITHMETIC-FALSE on the per-frame path while one verify buys
+// The origin signs the marshaled CRDTDeltaBatch wire directly:
 //
-// one delta. The ONLY honest path: collapse N verifies into ONE verify.
+//	batchSig = identity.SignCRDTFrame(originSeed, batchWire)
+//	verify   = identity.VerifyCRDTFrame(originPub, batchWire, batchSig)
 //
-// BatchEnvelope carries ONE Ed25519 signature over a BATCH of N self-originated
-// deltas, so the verify cost amortizes from 60.19 us/delta to 60.19/N us/delta.
-// At N=100 that is ~0.60 us/delta; the floor then moves to (batch-wire decode +
-// N applies + net), each sub-microsecond per delta on the PROVEN 32c apply
-// number (~36 ns/entry). This is the arithmetic unlock for the >=1M/sec
-// headline bench.
+// Ed25519 already hashes the message with SHA-512 as part of RFC 8032, so an
+// additional batch-root hash is unnecessary. Direct signing also reuses the
+// existing verification path and covers the exact bytes that
+// ApplyCRDTDeltaBatch decodes. There is no separately reconstructed payload
+// between verification and application.
 //
-// THE CRYPTO-MINIMAL DESIGN (strictly STRONGER than a SHA-256 batch-root):
+// BatchEnvelope is for deltas signed by their origin. A relay does not have
+// another origin's private key, so it cannot produce that origin's batch
+// signature. Foreign deltas instead use RelayEnvelope: each relay adds a
+// SignHop signature over the inner wire and the preceding relay material.
 //
-//	Ed25519 signs the MARSHALED CRDTDeltaBatch WIRE DIRECTLY:
+// BatchEnvelope has the following wire layout. The receiver parses the header
+// before verification and leaves batchWire opaque until verification succeeds.
 //
-// batchSig = identity.SignCRDTFrame(originSeed, batchWire)
-// verify = identity.VerifyCRDTFrame(originPub, batchWire, batchSig)
+//	[4]  magic         (uint32 big-endian, WireV1Magic)
+//	[1]  version       (uint8, WireV1Version)
+//	[8]  originSeq     (uint64 big-endian, monotonic per origin)
+//	[2]  batchCount    (uint16 big-endian)
+//	[16] originNodeID  (key for Directory.Lookup)
+//	[64] originSig     (Ed25519 signature over batchWire)
+//	[...] batchWire    (marshaled CRDTDeltaBatch capnp frame)
 //
-//	Ed25519 (circl, RFC-8032 strict) internally SHA-512-hashes the message
-//	byte string in Verify. Signing the wire directly gives:
-//
-// - ONE hash inside verify (the SHA-512 over batchWire) vs (N+1) SHA-256
-// hashes in a batch-root scheme — LESS crypto compute, same security
-// (Ed25519 is already a hash-then-sign scheme; an outer hash is
-// redundant).
-// - ZERO new hash scheme (reuse VerifyCRDTFrame VERBATIM — the 60.19us
-// PROVEN symbol, no new crypto to audit).
-// - NO hash-then-reconstruct gap: the bytes Verify checks ARE the bytes
-// ApplyCRDTDeltaBatch (pkg/sync/crdt_apply_batch.go:118) decodes — the
-// signature covers the EXACT wire batch the engine Join()s. STRONGER
-// binding than a hash-then-apply scheme (a wire-tamper opportunity
-// between a verified hash and a decoded wire is closed by construction).
-// - the engine's ApplyCRDTDeltaBatch ALREADY accepts a marshaled
-// CRDTDeltaBatch wire ([]byte) — so the wire you sign is the wire you
-// apply, end to end.
-//
-// THE SELF-ORIGIN BOUNDARY (load-bearing — encode it, do NOT hide it):
-//
-// A relayer forwarding a FOREIGN delta holds ONLY its own relay seed — it NEVER
-// holds the foreign ORIGIN's seed. It can ADD a relay hop-signature
-// (attribution.SignHop) over (innerWire || preceding) — the RelayEnvelope
-// hop chain (envelope.go) — but it CANNOT re-origin-sign a foreign delta.
-// BatchEnvelope therefore covers the SELF-ORIGINATED delta path (a node
-// batching its OWN N writes into one signed batch). Relay-chained foreign
-// deltas STAY per-frame (the RelayEnvelope v3 hop chain — unchanged).
-// A batch that relayer-signs foreign origins is a FORGERY (the relay has no
-// origin seed) and is a fabrication, not a feature. This is honest and is also
-// the DOMINANT production workload (a node's own writes are the high-rate path;
-// relay-chained foreign deltas are lower-rate forwarding).
-//
-// WIRE LAYOUT (the header is the ONLY thing the cheap gate stack parses;
-// batchWire is opaque until verify passes):
-//
-//	[4] magic (uint32 big-endian, WireV1Magic — the dispatch
-//
-// discriminator; DISTINCT from the RelayEnvelope's
-// uint16 little-endian version prefix so a post-length-
-// prefix peek routes a batch to HandleBatchFrame and a
-// relay frame to HandleFrame with zero ambiguity)
-//
-//	[1] version (uint8, WireV1Version — honored, no silent downgrade)
-//	[8] originSeq (uint64 big-endian — the origin's MONOTONIC per-batch
-//
-// sequence number, advancing by 1 per batch the origin
-// ships. This is the rate-gate counter the receiver
-// hands to PeerBucket.Accept: the bucket drains on the
-// DELTA between successive originSeq values from the
-// same origin, so a burst of batches drains the origin's
-// budget (the Sybil-burst isolation the rate gate exists
-// to enforce), amortized to one check per batch. It is
-// NOT the BatchCount (a static count of deltas would
-// produce a zero delta between same-size batches and the
-// budget would never drain — a dead rate gate for the
-// dominant steady-state workload). It mirrors the
-// per-frame path's dotCounter (the monotonic per-origin
-// sequence the per-frame rate gate keys on).)
-//
-//	[2] batchCount (uint16 big-endian — the number of deltas in the batch;
-//
-// informational; the authoritative count is the capnp
-// CRDTDeltaBatch.Events().Len() the apply path
-// decodes. Carried in the header so a cheap gate can
-// bound a batch without a capnp decode.)
-//
-//	[16] originNodeID ([16]byte — for the Directory.Lookup)
-//	[64] originSig (Ed25519 signature over batchWire by the origin;
-//
-// verified by the caller via VerifyCRDTFrame AFTER the
-// header parse. A zero originSig is an automatic DROP
-// — no unsigned batch is accepted, the same guard as
-// envelope.go's zero-originSig rule.)
-//
-//	[...] batchWire (the marshaled CRDTDeltaBatch capnp frame, verbatim —
-//
-// the wire schema is unchanged; this is the EXACT
-// []byte handed to ApplyCRDTDeltaBatch and the EXACT
-// []byte the origin signature covers.)
-//
-// NO SHA-256 batch root (per the crypto-minimal design — sign the wire
-// directly). NO reuse of the RelayEnvelope for the batch itself (the
-// per-frame RelayEnvelope path in envelope.go stays the SOLE carrier of RELAY
-// deltas; the batch is a distinct wire shape). envelope.go is NOT
-// touched.
+// originSeq advances by one for each batch. PeerBucket.Accept consumes the
+// difference between successive values, so fixed-size batches still drain the
+// origin's rate budget. batchCount is informational; the apply path obtains
+// the authoritative count from CRDTDeltaBatch.Events().Len(). A zero originSig
+// is rejected during parsing. batchWire is the exact signed byte sequence
+// passed to ApplyCRDTDeltaBatch.
 package attribution
 
 import (
@@ -121,26 +54,18 @@ import (
 	"errors"
 )
 
-// WireV1Magic is the 4-byte big-endian dispatch discriminator a receiver peeks
-// AFTER the length prefix is stripped to route a frame to the batch path. It is
-// DISTINCT from the RelayEnvelope's first on-wire bytes: a RelayEnvelope begins
-// with a uint16 little-endian version (2 or 3), so its first 4 bytes are
-// 0x02_00_???? or 0x03_00_???? (little-endian). WireV1Magic is chosen so its
-// big-endian encoding shares NO leading-uint16-LE prefix with any RelayEnvelope
-// version — the dispatch is unambiguous and a batch frame is never handed to
-// the RelayEnvelope parser (which would DropMalformed it — a silent
-// throughput collapse). The value is a fixed, opaque constant (NOT a budget or
-// hop-count magic number, so it is outside the forbidden-budget guard).
+// WireV1Magic routes a frame to the batch parser after the receiver removes
+// the length prefix. Its big-endian encoding begins with 0x53, whereas a
+// RelayEnvelope begins with little-endian version 2 or 3 (0x02 or 0x03).
+// A batch frame therefore cannot be mistaken for a relay frame.
 const WireV1Magic uint32 = 0x53424154 // "SBAT" — Sovereign BATch (big-endian on the wire)
 
-// WireV1Version is the forward-compat tag for the BatchEnvelope framing. It is
-// honored on parse: a version field != WireV1Version is an ErrMalformed (no
-// silent downgrade). It is a framing constant, not a budget/hop-count magic
-// number, so it is outside the forbidden-budget guard.
+// WireV1Version identifies the BatchEnvelope layout. UnmarshalBatchEnvelope
+// rejects any other version with ErrBatchMalformed.
 const WireV1Version uint8 = 1
 
 // BatchEnvelopeHeaderLen is the fixed size of the BatchEnvelope header
-// (everything BEFORE the variable-length batchWire). It is the offset at which
+// (everything before the variable-length batchWire). It is the offset at which
 // batchWire begins and the minimum length a frame must reach to parse a header.
 // Kept in sync with the layout above: 4 + 1 + 8 + 2 + 16 + 64 = 95.
 const BatchEnvelopeHeaderLen = 4 + 1 + 8 + 2 + OriginNodeIDSize + OriginSigSize
@@ -148,47 +73,36 @@ const BatchEnvelopeHeaderLen = 4 + 1 + 8 + 2 + OriginNodeIDSize + OriginSigSize
 // ErrBatchMalformed is returned by UnmarshalBatchEnvelope when the wire is too
 // short for a header, the magic does not match WireV1Magic, or the version does
 // not match WireV1Version. It is the cheap pre-verify reject (the parser touches
-// ONLY the header; a malformed batchWire is deferred to the post-verify apply).
+// only the header; a malformed batchWire is deferred to the post-verify apply).
 var ErrBatchMalformed = errors.New("attribution: malformed batch envelope header")
 
 // ErrBatchUnsigned is returned when the parsed header carries a zero originSig
-// — no unsigned batch is accepted (the same guard as envelope.go's
+// — no unsigned batch is accepted (the same rule as envelope.go's
 // zero-originSig rule: a zero originSig is a DropVerify, never an Accept).
 var ErrBatchUnsigned = errors.New("attribution: batch envelope carries a zero origin signature")
 
-// BatchEnvelope is the crypto-minimal batch envelope for self-originated
-// delta transport. It holds the parsed header fields plus a reference to the
-// verbatim batchWire slice (the bytes the origin signature covers and the
-// engine's ApplyCRDTDeltaBatch decodes). UnmarshalBatchEnvelope performs an O(1)
-// header parse and NEVER decodes batchWire — the parser touches ONLY the
-// header, so a malformed batchWire is deferred to the post-verify apply (the
-// reject-before-Verify discipline).
+// BatchEnvelope holds a parsed batch header and aliases the original wire.
+// The origin signature covers batchWire, and ApplyCRDTDeltaBatch decodes those
+// same bytes. UnmarshalBatchEnvelope parses only the fixed-size header;
+// payload decoding and its errors belong to the post-verification apply path.
 type BatchEnvelope struct {
 	originNodeID [OriginNodeIDSize]byte
 	originSig    [OriginSigSize]byte
 	originSeq    uint64
 	batchCount   uint16
-	wire         []byte // the FULL envelope wire (header + batchWire); owned by the caller
+	wire         []byte // the full envelope wire (header + batchWire); owned by the caller
 }
 
-// MarshalBatchEnvelope assembles the BatchEnvelope wire from the origin's
-// identity fields and the marshaled CRDTDeltaBatch wire. It is the SEND-side
-// builder: the caller (pkg/mesh ShipBatch) has already built batchWire via the
-// generated capnp API (NewRootCRDTDeltaBatch + NewEvents) and signed it once
-// via identity.SignCRDTFrame(originSeed, batchWire); this function stamps the
-// header around the signed wire. The returned slice is a fresh allocation owned
-// by the caller (the header is small and built once per batch, off the per-delta
-// hot path — the amortization is the point).
+// MarshalBatchEnvelope builds a batch wire from the origin identity fields
+// and a marshaled CRDTDeltaBatch. The caller, normally mesh ShipBatch, creates
+// batchWire with the capnp API and signs it with identity.SignCRDTFrame before
+// calling this function. The returned slice is a new allocation owned by the
+// caller.
 //
-// batchCount is the number of deltas in the batch (informational; the
-// authoritative count is the capnp CRDTDeltaBatch.Events().Len() the
-// apply path decodes). originSeq is the origin's MONOTONIC per-batch sequence
-// number (advancing by 1 per batch the origin ships) — the rate-gate counter
-// the receiver hands to PeerBucket.Accept (the bucket drains on the delta
-// between successive originSeq values, NOT on the static batchCount). originSig
-// is the 64-byte Ed25519 signature over batchWire; a zero originSig is still
-// marshaled (the receiver rejects it pre-verify), so a caller that fails to
-// sign produces a wire the receiver drops — never a silent accept.
+// originSeq is the per-origin sequence passed to PeerBucket.Accept on receipt.
+// batchCount is informational; CRDTDeltaBatch.Events().Len() is authoritative.
+// originSig covers batchWire directly. A zero signature is serialized but
+// rejected by the receiver's parser.
 func MarshalBatchEnvelope(originNodeID [OriginNodeIDSize]byte, originSig [OriginSigSize]byte, originSeq uint64, batchCount uint16, batchWire []byte) []byte {
 	out := make([]byte, BatchEnvelopeHeaderLen+len(batchWire))
 	binary.BigEndian.PutUint32(out[0:4], WireV1Magic)
@@ -201,19 +115,13 @@ func MarshalBatchEnvelope(originNodeID [OriginNodeIDSize]byte, originSig [Origin
 	return out
 }
 
-// UnmarshalBatchEnvelope parses the BatchEnvelope header from wire (the FULL
-// envelope bytes — the length-prefix reassembler has already stripped the 4-byte
-// prefix). It is an O(1) header parse: it reads the magic, version, originSeq,
-// batchCount, originNodeID, and originSig, and stores a reference to the
-// verbatim batchWire slice (out[BatchEnvelopeHeaderLen:]). It NEVER decodes
-// batchWire — the parser touches ONLY the header, so a malformed batchWire is
-// deferred to the post-verify apply (the reject-before-Verify discipline). A
-// too-short wire, a magic mismatch, or a version mismatch is an
-// ErrBatchMalformed. A zero originSig is an ErrBatchUnsigned (the unsigned-batch
-// guard).
+// UnmarshalBatchEnvelope parses a complete frame after the transport has
+// removed its length prefix. It reads the fixed header and retains the wire;
+// it does not decode batchWire. A short header, wrong magic, or wrong version
+// returns ErrBatchMalformed. A zero originSig returns ErrBatchUnsigned.
 //
-// The returned *BatchEnvelope aliases the caller's wire slice (batchWire is a
-// sub-slice); the caller MUST NOT mutate wire for the lifetime of the envelope.
+// The returned envelope aliases wire. The caller must not modify wire for the
+// lifetime of the envelope.
 func UnmarshalBatchEnvelope(wire []byte) (*BatchEnvelope, error) {
 	if len(wire) < BatchEnvelopeHeaderLen {
 		return nil, ErrBatchMalformed
@@ -237,306 +145,161 @@ func UnmarshalBatchEnvelope(wire []byte) (*BatchEnvelope, error) {
 	return env, nil
 }
 
-// BatchWire returns the verbatim marshaled CRDTDeltaBatch wire the origin
-// signature covers and the engine's ApplyCRDTDeltaBatch decodes. It is the EXACT
-// []byte handed to ApplyCRDTDeltaBatch — the bytes Verify checks ARE the bytes
-// the engine Join()s (the no-hash-then-reconstruct-gap property of the
-// crypto-minimal design). The returned slice aliases the envelope's wire; the
-// caller MUST NOT mutate it.
+// BatchWire returns the signed CRDTDeltaBatch bytes that the receiver passes
+// to ApplyCRDTDeltaBatch. The slice aliases the envelope's wire and must not
+// be modified.
 func (e *BatchEnvelope) BatchWire() []byte {
 	return e.wire[BatchEnvelopeHeaderLen:]
 }
 
-// OriginNodeID returns the [16]byte origin identity the receiver resolves to an
-// Ed25519 public key via the Directory.Lookup. It is the key the verify
-// (one Ed25519 over the batch) keys on, and (zero-extended to 32 bytes) the key
-// the rate gate buckets the origin under.
+// OriginNodeID returns the identity that Directory.Lookup resolves to the
+// origin's Ed25519 public key. The rate gate zero-extends the same identity to
+// 32 bytes when selecting the origin's bucket.
 func (e *BatchEnvelope) OriginNodeID() [OriginNodeIDSize]byte { return e.originNodeID }
 
-// OriginSeq returns the origin's MONOTONIC per-batch sequence number — the
-// rate-gate counter the receiver hands to PeerBucket.Accept. The bucket drains
-// on the DELTA between successive OriginSeq values from the same origin, so a
-// burst of batches drains the origin's budget (the Sybil-burst isolation the
-// rate gate exists to enforce), amortized to one check per batch. It mirrors
-// the per-frame path's dotCounter (the monotonic per-origin sequence the
-// per-frame rate gate keys on). It is NOT the BatchCount: a static count would
-// produce a zero delta between same-size batches and the budget would never
-// drain — a dead rate gate for the dominant steady-state workload (a node
-// shipping its own N writes/sec in fixed-size batches).
+// OriginSeq returns the origin's monotonic per-batch sequence. PeerBucket.Accept
+// charges the difference between successive values, so fixed-size batches
+// continue to drain the origin's rate budget. BatchCount cannot serve this
+// purpose because it does not increase between equal-sized batches.
 func (e *BatchEnvelope) OriginSeq() uint64 { return e.originSeq }
 
-// OriginSig returns the 64-byte Ed25519 signature over batchWire by the origin,
-// handed to identity.VerifyCRDTFrame(originPub, batchWire, originSig). It is
-// the ONE verify that now covers N deltas (the 60.19us amortized to 60.19/N
-// us/delta). A zero originSig is rejected pre-verify by UnmarshalBatchEnvelope
-// (the unsigned-batch guard), so a verified envelope always carries a non-zero
-// sig.
+// OriginSig returns the origin's 64-byte Ed25519 signature over batchWire.
+// The receiver passes it to identity.VerifyCRDTFrame, covering every delta in
+// the batch with one verification. UnmarshalBatchEnvelope rejects a zero value.
 func (e *BatchEnvelope) OriginSig() [OriginSigSize]byte { return e.originSig }
 
-// BatchCount returns the header-declared number of deltas in the batch. It is
-// informational (the authoritative count is the capnp CRDTDeltaBatch.Events()
-// .Len() the apply path decodes); it lets a cheap gate bound a batch
-// without a capnp decode.
+// BatchCount returns the count declared in the header. It is informational;
+// ApplyCRDTDeltaBatch uses CRDTDeltaBatch.Events().Len() as the authoritative
+// count. The header value is available before capnp decoding.
 func (e *BatchEnvelope) BatchCount() uint16 { return e.batchCount }
 
-// IsBatchFrame is the dispatch discriminator a receiver peeks AFTER the length
+// IsBatchFrame is the dispatch discriminator a receiver peeks after the length
 // prefix is stripped: it reads the first 4 bytes of the post-prefix frame body
-// and returns true iff they match WireV1Magic (big-endian). It is a NO-COPY
+// and returns true iff they match WireV1Magic (big-endian). It is a no-copy
 // peek (it reads the slice header, never allocates). A false return routes the
 // frame to the existing RelayEnvelope path (HandleFrame); a true return routes
 // it to HandleBatchFrame. The RelayEnvelope's first 2 bytes are its uint16
 // little-endian version (2 or 3), so its first 4 bytes never equal WireV1Magic
 // (big-endian) — the dispatch is unambiguous.
 //
-// The peek reads the post-length-prefix BODY (ReadFrame already stripped the
-// 4-byte length prefix), NOT the length prefix itself (the length prefix is
+// The peek reads the post-length-prefix body (ReadFrame already stripped the
+// 4-byte length prefix), not the length prefix itself (the length prefix is
 // common to both wire shapes and carries no type information).
 func IsBatchFrame(frame []byte) bool {
 	return len(frame) >= 4 && binary.BigEndian.Uint32(frame[0:4]) == WireV1Magic
 }
 
-// WireDigestMagic is the 4-byte big-endian dispatch discriminator a receiver
-// peeks AFTER the length prefix is stripped to route a frame to the
-// STRATIFIED ANTI-ENTROPY digest-exchange path (ADR-0034). It is DISTINCT from
-// BOTH WireV1Magic (the batch path) AND the RelayEnvelope's uint16 little-
-// endian version prefix (2 or 3 -> first bytes 0x02/0x03), so the THREE-way
-// dispatch (batch / digest / relay) is unambiguous: a digest frame is never
-// handed to the RelayEnvelope parser (which would DropMalformed it) nor
-// to the batch path (which would ErrBatchMalformed it). The value spells "SDST"
-// big-endian — Sovereign DiGeST — chosen so its first byte (0x53) shares no
-// leading byte with the RelayEnvelope's 0x02/0x03 and its full 4 bytes differ
-// from WireV1Magic ("SBAT" 0x53424154).
+// WireDigestMagic identifies a stratified anti-entropy digest after the
+// transport removes the length prefix (ADR-0034). Its 0x53 leading byte differs
+// from the RelayEnvelope version prefix, and the complete value differs from
+// WireV1Magic, so batch, digest, and relay frames reach different parsers.
 //
-// THREAT MODEL (honest, load-bearing): a StrataEstimator + remote-IBLT digest
-// is NOT signed. It is a COARSE-DIFF SUMMARY, not state — a tampered digest
-// cannot corrupt engine state: the worst outcome of a wrong remote IBLT is a
-// wrong |A−B| estimate, which makes GenerateDelta either (a) ship a delta that
-// is a strict superset of the genuine diff (oversend — CRDT-idempotent Join
-// absorbs it, convergence holds) or (b) fall back to full oversend via the
-// peel-failure branch (crdt.go:1603 — the honest fallback). A malicious
-// digest CANNOT drop a dot the recipient lacks (the peel EXCLUDES only keys the
-// remote estimator hashes say the remote HAS, and the fallback yields EVERY
-// entry when the peel fails — never an empty delta). The integrity of the
-// actual STATE transfers is unchanged: every delta the sweep ships is still a
-// signed RelayEnvelope routed through the HandleFrame gate stack. The
-// digest exchange only selects WHICH signed deltas to send; it never carries
-// state itself. This is the same trust boundary the /v1/merkle control route
-// (control.go handleMerkle) already draws: a digest is advisory, the signed
-// frame is authoritative.
+// A StrataEstimator and its remote IBLT are unsigned advisory data, not state.
+// GenerateDelta uses the digest to select entries; a failed peel or an invalid
+// subtraction falls back to sending every entry. A forged digest can otherwise
+// change the selected set, causing oversend or delaying entries that a peer
+// needs. It cannot directly inject state because the resulting deltas still
+// travel as signed RelayEnvelope frames through the receive verification path.
 const WireDigestMagic uint32 = 0x53445354 // "SDST" — Sovereign DiGeST (big-endian on the wire)
 
-// IsDigestFrame is the dispatch discriminator a receiver peeks AFTER the length
-// prefix is stripped: it returns true iff the first 4 bytes of the post-prefix
-// frame body match WireDigestMagic (big-endian). It is a NO-COPY peek (sibling
-// to IsBatchFrame). A true return routes the frame to the mesh-internal digest
-// sink (the digest-exchange phase), NOT to the receive gate
-// stack — a StrataEstimator is not a CRDTDeltaEvent, so HandleFrame would
-// DropMalformed it (the gossip.go:356 comment names this). The three-way
-// dispatch order is: IsBatchFrame -> batch path; else IsDigestFrame -> digest
-// sink; else -> relay/HandleFrame. The magics are pairwise distinct AND
-// distinct from the RelayEnvelope's uint16-LE version prefix, so the order is
-// unambiguous and a digest frame never reaches the relay parser.
+// IsDigestFrame reports whether a post-length-prefix frame starts with
+// WireDigestMagic. The check does not allocate. Dispatch tries batch, digest,
+// and hybrid recognition before falling back to the relay parser; a digest
+// belongs to the mesh's digest sink rather than HandleFrame.
 func IsDigestFrame(frame []byte) bool {
 	return len(frame) >= 4 && binary.BigEndian.Uint32(frame[0:4]) == WireDigestMagic
 }
 
-// PutDigestFrame stamps WireDigestMagic (big-endian) into the first 4 bytes of
-// dst. It is the SEND-side counterpart to IsDigestFrame's receive-side peek:
-// the mesh's buildDigestFrame (mesh/digest.go) uses it to tag a marshaled
-// StrataEstimator so the peer's readLoop routes the frame to the digestSink.
-// dst MUST be at least 4 bytes (the caller sizes the full frame buffer). It is
-// a NO-COPY 4-byte write (sibling to the MarshalBatchEnvelope header stamp).
+// PutDigestFrame writes WireDigestMagic into the first four bytes of dst.
+// buildDigestFrame uses it to tag a marshaled StrataEstimator for digest
+// dispatch. The caller must provide at least four bytes.
 func PutDigestFrame(dst []byte) {
 	binary.BigEndian.PutUint32(dst[0:4], WireDigestMagic)
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// ADR-0037: the hybrid-PQ CRDT-delta SIGN-WIRE — a NEW frame shape
-// carrying BOTH the Ed25519 originSig [64] AND the ML-DSA-65 pqSig [3309] over
-// the SAME batchWire, dispatched by a NEW magic (WireHybridPQMagic) WITHOUT
-// modifying envelope.go. ADR-0036 wired the VERIFY half of the PQ
-// moat (VerifyCRDTFrame_Hybrid — the BOTH-required gate) but disclosed an
-// honest NOT-YET: under --hybrid-verify EVERY v1 frame is REJECTED today (the
-// v1 wire carries ONE 64-byte Ed25519 originSig; the Directory carries ONE
-// ed25519.PublicKey — a both-verify with one input is a strict-reject gate for
-// a wire shape that does not exist). This change closes the SIGN half: this NEW
-// frame shape (a sibling to the BatchEnvelope + the digest frame) carries BOTH
-// sigs; the receiver's HandleHybridFrame looks up BOTH pubkeys via the grown
-// Directory.LookupBoth + calls VerifyBatchHybrid (the BOTH gate, fed the SAME
-// 120-byte SHAKE256 pad both sigs signed).
+// Hybrid frames (ADR-0037) carry a 64-byte randomized-nonce Ed25519 signature
+// and a 3309-byte ML-DSA-65 signature over the same 120-byte SHAKE256 pad of a
+// self-originated batchWire. HandleHybridFrame resolves both public keys with
+// Directory.LookupBoth and requires both verifications in VerifyBatchHybrid.
 //
-// THE MOLD (the digest-frame precedent, applied to a state-carrying
-// frame). WireDigestMagic was added to THIS file (wire_v1.go) as
-// a NEW dispatch discriminator for the digest-exchange frame WITHOUT touching
-// envelope.go — the "new magic in a separate file dispatches a
-// new frame shape" precedent. The SAME pattern is used here: WireHybridPQMagic
-// (sibling to WireV1Magic + WireDigestMagic) dispatches a hybrid frame the
-// EXISTING DispatchFrame router routes to its 4th arm (HandleHybridFrame). The
-// envelope.go body is byte-UNCHANGED — MarshalBatchEnvelope is UNCHANGED;
-// a v1 peer that does NOT speak hybrid forwards the v1 BatchEnvelope
-// byte-identical (backward-compat, the mold). The hybrid frame is a
-// STATE-CARRYING CRDT-delta frame (NOT a mesh-internal advisory like the
-// digest), so it routes to the Receiver's gate stack (rate -> clock-gate-free
-// for a 0-hop self-originated batch -> verify -> Join), NOT to a mesh sink.
+// Hybrid signing and verification are opt-in through --hybrid-sign and
+// --hybrid-verify. A v1 batch carries only an Ed25519 signature and is rejected
+// when hybrid verification is required. The default configuration uses v1.
+// Hybrid frames have their own dispatch magic and enter the receive gate stack
+// rather than the mesh's advisory digest sink.
 //
-// WIRE LAYOUT (sibling to the BatchEnvelope header, grown by the [3309] pqSig
-// slot; batchWire is opaque until verify passes — the SAME crypto-minimal
-// discipline):
+// The hybrid header extends BatchEnvelope with pqSig:
 //
-//	[4] magic (uint32 big-endian, WireHybridPQMagic — "SHYB")
-//	[1] version (uint8, WireHybridPQVersion — honored, no silent downgrade)
-//	[8] originSeq (uint64 big-endian — the origin's MONOTONIC per-batch
-// sequence, the SAME rate-gate counter BatchEnvelope
-// carries; the receiver's PeerBucket.Accept drains on
-// the delta between successive originSeq values)
-//	[2] batchCount (uint16 big-endian — informational; the authoritative
-// count is the capnp CRDTDeltaBatch.Events().Len() the
-// apply path decodes; carried so a cheap gate can
-// bound a batch without a capnp decode)
-//	[16] originNodeID ([16]byte — for the grown Directory.LookupBoth, which
-// resolves originNodeID -> BOTH the Ed25519 + ML-DSA-65
-// pubkeys; the OOB provisioning model the classical
-// verify uses, extended to BOTH keys)
-//	[64] edSig (the hedged Ed25519 signature over the 120-byte SHAKE256
-// pad of batchWire — identity.SignCRDTFrame_Hybrid's
-// edSig half; verified by VerifyCRDTFrame inside the
-// hybrid gate. A zero edSig is an automatic DROP — no
-// unsigned hybrid frame is accepted, the SAME guard as
-// BatchEnvelope's zero-originSig rule.)
-//	[3309] pqSig (the ML-DSA-65 signature over the SAME 120-byte pad —
-// identity.SignCRDTFrame_Hybrid's pqSig half; verified by
-// VerifyCRDTFrame_PostQuantum inside the hybrid gate. A
-// zero pqSig is an automatic DROP — BOTH sigs is the
-// contract; a frame with one sig is a classical-only
-// frame the hybrid verifier rejects, NOT a hybrid frame.)
-//	[...] batchWire (the marshaled CRDTDeltaBatch capnp frame, verbatim —
-// the wire schema is unchanged; this is the EXACT
-// []byte handed to ApplyCRDTDeltaBatch. The pad is for
-// SIGNING only; the receiver applies the ORIGINAL wire,
-// NOT the pad, so Join sees the real bytes — the no-
-// hash-then-reconstruct-gap property of the crypto-
-// minimal design, preserved for the hybrid frame.)
+//	[4]    magic        (uint32 big-endian, WireHybridPQMagic, "SHYB")
+//	[1]    version      (uint8, WireHybridPQVersion)
+//	[8]    originSeq    (uint64 big-endian, monotonic per origin)
+//	[2]    batchCount   (uint16 big-endian, informational)
+//	[16]   originNodeID (key for Directory.LookupBoth)
+//	[64]   edSig        (randomized-nonce Ed25519 signature over the pad)
+//	[3309] pqSig        (ML-DSA-65 signature over the same pad)
+//	[...]  batchWire    (marshaled CRDTDeltaBatch capnp frame)
 //
-// NO SHA-256 batch root (per the crypto-minimal design — the pad is a SIGN
-// binding, NOT an apply binding; the apply path consumes the verbatim
-// batchWire). NO reuse of the RelayEnvelope (the per-frame
-// RelayEnvelope path in envelope.go stays the SOLE carrier of RELAY deltas;
-// the hybrid frame is a self-originated-BATCH shape, a sibling to the
-// BatchEnvelope, NOT a relay envelope). envelope.go is NOT touched.
-// ──────────────────────────────────────────────────────────────────────────
+// SignCRDTFrame_Hybrid constructs the 120-byte SHAKE256 pad from batchWire.
+// The hybrid verifier checks edSig first and pqSig second; a zero value for
+// either signature is rejected during parsing. originSeq serves the same rate
+// gate as BatchEnvelope. The pad is only signed and verified: the receiver
+// passes the original batchWire, not the pad, to ApplyCRDTDeltaBatch.
 
-// WireHybridPQMagic is the 4-byte big-endian dispatch discriminator a receiver
-// peeks AFTER the length prefix is stripped to route a frame to the
-// HYBRID-PQ CRDT-delta path (ADR-0037). It is DISTINCT from BOTH WireV1Magic
-// (the batch path, "SBAT" 0x53424154) AND WireDigestMagic (the digest
-// path, "SDST" 0x53445354) AND the RelayEnvelope's uint16 little-endian version
-// prefix (2 or 3 -> first bytes 0x02/0x03), so the FOUR-way dispatch (batch /
-// digest / hybrid / relay) is unambiguous: a hybrid frame is never handed to
-// the RelayEnvelope parser (which would DropMalformed it), nor to the
-// batch path (which would ErrBatchMalformed it), nor to the digest sink (which
-// would deliver a CRDT delta to a mesh-internal advisory channel — a
-// state-loss bug). The value spells "SHYB" big-endian — Sovereign HYBrid —
-// chosen so its first byte (0x53) shares no leading byte with the
-// RelayEnvelope's 0x02/0x03 (the SAME first-byte discipline SBAT/SDST use) and
-// its full 4 bytes (0x53485942) differ from WireV1Magic (0x53424154) +
-// WireDigestMagic (0x53445354) at every byte position past the shared 'S'
-// (byte 1: 0x48 vs 0x42/0x44; byte 2: 0x59 vs 0x41/0x53; byte 3: 0x42 vs
-// 0x54/0x54). The pairwise bit-distinctness is asserted by a
-// wire-shape guard test (the digest-magic-collision guard
-// extended to the 4th magic).
+// WireHybridPQMagic routes a post-length-prefix frame to HandleHybridFrame
+// (ADR-0037). "SHYB" differs from the batch and digest magics, and its 0x53
+// leading byte differs from the RelayEnvelope version prefix. The four frame
+// shapes therefore have unambiguous dispatch; TestPQ_HybridFrameWireShape
+// checks those distinctions.
 const WireHybridPQMagic uint32 = 0x53485942 // "SHYB" — Sovereign HYBrid (big-endian on the wire)
 
-// WireHybridPQVersion is the forward-compat tag for the hybrid-frame framing.
-// It is honored on parse: a version field != WireHybridPQVersion is an
-// ErrHybridMalformed (no silent downgrade — the SAME guard WireV1Version
-// enforces for the BatchEnvelope). It is a framing constant, not a budget/
-// hop-count magic number, so it is outside the forbidden-budget guard.
+// WireHybridPQVersion identifies the hybrid frame layout.
+// UnmarshalHybridFrame rejects any other version with ErrHybridMalformed.
 const WireHybridPQVersion uint8 = 1
 
-// PQSignatureSize is the wire slot size for the ML-DSA-65 signature (3309
-// bytes — mldsa.MLDSA65SignatureSize, FIPS 204). It is a WIRE CONSTANT cited
-// from the filippo.io/mldsa pin (pq_mldsa.go:26) — attribution is a LEAF
-// package (encoding/binary + errors only; the crypto-minimal discipline)
-// and does NOT import filippo.io/mldsa, so the size is a const here, the single
-// source of truth for the hybrid frame's [3309] pqSig slot. The mesh's
-// MarshalHybridFrame caller copies the mldsa sig into a
-// [attribution.PQSignatureSize]byte array; the identity layer's
-// SignCRDTFrame_Hybrid returns a [mldsa.MLDSA65SignatureSize]byte (the SAME
-// 3309 — the two consts are the same value, asserted by a
-// sign-then-verify guard (which round-trips a sig through both).
-// The 3309B sig is 51.7x the 64B Ed25519 sig — the honest wire-cost
-// inflation the hybrid frame carries.
+// PQSignatureSize is the 3309-byte ML-DSA-65 signature size from FIPS 204.
+// It mirrors mldsa.MLDSA65SignatureSize so this framing file need not import
+// filippo.io/mldsa only for the constant. SignCRDTFrame_Hybrid returns an array
+// of the same size, exercised by TestPQ_HybridSignThenVerify. The ML-DSA-65
+// signature is 51.7 times the size of a 64-byte Ed25519 signature.
 const PQSignatureSize = 3309
 
-// HybridEnvelopeHeaderLen is the fixed size of the hybrid-frame header
-// (everything BEFORE the variable-length batchWire). It is the offset at which
-// batchWire begins and the minimum length a frame must reach to parse a header.
-// Kept in sync with the layout above: 4 + 1 + 8 + 2 + 16 + 64 + 3309 = 3404.
-// The [3309] pqSig slot is the dominant term (the ML-DSA-65 wire cost) — the
-// hybrid frame's per-frame overhead is 3404B vs the BatchEnvelope's 95B (the
-// 3309B sig + the 16B nodeID + the 64B edSig + the 15B fixed header), the
-// honest wire-cost disclosed in ADR-0037 (a review caught an earlier draft
-// citing a nonexistent guard as the record site; the wire-cost is a doc
-// disclosure, not a guard-recorded number).
+// HybridEnvelopeHeaderLen is the offset of batchWire and the shortest valid
+// hybrid frame: 4 + 1 + 8 + 2 + 16 + 64 + 3309 = 3404 bytes. The corresponding
+// classical BatchEnvelope header is 95 bytes.
 const HybridEnvelopeHeaderLen = 4 + 1 + 8 + 2 + OriginNodeIDSize + OriginSigSize + PQSignatureSize
 
-// ErrHybridMalformed is returned by UnmarshalHybridFrame when the wire is too
-// short for a header, the magic does not match WireHybridPQMagic, or the
-// version does not match WireHybridPQVersion. It is the cheap pre-verify reject
-// (the parser touches ONLY the header; a malformed batchWire is deferred to the
-// post-verify apply — the SAME reject-before-Verify discipline
-// UnmarshalBatchEnvelope uses).
+// ErrHybridMalformed is returned by UnmarshalHybridFrame for a short header,
+// wrong magic, or unsupported version. Payload decoding remains the apply
+// path's responsibility after signature verification.
 var ErrHybridMalformed = errors.New("attribution: malformed hybrid-PQ envelope header")
 
-// ErrHybridUnsigned is returned when the parsed header carries a zero edSig OR
-// a zero pqSig — no unsigned hybrid frame is accepted (BOTH sigs is the
-// contract; a frame with one sig is a classical-only frame the hybrid verifier
-// rejects, NOT a hybrid frame). It is the SAME guard as ErrBatchUnsigned (a
-// zero originSig is a DropVerify, never an Accept) extended to BOTH sigs.
+// ErrHybridUnsigned is returned when either edSig or pqSig is zero. Hybrid
+// verification requires both signatures; a frame with only one is rejected
+// during parsing, just as ErrBatchUnsigned rejects an unsigned classical batch.
 var ErrHybridUnsigned = errors.New("attribution: hybrid-PQ envelope carries a zero Ed25519 or ML-DSA-65 signature")
 
-// HybridEnvelope is the crypto-minimal hybrid-PQ batch envelope for
-// self-originated delta transport under --hybrid-sign. It holds the parsed
-// header fields plus a reference to the verbatim batchWire slice (the bytes
-// BOTH sigs cover via the 120-byte SHAKE256 pad + the
-// engine's ApplyCRDTDeltaBatch decodes). UnmarshalHybridFrame performs an O(1) header
-// parse and NEVER decodes batchWire — the parser touches ONLY the header, so a
-// malformed batchWire is deferred to the post-verify apply (the reject-before-
-// Verify discipline). It is the sibling of BatchEnvelope (the batch
-// path) carrying the SECOND signature (the PQ half of the hybrid contract).
+// HybridEnvelope is the opt-in hybrid-PQ batch format used with --hybrid-sign.
+// It aliases the original wire, whose batchWire is covered by both signatures
+// through the 120-byte SHAKE256 pad. UnmarshalHybridFrame parses only the
+// header; ApplyCRDTDeltaBatch decodes the original payload after verification.
 type HybridEnvelope struct {
 	originNodeID [OriginNodeIDSize]byte
 	edSig        [OriginSigSize]byte
 	pqSig        [PQSignatureSize]byte
 	originSeq    uint64
 	batchCount   uint16
-	wire         []byte // the FULL envelope wire (header + batchWire); owned by the caller
+	wire         []byte // the full envelope wire (header + batchWire); owned by the caller
 }
 
-// MarshalHybridFrame assembles the HybridEnvelope wire from the origin's
-// identity fields, the dual signatures, and the marshaled CRDTDeltaBatch wire.
-// It is the SEND-side builder: the caller (pkg/mesh ShipBatchHybrid) has already
-// built batchWire via the generated capnp API + signed it ONCE under BOTH
-// Ed25519 + ML-DSA-65 via identity.SignCRDTFrame_Hybrid (which returns the
-// [64] edSig + the [3309] pqSig over the 120-byte SHAKE256 pad of batchWire);
-// this function stamps the header around the signed wire. The returned slice is
-// a fresh allocation owned by the caller (the header is built once per batch,
-// off the per-delta hot path — the amortization is the point, the SAME as
-// MarshalBatchEnvelope).
+// MarshalHybridFrame builds a hybrid wire from the origin identity, both
+// signatures, and a marshaled CRDTDeltaBatch. mesh ShipBatchHybrid creates
+// batchWire with the capnp API and obtains edSig and pqSig from
+// identity.SignCRDTFrame_Hybrid, which signs its 120-byte SHAKE256 pad.
+// The returned slice is a new allocation owned by the caller.
 //
-// batchCount is the number of deltas in the batch (informational; the
-// authoritative count is the capnp CRDTDeltaBatch.Events().Len() the
-// apply path decodes). originSeq is the origin's MONOTONIC per-batch sequence
-// number (advancing by 1 per batch the origin ships) — the rate-gate counter
-// the receiver hands to PeerBucket.Accept (the SAME field BatchEnvelope
-// carries). edSig is the 64-byte Ed25519 signature over the batchWire's pad;
-// pqSig is the 3309-byte ML-DSA-65 signature over the SAME pad. A zero edSig
-// or pqSig is still marshaled (the receiver rejects it pre-verify), so a caller
-// that fails to sign produces a wire the receiver drops — never a silent accept.
-//
-// This is a NEW function, NOT an edit to MarshalBatchEnvelope (the
-// v1 path stays byte-identical — the hybrid is an ADD, sibling to the
-// digest frame's PutDigestFrame, the add-not-replace discipline).
+// originSeq is the per-origin sequence used by PeerBucket.Accept. batchCount
+// is informational; CRDTDeltaBatch.Events().Len() is authoritative. A zero
+// signature is serialized but rejected by UnmarshalHybridFrame.
 func MarshalHybridFrame(originNodeID [OriginNodeIDSize]byte, edSig [OriginSigSize]byte, pqSig [PQSignatureSize]byte, originSeq uint64, batchCount uint16, batchWire []byte) []byte {
 	out := make([]byte, HybridEnvelopeHeaderLen+len(batchWire))
 	binary.BigEndian.PutUint32(out[0:4], WireHybridPQMagic)
@@ -550,19 +313,13 @@ func MarshalHybridFrame(originNodeID [OriginNodeIDSize]byte, edSig [OriginSigSiz
 	return out
 }
 
-// UnmarshalHybridFrame parses the HybridEnvelope header from wire (the FULL
-// envelope bytes — the length-prefix reassembler has already stripped the
-// 4-byte prefix). It is an O(1) header parse: it reads the magic, version,
-// originSeq, batchCount, originNodeID, edSig, and pqSig, and stores a reference
-// to the verbatim batchWire slice (out[HybridEnvelopeHeaderLen:]). It NEVER
-// decodes batchWire — the parser touches ONLY the header, so a malformed
-// batchWire is deferred to the post-verify apply (the reject-before-Verify
-// discipline). A too-short wire, a magic mismatch, or a version mismatch is an
-// ErrHybridMalformed. A zero edSig OR a zero pqSig is an ErrHybridUnsigned (the
-// unsigned-hybrid guard — BOTH sigs is the contract).
+// UnmarshalHybridFrame parses a complete hybrid frame after transport length
+// prefix removal. It reads the fixed header and retains the wire without
+// decoding batchWire. Short headers, wrong magic, and unsupported versions
+// return ErrHybridMalformed; a zero signature returns ErrHybridUnsigned.
 //
-// The returned *HybridEnvelope aliases the caller's wire slice (batchWire is a
-// sub-slice); the caller MUST NOT mutate wire for the lifetime of the envelope.
+// The returned envelope aliases wire. The caller must not modify wire for the
+// lifetime of the envelope.
 func UnmarshalHybridFrame(wire []byte) (*HybridEnvelope, error) {
 	if len(wire) < HybridEnvelopeHeaderLen {
 		return nil, ErrHybridMalformed
@@ -589,61 +346,51 @@ func UnmarshalHybridFrame(wire []byte) (*HybridEnvelope, error) {
 	return env, nil
 }
 
-// BatchWire returns the verbatim marshaled CRDTDeltaBatch wire BOTH sigs cover
-// (via the 120-byte SHAKE256 pad) and the engine's ApplyCRDTDeltaBatch decodes.
-// It is the EXACT []byte handed to ApplyCRDTDeltaBatch — the bytes Verify
-// checks (via the pad) ARE the bytes the engine Join()s (the no-hash-then-
-// reconstruct-gap property of the crypto-minimal design, preserved for the
-// hybrid frame). The returned slice aliases the envelope's wire; the caller
-// MUST NOT mutate it.
+// BatchWire returns the original CRDTDeltaBatch bytes. Both signatures cover
+// their 120-byte SHAKE256 pad, and ApplyCRDTDeltaBatch decodes this original
+// payload after verification. The returned slice aliases the envelope's wire
+// and must not be modified.
 func (e *HybridEnvelope) BatchWire() []byte {
 	return e.wire[HybridEnvelopeHeaderLen:]
 }
 
 // OriginNodeID returns the [16]byte origin identity the receiver resolves to
-// BOTH the Ed25519 + ML-DSA-65 public keys via the grown Directory.LookupBoth
-// ADR-0037. It is the key the hybrid verify keys on (BOTH sigs over
-// the batchWire's pad) AND (zero-extended to 32 bytes) the key the rate gate
-// buckets the origin under — the SAME dual role BatchEnvelope's OriginNodeID
-// plays, extended to the hybrid frame.
+// both the Ed25519 and ML-DSA-65 public keys via the grown Directory.LookupBoth
+// (ADR-0037). It is the key the hybrid verify keys on (both sigs over
+// the batchWire's pad) and (zero-extended to 32 bytes) the key the rate gate
+// buckets the origin under — the same dual role BatchEnvelope's OriginNodeID
+// plays, carried forward to the hybrid frame.
 func (e *HybridEnvelope) OriginNodeID() [OriginNodeIDSize]byte { return e.originNodeID }
 
-// OriginSeq returns the origin's MONOTONIC per-batch sequence number — the
-// rate-gate counter the receiver hands to PeerBucket.Accept (the SAME field
-// BatchEnvelope carries; the bucket drains on the delta between successive
-// originSeq values from the same origin). It is NOT the BatchCount (a static
-// count would produce a zero delta between same-size batches and the budget
-// would never drain — a dead rate gate for the dominant steady-state
-// workload). See BatchEnvelope.OriginSeq for the full rationale.
+// OriginSeq returns the origin's monotonic per-batch sequence. As with
+// BatchEnvelope, PeerBucket.Accept charges the difference between successive
+// values rather than using the fixed batch size.
 func (e *HybridEnvelope) OriginSeq() uint64 { return e.originSeq }
 
-// EdSig returns the 64-byte hedged Ed25519 signature over the 120-byte SHAKE256
-// pad of batchWire — the classical half of the hybrid contract, verified by
-// VerifyCRDTFrame inside the hybrid gate (the cheap first gate; a classical
-// reject skips the PQ verify — short-circuit AND). A zero edSig is rejected
-// pre-verify by UnmarshalHybridFrame (the unsigned-hybrid guard), so a
-// verified envelope always carries a non-zero edSig.
+// EdSig returns the 64-byte randomized-nonce Ed25519 signature over the
+// 120-byte SHAKE256 pad of batchWire — the classical half of the hybrid contract,
+// verified by VerifyCRDTFrame inside the hybrid gate (checked first so invalid
+// classical frames skip PQ verification). A zero edSig is rejected pre-verify
+// by UnmarshalHybridFrame.
 func (e *HybridEnvelope) EdSig() [OriginSigSize]byte { return e.edSig }
 
-// PQSig returns the 3309-byte ML-DSA-65 signature over the SAME 120-byte
+// PQSig returns the 3309-byte ML-DSA-65 signature over the same 120-byte
 // SHAKE256 pad of batchWire — the PQ half of the hybrid contract, verified by
 // VerifyCRDTFrame_PostQuantum inside the hybrid gate (the expensive ~74us 4c
 // gate that runs only after the classical verify passes). A zero pqSig is
-// rejected pre-verify by UnmarshalHybridFrame (the unsigned-hybrid guard —
-// BOTH sigs is the contract; a frame with one sig is a classical-only frame
-// the hybrid verifier rejects, NOT a hybrid frame).
+// rejected pre-verify by UnmarshalHybridFrame (the unsigned-hybrid negative
+// control — both sigs is the contract; a frame with one sig is a classical-only
+// frame the hybrid verifier rejects, not a hybrid frame).
 func (e *HybridEnvelope) PQSig() [PQSignatureSize]byte { return e.pqSig }
 
-// BatchCount returns the header-declared number of deltas in the batch. It is
-// informational (the authoritative count is the capnp CRDTDeltaBatch.Events()
-// .Len() the apply path decodes); it lets a cheap gate bound a batch
-// without a capnp decode — the SAME role BatchEnvelope.BatchCount plays.
+// BatchCount returns the informational count in the hybrid header. As with
+// BatchEnvelope, the apply path uses CRDTDeltaBatch.Events().Len() instead.
 func (e *HybridEnvelope) BatchCount() uint16 { return e.batchCount }
 
-// IsHybridFrame is the dispatch discriminator a receiver peeks AFTER the length
+// IsHybridFrame is the dispatch discriminator a receiver peeks after the length
 // prefix is stripped: it reads the first 4 bytes of the post-prefix frame body
 // and returns true iff they match WireHybridPQMagic (big-endian). It is a
-// NO-COPY peek (it reads the slice header, never allocates — sibling to
+// no-copy peek (it reads the slice header, never allocates — sibling to
 // IsBatchFrame + IsDigestFrame). A true return routes the frame to the hybrid
 // path (Receiver.HandleHybridFrame, the 4th DispatchFrame arm); a false return
 // leaves it for the batch/digest/relay arms. The four magics (WireV1Magic /
@@ -654,8 +401,8 @@ func (e *HybridEnvelope) BatchCount() uint16 { return e.batchCount }
 // relay parser (which would DropMalformed it) or the batch path (which would
 // ErrBatchMalformed it).
 //
-// The peek reads the post-length-prefix BODY (ReadFrame already stripped the
-// 4-byte length prefix), NOT the length prefix itself (the length prefix is
+// The peek reads the post-length-prefix body (ReadFrame already stripped the
+// 4-byte length prefix), not the length prefix itself (the length prefix is
 // common to all wire shapes and carries no type information).
 func IsHybridFrame(frame []byte) bool {
 	return len(frame) >= 4 && binary.BigEndian.Uint32(frame[0:4]) == WireHybridPQMagic

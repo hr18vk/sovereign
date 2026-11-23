@@ -8,30 +8,13 @@
 
 package transport
 
-// LIVE kernel eBPF stickiness guards (the SILICON form of the
-// in-process guards at pkg/transport/fanout_test.go).
+// These tests exercise eBPF SO_REUSEPORT routing on Linux, complementing the
+// in-process tests in fanout_test.go. They use fixed sample sizes because one
+// mis-routed datagram fails the flow-affinity property; averaging throughput
+// samples would hide that failure.
 //
-// WHY A TEST, NOT A BENCHMARK (load-bearing idiom choice, mirrored from
-// fanout_test.go): a
-// flow-stickiness gate is about the FAILURE RATE across a roam, NOT the
-// average throughput. testing.B's b.N mean re-stabilization is the WRONG
-// idiom — b.N ramps to find a stable MEAN; a stickiness gate needs a FIXED
-// sample size so a single mis-route is a hard FAIL, not averaged away. So
-// these are fixed-sample Tests (`const n = 1000`), NOT
-// Benchmarks.
-//
-// HONEST GEAR: these are SILICON numbers on a Spot
-// c8g.8xlarge (Graviton4 0xd4f, kernel 6.18, CAP_BPF via sudo), GOMAXPROCS=32.
-// The failure rate is the
-// DETERMINISTIC stickiness (0/1000), which is the load-bearing metric.
-//
-// NON-VACUOUS SILICON GUARD: a run with CAP_BPF revoked MUST t.Skip
-// (NOT pass). The tests call requireCapBPF(t) FIRST; on a capability-absent
-// box they Skip cleanly (the same skip-without-creds shape the S3 silicon
-// tests use), so a committed ebpf_reuseport_test.go that Skips on a
-// capability-absent box is an HONEST partial result (the code ships, the
-// measurement defers), NOT a fabricated pass. A
-// capability-absent pass-faking is forbidden.
+// Each test first probes BPF_MAP_CREATE. Tests skip when the process lacks
+// CAP_BPF, so an unprivileged run does not claim kernel coverage.
 
 import (
 	"errors"
@@ -45,38 +28,11 @@ import (
 	"github.com/hr18vk/sovereign/pkg/attribution"
 )
 
-// requireCapBPF is the non-vacuous silicon guard. It Skips (NOT passes)
-// the test when the process lacks CAP_BPF — the eBPF load needs CAP_BPF in the
-// effective set (the box has unprivileged_bpf_disabled=1, so the tests run
-// via `sudo`). The detection is a probe: try to create a minimal BPF map
-// (BPF_MAP_TYPE_ARRAY, the cheapest bpf(2) cmd 0x0 BPF_MAP_CREATE); EPERM
-// means CAP_BPF is absent -> t.Skip. This is the same skip-without-creds shape
-// the S3 silicon tests use, applied to the kernel
-// capability.
-//
-// We probe via the cilium loader (ebpf.NewMap) rather than a raw capsh parse
-// so the guard is a FUNCTIONAL capability test (the actual bpf(2) syscall
-// succeeds), not a heuristic parse of the bounding set. A bounding-set
-// CAP_BPF that the effective set lacks (e.g. unprivileged_bpf_disabled=1
-// without sudo) would pass a capsh parse but FAIL the functional probe — the
-// functional probe is the honest guard.
-
-// requireCapBPF probes the live CAP_BPF capability by creating a throwaway BPF
-// SOCKHASH map (a known-good config: key16/val8/max1, verified to succeed under
-// CAP_BPF). On EPERM it t.Skip's (the non-vacuous guard — CAP_BPF absent from
-// the effective set); on success it closes the probe map and returns. It is
-// called FIRST by every Test in this file.
-//
-// HONEST ERROR CLASSIFICATION: the probe distinguishes EPERM (capability) from
-// EINVAL (a parameter bug). EPERM -> t.Skip (the honest STOP on a
-// capability-absent box). EINVAL -> t.Fatalf (a
-// parameter error is a REAL BUG in the map config, NOT a capability gap —
-// skipping on EINVAL would hide the bug and fake a pass, the exact
-// anti-fabrication failure). This distinction is load-bearing: an earlier
-// draft keyed the probe on REUSEPORT_SOCKARRAY with a 16-byte key, which the
-// kernel rejects with EINVAL (REUSEPORT_SOCKARRAY is an ARRAY map keyed on a
-// u32 index, not a 16-byte hash) — that EINVAL was a parameter bug, not a
-// missing CAP_BPF, and the guard must NOT have skipped on it.
+// requireCapBPF probes CAP_BPF by creating the same kind of SOCKHASH map used
+// by KernelFanout. A successful probe is closed immediately. EPERM skips the
+// calling test; other errors fail it because they indicate an invalid map or
+// host configuration rather than a missing capability. The functional probe
+// checks the effective capability instead of inferring it from process state.
 func requireCapBPF(t *testing.T) {
 	t.Helper()
 	probe, err := newReuseportSockHashMap(1)
@@ -87,19 +43,17 @@ func requireCapBPF(t *testing.T) {
 	// Classify the error. cilium wraps the bpf(2) errno; EPERM = capability,
 	// EINVAL = parameter bug. errors.Is against unix.EPERM / unix.EINVAL.
 	if errors.Is(err, unix.EPERM) {
-		t.Skipf(" silicon guard: CAP_BPF not granted on this box (bpf(2) BPF_MAP_CREATE EPERM: %v) — the eBPF load needs CAP_BPF in the effective set (run via sudo on a box with unprivileged_bpf_disabled=1). Skipping honestly; the in-process guards at fanout_test.go still cover the determinism/stickiness properties.", err)
+		t.Skipf("CAP_BPF is unavailable (bpf(2) BPF_MAP_CREATE: %v); skipping kernel tests, while fanout_test.go still covers the Go selector", err)
 		return
 	}
-	// Any other error (EINVAL, ENOMEM,...) is NOT a capability gap — it is a
-	// real bug in the map config or the box state. Fail loudly; do NOT skip
-	// (skipping would fake a pass on a broken map config — anti-fabrication).
-	t.Fatalf(" silicon guard: BPF_MAP_CREATE failed with a NON-EPERM error (not a capability gap — a real bug in the map config or box state): %v", err)
+	// Errors other than EPERM indicate a bad map or host configuration, not a
+	// missing capability, so they must not be hidden by a skip.
+	t.Fatalf("BPF_MAP_CREATE failed for a reason other than missing CAP_BPF: %v", err)
 }
 
-// freeUDPPort returns a UDP port that is free to bind on loopback, so the
-// 32-socket SO_REUSEPORT group does not collide with a port another test or
-// process is using. It opens a socket, reads its bound port, and closes
-// it (a TOCTOU race window the test accepts — the group rebinds immediately).
+// freeUDPPort reserves a kernel-assigned loopback UDP port and releases it for
+// the socket group. Another process could claim the port before the group
+// binds; the subsequent bind reports that collision.
 func freeUDPPort(t *testing.T) int {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -110,14 +64,9 @@ func freeUDPPort(t *testing.T) int {
 	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
-// makeFrame builds a v3 relay envelope frame whose wire bytes [80:96] are the
-// given OriginNodeID, via the SAME helper the in-process
-// TestRoamStickiness_32ListIncomplete uses (fanout_test.go:87
-// NewSignedRelayEnvelopeV3). The eBPF program reads payload bytes [80:96] —
-// the EXACT window this frame populates — so a frame built here routes through
-// the kernel program identically to how the in-process SelectRoute routes it.
-// The inner wire / originSig / hops are irrelevant to routing (the selector
-// reads ONLY OriginNodeID — the no-crypto guard, TestNoCryptoBeforeRoute_EBPF).
+// makeFrame builds a v3 relay envelope with cid at wire bytes [80:96]. The
+// inner wire, signature, and hops stay empty because routing uses only the
+// plaintext connection ID. The test also checks the encoded offset.
 func makeFrame(t *testing.T, cid [attribution.OriginNodeIDSize]byte) []byte {
 	t.Helper()
 	env := attribution.NewSignedRelayEnvelopeV3(
@@ -131,7 +80,7 @@ func makeFrame(t *testing.T, cid [attribution.OriginNodeIDSize]byte) []byte {
 	if got := env.OriginNodeID(); got != cid {
 		t.Fatalf("OriginNodeID() round-trip mismatch: want %x got %x", cid, got)
 	}
-	// Sanity: the wire window [80:96] MUST equal the cid (envelope.go:498-503).
+	// Sanity: the wire window [80:96] equals the cid (envelope.go: OriginNodeID wire offset).
 	if len(frame) < originNodeIDWireOffset+attribution.OriginNodeIDSize {
 		t.Fatalf("frame too short (%d bytes) to carry the [80:96] OriginNodeID window", len(frame))
 	}
@@ -143,11 +92,9 @@ func makeFrame(t *testing.T, cid [attribution.OriginNodeIDSize]byte) []byte {
 	return frame
 }
 
-// setupGroup is the shared harness: it builds a numSockets-member SO_REUSEPORT
-// UDP group on a free loopback port, loads + attaches the eBPF program, and
-// pins the given CID to socketIndex 0 (the pre-roam pinned socket). It returns
-// the KernelFanout, the port, and a cleanup func. Every Test calls this FIRST
-// (after requireCapBPF) so the gear is asserted once.
+// setupGroup creates a SO_REUSEPORT group on an ephemeral port, loads and
+// attaches the program, and pins cid to socket 0. It registers cleanup and
+// returns the group and its bound port.
 func setupGroup(t *testing.T, numSockets uint32, cid [attribution.OriginNodeIDSize]byte) (*KernelFanout, int) {
 	t.Helper()
 	port := freeUDPPort(t)
@@ -160,7 +107,7 @@ func setupGroup(t *testing.T, numSockets uint32, cid [attribution.OriginNodeIDSi
 		t.Fatalf("LoadProgram (BPF_PROG_LOAD): %v", err)
 	}
 	// Pin the CID to socket 0 — the pre-roam pinned socket every frame in the
-	// roam MUST land on (the stickiness property).
+	// roam must land on (the stickiness property).
 	if err := k.PinFlow(cid, 0); err != nil {
 		_ = k.Close()
 		t.Fatalf("PinFlow(cid, 0): %v", err)
@@ -174,23 +121,9 @@ func setupGroup(t *testing.T, numSockets uint32, cid [attribution.OriginNodeIDSi
 	return k, port
 }
 
-// sendFrame sends one UDP datagram whose payload is the frame to the group's
-// port from a DIFFERENT source port per call (the 4-tuple roam: the source
-// port changes while the Application Connection ID stays constant). The eBPF
-// program keys ONLY on the CID (wire [80:96]); the 4-tuple is IGNORED by the
-// route — that is the stickiness property under test.
-//
-// The source address is nil so the OS assigns a FREE ephemeral source port per
-// DialUDP call — each frame thus gets a distinct 4-tuple (the roam) with NO
-// possibility of colliding with the SO_REUSEPORT group's bound port. An earlier
-// draft dialed with an explicit srcPort (40000+i / 50000+i / 20000+i), which
-// (a) overflows the u16 source-port space past 65535 (DialUDP EINVAL), and
-// (b) collides with the group's bound port when freeUDPPort returns a port in
-// the same range — `bind: address already in use` (the dial socket lacks
-// SO_REUSEPORT, so it cannot share the group's port). Letting the OS pick the
-// source port eliminates both failure modes and still varies the 4-tuple per
-// frame (the kernel assigns distinct ephemeral ports to distinct DialUDP
-// sockets), so the roam property holds.
+// sendFrame writes one datagram through a fresh UDP socket. The kernel selects
+// its ephemeral source port, allowing the network 4-tuple to vary while the
+// Application Connection ID in frame stays fixed.
 func sendFrame(t *testing.T, port int, frame []byte) {
 	t.Helper()
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
@@ -204,9 +137,8 @@ func sendFrame(t *testing.T, port int, frame []byte) {
 	}
 }
 
-// recvCount reads up to `want` datagrams from the socket at socketIndex with a
-// deadline, returning the count it actually received. Used to build the
-// per-socket receipt table (the stickiness measurement).
+// recvCount reads at most want datagrams from socketIndex. A receive timeout
+// ends the count, producing the per-socket totals used by the routing checks.
 func recvCount(t *testing.T, k *KernelFanout, socketIndex uint32, want int) int {
 	t.Helper()
 	fd := k.SocketFD(socketIndex)
@@ -215,8 +147,7 @@ func recvCount(t *testing.T, k *KernelFanout, socketIndex uint32, want int) int 
 	}
 	buf := make([]byte, 2048)
 	count := 0
-	// 2s deadline per socket — generous for loopback; a mis-route would show
-	// up as a socket receiving 0 and the pinned socket receiving want.
+	// Stop waiting after two seconds when a socket has no more datagrams.
 	for count < want {
 		_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Sec: 2})
 		n, _, err := unix.Recvfrom(fd, buf, 0)
@@ -233,15 +164,9 @@ func recvCount(t *testing.T, k *KernelFanout, socketIndex uint32, want int) int 
 	return count
 }
 
-// drainConcurrent starts one goroutine per socket that Recvfrom's in a loop
-// until sendingDone is closed AND the socket buffer is empty, then returns the
-// per-socket receipt counts. It is the BUFFER-PRESSURE DISCIPLINE: the 32
-// sockets are SOCK_NONBLOCK with bounded SO_RCVBUF, so sending many datagrams
-// with NO concurrent reader overflows the receive buffers and the kernel DROPS
-// the excess (a transport artifact, NOT a routing failure). Draining
-// concurrently keeps the buffers from overflowing so every sent datagram is
-// delivered + counted — isolating the routing property from the socket-buffer
-// capacity. The caller closes sendingDone once all frames are sent.
+// drainConcurrent reads every socket while the sender runs, limiting receive
+// buffer pressure that could otherwise cause datagram loss. After sendingDone
+// closes, each reader makes a final non-blocking pass and reports its total.
 func drainConcurrent(t *testing.T, k *KernelFanout, numSockets uint32, sendingDone <-chan struct{}) []int {
 	t.Helper()
 	receipts := make([]int, numSockets)
@@ -293,14 +218,9 @@ func drainConcurrent(t *testing.T, k *KernelFanout, numSockets uint32, sendingDo
 	return receipts
 }
 
-// TestEBPFRoamStickiness_32Sockets — the load-bearing gate: the
-// SILICON form of TestRoamStickiness_32ListIncomplete (fanout_test.go:67).
-// 32 real SO_REUSEPORT sockets, 1000 packets, the 4-tuple changes (source
-// port per packet) / Application Connection ID (originNodeID) constant -> all
-// 1000 land on ONE socket (the pinned socket 0). 0 failures. t.Fatalf on any
-// mis-route. The receipt is counted via real Recvfrom on each socket (the
-// actual kernel delivery), not merely the route decision — no route-vs-
-// receipt race.
+// TestEBPFRoamStickiness_32Sockets sends 1,000 frames with one connection ID
+// through fresh UDP sockets. All datagrams must arrive on pinned socket 0 of
+// the 32-socket group; any receipt elsewhere fails flow affinity.
 func TestEBPFRoamStickiness_32Sockets(t *testing.T) {
 	requireCapBPF(t)
 	const (
@@ -314,12 +234,8 @@ func TestEBPFRoamStickiness_32Sockets(t *testing.T) {
 
 	k, port := setupGroup(t, numSockets, cid)
 
-	// Send 1000 frames with the SAME cid but a DIFFERENT source port per frame
-	// (the roam: the 4-tuple changes, the CID is constant), draining
-	// concurrently so the socket buffers never overflow (the buffer-pressure
-	// discipline — see drainConcurrent). Source port 40000..40999 — a distinct
-	// 4-tuple per frame (the OS assigns a distinct ephemeral source port per
-	// DialUDP — see sendFrame).
+	// Each send uses a fresh UDP socket while cid remains constant. Drain all
+	// sockets concurrently to keep buffer pressure out of the routing check.
 	sendingDone := make(chan struct{})
 	go func() {
 		for i := 0; i < n; i++ {
@@ -329,57 +245,40 @@ func TestEBPFRoamStickiness_32Sockets(t *testing.T) {
 	}()
 	receipts := drainConcurrent(t, k, numSockets, sendingDone)
 
-	// The stickiness assertion: all n frames on ONE socket (the pinned socket
-	// 0), 0 on every other. t.Fatalf BEFORE any latency number.
+	// Every datagram must arrive, and only the pinned socket may receive one.
 	pinned := uint32(0)
 	total := 0
 	for w := uint32(0); w < numSockets; w++ {
 		total += receipts[w]
 	}
 	if total != n {
-		t.Fatalf("roam stickiness FAIL: received %d/%d frames (some lost — a socket-buffer drop, not a routing failure). Per-socket: %v", total, n, receipts)
+		t.Fatalf("roam stickiness: received %d/%d frames; per-socket receipts: %v", total, n, receipts)
 	}
 	for w := uint32(0); w < numSockets; w++ {
 		if receipts[w] != 0 && w != pinned {
-			t.Fatalf("roam stickiness FAIL: socket %d received %d frames (expected 0; only socket %d should receive). Per-socket: %v", w, receipts[w], pinned, receipts)
+			t.Fatalf("roam stickiness: socket %d received %d frames, want 0 (only socket %d may receive); per-socket receipts: %v", w, receipts[w], pinned, receipts)
 		}
 	}
 	if receipts[pinned] != n {
-		t.Fatalf("roam stickiness FAIL: pinned socket %d received %d/%d. Per-socket: %v", pinned, receipts[pinned], n, receipts)
+		t.Fatalf("roam stickiness: pinned socket %d received %d/%d frames; per-socket receipts: %v", pinned, receipts[pinned], n, receipts)
 	}
 
-	// Print the stickiness table.
-	t.Logf(" ROAM STICKINESS TABLE (32 sockets, %d frames, 4-tuple roam / CID constant):", n)
-	t.Logf(" pinned socket: %d", pinned)
-	t.Logf(" cid: %x", cid)
+	// Report nonzero receipts after the assertions have established the totals.
+	t.Logf("roam stickiness table (32 sockets, %d frames, 4-tuple roam with constant CID):", n)
+	t.Logf("  pinned socket: %d", pinned)
+	t.Logf("  cid: %x", cid)
 	for w := uint32(0); w < numSockets; w++ {
 		if receipts[w] != 0 {
-			t.Logf(" socket %2d: %d receipts", w, receipts[w])
+			t.Logf("  socket %d: %d receipts", w, receipts[w])
 		}
 	}
-	t.Logf(" FAILURE RATE: 0/%d (SILICON-PROVEN on c8g kernel 6.18)", n)
-	t.Logf(" verdict: all %d frames landed on socket %d (the eBPF-pinned core); 0 mis-routes", n, pinned)
+	t.Logf("  mis-routes: 0/%d", n)
+	t.Logf("  all %d frames landed on eBPF-pinned socket %d", n, pinned)
 }
 
-// TestEBPFDeterminism — the SILICON form of TestSelectRouteDeterminism
-// (fanout_test.go:34): same CID -> same socket for 1<<20 packets. The kernel
-// eBPF program is deterministic BY DEFINITION (a remap keyed on a fixed field
-// via the SOCKHASH lookup); the silicon load MUST be too. FAIL on any drift —
-// a single differing receipt is a hard FAIL, not an averaged-away mean. (Uses a
-// smaller fixed sample than 1<<20 for the silicon run — 10000 datagrams —
-// because each is a real kernel delivery + Recvfrom, not an in-process hash;
-// the determinism property is proven at 10000 and the in-process 1<<20 guard
-// at fanout_test.go:43 covers the pure-Go hash.)
-//
-// BUFFER-PRESSURE DISCIPLINE (silicon-proven): the 32 sockets are
-// SOCK_NONBLOCK with bounded SO_RCVBUF. Sending 10000 datagrams with NO
-// concurrent reader overflows the receive buffers and the kernel DROPS the
-// excess (an earlier draft lost ~2400/10000 — a measurement artifact, NOT a
-// routing failure). The test therefore DRAINS CONCURRENTLY while sending: a
-// goroutine per socket Recvfrom's in a loop, so the buffers never overflow and
-// every sent datagram is delivered + counted. This isolates the determinism
-// property (same CID -> same socket) from the socket-buffer capacity, which is
-// a transport-layer concern, not a routing concern.
+// TestEBPFDeterminism sends 10,000 datagrams with one connection ID and checks
+// that exactly one socket receives them. Concurrent draining reduces loss from
+// bounded socket receive buffers; a short total still fails the test.
 func TestEBPFDeterminism(t *testing.T) {
 	requireCapBPF(t)
 	const (
@@ -393,10 +292,7 @@ func TestEBPFDeterminism(t *testing.T) {
 
 	k, port := setupGroup(t, numSockets, cid)
 
-	// Drain concurrently (the buffer-pressure discipline — see drainConcurrent).
-	// Send n frames with the SAME cid but a DIFFERENT source port per frame
-	// (the OS assigns a distinct ephemeral source port per DialUDP — see
-	// sendFrame).
+	// Use fresh UDP sockets for the sends and drain every group member.
 	sendingDone := make(chan struct{})
 	go func() {
 		for i := 0; i < n; i++ {
@@ -415,23 +311,16 @@ func TestEBPFDeterminism(t *testing.T) {
 		}
 	}
 	if total != n {
-		t.Fatalf("determinism FAIL: received %d/%d (some lost — a socket-buffer drop, not a routing failure). Per-socket: %v", total, n, receipts)
+		t.Fatalf("determinism: received %d/%d frames; per-socket receipts: %v", total, n, receipts)
 	}
 	if nonzero != 1 {
-		t.Fatalf("determinism FAIL: %d sockets received frames (expected exactly 1 — the pinned socket). Per-socket: %v", nonzero, receipts)
+		t.Fatalf("determinism: %d sockets received frames, want exactly 1; per-socket receipts: %v", nonzero, receipts)
 	}
-	t.Logf(" DETERMINISM: same cid -> same socket for %d packets; %d socket(s) received (the pinned core). SILICON-PROVEN.", n, nonzero)
+	t.Logf("determinism: same cid -> same socket for %d packets; %d socket(s) received", n, nonzero)
 }
 
-// TestNoCryptoBeforeRoute_EBPF — the SILICON form of TestNoCryptoBeforeRoute
-// (fanout_test.go): the strip-from-packet eBPF invariant is load-bearing in
-// the KERNEL too. The eBPF program runs in kernel context BEFORE userspace
-// crypto; it CANNOT call Open/Verify, so the guard must hold. This test
-// asserts the program routes a frame whose crypto fields (originSig, hops)
-// are ZERO / absent — the route succeeds purely on the plaintext OriginNodeID
-// header mirror, proving the kernel program never touches the crypto path. If
-// the program depended on verified material, a zero-sig / zero-hop frame
-// would mis-route or drop; it routes to the pinned socket instead.
+// TestNoCryptoBeforeRoute_EBPF checks that a frame with an empty signature and
+// no hops reaches its pinned socket using only the plaintext OriginNodeID.
 func TestNoCryptoBeforeRoute_EBPF(t *testing.T) {
 	requireCapBPF(t)
 	const numSockets uint32 = 32
@@ -442,14 +331,8 @@ func TestNoCryptoBeforeRoute_EBPF(t *testing.T) {
 
 	k, port := setupGroup(t, numSockets, cid)
 
-	// makeFrame builds a frame with ZERO originSig and ZERO hops — the crypto
-	// material is absent. The route keys ONLY on OriginNodeID (the plaintext
-	// header mirror, envelope.go:345 read-before-Verify). If the eBPF program
-	// touched crypto, this frame would mis-route; it routes to socket 0.
 	frame := makeFrame(t, cid)
-	// Verify the frame's crypto fields are zero (the no-crypto precondition).
-	// originSig is at wire [8:72] (envelope.go:510); hops are after the inner
-	// wire. Both are zero in a NewSignedRelayEnvelopeV3(..., [OriginSigSize]byte{}, 0, cid, nil).
+	// Confirm crypto fields are zeroed: originSig spans [8:72] per envelope.go.
 	for i := 8; i < 8+attribution.OriginSigSize; i++ {
 		if frame[i] != 0 {
 			t.Fatalf("no-crypto precondition violated: originSig byte %d is non-zero (%x)", i, frame[i])
@@ -461,38 +344,25 @@ func TestNoCryptoBeforeRoute_EBPF(t *testing.T) {
 
 	pinned := recvCount(t, k, 0, 1)
 	if pinned != 1 {
-		t.Fatalf("no-crypto-before-route FAIL: pinned socket received %d (expected 1 — the route must succeed on the plaintext OriginNodeID alone, with zero crypto material). The eBPF program must not touch the crypto path.", pinned)
+		t.Fatalf("no-crypto routing: pinned socket received %d frames, want 1", pinned)
 	}
-	// Verify no other socket received (the route was deterministic on the CID).
 	for w := uint32(1); w < numSockets; w++ {
 		if c := recvCount(t, k, w, 1); c != 0 {
-			t.Fatalf("no-crypto-before-route FAIL: socket %d received %d (expected 0 — a zero-crypto frame must route to the pinned socket only)", w, c)
+			t.Fatalf("no-crypto routing: socket %d received %d frames, want 0", w, c)
 		}
 	}
-	t.Logf(" NO-CRYPTO-BEFORE-ROUTE: zero-sig / zero-hop frame routed to the pinned socket on the plaintext OriginNodeID alone. VerifyHookCount==0 across the kernel routing decision (the eBPF program runs in kernel context BEFORE userspace crypto; it CANNOT call Open/Verify). SILICON-PROVEN.")
+	t.Logf("no-crypto-before-route: zero-sig / zero-hop frame routed to pinned socket on plaintext OriginNodeID alone")
 }
 
-// TestEBPFMalformedFrameNoDrop — the SILICON form of TestNoPanicOnZeroFrame
-// (fanout_test.go:254): a 0-length / out-of-bounds payload falls back to
-// SELECT_OR_MIGRATE (0x28) = 0 (the kernel default hash); NOT a panic, NOT a
-// drop. The receive contract is preserved (a malformed frame is a Verdict,
-// never a crash — receiver.go:244 HandleFrame never panics). The eBPF
-// program's bounds-check (data+96 > data_end) returns SK_PASS without calling
-// the helper; selected_sk stays NULL and the kernel falls back to its default
-// reuseport hash. The packet is DELIVERED (to the hash-selected socket), not
-// dropped — so the total receipt across the group equals the number of
-// malformed frames sent.
+// TestEBPFMalformedFrameNoDrop sends payloads too short to contain data[88:104].
+// The program must skip its lookup, return SK_PASS, and let the kernel hash
+// deliver every datagram instead of dropping it.
 func TestEBPFMalformedFrameNoDrop(t *testing.T) {
 	requireCapBPF(t)
 	const (
 		numSockets uint32 = 32
 		n                 = 100
 	)
-	// A CID that is NOT pinned (no PinFlow call) — so a well-formed frame
-	// would fall back to the hash. The malformed frames are SHORTER than the
-	// [80:96] window, so the eBPF bounds-check fires and the program returns
-	// SK_PASS without the helper. The kernel delivers each to its hash-selected
-	// socket (NOT dropped).
 	var cid [attribution.OriginNodeIDSize]byte
 	for i := range cid {
 		cid[i] = byte(0xC0 + i)
@@ -507,23 +377,15 @@ func TestEBPFMalformedFrameNoDrop(t *testing.T) {
 		_ = k.Close()
 		t.Fatalf("LoadProgram: %v", err)
 	}
-	// NOTE: no PinFlow — the CID is absent from the map, so even a well-formed
-	// frame would miss and fall back to the hash. The malformed frames test the
-	// bounds-check fallback specifically.
+	// Leave the map empty to isolate the short-frame bounds-check fallback.
 	if err := k.AttachProgram(); err != nil {
 		_ = k.Close()
 		t.Fatalf("AttachProgram: %v", err)
 	}
 	t.Cleanup(func() { _ = k.Close() })
 
-	// Send n SHORT frames (10 bytes each — shorter than the [88:104] window
-	// the corrected program reads: ctx->data begins at the UDP header, so the
-	// originNodeID at envelope offset [80:96] is at data[88:104], and a 10-byte
-	// payload (data_end - data = 8 UDP hdr + 10 payload = 18) is far short of
-	// 104). The eBPF bounds-check (data+104 > data_end) fires; the program
-	// returns SK_PASS without the helper; the kernel falls back to the hash.
-	// The packet is delivered, NOT dropped. The OS assigns a distinct ephemeral
-	// source port per DialUDP (see sendFrame) — a distinct 4-tuple per frame.
+	// Eight UDP-header bytes plus a 10-byte payload leave data+104 beyond
+	// data_end, forcing the SK_PASS fallback.
 	shortFrame := make([]byte, 10)
 	for i := range shortFrame {
 		shortFrame[i] = byte(i)
@@ -533,41 +395,36 @@ func TestEBPFMalformedFrameNoDrop(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// The no-drop assertion: the total receipt across the group equals n (the
-	// malformed frames were DELIVERED via the hash fallback, not dropped). A
-	// drop would show up as total < n.
 	total := 0
 	for w := uint32(0); w < numSockets; w++ {
 		total += recvCount(t, k, w, n)
 	}
 	if total != n {
-		t.Fatalf("malformed-frame no-drop FAIL: received %d/%d short frames (the kernel DROPPED %d — a malformed frame must fall back to the hash, NOT drop). The eBPF bounds-check must return SK_PASS, not SK_DROP.", total, n, n-total)
+		t.Fatalf("short-frame delivery: received %d/%d frames, lost %d; bounds check must return SK_PASS", total, n, n-total)
 	}
-	t.Logf(" MALFORMED-FRAME NO-DROP: %d/%d short frames (< [80:96] window) delivered via the SELECT_OR_MIGRATE hash fallback; 0 dropped. The eBPF bounds-check returns SK_PASS (not SK_DROP); a malformed frame is a Verdict, never a crash (receiver.go:244). SILICON-PROVEN.", total, n)
+	t.Logf("short-frame delivery: %d/%d frames delivered through the kernel hash fallback", total, n)
 }
 
-// TestEBPFDecisionMatrix prints the clause A/B/C table. clause A: wire load =
-// the eBPF program bytes-on-the-pin (the BPF instruction stream keyed on
-// OriginNodeID [80:96]), NOT a wire-frame size — honest framing. clause B:
-// stickiness 0/1000 on silicon (TestEBPFRoamStickiness). clause C: verdict =
-// the kernel seam is SILICON-PROVEN. The eBPF seam stays opt-in behind its
-// build tag, and the PQ envelope stays gated behind its own build tag.
+// TestEBPFDecisionMatrix logs the kernel routing configuration and its build
+// constraint. TestEBPFRoamStickiness_32Sockets records per-run receipt counts.
 func TestEBPFDecisionMatrix(t *testing.T) {
 	requireCapBPF(t)
 	t.Logf("==========================================================")
-	t.Logf(" DECISION MATRIX (clause A/B/C)")
+	t.Logf(" kernel reuseport fanout summary (ADR-0002 / ADR-0003)")
 	t.Logf("==========================================================")
-	t.Logf(" clause A (wire load): the eBPF program is a BPF_PROG_TYPE_SK_REUSEPORT")
-	t.Logf(" instruction stream keyed on the plaintext")
-	t.Logf(" OriginNodeID [80:96] (envelope.go:498-503),")
-	t.Logf(" loaded via BPF_PROG_LOAD (bpf(2) cmd 0x5) and")
-	t.Logf(" attached via SO_ATTACH_REUSEPORT_EBPF (0x34).")
-	t.Logf(" This is the eBPF program bytes-on-the-pin,")
-	t.Logf(" NOT a wire-frame size — honest framing.")
-	t.Logf(" clause B (stickiness): 0/1000 mis-routes across a 4-tuple roam on")
-	t.Logf(" c8g.8xlarge kernel 6.18 (TestEBPFRoamStickiness).")
-	t.Logf(" clause C (verdict): the kernel seam is SILICON-PROVEN on c8g")
-	t.Logf(" kernel 6.18. The eBPF seam stays opt-in behind the ebpf_kernel")
-	t.Logf(" build tag; the PQ envelope stays gated behind its own build tag.")
+	t.Logf(" wire field    : BPF_PROG_TYPE_SK_REUSEPORT reads plaintext")
+	t.Logf("                 OriginNodeID at envelope [80:96] (data[88:104]),")
+	t.Logf("                 matching the ReusePortFanout connection ID.")
+	t.Logf("                 loaded via BPF_PROG_LOAD and")
+	t.Logf("                 attached via SO_ATTACH_REUSEPORT_EBPF.")
+	t.Logf("                 The program is loaded into the kernel;")
+	t.Logf("                 these entries do not describe a wire-frame size.")
+	t.Logf(" flow affinity : see TestEBPFRoamStickiness_32Sockets")
+	t.Logf("                 for this run's per-socket receipt counts.")
+	t.Logf(" build         : included only with -tags ebpf_kernel;")
+	t.Logf("                 the in-process selector is tested separately.")
+	t.Logf("                 Hybrid TLS KEM reporting is configured independently.")
+	t.Logf("                 KernelFanout is referenced by ebpf-tagged receive code")
+	t.Logf("                 and tests, not by non-tagged production code.")
 	t.Logf("==========================================================")
 }

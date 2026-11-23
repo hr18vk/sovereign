@@ -6,19 +6,16 @@
 
 package mesh
 
-// relay_counters_test.go — guards (ADR-0045):
+// These tests cover two sweep diagnostics (ADR-0045 §7).
 //
-// 1. THE misses SPLIT. Before the split, the sweep's `misses` counter conflated
-//     two classes: the ORPHAN class (SELF entry, no payload recorded, no
-//     commit in flight — a real defect, zero at steady state) and the
-//     RELAY-RETENTION class (FOREIGN entry, no retained frame — the delta
-//     propagates one hop and a relay holding the frame ships it next sweep).
-//     A counter that means two things means nothing. The split moves the
-//     foreign class to relay_misses.
-//  2. THE HEARTBEAT. The sweep summary line was suppressed whenever every
-//     counter was 0, so a STALLED sweep and a QUIET one were byte-identical in
-//     the log — silence was not evidence of quiet. Every sweepHeartbeatRounds
-//     -th round now prints unconditionally.
+// A self-originated entry without a payload and without a commit in flight is
+// an orphan and increments misses. A foreign entry without a retained frame is
+// a relay miss and increments relay_misses instead. Separate counters
+// distinguish missing local payloads from relay retention.
+//
+// The sweep summary is also printed every sweepHeartbeatRounds rounds, even
+// when all counters are zero. A periodic line distinguishes an idle sweep from
+// one that has stalled.
 
 import (
 	"context"
@@ -33,28 +30,29 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// relayLogSink captures the `log` package's output; log.Logger serializes its
-// own writes, the mutex guards the test's reads.
-type relayLogSink struct {
+// RelayCountersLogSink captures the `log` package's output; log.Logger
+// serializes its own writes, the mutex guards the test's reads.
+type RelayCountersLogSink struct {
 	mu  sync.Mutex
 	buf strings.Builder
 }
 
-func (s *relayLogSink) Write(p []byte) (int, error) {
+func (s *RelayCountersLogSink) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.Write(p)
 }
 
-func (s *relayLogSink) String() string {
+func (s *RelayCountersLogSink) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.buf.String()
 }
 
-// waitRelayKeys polls engineA's state until all n keys prefix-0..n-1 are
-// present or the deadline expires (the receive path applies asynchronously).
-func waitRelayKeys(t *testing.T, m *batchMesh, prefix string, n int) {
+// relayCountersWaitKeys polls engineA's state until all n keys with the given
+// prefix are present or the deadline expires (the receive path applies
+// asynchronously).
+func relayCountersWaitKeys(t *testing.T, m *batchMesh, prefix string, n int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -69,16 +67,15 @@ func waitRelayKeys(t *testing.T, m *batchMesh, prefix string, n int) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("premise broken: A received %d/%d of B's keys (the receive path, not the relay counter, is broken)", got, n)
+			t.Fatalf("receive path applied %d/%d of B's keys before the deadline", got, n)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// TestRelayMissSplitFromOrphanMiss is the split guard: a FOREIGN entry
-// with NO retained frame must move relay_misses and MUST NOT move misses (the
-// orphan counter); with the retainer wired, the same shape ships and neither
-// counter moves.
+// TestRelayMissSplitFromOrphanMiss checks that a foreign entry without a
+// retained frame increments relay_misses and leaves the orphan counter alone.
+// With the retainer wired, the same entry ships and neither counter moves.
 func TestRelayMissSplitFromOrphanMiss(t *testing.T) {
 	originate := func(m *batchMesh, prefix string, n int) {
 		for i := 0; i < n; i++ {
@@ -92,19 +89,19 @@ func TestRelayMissSplitFromOrphanMiss(t *testing.T) {
 		defer m.close()
 		m.gB.SetBatchSize(100)
 		m.gA.SetBatchSize(100)
-		// NO WireRelayHooks on A: the receive path applies (state advances) but
-		// retains nothing — the unwired shape, and the ONLY way a
+		// No WireRelayHooks on A: the receive path applies (state advances) but
+		// retains nothing — the batch retainer unwired shape, and the only way a
 		// relay miss arises.
 		originate(m, "relay-unwired-", 5)
 		m.gB.AntiEntropySweep(context.Background())
-		waitRelayKeys(t, m, "relay-unwired-", 5)
+		relayCountersWaitKeys(t, m, "relay-unwired-", 5)
 
 		st := m.gA.AntiEntropySweep(context.Background())
 		if st.relayMisses != 5 {
 			t.Fatalf("the relay class must count on relay_misses: got %d, want 5 (5 foreign entries, no retained frame)", st.relayMisses)
 		}
 		if st.payloadMisses != 0 {
-			t.Fatalf("the orphan counter must NOT move for the relay class: misses=%d — that conflation is exactly what the split removes", st.payloadMisses)
+			t.Fatalf("the orphan counter must not move for the relay class: misses=%d — that conflation is exactly what the split removes", st.payloadMisses)
 		}
 		if st.shippedEnvelopes != 0 {
 			t.Fatalf("nothing may ship without a retained frame: shipped_env=%d", st.shippedEnvelopes)
@@ -116,10 +113,10 @@ func TestRelayMissSplitFromOrphanMiss(t *testing.T) {
 		defer m.close()
 		m.gB.SetBatchSize(100)
 		m.gA.SetBatchSize(100)
-		m.gA.WireRelayHooks(m.recvA) // the production wiring seam
+		m.gA.WireRelayHooks(m.recvA) // the production wiring seam (batch retainer)
 		originate(m, "relay-wired-", 5)
 		m.gB.AntiEntropySweep(context.Background())
-		waitRelayKeys(t, m, "relay-wired-", 5)
+		relayCountersWaitKeys(t, m, "relay-wired-", 5)
 
 		st := m.gA.AntiEntropySweep(context.Background())
 		if st.relayMisses != 0 {
@@ -129,17 +126,16 @@ func TestRelayMissSplitFromOrphanMiss(t *testing.T) {
 			t.Fatalf("no orphans on this shape: misses=%d", st.payloadMisses)
 		}
 		if st.shippedEnvelopes == 0 {
-			t.Fatalf("the retained foreign batch must RELAY (Root-2 closure): shipped_env=0")
+			t.Fatalf("retained foreign batch was not relayed")
 		}
 	})
 }
 
-// TestSweepHeartbeatSilenceIsNotQuiet drives the REAL SweepLoop on a
-// zero-peer gossiper (nothing to ship, nothing to miss — every counter 0) and
-// asserts the summary line still prints at the heartbeat cadence, carrying the
-// all-zero counters. Pre-this shape printed NOTHING.
+// TestSweepHeartbeatSilenceIsNotQuiet drives SweepLoop on a zero-peer
+// gossiper. The heartbeat must still print at its cadence and include the zero
+// counters even though there is nothing to ship or miss.
 func TestSweepHeartbeatSilenceIsNotQuiet(t *testing.T) {
-	sink := &relayLogSink{}
+	sink := &RelayCountersLogSink{}
 	prev := log.Writer()
 	log.SetOutput(sink)
 	defer log.SetOutput(prev)
@@ -155,21 +151,17 @@ func TestSweepHeartbeatSilenceIsNotQuiet(t *testing.T) {
 	engine := newTestEngine(t, owner.NodeID, t.TempDir())
 	t.Cleanup(func() { _ = engine.Close() })
 	g := NewGossiper(NewPeerSet(nil, nopFrameSink{}, owner, engine), owner, engine, identity.NewDirectory())
-	// NO peers, NO inserts: every sweep is all-zero counters — the exact shape
-	// the pre-print condition suppressed.
+	// No peers and no inserts keep every counter at zero.
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// JOIN THE LOOP: SweepLoop reads the engine (stampConvergence →
-	// MerkleRootFromShards) on every tick, so the goroutine must be provably
-	// EXITED before the test returns — otherwise t.Cleanup's engine.Close frees
-	// the arena under a mid-flight sweep (the constructor-cleanup
-	// SIGSEGV class; observed: fault in stampConvergence→HAMT.Len).
+	// SweepLoop reads the engine on every tick. Cancel and join it before
+	// cleanup closes the engine and releases its arena.
 	done := make(chan struct{})
 	go func() { g.SweepLoop(ctx, time.Millisecond); close(done) }()
 	defer func() { cancel(); <-done }()
-	// Poll the captured log until a heartbeat line lands (cadence 100 rounds ≈
-	// 100 ms at the 1 ms tick; a 5 s cap absorbs a loaded 4-core box without a
-	// hard-coded sleep count that would flake under it).
+	// Poll the captured log until a heartbeat line lands. The cadence is 100
+	// rounds, about 100 ms at this tick; the 5 s deadline accommodates a loaded
+	// host without relying on a fixed number of sleeps.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		out := sink.String()
@@ -180,7 +172,7 @@ func TestSweepHeartbeatSilenceIsNotQuiet(t *testing.T) {
 			return // the deferred cancel+<-done joins the loop before cleanup
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("HEARTBEAT MISSING: 5 s of zero-activity sweeps printed no `sweep round=` line — a stalled sweep is indistinguishable from a quiet one (the §15.15 blind spot the heartbeat closes)")
+			t.Fatalf("zero-activity sweeps printed no heartbeat within 5s; an idle sweep must be distinguishable from a stalled one")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

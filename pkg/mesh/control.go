@@ -11,117 +11,105 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hr18vk/sovereign/internal/database"
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// ControlServer is the JSON-over-mTLS control port. It holds a *Gossiper and
-// serves the /v1/* routes a downstream SDK consumer calls, plus /livecheck and
-// (optionally) /metrics so a single TLS dial reaches every read the SDK offers.
-// It is the additive control surface — SEPARATE from the peer/gossip
-// --bind listener (the data plane) and the plain-HTTP --metrics-addr ops surface
-// (ADR-0011 §3: three surfaces, one trust root).
+// ControlServer serves the SDK's JSON routes over mTLS, together with
+// /livecheck and an optional /metrics handler. It uses a listener separate
+// from the peer data plane and the plain-HTTP operations endpoint; all three
+// surfaces share one trust root (ADR-0011 §3).
 //
-// The control port is a LOW-RATE manageability surface (1 op/sec to ~1K
-// ops/sec). Its floor is the JSON unmarshal + the engine.InsertLocal CAS
-// (~36 ns on 32c apply-class) + the TLS record write (~30-50 ns AES-GCM), NOT
-// the 60.19 us Ed25519 verify (verify is the gossip fan-out's gate, not the
-// local insert). It does NOT replace the batched binary data plane; the
-// two do NOT compete (ADR-0011 §2).
+// This is a low-rate management API, intended for roughly 1 to 1,000
+// operations per second. Local inserts pay for JSON decoding, the engine's
+// compare-and-swap (about 36 ns on the measured 32-core apply path), and an
+// AES-GCM TLS record write (about 30–50 ns). The measured 60.19 µs Ed25519
+// verification belongs to gossip fan-out, not to this path. The batched binary
+// data plane remains the high-throughput write path (ADR-0011 §2).
 //
-// The handlers NEVER call engine.InsertLocal directly: the /v1/insert route
-// goes through Gossiper.InsertLocalEvents (gossip.go:202) so the payload is
-// recorded in the cache a future gossip sweep ships. A route that called
-// engine.InsertLocal would bypass the cache -> a future sweep ships a delta
-// with no payload -> the peer's ReconstructEntry cross-check FAILS -> the delta
-// is a DropVerify on every peer (ADR-0011 §4).
+// Insert handlers go through the Gossiper rather than calling InsertLocal on
+// the engine directly. The Gossiper records each payload for a later sweep;
+// bypassing that cache would produce deltas whose payloads peers cannot
+// reconstruct, and their verification would fail (ADR-0011 §4).
 type ControlServer struct {
 	gossiper *Gossiper
 	nodeID   [16]byte
 	peers    []string
-	metrics  http.Handler // optional /metrics handler (the metrics.Exporter.Handler); nil disables the route
-	// resolver is the bitemporal query tier over the persisted Arrow
-	// index (Resolver.AsOf — the READ half of the durability tier). It is nil
-	// when the snapshot store is OFF (a research/in-memory node, or --lsm-root
-	// absent): in that case /v1/query returns an honest 503 ("query-tier
-	// disabled (no --lsm-root)"), NOT a silent 404. Wired by cmd/sovereign-node
-	// via SetResolver (mirrors the SetSnapshotter precedent — keeps
-	// NewControlServer's 4-arg signature stable for the existing tests). ADR-0017.
+	metrics  http.Handler // nil disables /metrics
+	// resolver reads the persisted Arrow index. A nil resolver disables the
+	// query routes with HTTP 503 so clients can distinguish an unavailable
+	// query tier from a missing entity. cmd/sovereign-node sets it when
+	// --lsm-root is configured (ADR-0017).
 	resolver *database.Resolver
+	// secondaryIndexEnabled controls registration of /v1/querybyh3 and
+	// /v1/querybysystime and acceptance of nonzero h3_index fields. When
+	// false, the routes are absent and h3_index is ignored. cmd/sovereign-node
+	// passes the --secondary-index flag to SetSecondaryIndex.
+	secondaryIndexEnabled bool
 }
 
-// NewControlServer binds a control port to a Gossiper. nodeID and peers feed
-// the /livecheck JSON (the same shape the plain-HTTP ops surface serves).
-// metrics is the optional /metrics handler (passed as an http.Handler so this
-// package does NOT import pkg/metrics — no cycle; the seam discipline).
+// NewControlServer binds a control port to a Gossiper. nodeID and peers are
+// reported by /livecheck. The optional metrics handler is accepted as an
+// http.Handler so this package does not import pkg/metrics.
 func NewControlServer(g *Gossiper, nodeID [16]byte, peers []string, metrics http.Handler) *ControlServer {
 	return &ControlServer{gossiper: g, nodeID: nodeID, peers: peers, metrics: metrics}
 }
 
-// SetResolver wires the bitemporal query tier (Resolver.AsOf over the
-// persisted Arrow index) onto the control port. It mirrors the
-// SetSnapshotter precedent on a SEPARATE seam — a SetResolver method, NOT a
-// NewControlServer arg, so the 4-arg constructor signature stays stable for
-// the existing mesh tests (which call NewControlServer(g, nodeID, peers,
-// metrics)). A nil resolver (or no call) disables /v1/query: the route returns
-// an honest 503, NOT a silent 404 (ADR-0017 §3 — the
-// honest-no-availability contract). cmd/sovereign-node calls this only when
-// --lsm-root is set.
+// SetResolver enables bitemporal queries over the persisted Arrow index.
+// Keeping this separate from NewControlServer preserves the constructor's
+// four-argument API. A nil resolver, including no call to SetResolver, makes
+// the query routes return HTTP 503 (ADR-0017 §3).
 func (s *ControlServer) SetResolver(r *database.Resolver) { s.resolver = r }
 
-// insertRequest is the JSON body POST /v1/insert accepts.
+// SetSecondaryIndex enables the cross-entity query routes and nonzero
+// h3_index request fields. Its default is false: the routes are not
+// registered and h3_index is ignored.
+func (s *ControlServer) SetSecondaryIndex(enabled bool) { s.secondaryIndexEnabled = enabled }
+
+// insertRequest is the JSON body accepted by POST /v1/insert.
 //
-// It carries the bitemporal opt-in + the honest default. A byte-verified read
-// found that the legacy body {Key, Val}
-// caused handleInsert to stamp an all-zero eng.CRDTEntry{}, whose ValidTime
-// range [0, 0) is EMPTY by construction. AsOf's Filter 3 (query.go:360)
-// `validTimeNs >= validEnd` then skips the row for every query point, so a
-// /v1/insert-written event was UNQUERYABLE via /v1/query. The historical live
-// proof: POST /v1/insert wonder=... → 200, GET /v1/get → 200 present, GET
-// /v1/query → 404 on the SAME persisted event. The guards passed only
-// because they called bridge.PutLocal(.., queryTestEntry(..)) directly with a
-// real open-ended range, BYPASSING handleInsert — they proved the
-// Resolver.AsOf ↔ LocalFS ↔ Arrow seam, never the production HTTP round-trip.
-//
-// Fix (honest, NOT a fabrication): expose an OPTIONAL bitemporal claim on the
-// write API. ValidFromNs / ValidForNs default to nil = "the client asserted no
-// bitemporal window" — which honestly means "valid from write-time,
-// indefinitely" (the semantics a non-bitemporal write API can only honestly
-// carry). The default is the DOCUMENTED default for a DOCUMENTED absence
-// (disclosed here + in ADR-0017 §6), NOT a fabricated range asserted as if the
-// client had claimed it. When the client DOES assert valid_from / valid_for,
-// both are honored (ValidFor=0 means open-ended on the asserted start; the
-// sentinel below is the canonical open end). The open-end sentinel is the
-// int64-safe mesh.OpenEndedValidEndNs (year ~2253, < MaxInt64) — NOT
-// database.MaxValidTime.UnixNano (year-9999 overflows int64 to a negative).
+// ValidFromNs and ValidForNs let a client assert a bitemporal window. An
+// all-zero CRDTEntry would have the empty interval [0, 0), which Resolver.AsOf
+// rejects at every query time. Omitting the fields instead means valid from
+// the write time with no asserted end (ADR-0017 §6). A supplied start and
+// duration are preserved; a zero or omitted duration uses the open-end
+// sentinel below. That sentinel fits int64, unlike UnixNano for year 9999.
 type insertRequest struct {
 	Key string `json:"key"`
 	Val string `json:"val"`
 
-	// ValidFromNs is the optional valid-time start (UnixNano). Nil = write-time (now).
+	// ValidFromNs is the optional valid-time start in Unix nanoseconds. Nil
+	// uses the write time.
 	ValidFromNs *int64 `json:"valid_from_ns,omitempty"`
-	// ValidForNs is the optional valid-time DURATION (nanoseconds) from the
-	// start. Nil or 0 means open-ended (ValidTimeEnd = OpenEndedValidEndNs).
+	// ValidForNs is the optional valid-time duration in nanoseconds. Nil or
+	// zero selects OpenEndedValidEndNs.
 	ValidForNs *int64 `json:"valid_for_ns,omitempty"`
+	// H3Index is an optional H3 cell index. The pointer distinguishes an
+	// omitted field from explicit zero, although both store zero, the engine's
+	// no-cell value. A nonzero value is used only with the secondary index
+	// enabled and must have the H3 cell mode bits. This is a syntactic check,
+	// not geographic validation; the engine treats the cell as opaque.
+	H3Index *uint64 `json:"h3_index,omitempty"`
 }
 
-// OpenEndedValidEndNs is the int64-safe sentinel for an open-ended valid-time
-// interval end. It is `9e18` ns from epoch = year ~2253, comfortably below
-// math.MaxInt64 (~9.22e18) so it does not overflow, and dominates every
-// realistic UnixNano SystemTime, making AsOf's Filter 3 (validTime < validEnd)
-// accept any validTime >= ValidTimeStart — the honest "valid indefinitely"
-// range for a write that asserts no temporal bound. It is DELIBERATELY NOT
-// database.MaxValidTime.UnixNano: MaxValidTime = year 9999 → UnixNano is
-// ~2.5e26 ns, far beyond int64's 9.2e18 ceiling, wrapping to a large NEGATIVE
-// (verified: -4,852,116,232,933,722,624) — a row with that validEnd is
-// unqueryable for every positive validTime. internal/database defines the
-// MaxValidTime var for the WRITE schema's "open-ended" documentation but no
-// production code calls .UnixNano on it (verified); mesh owns the int64-safe
-// runtime sentinel for its own write boundary. query_test.go's queryValidEndNs
-// (guards) is the same value — the guards pinned the contract first.
+// OpenEndedValidEndNs ends a valid-time interval for which the client
+// asserted no bound. At 9e18 nanoseconds after the Unix epoch, approximately
+// year 2253, it remains below math.MaxInt64. By contrast, calling UnixNano on
+// database.MaxValidTime (year 9999) overflows int64 to a negative value,
+// producing an interval that Resolver.AsOf cannot match. Production code
+// therefore uses this sentinel rather than MaxValidTime.UnixNano.
 const OpenEndedValidEndNs int64 = 9_000_000_000_000_000_000
+
+// plausibleH3Cell checks that the mode nibble in bits [59,63) is 1, as
+// required for an H3 cell. The four-bit resolution field cannot fall outside
+// [0,15], so a range check on it would add no validation. Geographic validity
+// is not checked: no H3 library is imported and the cell remains opaque to
+// the engine.
+func plausibleH3Cell(h uint64) bool { return (h>>59)&0xF == 1 }
 
 // insertResponse is the JSON body POST /v1/insert returns. DotHex is the hex
 // of the CausalDot (NodeID||Counter) the engine assigned — the receipt the
@@ -130,28 +118,19 @@ type insertResponse struct {
 	DotHex string `json:"dot_hex"`
 }
 
-// batchInsertRequest is the JSON body POST /v1/batch-insert accepts.
-// The batch-inject endpoint that closes the serial-inject
-// bottleneck — the serial /v1/insert over WAN (10K HTTP round-trips = minutes). One
-// POST carries N entries; the server loops the SAME InsertLocalEvents path
-// per entry (NO new write code — the existing dot-stamping + payload-digest +
-// bridge fsync contract is reused per entry). Each item is the SAME shape the
-// single /v1/insert accepts (insertRequest) so the per-entry bitemporal
-// stamping + empty-key 400 + the ACK-before-durability 503 contract are
-// byte-faithful to handleInsert. The single /v1/insert is NOT removed
-// (backward compat — a 1-key probe still uses it).
+// batchInsertRequest is the JSON body accepted by POST /v1/batch-insert.
+// One request carries multiple insertRequest values, avoiding a separate HTTP
+// round trip for each key. Entries use the same temporal stamping and empty-key
+// validation as /v1/insert. The single-insert endpoint remains available.
 type batchInsertRequest struct {
 	Items []insertRequest `json:"items"`
 }
 
-// batchInsertItemStatus is the per-entry honest status in the batch response.
-// Code mirrors HTTP status semantics: 200 (inserted, durable — DotHex non-empty),
-// 400 (bad entry — empty key, the rest still attempted), 503 (WAL fsync failed
-// for THIS entry — the ACK-before-durability contract is per-entry, NOT
-// per-batch: a failed entry does NOT fail the batch). DotHex is "" on 400/503.
-// A PARTIAL batch is reported HONESTLY — NOT a lying 200-all. The
-// convergence-gate client (cmd/convergence-gate) sums the failures into its
-// injectFail false-pass guard.
+// batchInsertItemStatus reports one entry's outcome. Code uses HTTP status
+// semantics: 200 means inserted and durable with a non-empty DotHex, 400 means
+// invalid input, and 503 means the batch was not durable. DotHex is empty on
+// failure. Input errors are per entry; a WAL failure marks every otherwise
+// valid entry 503 because the WAL batch is atomic (ADR-0044 §4).
 type batchInsertItemStatus struct {
 	Index  int    `json:"index"`
 	Key    string `json:"key"`
@@ -159,42 +138,35 @@ type batchInsertItemStatus struct {
 	DotHex string `json:"dot_hex,omitempty"`
 }
 
-// batchInsertResponse is the JSON body POST /v1/batch-insert returns. Inserted
-// is the count of durable entries (Code 200); Failed is 400 + 503 combined. The
-// operator reads Inserted == len(Items) as full success; Failed > 0 is the
-// honest partial-batch signal (never a 200-all lie on a partial batch).
+// batchInsertResponse is returned by POST /v1/batch-insert. Inserted counts
+// durable entries and Failed combines 400 and 503 outcomes. Full success
+// requires Inserted == len(Items); Failed > 0 reports a partial failure.
 type batchInsertResponse struct {
 	Inserted int                     `json:"inserted"`
 	Failed   int                     `json:"failed"`
 	Items    []batchInsertItemStatus `json:"items"`
 }
 
-// getResponse is the JSON body GET /v1/get returns. It mirrors the SDK's
-// GetResult (ADR-0011 §1.1): Payload is NON-EMPTY only on the originator node
-// (the cache hit); on a peer it is "" and PayloadDigest carries the digest the
-// value was hashed to before the Join-contract discard. A response that reports the
-// digest as if it were the value is a FABRICATION.
+// getResponse is returned by GET /v1/get and mirrors the SDK's GetResult
+// (ADR-0011 §1.1). Payload is populated only when the local payload cache has
+// the value, normally on its originator. Peers return an empty Payload and the
+// stored PayloadDigest; the digest is never substituted for the value.
 type getResponse struct {
 	EntityID      string `json:"entity_id"`
 	Present       bool   `json:"present"`
-	Payload       string `json:"payload"`        // NON-EMPTY only on the originator (the Join contract)
-	PayloadDigest string `json:"payload_digest"` // hex; ALWAYS present when Present=true
+	Payload       string `json:"payload"`        // NON-EMPTY only on the originator
+	PayloadDigest string `json:"payload_digest"` // hex; populated whenever Present=true
 	DotNodeID     string `json:"dot_node_id"`    // hex
 	DotCounter    uint64 `json:"dot_counter"`
 	OriginNodeID  string `json:"origin_node_id"` // hex
 }
 
-// queryResponse is the JSON body GET /v1/query returns. It reports the
-// PERSISTED tri-temporal event Resolver.AsOf dominant-picked from the Arrow
-// index on disk — NOT the live HAMT (that is /v1/get's job, ADR-0011 §1.1). It
-// is the READ half of the durability tier; the mirror of the WRITE half
-// (SnapshotToLSM — the index AsOf scans). PayloadDigest is echoed verbatim from
-// the index (the HONEST digest the write path stamped — memtable.go:166 trusts
-// the caller digest; SnapshotToLSM emits it with a SENTRY payload body). There
-// is intentionally NO `payload` field: the index carries an empty body, not the
-// value, so reporting one would be the "digest-is-not-value" fabrication
-// the honesty guard forbids (ADR-0017 §3). present mirrors /v1/get for a
-// uniform SDK surface.
+// queryResponse is returned by GET /v1/query. Resolver.AsOf selects the
+// dominant persisted tri-temporal event from the Arrow index, rather than
+// reading current state from the live HAMT (ADR-0011 §1.1). PayloadDigestHex
+// is copied from the index, whose rows carry the write path's digest and an
+// empty sentinel body. There is no payload field because the index does not
+// contain the value (ADR-0017 §3). Present mirrors /v1/get for the SDK.
 type queryResponse struct {
 	EntityID         string `json:"entity_id"`
 	SystemTimeNs     int64  `json:"system_time_ns"`
@@ -206,35 +178,26 @@ type queryResponse struct {
 	Present          bool   `json:"present"`
 }
 
-// queryDisabledBody is the honest 503 body when /v1/query is disabled (no
-// resolver — the snapshot store is off).
+// queryDisabledBody is the HTTP 503 response when no resolver is configured.
 type queryDisabledBody struct {
 	Error string `json:"error"`
 }
 
-// queryNotFoundBody is the honest 404 body when AsOf has no matching event.
+// queryNotFoundBody is the HTTP 404 response when AsOf finds no matching event.
 type queryNotFoundBody struct {
 	Error  string `json:"error"`
 	Entity string `json:"entity"`
 }
 
-// windowRow is one durable bitemporal-history row in a /v1/range window
-// (ADR-0024). It mirrors queryResponse FIELD-FOR-FIELD (the persisted
-// tri-temporal event the Arrow index carries) with the SAME contract the
-// single-point queryResponse enforces: PayloadDigestHex is the index's HONEST
-// digest, echoed verbatim (never recomputed); there is intentionally NO
-// `payload` field because the index stores a SENTRY body, not the value (the
-// "digest-is-not-value" fabrication guard, ADR-0017 §3 — carries ONE-FOR-
-// ONE across the window surface). present is dropped (a window row IS present by
-// construction — Range returns only intersecting rows; an empty window is the
-// 404, not a present=false row).
+// windowRow is one durable tri-temporal event in a /v1/range response
+// (ADR-0024). Its fields mirror queryResponse, including the verbatim index
+// digest and the absence of a payload body (ADR-0017 §3). Present is omitted
+// because Range returns only intersecting rows; an empty result is a 404.
 type windowRow struct {
-	// Field order: scalars FIRST, then the two strings. Two string fields carry
-	// a residual fieldalignment pointer-bytes note (the SAME one's
-	// queryResponse, line 153, carries — the precedent); this is a JSON-marshal
-	// DTO, NOT a hot-path contended-atomic struct, so the cache-law (
-	// 128-byte stride for contended atomics) does NOT apply. JSON tags are
-	// explicit so the reorder is wire-format-identical.
+	// Scalars precede strings to reduce padding. This JSON data-transfer
+	// object is not a hot-path structure containing contended atomics, so the
+	// 128-byte cache-line stride rule does not apply. Explicit JSON tags keep
+	// the wire representation independent of field order.
 	SystemTimeNs     int64  `json:"system_time_ns"`
 	ValidTimeStartNs int64  `json:"valid_time_start_ns"`
 	ValidTimeEndNs   int64  `json:"valid_time_end_ns"`
@@ -244,34 +207,29 @@ type windowRow struct {
 	PayloadDigestHex string `json:"payload_digest_hex"`
 }
 
-// rangeResponse is the JSON body GET /v1/range returns (ADR-0024). It is
-// the multi-row generalization of queryResponse: a SORTED window (by
-// validTimeStart ascending) of every durable bitemporal-history row whose
-// valid-time interval INTERSECTS the query window [vLo, vHi) and whose SystemTime
-// is <= tx_time (the operator's bitemporal-history range read). truncated=true
-// signals the MaxRangeRows ceiling was hit (the unbounded-amplification guard —
-// the marshal NEVER sees >MaxRangeRows rows; the operator widens the window or
-// paginates). It is the READ half of the durability tier over the SAME disk
-// /v1/query reads; Range is a SUPERSET of every AsOf point in the window.
+// rangeResponse is returned by GET /v1/range (ADR-0024). Rows are sorted by
+// validTimeStart and include durable events whose valid-time intervals overlap
+// [vLo, vHi) and whose SystemTime is at most tx_time. Truncated reports that
+// MaxRangeRows was reached; the resolver enforces that limit before JSON
+// marshaling. Range reads the same index as /v1/query and covers every AsOf
+// point in the requested window.
 type rangeResponse struct {
 	Entity    string      `json:"entity"`
 	Rows      []windowRow `json:"rows"`
 	Truncated bool        `json:"truncated"`
 }
 
-// merkleResponse is the JSON body GET /v1/merkle returns.
+// merkleResponse is returned by GET /v1/merkle.
 type merkleResponse struct {
 	RootHex string `json:"root_hex"`
-	// (ADR-0045 — AMENDED): the quiescence probe's
-	// missing premise, served on the SAME scrape the probe already makes. Under
-	// a write-behind WAL the root stops changing the moment the last
-	// InsertLocal lands — long before the commit's fsync returns — so root
-	// stability alone is NOT quiescence (declared quiesced at 3.12 s
-	// with a ~213 s commit outstanding). The probe must additionally require
-	// commit_in_flight == 0. The commit_* fields are the bridge's group-commit
-	// tail instrument (count / Σ append ns / worst append ns) — the direct
-	// emitter for the 213 s class, so a convergence run reads the number instead
-	// of inferring it from symptoms.
+	// Commit fields let a quiescence probe check durability on the same
+	// request as the root (ADR-0045 §7). With a write-behind WAL, the root
+	// can stop changing as soon as the last InsertLocal lands, long before the
+	// commit's fsync returns. One measured run had a stable root at 3.12 s
+	// while a commit remained outstanding for about 213 s. A stable root
+	// therefore requires commit_in_flight == 0 before the node can be
+	// considered quiescent. The remaining fields report commit count, total
+	// append time, and worst append time from the group-commit bridge.
 	CommitInFlight      int64  `json:"commit_in_flight"`
 	CommitCount         uint64 `json:"commit_count"`
 	CommitTotalAppendNs int64  `json:"commit_total_append_ns"`
@@ -279,17 +237,17 @@ type merkleResponse struct {
 }
 
 // livecheckResponse is the JSON body GET /livecheck returns (mirrors the
-// plain-HTTP ops surface's livecheckBody so the SDK's Status is consistent).
+// plain-HTTP ops surface's livecheckBody so the SDK's Status() is consistent).
 type livecheckResponse struct {
 	NodeID     string   `json:"node_id"`
 	Peers      []string `json:"peers"`
 	TLSVersion string   `json:"tls_version"`
 }
 
-// Handler returns the http.Handler serving the control-port routes. It is
-// mounted on a SEPARATE *tls.Listener (the --control-addr) with the SAME mTLS
-// config as the peer path (RequireAndVerifyClientCert, Min==Max==1.3 —
-// ADR-0006); a no-cert dial is a hard TLS error.
+// Handler returns the control-port HTTP handler. cmd/sovereign-node mounts it
+// on the --control-addr TLS listener with client certificates required and
+// TLS 1.3 as both the minimum and maximum version (ADR-0006). A connection
+// without a valid client certificate fails during the TLS handshake.
 func (s *ControlServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/insert", s.handleInsert)
@@ -297,6 +255,14 @@ func (s *ControlServer) Handler() http.Handler {
 	mux.HandleFunc("/v1/get", s.handleGet)
 	mux.HandleFunc("/v1/query", s.handleQuery)
 	mux.HandleFunc("/v1/range", s.handleRange)
+	// Register cross-entity queries only when SetSecondaryIndex enables them.
+	// Otherwise these paths return 404 rather than an empty successful result.
+	// Their handlers use handleQuery's status conventions; a nil resolver
+	// returns 503 just as it does for /v1/query.
+	if s.secondaryIndexEnabled {
+		mux.HandleFunc("/v1/querybyh3", s.handleQueryByH3)
+		mux.HandleFunc("/v1/querybysystime", s.handleQueryBySystemTime)
+	}
 	mux.HandleFunc("/v1/merkle", s.handleMerkle)
 	mux.HandleFunc("/livecheck", s.handleLivecheck)
 	if s.metrics != nil {
@@ -305,10 +271,9 @@ func (s *ControlServer) Handler() http.Handler {
 	return mux
 }
 
-// handleInsert is POST /v1/insert. It routes through Gossiper.InsertLocalEvents
-// (gossip.go:202) — NEVER engine.InsertLocal — so the payload is cached for a
-// future gossip sweep (ADR-0011 §4). The insert is LOCAL-ONLY at return; peer
-// convergence is eventual (the next gossip sweep).
+// handleInsert serves POST /v1/insert through Gossiper.InsertLocalEvents so
+// the payload is cached for a later sweep (ADR-0011 §4). A successful response
+// acknowledges only the local durable write; peers converge asynchronously.
 func (s *ControlServer) handleInsert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -323,30 +288,22 @@ func (s *ControlServer) handleInsert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: empty key", http.StatusBadRequest)
 		return
 	}
-	// The entry's PayloadDigest is stamped inside InsertLocalEvents from the
-	// SAME payload the cache stores (gossip.go:212), so digest and payload are
-	// consistent by construction — the receive-side guard stays honest.
+	// InsertLocalEvents derives PayloadDigest from the same payload it caches,
+	// keeping the two consistent for receive-side verification.
 	//
-	// — VALID-TIME CONTRACT (the round-trip-closure fix). The legacy
-	// `entry := eng.CRDTEntry{}` stamped ValidTimeStart/End/SystemTime = 0, so
-	// the row's [validStart, validEnd) = [0, 0) interval was EMPTY and AsOf's
-	// Filter 3 skipped it for every query (a live-reproduced 404 on a 200-Put).
-	// InsertLocal (crdt.go:949) and bridge.PutLocal preserve the caller's
-	// ValidTime fields verbatim, so the WRITE boundary (here) is the ONLY
-	// honest place to assert a default. Undisclosed fabrication would be the
-	// "digest-as-value" class — so the default is the DOCUMENTED default
-	// for a DOCUMENTED absence (ADR-0017 §6): a client that asserts no
-	// bitemporal window means "valid from write-time, indefinitely".
+	// An empty CRDTEntry would produce the empty valid-time interval [0, 0),
+	// which AsOf excludes from every query. InsertLocal and bridge.PutLocal
+	// preserve these caller fields, so the HTTP boundary supplies the default:
+	// absent temporal fields mean valid from write time with no asserted end
+	// (ADR-0017 §6).
 	now := time.Now().UnixNano()
 	validFrom := now
 	if req.ValidFromNs != nil {
 		validFrom = *req.ValidFromNs
 	}
-	// Claimed SysTime (assertion/transaction time) is the write-time by default.
-	// AsOf's Filter 2 (query.go:355: SystemTime <= transactionTime) then admits
-	// the row for any tx_time >= write-time — the honest "visible once written"
-	// visibility boundary. If ValidForNs is asserted, the open-ended sentinel
-	// is overridden by the claimed duration end.
+	// SystemTime and AssertionTime default to the write time. AsOf admits the
+	// row when SystemTime <= transactionTime, making it visible once written.
+	// A positive ValidForNs replaces the open end with the claimed duration.
 	validEnd := OpenEndedValidEndNs
 	if req.ValidForNs != nil && *req.ValidForNs > 0 {
 		// Saturate against int64 to avoid overflow on a pathologically large
@@ -359,24 +316,32 @@ func (s *ControlServer) handleInsert(w http.ResponseWriter, r *http.Request) {
 			validEnd = claimed
 		}
 	}
+	// Ignore h3_index unless the secondary index is enabled. Nil and explicit
+	// zero both retain the engine's no-cell value in either mode. An enabled
+	// server validates the mode bits of nonzero values; this checks syntax,
+	// not geographic validity.
+	h3Index := uint64(0)
+	if s.secondaryIndexEnabled && req.H3Index != nil && *req.H3Index != 0 {
+		if !plausibleH3Cell(*req.H3Index) {
+			http.Error(w, "bad request: h3_index is not an H3 cell index (mode bits [59,63) must be 1; syntax only, not geographic validation)", http.StatusBadRequest)
+			return
+		}
+		h3Index = *req.H3Index
+	}
 	entry := eng.CRDTEntry{
 		SystemTime:     now,
 		ValidTimeStart: validFrom,
 		ValidTimeEnd:   validEnd,
 		AssertionTime:  now,
+		H3Index:        h3Index,
 	}
 	dot := s.gossiper.InsertLocalEvents(req.Key, req.Val, entry) // gossip.go:202
 
-	// ACK-before-durability contract. InsertLocalEvents
-	// returns a zero eng.CausalDot when the durability Bridge's PutLocal ORIGIN
-	// path fsync-failed (gossip.go:316): the write landed in the in-memory
-	// engine but NOT in the WAL → NOT durable → the client MUST NOT be ACKed
-	// as success. A zero dot is the unambiguous signal (a healthy dot always
-	// carries the non-zero localNodeID, so (eng.CausalDot{}) is never a real
-	// minted dot). Return 503 instead of a lying 200+zero-dot-hex; the operator
-	// reads the reason and retries. WITHOUT this guard a WAL-failed write was
-	// HttpSession-ACKed as 200 with an all-zero DotHex — a non-durable write
-	// sold as durable, the exact breach the durability floor exists to prevent.
+	// A zero CausalDot signals that the bridge's origin PutLocal failed after
+	// the in-memory write, so the WAL did not make the write durable. Healthy
+	// dots carry the nonzero localNodeID and cannot collide with this sentinel.
+	// Return 503 with no receipt so the client can retry instead of treating a
+	// non-durable write as successful.
 	if dot == (eng.CausalDot{}) && s.gossiper.BridgeActive() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -387,32 +352,22 @@ func (s *ControlServer) handleInsert(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(insertResponse{DotHex: dotHex(dot)})
 }
 
-// handleBatchInsert is POST /v1/batch-insert. The endpoint closes the
-// serial-inject bottleneck: 10K serial /v1/insert POSTs
-// over cross-region WAN = minutes of inject wall-time. (ADR-0044) routes
-// it through Gossiper.InsertLocalEventsBatch → Bridge.PutLocals → WAL.AppendMutations
-// — ONE fsync per BATCH (the fsync-COUNT cut silicon proved is the
-// binding constraint: ~2.1ms/fsync × 10000 = ~21s > 10s SLO; ONE fsync × 2.1ms =
-// 2.1ms inject, the 1000× count cut). The single /v1/insert stays byte-identical
-// (handleInsert → InsertLocalEvents → PutLocal → AppendMutation, the per-mutation
-// path, backward compat).
+// handleBatchInsert serves POST /v1/batch-insert through
+// Gossiper.InsertLocalEventsBatch, Bridge.PutLocals, and WAL.AppendMutations.
+// Group commit pays one fsync for the batch rather than one per mutation
+// (ADR-0044). At a measured 2.1 ms per fsync, 10,000 separate commits would
+// cost about 21 seconds instead of one 2.1 ms commit. The single-insert route
+// retains its per-mutation path.
 //
-// ACK GRANULARITY (the ADR-0044 §4 semantic change, disclosed HONESTLY): the
-// endpoint reported PER-ENTRY 503 (a WAL-failed entry → 503 for THAT
-// entry; the rest still 200). reports PER-BATCH 503: a Sync failure means
-// the WHOLE batch is un-durable (the WAL atomic-batch model — no subset can be
-// asserted durable), so ALL items get Code 503 and the client retries the WHOLE
-// batch. The per-entry 400 (empty key) STAYS per-entry — a bad entry is
-// honest-reported BEFORE the batch call (filtered out, skipped as 400, the rest
-// passed to InsertLocalEventsBatch). The TestBatchInsertWALFailPerEntry guard
-// stays a positive control: it posts all-success and all-fail batches separately (never a mixed
-// batch), so both semantics produce the same all-200 / all-503 observations.
+// WAL batches are atomic. A Sync failure means no subset can be reported
+// durable, so every otherwise valid item receives 503 and the client retries
+// the whole batch (ADR-0044 §4). Empty keys and invalid H3 cells receive
+// per-entry 400 statuses before the batch call and do not prevent valid
+// entries from being attempted.
 //
-// Bitemporal stamping per entry mirrors handleInsert verbatim: a nil
-// valid_from_ns means "valid from write-time, indefinitely" (the DOCUMENTED
-// default, ADR-0017 §6) — NOT a fabricated range. The whole batch shares ONE
-// `now` (write-time) so the entries' SystemTime/AssertionTime are consistent
-// within the batch (the same stamping discipline a serial loop would produce).
+// Temporal stamping matches handleInsert. Omitted valid_from_ns means valid
+// from write time with no asserted end (ADR-0017 §6). All entries share one
+// write timestamp for consistent SystemTime and AssertionTime values.
 func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -434,11 +389,9 @@ func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request
 	statuses := make([]batchInsertItemStatus, len(req.Items))
 	inserted, failed := 0, 0
 
-	// — per-entry 400 filter. A bad entry (empty key) is honest-reported
-	// BEFORE the batch call and DOES NOT abort the batch: its status is stamped
-	// 400 here, and the VALID entries are collected into a []BatchItem for the
-	// batch call. The 400s keep their ORIGINAL request index (statuses[i].Index
-	// = i) so the client maps the per-entry status back to its request position.
+	// Validate entries before the batch call. Invalid entries receive 400
+	// without aborting the others, and retain their original request indices
+	// so clients can map statuses back to the request.
 	batch := make([]BatchItem, 0, len(req.Items))
 	for i := range req.Items {
 		item := req.Items[i]
@@ -447,7 +400,7 @@ func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request
 			failed++
 			continue
 		}
-		// Verbatim bitemporal stamping from handleInsert (control.go:319-346).
+		// Apply the same temporal defaults as handleInsert.
 		validFrom := now
 		if item.ValidFromNs != nil {
 			validFrom = *item.ValidFromNs
@@ -461,22 +414,31 @@ func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request
 				validEnd = claimed
 			}
 		}
+		// Apply the single-insert H3 rules to each item. An invalid nonzero
+		// value receives 400 before the batch call and does not abort valid
+		// entries. With the secondary index disabled, h3_index is ignored.
+		h3Index := uint64(0)
+		if s.secondaryIndexEnabled && item.H3Index != nil && *item.H3Index != 0 {
+			if !plausibleH3Cell(*item.H3Index) {
+				statuses[i] = batchInsertItemStatus{Index: i, Key: item.Key, Code: http.StatusBadRequest}
+				failed++
+				continue
+			}
+			h3Index = *item.H3Index
+		}
 		entry := eng.CRDTEntry{
 			SystemTime:     now,
 			ValidTimeStart: validFrom,
 			ValidTimeEnd:   validEnd,
 			AssertionTime:  now,
+			H3Index:        h3Index,
 		}
 		batch = append(batch, BatchItem{EntityID: item.Key, Payload: item.Val, Entry: entry})
 	}
 
-	// — the batch call. If there are valid entries, route them through
-	// InsertLocalEventsBatch (gossip.go — the ADR-0044 batch path). On success
-	// (err == nil AND failedFrom == -1): ALL valid entries get Code 200 with
-	// DotHex=dotHex(dots[j]). On ANY failure (err != nil OR failedFrom != -1):
-	// ALL valid entries get Code 503 (the atomic-batch NOT-durable contract).
-	// A batch with ONLY 400s (every key empty) skips the batch call entirely —
-	// the per-entry 400s are the honest result, no durability attempted.
+	// Send valid entries through the ADR-0044 batch path. Success returns one
+	// dot per entry in batch order. Any batch error makes all valid entries
+	// non-durable. If validation rejected every item, skip the call entirely.
 	var dots []eng.CausalDot
 	var batchOK bool
 	if len(batch) > 0 {
@@ -485,25 +447,21 @@ func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request
 		batchOK = (berr == nil)
 	}
 
-	// — stamp the valid entries' statuses. The dots slice is indexed
-	// against the VALID-entry order (batch[j]), NOT the request order; the
-	// request-order statuses[i] are filled by walking req.Items again and
-	// advancing j past the 400s (the inverse of the 400-filter loop above).
+	// Dots follow valid-entry order, while statuses follow request order.
+	// Walk the original items and advance j only past entries that were not
+	// rejected during validation.
 	j := 0
 	for i := range req.Items {
 		if statuses[i].Code == http.StatusBadRequest {
-			continue // a 400, already stamped in the filter loop above
+			continue // already rejected during validation
 		}
 		if batchOK {
 			statuses[i] = batchInsertItemStatus{Index: i, Key: req.Items[i].Key, Code: http.StatusOK, DotHex: dotHex(dots[j])}
 			inserted++
 		} else {
-			// Per-BATCH 503: a Sync/Write failure means the WHOLE batch is
-			// un-durable (the WAL atomic-batch model — no subset can be asserted
-			// durable). Honest atomicity: ACK ALL valid entries as 503 so the
-			// client retries the WHOLE batch. This is the ADR-0044 §4 granularity
-			// CHANGE from the per-entry 503 (disclosed above + in the ADR).
-			// The single /v1/insert path keeps per-entry 503 byte-identical.
+			// A Sync or Write failure leaves the atomic WAL batch non-durable.
+			// Mark every valid entry 503 so the client retries the whole batch
+			// (ADR-0044 §4). The single-insert route retains its own 503 path.
 			statuses[i] = batchInsertItemStatus{Index: i, Key: req.Items[i].Key, Code: http.StatusServiceUnavailable}
 			failed++
 		}
@@ -513,22 +471,15 @@ func (s *ControlServer) handleBatchInsert(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(batchInsertResponse{Inserted: inserted, Failed: failed, Items: statuses})
 }
 
-// handleGet is GET /v1/get?key=... It reports the originator-vs-peer boundary
-// if it were the value is the fabrication the guard catches.
+// handleGet serves GET /v1/get?key=.... Payload is returned only on a local
+// cache hit; PayloadDigest always comes from the selected entry.
 //
-// SINGLE-SNAPSHOT DISCIPLINE:
-// the entry read is now engine.PointGet (point_get.go) — an O(log N) per-shard
-// read with ZERO arena allocation — replacing the former State.Get, which
-// rebuilt the ENTIRE merged HAMT under stateViewMu (O(total entries)) and LEAKED
-// O(N·log N) arena bytes per call. The TOCTOU lesson stands: the OLD handler
-// read the state TWICE — once here for the digest/dot fields and again inside
-// LatestPayload for the payload lookup — so a concurrent InsertLocalEvents
-// between the two reads could publish a new shard root and yield a response
-// whose payload is from one snapshot and whose digest/dot are from another (a
-// TOCTOU tear: the reported PayloadDigest could be the SHA-256 of a DIFFERENT
-// payload). The fix is ONE PointGet, ONE selectLatestDot pick, and ONE
-// PayloadForDot lookup against that single `latest` entry — every field of the
-// response derives from the same entry, so the tear is impossible.
+// PointGet performs an O(log N) per-shard read without allocating arena memory.
+// State().Get instead rebuilds the entire merged HAMT and retains O(N·log N)
+// arena bytes per call. One PointGet, one selectLatestDot decision, and one
+// PayloadForDot lookup against that entry also keep the response consistent:
+// separate state reads could combine a payload from one version with the dot
+// and digest from another after a concurrent insert.
 func (s *ControlServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -539,15 +490,15 @@ func (s *ControlServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: missing key", http.StatusBadRequest)
 		return
 	}
-	entries := s.gossiper.engine.PointGet(key) // point_get.go — O(log N) per-shard, no State arena leak
-	latest, ok := selectLatestDot(entries)     // total-order pick, deterministic
+	entries := s.gossiper.engine.PointGet(key) // O(log N) per shard, without a merged State view
+	latest, ok := selectLatestDot(entries)     // deterministic total-order selection
 	if !ok {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(getResponse{EntityID: key, Present: false})
 		return
 	}
-	// ONE cache lookup against the SAME `latest` entry the digest/dot fields
-	// derive from — no second State scan, no cross-snapshot tear.
+	// Look up the payload for the same latest entry that supplied the dot and
+	// digest, avoiding a second state read and a cross-version response.
 	payload, _ := s.gossiper.PayloadForDot(key, latest.Dot()) // gossip.go — originator hit, peer miss
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(getResponse{
@@ -561,27 +512,16 @@ func (s *ControlServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleQuery is GET /v1/query?key=<entityID>&valid_time=<rfc3339>&tx_time=<rfc3339>.
-// It is the READ half of the durability tier: the persisted bitemporal
-// query over the Arrow index (Resolver.AsOf), the mirror of the WRITE
-// half (SnapshotToLSM). It answers "what was this entity's value as observed AT
-// valid-time V, transaction-time T?" — the question the persisted index exists
-// to answer, which /v1/get (the LIVE HAMT, current-state-at-now) CANNOT. A node
-// that crashed + bounded-recovered can be re-queried for its live state
-// (/v1/get) AND now for its persisted history (/v1/query) — the tier is
-// round-trip-closed: write → checkpoint → crash → recover → query-the-history.
+// handleQuery serves GET /v1/query?key=<entityID>&valid_time=<rfc3339>&tx_time=<rfc3339>.
+// Resolver.AsOf answers which persisted version was dominant at the requested
+// valid and transaction times. /v1/get instead reads current live state.
+// Together they cover recovery of current state and queries over its history.
 //
-// HONEST-AVAILABILITY contract (precedent, ADR-0017 §3): when the
-// resolver is nil — a research/in-memory node, or --lsm-root absent — the route
-// returns 503 with {"error":"query-tier disabled (no --lsm-root)"}. It does NOT
-// return 404: a route-absent 404 is indistinguishable to a client from "entity
-// not found", so a disabled query tier that 404'd would be a silent lie. The
-// 503 makes the unavailable tier observable — the same discipline as the
-// ACK-before-durability 503 in handleInsert (control.go:137).
-//
-// NO-RECOMPUTE law: the PayloadDigest is echoed verbatim
-// from entry.PayloadDigest (the index's honest digest). Recomputing it would
-// fabricate a value the index may never have held — the fabrication class.
+// A nil resolver returns 503 with {"error":"query-tier disabled (no
+// --lsm-root)"}; 404 is reserved for a missing entity so clients can
+// distinguish an unavailable query tier from an absent row (ADR-0017 §3).
+// PayloadDigestHex is copied from entry.PayloadDigest rather than recomputed,
+// because the index does not necessarily hold the corresponding value.
 func (s *ControlServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -635,44 +575,29 @@ func (s *ControlServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRange is GET /v1/range?key=<entityID>&valid_time_lo=<rfc3339>&valid_time_hi=<rfc3339>&tx_time=<rfc3339>[&coalesce=true].
-// It is the READ-half multi-row generalization of handleQuery: the
-// persisted bitemporal-HISTORY range query over the SAME Arrow index AsOf scans
-// (Resolver.Range), answering "give me every state of E asserted as-of txTime T
-// whose ValidTime interval intersects [vLo, vHi)" — the question /v1/query (a
-// single dominant point) CANNOT. An operator debugging a time window, a compliance
-// reviewer reconstructing a record's history, a reconciliation sweep comparing two
-// txTimes are all served here. It mirrors /v1/query's 405/503/400/404/500 discipline EXACTLY for
-// the shared cases (the route is the operator-facing seam — ADR-0024). The 503-
-// disabled contract (honest-no-availability precedent) carries ONE-FOR-
-// ONE: a nil resolver returns 503 + {"error":"query-tier disabled (no --lsm-root)"},
-// NOT a silent 404. The 503-disabled guard runs BEFORE param validation (the tier
-// is OFF; a malformed range to a disabled tier is "unavailable", not "bad
-// request" — the SAME order handleQuery pins so a disabled state is not hidden
-// behind a 400).
+// handleRange serves GET /v1/range?key=<entityID>&valid_time_lo=<rfc3339>&valid_time_hi=<rfc3339>&tx_time=<rfc3339>[&coalesce=true].
+// Resolver.Range returns every persisted state whose valid-time interval
+// overlaps [vLo, vHi) at the requested transaction time, rather than the single
+// dominant point returned by /v1/query. Shared error statuses follow handleQuery
+// (ADR-0024). A nil resolver produces the same 503 response, checked before
+// parameter validation so an unavailable tier cannot be mistaken for bad input.
 //
-// RANGE-SPECIFIC 400 GUARDS: valid_time_lo + valid_time_hi MUST both parse as
-// RFC3339Nano AND form a non-empty half-open window (valid_time_hi > valid_time_lo;
-// hi <= lo is the empty-window class the resolver double-guards). These are the
-// RANGE-only cases (handleQuery has a single valid_time); the shared key/tx_time
-// 400s mirror handleQuery verbatim. The optional ?coalesce=true param switches
-// the output from the raw sorted window (the default, ADR-0024 §1.1) to the
-// post-sort per-start-dominance coalesce (CoalesceRange — a DIFFERENT projection,
-// reusing the SAME Filter-2 + dominance rule; NOT a scanRecordBatch change).
+// Both range bounds must parse as RFC3339Nano and valid_time_hi must be after
+// valid_time_lo; an empty half-open interval receives 400 before the disk scan.
+// The optional coalesce=true parameter applies CoalesceRange after sorting,
+// selecting per-start dominance without changing the resolver's scan or filter
+// rules (ADR-0024 §1.1).
 //
-// (no-recompute, ADR-0017 §3): PayloadDigestHex is echoed verbatim from each
-// row.PayloadDigest (the index's honest digest). Recomputing it would fabricate a
-// value the index may never have held — the fabrication class, carried across
-// the window surface (windowRow).
+// PayloadDigestHex is copied from each row. Recomputing it would imply access
+// to a value that the index does not necessarily contain (ADR-0017 §3).
 func (s *ControlServer) handleRange(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if s.resolver == nil {
-		// Honest-no-availability — the SAME 503-body + BEFORE-param-validation
-		// order handleQuery uses (a disabled range tier is "unavailable", not a
-		// 404-indistinguishable-from-not-found, not a 400-hiding-disabled).
+		// Match handleQuery: return the disabled-tier 503 before validating
+		// parameters, so 400 or 404 cannot hide an unavailable resolver.
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(queryDisabledBody{Error: "query-tier disabled (no --lsm-root)"})
@@ -694,9 +619,8 @@ func (s *ControlServer) handleRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validHi.After(validLo) {
-		// Empty half-open window: hi <= lo. The resolver double-guards this (no
-		// row's [vs,ve) intersects a non-positive-width window); the handler
-		// surfaces it as an honest 400 BEFORE the durable scan (waste-free).
+		// Reject hi <= lo before scanning. The resolver also rejects empty
+		// half-open windows because no row can intersect them.
 		http.Error(w, "bad request: valid_time_hi must be after valid_time_lo (half-open window [lo,hi) is empty)", http.StatusBadRequest)
 		return
 	}
@@ -710,27 +634,24 @@ func (s *ControlServer) handleRange(w http.ResponseWriter, r *http.Request) {
 	rows, truncated, err := s.resolver.Range(r.Context(), key, validLo, validHi, txTime)
 	if err != nil {
 		if errors.Is(err, database.ErrEntityNotFound) {
-			// The honest 404: no durable row in the index intersects the window at
-			// txTime. Mirrors handleQuery's ErrEntityNotFound 404 surfacing (the
-			// SAME body shape — windowRow:Error + windowRow:Entity so a client
-			// distinguishes "not found" from a 500 scan failure).
+			// No durable row intersects the window at txTime. Match
+			// handleQuery's 404 body so clients can distinguish absence from a
+			// scan failure.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(queryNotFoundBody{Error: "not found", Entity: key})
 			return
 		}
-		// Surfaces — never swallows — the wrapped list/download/scan error (the
-		// SAME 500 boundary handleQuery uses; NOT a 404 hiding a sick tier).
+		// Surface wrapped list, download, and scan errors as 500, matching
+		// handleQuery rather than disguising them as missing rows.
 		http.Error(w, "query: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// The cap is enforced INSIDE the resolver's collector (pre-marshal), so the
-	// marshal here NEVER sees >MaxRangeRows rows — the unbounded-amplification
-	// guard (ADR-0024 §1.2). Build the windowRow slice from the durable rows;
-	// PayloadDigestHex is echoed verbatim. The optional coalesce is a
-	// POST-sort pass over the collected rows IN THE HANDLER (NOT a resolver
-	// scanRecordBatch change) — the default is the raw sorted window.
+	// The resolver's collector enforces MaxRangeRows before marshaling
+	// (ADR-0024 §1.2), bounding the response size. Copy each durable row and
+	// its digest into the response. Coalescing, when requested, is a post-sort
+	// handler projection; the resolver's scan is unchanged.
 	respRows := make([]windowRow, len(rows))
 	for i, ev := range rows {
 		respRows[i] = windowRow{
@@ -744,9 +665,9 @@ func (s *ControlServer) handleRange(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if coalesce {
-		// CoalesceRange operates on []*TriTemporalEvent (the resolver's in-memory
-		// form); build the coalesced view BEFORE projecting to windowRow so the
-		// dominance rule reuses the SAME SystemTime/Mask the resolver carried.
+		// CoalesceRange operates on the resolver's TriTemporalEvent values.
+		// Apply it before projecting to windowRow so dominance uses the same
+		// SystemTime and mask selected by the resolver.
 		coalesced := database.CoalesceRange(rows)
 		respRows = make([]windowRow, len(coalesced))
 		for i, ev := range coalesced {
@@ -780,22 +701,17 @@ func parseQueryTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
-// handleMerkle is GET /v1/merkle. It returns the engine's current MerkleRoot as
-// hex (crdt.go:1225 -> hamt.go:265). Stable across re-reads when the state is
-// unchanged (CRDT idempotency —). Switched the root
-// source from engine.State.MerkleRoot to engine.MerkleRootFromShards —
-// the BYTE-IDENTICAL root computed directly from the per-shard roots with NO
-// merged HAMT view (zero arena growth). This is the SILICON convergence check
-// (the cmd/convergence-gate client polls /v1/merkle on all 100 nodes); under State
-// each poll at 100×10K built a 10K-entry merged view → HamtArena OOM
-// (hamt_arena.go:638). The root is byte-identical, so the convergence proof
-// (same root on convergent nodes) is UNCHANGED. See pkg/sync/merkle_sharded.go.
+// handleMerkle serves GET /v1/merkle. MerkleRootFromShards returns the same
+// root as State().MerkleRoot without constructing a merged HAMT view, so
+// repeated convergence polling does not grow the arena. Building that view for
+// 100 nodes with 10,000 entries each exhausted the arena in an earlier
+// measurement. See pkg/sync/merkle_sharded.go.
 func (s *ControlServer) handleMerkle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	root := s.gossiper.engine.MerkleRootFromShards() // merkle_sharded.go — byte-identical to State.MerkleRoot, no merged-view OOM
+	root := s.gossiper.engine.MerkleRootFromShards() // byte-identical root without a merged HAMT view
 	commitCount, commitTotalNs, commitMaxNs := s.gossiper.CommitStats()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(merkleResponse{
@@ -808,7 +724,7 @@ func (s *ControlServer) handleMerkle(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLivecheck is GET /livecheck. It mirrors the plain-HTTP ops surface's
-// livecheckBody so the SDK's Status is consistent across the two surfaces.
+// livecheckBody so the SDK's Status() is consistent across the two surfaces.
 func (s *ControlServer) handleLivecheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -830,4 +746,182 @@ func dotHex(d eng.CausalDot) string {
 	b = append(b, byte(d.Counter>>56), byte(d.Counter>>48), byte(d.Counter>>40), byte(d.Counter>>32),
 		byte(d.Counter>>24), byte(d.Counter>>16), byte(d.Counter>>8), byte(d.Counter))
 	return hex.EncodeToString(b)
+}
+
+// queryByH3Response is returned by GET /v1/querybyh3. Rows contain the
+// resolver's dominant event for each entity. The response also reports the
+// queried cell, candidate count, indexed entity count, and index loss counters:
+// TieDrops records MaxTieCells eviction and CeilingDrops records memory-ceiling
+// eviction. These fields make a reduced candidate set visible to the caller.
+type queryByH3Response struct {
+	// As with windowRow, this JSON data-transfer object is not a hot-path
+	// structure containing contended atomics, so the cache-line stride rule
+	// does not apply.
+	Cell            uint64          `json:"cell"`
+	Rows            []queryResponse `json:"rows"`
+	Candidates      int             `json:"candidates"`
+	IndexedEntities int             `json:"indexed_entities"`
+	TieDrops        uint64          `json:"tie_drops"`
+	CeilingDrops    uint64          `json:"ceiling_drops"`
+	Truncated       bool            `json:"truncated"`
+	CurrentState    bool            `json:"current_state"`
+}
+
+// handleQueryByH3 serves GET /v1/querybyh3?cell=0x<hex>&valid_time=<rfc3339>&tx_time=<rfc3339>.
+// It returns the dominant persisted event for every entity in the requested
+// H3 cell at those temporal coordinates. The cell accepts 0x-prefixed
+// hexadecimal, and timestamps follow /v1/query.
+//
+// A nil resolver returns 503. Disabled and known-degraded indexes also return
+// 503, while other resolver failures return 500; partial results are not
+// returned as successful responses.
+func (s *ControlServer) handleQueryByH3(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.resolver == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(queryDisabledBody{Error: "query-tier disabled (no --lsm-root)"})
+		return
+	}
+	cellStr := r.URL.Query().Get("cell")
+	if cellStr == "" {
+		http.Error(w, "bad request: missing cell", http.StatusBadRequest)
+		return
+	}
+	cell, cerr := strconv.ParseUint(strings.TrimPrefix(cellStr, "0x"), 16, 64)
+	if cerr != nil {
+		http.Error(w, "bad request: invalid cell (expect the H3 index as 0x-prefixed hex, e.g. 0x8928308280fffff)", http.StatusBadRequest)
+		return
+	}
+	validTime, verr := parseQueryTime(r.URL.Query().Get("valid_time"))
+	if verr != nil {
+		http.Error(w, "bad request: invalid valid_time (expect RFC3339): "+verr.Error(), http.StatusBadRequest)
+		return
+	}
+	txTime, terr := parseQueryTime(r.URL.Query().Get("tx_time"))
+	if terr != nil {
+		http.Error(w, "bad request: invalid tx_time (expect RFC3339): "+terr.Error(), http.StatusBadRequest)
+		return
+	}
+	rows, disc, qerr := s.resolver.QueryByH3(r.Context(), cell, validTime, txTime)
+	if qerr != nil {
+		if errors.Is(qerr, database.ErrSecondaryIndexDisabled) || errors.Is(qerr, database.ErrSecondaryIndexDegraded) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(queryDisabledBody{Error: qerr.Error()})
+			return
+		}
+		http.Error(w, "query: "+qerr.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]queryResponse, len(rows))
+	for i, ev := range rows {
+		out[i] = queryResponse{
+			EntityID:         ev.EntityID,
+			SystemTimeNs:     ev.SystemTime,
+			ValidTimeStartNs: ev.ValidTimeStart,
+			ValidTimeEndNs:   ev.ValidTimeEnd,
+			AssertionTimeNs:  ev.AssertionTime,
+			H3Index:          ev.H3Index,
+			PayloadDigestHex: hex.EncodeToString(ev.PayloadDigest[:]),
+			Present:          true,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(queryByH3Response{
+		Cell:            cell,
+		Rows:            out,
+		Candidates:      disc.Candidates,
+		IndexedEntities: disc.IndexedEntities,
+		TieDrops:        disc.TieDrops,
+		CeilingDrops:    disc.CeilingDrops,
+		Truncated:       disc.Truncated,
+		CurrentState:    disc.CurrentState,
+	})
+}
+
+// queryBySystemTimeResponse is returned by GET /v1/querybysystime. It carries
+// the same rows, candidate counts, and index loss counters as
+// queryByH3Response, keyed by after_ns instead of a cell.
+type queryBySystemTimeResponse struct {
+	// This response has the same JSON data-transfer layout considerations as
+	// queryByH3Response and windowRow.
+	AfterNs         int64           `json:"after_ns"`
+	Rows            []queryResponse `json:"rows"`
+	Candidates      int             `json:"candidates"`
+	IndexedEntities int             `json:"indexed_entities"`
+	TieDrops        uint64          `json:"tie_drops"`
+	CeilingDrops    uint64          `json:"ceiling_drops"`
+	Truncated       bool            `json:"truncated"`
+	CurrentState    bool            `json:"current_state"`
+}
+
+// handleQueryBySystemTime serves GET /v1/querybysystime?after_time=<rfc3339>&valid_time=<rfc3339>&tx_time=<rfc3339>.
+// It returns every entity whose resolved current SystemTime is at least
+// after_time. Method, input, resolver, and failure handling match
+// handleQueryByH3, including 503 for disabled or degraded indexes.
+func (s *ControlServer) handleQueryBySystemTime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.resolver == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(queryDisabledBody{Error: "query-tier disabled (no --lsm-root)"})
+		return
+	}
+	after, aerr := parseQueryTime(r.URL.Query().Get("after_time"))
+	if aerr != nil {
+		http.Error(w, "bad request: invalid after_time (expect RFC3339): "+aerr.Error(), http.StatusBadRequest)
+		return
+	}
+	validTime, verr := parseQueryTime(r.URL.Query().Get("valid_time"))
+	if verr != nil {
+		http.Error(w, "bad request: invalid valid_time (expect RFC3339): "+verr.Error(), http.StatusBadRequest)
+		return
+	}
+	txTime, terr := parseQueryTime(r.URL.Query().Get("tx_time"))
+	if terr != nil {
+		http.Error(w, "bad request: invalid tx_time (expect RFC3339): "+terr.Error(), http.StatusBadRequest)
+		return
+	}
+	rows, disc, qerr := s.resolver.QueryBySystemTime(r.Context(), after, validTime, txTime)
+	if qerr != nil {
+		if errors.Is(qerr, database.ErrSecondaryIndexDisabled) || errors.Is(qerr, database.ErrSecondaryIndexDegraded) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(queryDisabledBody{Error: qerr.Error()})
+			return
+		}
+		http.Error(w, "query: "+qerr.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]queryResponse, len(rows))
+	for i, ev := range rows {
+		out[i] = queryResponse{
+			EntityID:         ev.EntityID,
+			SystemTimeNs:     ev.SystemTime,
+			ValidTimeStartNs: ev.ValidTimeStart,
+			ValidTimeEndNs:   ev.ValidTimeEnd,
+			AssertionTimeNs:  ev.AssertionTime,
+			H3Index:          ev.H3Index,
+			PayloadDigestHex: hex.EncodeToString(ev.PayloadDigest[:]),
+			Present:          true,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(queryBySystemTimeResponse{
+		AfterNs:         after.UnixNano(),
+		Rows:            out,
+		Candidates:      disc.Candidates,
+		IndexedEntities: disc.IndexedEntities,
+		TieDrops:        disc.TieDrops,
+		CeilingDrops:    disc.CeilingDrops,
+		Truncated:       disc.Truncated,
+		CurrentState:    disc.CurrentState,
+	})
 }

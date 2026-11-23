@@ -4,24 +4,24 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — COMPOSED-THROUGHPUT BENCH. This file is FILE 1 of the two-file
-// scope (§4): the three-shape receiver-composition bench that replaces
-// "almost certainly noise" with a MEASURED residue on THIS box.
+// Composed-throughput bench for the receiver. This file is the composed-throughput
+// suite for the receiver: the three-shape receiver-composition bench that replaces
+// "almost certainly noise" with a measured residue on this machine.
 //
-// GEAR TAG (HONEST): _4c. This box is GOMAXPROCS=4, CPU part 0xd40
-// (Cortex-A76-class, Graviton3-era), Go 1.26.1, nproc=4. It is NOT
-// c8g.8xlarge at 32c. The "_4c" suffix on every bench here is the HONEST gear
+// Gear tag: _4c. This box runs GOMAXPROCS=4, CPU part 0xd40
+// (Cortex-A76-class, Graviton3-era), Go 1.26.1, nproc=4. It is not
+// a c8g.8xlarge at 32c. The "_4c" suffix on every bench here is the gear
 // tag; the 32c figures cited separately (Verify 60.2 us, Open 3x60.2 us) are
-// the PROVEN publication numbers, NOT a 4c re-measurement — they are
+// the 32-core Graviton4 silicon benchmark proven publication numbers, not a 4c re-measurement — they are
 // never blurred with the 4c numbers measured here. A future 32c box relabels
-// per its own gear; the 4 is not baked (the honest-gear guard).
+// per its own gear; the 4 is not baked.
 //
-// The bench drives the FULL HandleFrame composition (§3): UnmarshalRelayEnvelope
-// -> readLastHop -> readGateFields -> PeerBucket.Accept -> IngressHLCScalarCap.
+// The bench drives the full HandleFrame composition: UnmarshalRelayEnvelope
+// -> readLastHop -> readGateFields -> PeerBucket.Accept -> IngressHLCScalarCap
 // Admit -> RelayEnvelope.Open -> Directory.Lookup -> VerifyCRDTFrame ->
-// ApplyCRDTDeltaEvent. It does NOT bypass HandleFrame and it does NOT feed a
-// non-capnp inner (fakeInnerWire) on the ACCEPT path (§9): the inner wire is a
-// REAL CRDTDeltaEvent built via the (now value-parameterized) buildCRDTDeltaWire,
+// ApplyCRDTDeltaEvent. It does not bypass HandleFrame and it does not feed a
+// non-capnp inner (fakeInnerWire) on the accept path: the inner wire is a
+// real CRDTDeltaEvent built via the (now value-parameterized) buildCRDTDeltaWire,
 // so ApplyCRDTDeltaEvent's capnp.Unmarshal accepts it and the Join seam runs.
 package receive
 
@@ -44,50 +44,49 @@ import (
 )
 
 // benchWallBase is the pinned synthetic-clock base (microseconds) shared by
-// every bench shape so the 3.0 clock gate admits honest frames (the last
+// every bench shape so the 3.0 clock gate admits frames (the last
 // hop's WallUSec is within the 2ms epsilon of the local clock). It mirrors
 // the wallBase the existing receiver tests use.
 const benchWallBase = int64(1_700_000_000_000_000)
 
 // benchBudgetNS is the 3.2 admission budget for the ACCEPT shapes: 1ms ->
 // MaxHopsForBudget=15, which admits the 3-hop relay chain Shape A uses (so
-// Open runs 3 outer Verifies, matching the §1 "Open(3 hops)" baseline Shape C
+// Open runs 3 outer Verifies, matching the "Open(3 hops)" baseline Shape C
 // re-measures). The DROP shapes use their own budgets (see each sub-bench).
 const benchBudgetNS = int64(1_000_000_000) // 1ms -> MaxHopsForBudget=15
 
 // benchHops is the relay-chain depth Shape A uses. 3 hops so Open's cost
-// matches the §1 "Envelope.Open(3 hops)" baseline (3 outer Verifies) that
+// matches the "Envelope.Open(3 hops)" baseline (3 outer Verifies) that
 // Shape C re-measures as a standalone part — keeping the residual math
-// apples-to-apples (the Open cost in the composed total is the SAME 3-hop
+// apples-to-apples (the Open cost in the composed total is the same 3-hop
 // Open Shape C measures in isolation).
 const benchHops = 3
 
-// benchEntityID derives a UNIQUE entityID per op from the op index, so each
-// entityID's dot-list stays length 1 across the bench (TRAP-2 + the O(N^2)
-// perShardMerge walk both die on unique-entityID — the same fix, per the §4
-// amendment root cause). It is a deterministic, per-op-distinct string; the
+// benchEntityID derives a unique entityID per op from the op index, so each
+// entityID's dot-list stays length 1 across the bench (bounding per-entity
+// dot list lengths to prevent O(N^2) perShardMerge walks during benchmark runs). It is a deterministic, per-op-distinct string; the
 // engine does not validate the entityID format, only that DotNodeID ==
 // OriginNodeID and the digest cross-checks, so a per-op-distinct entityID is a
-// faithful unique-merge-every-op workload. The monotone-stream probe uses the
-// SAME derivation so it runs the bench's EXACT dc-sequence (dc=1..K, unique
+// faithful unique-merge-every-op workload. The probe uses the same
+// derivation so it runs the bench's exact dc-sequence (dc=1..K, unique
 // entityID each).
 func benchEntityID(i uint64) string {
 	return fmt.Sprintf("bench:entity:%020d", i)
 }
 
-// benchFixedRelayKeys generates n fresh Ed25519 relay keypairs ONCE. The bench
-// reuses the SAME relay keys across every frame so the 3.1 PeerBucket rate gate
-// sees a WARM peer (a steady-state lookup, ~41 ns 0-alloc, matching the §1
+// benchFixedRelayKeys generates n fresh Ed25519 relay keypairs once. The bench
+// reuses the same relay keys across every frame so the 3.1 PeerBucket rate gate
+// sees a warm peer (a steady-state lookup, ~41 ns 0-alloc, matching the
 // PeerBucket.Accept baseline) rather than a fresh peer per frame (which would
 // allocate a PeerEWMA + map entry per op and misattribute rate-gate map growth
 // as "accept-path" allocs). The origin key is likewise fixed (see
-// benchSetupOrigin) so the Directory.Lookup is a warm hit. This is the honest
-// steady-state workload: ONE origin peer streams a sequence of CRDT deltas
-// (unique entityID, monotone dc per delta) through a FIXED relay chain to the
-// receiver. The chain is built by composing the EXPORTED attribution primitives
+// benchSetupOrigin) so the Directory.Lookup is a warm hit. This is the
+// steady-state workload: one origin peer streams a sequence of CRDT deltas
+// (unique entityID, monotone dc per delta) through a fixed relay chain to the
+// receiver. The chain is built by composing the exported attribution primitives
 // (SignHop / SignedMaterial / NewSignedRelayEnvelope) — the single source of
-// truth for hop construction — NOT by re-deriving any envelope byte-offset
-// layout (the desync guard confirms no offset/field-order literals).
+// truth for hop construction — not by re-deriving any envelope byte-offset
+// layout (the desync check confirms no offset/field-order literals).
 func benchFixedRelayKeys(tb testing.TB, n int) ([]ed25519.PublicKey, []ed25519.PrivateKey) {
 	tb.Helper()
 	pubs := make([]ed25519.PublicKey, n)
@@ -109,13 +108,13 @@ func benchSetupOrigin(tb testing.TB) (ed25519.PublicKey, ed25519.PrivateKey) {
 }
 
 // benchMarshalFrame builds a signed 3-hop relay envelope over innerWire with
-// the FIXED origin + FIXED relay keys, and returns the marshalled wire bytes
+// the fixed origin and relay keys, and returns the marshalled wire bytes
 // (the full envelope, no length prefix — HandleFrame takes the envelope
 // directly). The origin signs innerWire (originSig rides the envelope); each
 // relay signs the chain-of-custody material via the exported SignHop /
-// SignedMaterial, threading the signed-material accumulator EXACTLY as Open
+// SignedMaterial, threading the signed-material accumulator exactly as Open
 // verifies it. This composes the same exported primitives relayChain uses,
-// with fixed keys; it does NOT re-derive envelope offsets (the desync guard).
+// with fixed keys; it does not re-derive envelope offsets.
 func benchMarshalFrame(tb testing.TB, innerWire []byte, originPriv ed25519.PrivateKey, relayPrivs []ed25519.PrivateKey, relayPubs []ed25519.PublicKey, wallBase int64) []byte {
 	tb.Helper()
 	originSig := ed25519.Sign(originPriv, innerWire)
@@ -137,7 +136,7 @@ func benchMarshalFrame(tb testing.TB, innerWire []byte, originPriv ed25519.Priva
 	return env.Marshal()
 }
 
-// benchBuildFrame builds a full ACCEPT-path frame for op index i: a unique
+// benchBuildFrame builds a full accept-path frame for op index i: a unique
 // entityID (benchEntityID(i)) + monotone dotCounter = uint64(i), signed by the
 // fixed origin and relayed through the fixed 3-hop chain. This is the Shape A
 // per-op workload (and the probe's dc-sequence).
@@ -147,9 +146,9 @@ func benchBuildFrame(tb testing.TB, i uint64, originPriv ed25519.PrivateKey, rel
 	return benchMarshalFrame(tb, innerWire, originPriv, relayPrivs, relayPubs, benchWallBase)
 }
 
-// benchBuildFrameConst builds a frame with the CONSTANT rcvEntityID sentinel
-// and a fixed dotCounter (the NEGATIVE-CONTROL workload: identical dots every
-// frame -> Join dedup-SKIPs after the first). It reuses the fixed keys so the
+// benchBuildFrameConst builds a frame with the constant rcvEntityID sentinel
+// and a fixed dotCounter (the negative-control workload: identical dots every
+// frame -> Join dedup-skips after the first). It reuses the fixed keys so the
 // rate gate + Directory stay warm (isolating the Join insert-vs-skip delta).
 func benchBuildFrameConst(tb testing.TB, dc uint64, originPriv ed25519.PrivateKey, relayPrivs []ed25519.PrivateKey, relayPubs []ed25519.PublicKey) []byte {
 	tb.Helper()
@@ -157,15 +156,14 @@ func benchBuildFrameConst(tb testing.TB, dc uint64, originPriv ed25519.PrivateKe
 	return benchMarshalFrame(tb, innerWire, originPriv, relayPrivs, relayPubs, benchWallBase)
 }
 
-// benchOverrideDataDirToTmpfs points the protected-core engine's DataDir at a tmpfs
+// benchOverrideDataDirToTmpfs points the frozen engine's DataDir at a tmpfs
 // (/dev/shm) subdir so the background persist worker's fsync cannot stall a
-// mmap/tmpfile allocation that would bleed into the measured ns/op (TRAP-3).
+// mmap/tmpfile allocation that would bleed into the measured ns/op.
 // setupEngine already sets DataDir to t.TempDir() (which is /tmp = tmpfs on
-// THIS box), but /dev/shm makes the tmpfs isolation explicit and reportable
+// this box), but /dev/shm makes the tmpfs isolation explicit and reportable
 // (the commit message states the data dir is on tmpfs). The override is
 // bench-local: it mutates the exported eng.DataDir package var (the same var
-// setupEngine mutates) and restores it on cleanup. It does NOT touch any
-// protected-core file.
+// setupEngine mutates) and restores it on cleanup.
 func benchOverrideDataDirToTmpfs(tb testing.TB) {
 	tb.Helper()
 	dir, err := os.MkdirTemp("/dev/shm", "receive-bench-*")
@@ -181,30 +179,30 @@ func benchOverrideDataDirToTmpfs(tb testing.TB) {
 }
 
 // ---------------------------------------------------------------------------
-// SHAPE A — Steady-state ACCEPT throughput (the headline number)
+// Shape A — Steady-state accept throughput (the headline number)
 // ---------------------------------------------------------------------------
 
-// BenchmarkReceiver_AcceptStream_4c measures the end-to-end ACCEPT cost of
+// BenchmarkReceiver_AcceptStream_4c measures the end-to-end accept cost of
 // HandleFrame over a steady-state stream of unique CRDT deltas (unique entityID
 // + monotone dc per op, fixed origin + fixed 3-hop relay so the rate gate and
-// Directory are warm). It runs the FULL §3 composition including step 9
+// Directory are warm). It runs the full §3 composition including step 9
 // (ApplyCRDTDeltaEvent — the unmeasured tail this bench exists to capture) and
 // reports ns/op, B/op, allocs/op, and frames/sec (1e9 / ns_per_op).
 //
-// Constraints (§5 Shape A): monotone dc (TRAP-1 safe — delta=1 never drains the
-// 1<<20 budget within any realistic b.N), unique entityID per op (TRAP-2 + the
-// O(N^2) walk both die), data dir on tmpfs (TRAP-3 isolated), synthetic clock
+// Constraints (Shape A): monotone dc (delta=1 does not drain the
+// 1<<20 budget within realistic b.N), unique entityID per op (bounding
+// perShardMerge walks), data dir on tmpfs (isolating background fsyncs), synthetic clock
 // pinned (no OS clock drift in the timed region), single goroutine loop
-// (NO b.RunParallel — §9). Keys/frames are pre-computed OUTSIDE b.ResetTimer
+// (no b.RunParallel — §9). Keys/frames are pre-computed outside b.ResetTimer
 // (keygen + signing are expensive and not the measured path). The bench body
-// asserts every frame Accepts (a drop is reported via b.Fatal, not hidden).
+// asserts every frame accepts (a drop is reported via b.Fatal, not hidden).
 func BenchmarkReceiver_AcceptStream_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
 	originPub, originPriv := benchSetupOrigin(b)
 	relayPubs, relayPrivs := benchFixedRelayKeys(b, benchHops)
 	r, _, _, _ := setupReceiver(b, benchWallBase, benchBudgetNS, originPub)
 
-	// Pre-compute b.N unique frames OUTSIDE the timed loop. The bench
+	// Pre-compute b.N unique frames outside the timed loop. The bench
 	// framework calls this function with increasing b.N (1, ~100, ~final);
 	// each call pre-computes exactly its b.N frames. Keygen + signing + the
 	// 3-hop marshal happen here, never in the measured region.
@@ -229,16 +227,16 @@ func BenchmarkReceiver_AcceptStream_4c(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// SHAPE B — Adversarial-DROP throughput (the DDoS-endurance number)
+// Shape B — Adversarial-drop throughput (the DDoS-endurance number)
 // ---------------------------------------------------------------------------
 
 // BenchmarkReceiver_DropDepth_4c measures the depth-exceed drop path: a 3-hop
 // frame under a 30us budget (MaxHopsForBudget=0) is dropped at the 3.2 depth
-// check with ZERO Verify calls (the O(1) reject-before-Verify defense). The
-// bench installs a counting VerifyHook and asserts count==0 INSIDE the bench
-// body (b.Fatal on nonzero) — the reject-before-Verify ordering is EXECUTED
+// check with zero Verify calls (the O(1) reject-before-Verify defense). The
+// bench installs a counting VerifyHook and asserts count==0 inside the bench
+// body (b.Fatal on nonzero) — the reject-before-Verify ordering is executed
 // under bench load, not just under -count=1 tests (the F2-corrected
-// discipline). Shape B frames/sec MUST be >= 1000x Shape A (the DoS-defense
+// discipline). Shape B frames/sec must be >= 1000x Shape A (the DoS-defense
 // bar); the commit reports whether it meets that bar.
 func BenchmarkReceiver_DropDepth_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
@@ -263,7 +261,7 @@ func BenchmarkReceiver_DropDepth_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf("depth reject must issue ZERO Verify calls under bench load, got %d", got)
+		b.Fatalf("depth reject must issue zero Verify calls under bench load, got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
@@ -272,7 +270,7 @@ func BenchmarkReceiver_DropDepth_4c(b *testing.B) {
 
 // BenchmarkReceiver_DropRate_4c measures the rate-exceed drop path: a
 // MaxUint64 dotCounter drains the peer's bucket to 0, so Accept returns Drop
-// BEFORE Open (zero Verifies). The bench drives the bucket to Exhaust once
+// before Open (zero Verifies). The bench drives the bucket to exhaust once
 // (a MaxUint64 ratchet pins budget to 0), then measures the steady-state Drop
 // under load, asserting VerifyHook count==0 in the body.
 func BenchmarkReceiver_DropRate_4c(b *testing.B) {
@@ -281,7 +279,7 @@ func BenchmarkReceiver_DropRate_4c(b *testing.B) {
 	relayPubs, relayPrivs := benchFixedRelayKeys(b, benchHops)
 	r, _, _, _ := setupReceiver(b, benchWallBase, benchBudgetNS, originPub)
 	// Build the MaxUint64-dc frame once (the relay keys are fixed, so the rate
-	// gate sees the SAME peer every iteration — the bucket drains on the first
+	// gate sees the same peer every iteration — the bucket drains on the first
 	// Accept and stays drained).
 	frame := benchBuildFrame(b, MaxUint64DotCounter, originPriv, relayPrivs, relayPubs)
 
@@ -299,7 +297,7 @@ func BenchmarkReceiver_DropRate_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf("rate reject must issue ZERO Verify calls under bench load, got %d", got)
+		b.Fatalf("rate reject must issue zero Verify calls under bench load, got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
@@ -308,14 +306,14 @@ func BenchmarkReceiver_DropRate_4c(b *testing.B) {
 
 // BenchmarkReceiver_DropClock_4c measures the clock-future drop path: the
 // last hop's WallUSec is 3000us ahead of the local clock (beyond the 2ms
-// epsilon), so IngressHLCScalarCap.Admit rejects BEFORE Open (zero Verifies).
+// epsilon), so IngressHLCScalarCap.Admit rejects before Open (zero Verifies).
 // The bench pins the local clock 3000us behind the frame's physical time and
 // asserts VerifyHook count==0 in the body.
 func BenchmarkReceiver_DropClock_4c(b *testing.B) {
 	benchOverrideDataDirToTmpfs(b)
 	originPub, originPriv := benchSetupOrigin(b)
 	relayPubs, relayPrivs := benchFixedRelayKeys(b, benchHops)
-	// Local clock 3000us BEHIND the frame's last-hop physical time (benchWallBase)
+	// Local clock 3000us behind the frame's last-hop physical time (benchWallBase)
 	// so the frame is 3000us-future -> 3000 > 2000 epsilon -> clock reject.
 	r, _, _, _ := setupReceiver(b, benchWallBase-3000, benchBudgetNS, originPub)
 	frame := benchBuildFrame(b, 7, originPriv, relayPrivs, relayPubs)
@@ -334,7 +332,7 @@ func BenchmarkReceiver_DropClock_4c(b *testing.B) {
 	}
 	b.StopTimer()
 	if got := count.Load(); got != 0 {
-		b.Fatalf("clock reject must issue ZERO Verify calls under bench load, got %d", got)
+		b.Fatalf("clock reject must issue zero Verify calls under bench load, got %d", got)
 	}
 	if ns := benchNsPerOp(b); ns > 0 {
 		b.ReportMetric(float64(1e9)/float64(ns), "frames/sec")
@@ -342,30 +340,29 @@ func BenchmarkReceiver_DropClock_4c(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// SHAPE C — Composition-overhead RESIDUAL (the "is it noise?" number)
+// Shape C — Composition-overhead residual (the noise evaluation metric)
 // ---------------------------------------------------------------------------
 
 // BenchmarkReceiver_OverheadResidual_4c measures the composition overhead as a
-// RESIDUAL: (HandleFrame end-to-end total) - (sum of the standalone-measured
+// residual: (HandleFrame end-to-end total) - (sum of the standalone-measured
 // parts: Open(3 hops), VerifyCRDTFrame, PeerBucket.Accept, Admit). The parts
-// are RE-MEASURED in THIS bench (same process, same thermal state as the
-// HandleFrame total) — NOT pasted from §1 — so the residual is an honest
+// are re-measured in this bench (same process, same thermal state as the
+// HandleFrame total) — not pasted from §1 — so the residual is a
 // same-box, same-commit figure. The residual captures readGateFields (the 2x
 // capnp decode: one in HandleFrame's readGateFields, one in
 // ApplyCRDTDeltaEvent's capnp.Unmarshal), Directory.Lookup, the Join/HAMT
-// merge, and the persist select-default attempt — the steps NOT in any
+// merge, and the persist select-default attempt — the steps not in any
 // standalone part.
 //
-// The bench reports the residual as an ABSOLUTE ns and a PERCENTAGE of the
-// total, with each component labeled with its MEASURED number. The honesty
-// gate (§5 Shape C): the residual must NOT magically be zero or negative with
+// The bench reports the residual as an absolute ns and a percentage of the
+// total, with each component labeled with its measured number. The integrity gate (§5 Shape C): the residual must not magically be zero or negative with
 // no explanation; if it is > 5% of the total, "composition overhead is noise"
-// is REFUTED as a measured number. Either outcome is reported; the outcome is
+// is refuted as a measured number. Either outcome is reported; the outcome is
 // not chosen before measuring.
 //
 // Method: b.N is fixed across the sub-measurements by reading each part's
 // ns/op from its own b.N-scaled loop and computing the residual in ns. The
-// parts use the SAME fixed keys + workload as Shape A so the comparison is
+// parts use the same fixed keys + workload as Shape A so the comparison is
 // apples-to-apples (warm rate gate, warm Directory, 3-hop Open, the same
 // inner-wire shape).
 func BenchmarkReceiver_OverheadResidual_4c(b *testing.B) {
@@ -385,7 +382,7 @@ func BenchmarkReceiver_OverheadResidual_4c(b *testing.B) {
 	innerWire := buildCRDTDeltaWire(b, benchEntityID(1), 1)
 	originSig := ed25519.Sign(originPriv, innerWire)
 	// A 3-hop envelope for the standalone Open(3 hops) part (NewRelayEnvelope:
-	// zero originSig, so Open does 3 outer Verifies only — matching the §1
+	// zero originSig, so Open does 3 outer Verifies only — matching the
 	// "Open(3 hops)" baseline that excludes the inner origin Verify).
 	relayHops := make([]attribution.Hop, benchHops)
 	{
@@ -411,7 +408,7 @@ func BenchmarkReceiver_OverheadResidual_4c(b *testing.B) {
 	totalNs := benchNsPerOp(b) // ns/op for the full composition
 	b.StopTimer()
 
-	// --- Parts 2-5: re-measure each standalone part in the SAME process. ---
+	// --- Parts 2-5: re-measure each standalone part in the same process. ---
 	// Each part runs its own b.N loop and we read its ns/op. To keep the parts
 	// comparable to the total (same b.N), we run them at the same iteration
 	// count; the testing framework's b.N is fixed for this bench invocation,
@@ -438,23 +435,23 @@ func BenchmarkReceiver_OverheadResidual_4c(b *testing.B) {
 	// Cheap parts (accept ~42 ns, admit ~4-5 ns) are loop-overhead-bound at
 	// b.N~10^4: the per-op figure's real uncertainty is ~3% (re-measured across
 	// runs). Reporting 4 sigfigs (4.367) claims a precision the measurement
-	// cannot deliver. Round to 2 sigfigs at report time so the DISPLAYED number
-	// is honest about its resolution; the full-precision value is retained in
+	// cannot deliver. Round to 2 sigfigs at report time so the displayed number
+	// is accurate about its resolution; the full-precision value is retained in
 	// sumParts/residual (the residual is computed from full precision — only the
-	// DISPLAYED cheap-part labels are rounded). open3/verify/residual/total stay
+	// displayed cheap-part labels are rounded). open3/verify/residual/total stay
 	// full precision (µs-class, well above the loop-overhead floor).
 	b.ReportMetric(round2sf(acceptNs), "accept_ns/op")
 	b.ReportMetric(round2sf(admitNs), "admit_ns/op")
 	b.ReportMetric(float64(residualNs), "residual_ns/op")
 	b.ReportMetric(pct, "residual_pct")
 	if residualNs < 0 {
-		b.Logf("RESIDUAL NEGATIVE: total=%.0f ns sum(parts)=%.0f ns (open=%.0f verify=%.0f accept=%.0f admit=%.0f) — explain before trusting",
+		b.Logf("Residual negative: total=%.0f ns sum(parts)=%.0f ns (open=%.0f verify=%.0f accept=%.0f admit=%.0f) — explain before trusting",
 			totalNs, sumParts, openNs, verifyNs, acceptNs, admitNs)
 	}
 }
 
 // benchMeasureOpen3 measures Open(3 hops) ns/op over b.N iterations. It runs
-// OUTSIDE the main b.ResetTimer window (the residual bench already stopped the
+// outside the main b.ResetTimer window (the residual bench already stopped the
 // timer); it uses a private loop and returns the per-op ns. The envelope is
 // built once (keygen is not the measured path); Open is called b.N times.
 func benchMeasureOpen3(b *testing.B, env *attribution.RelayEnvelope, maxHops int) float64 {
@@ -488,16 +485,16 @@ func benchMeasureVerifyCRDTFrame(b *testing.B, pub ed25519.PublicKey, msg, sig [
 }
 
 // benchMeasurePeerBucketAccept measures PeerBucket.Accept ns/op (warm peer,
-// monotone dc) over b.N, matching the §1 PeerBucket baseline shape.
+// monotone dc) over b.N, matching the PeerBucket baseline shape.
 func benchMeasurePeerBucketAccept(b *testing.B, relayPub ed25519.PublicKey) float64 {
 	bucket := admission.NewPeerBucket()
 	pb := pubArray(relayPub)
 	// Warm the peer with one accept so the loop measures the steady-state
 	// lookup (not the first-frame insertion).
-	_ = bucket.Accept(pb[:], 1)
+	_, _ = bucket.Accept(pb[:], 1)
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
-		_ = bucket.Accept(pb[:], uint64(i+2))
+		_, _ = bucket.Accept(pb[:], uint64(i+2))
 	}
 	elapsed := time.Since(start)
 	if b.N == 0 {
@@ -507,14 +504,18 @@ func benchMeasurePeerBucketAccept(b *testing.B, relayPub ed25519.PublicKey) floa
 }
 
 // benchMeasureAdmit measures IngressHLCScalarCap.Admit ns/op (accept path)
-// over b.N. It uses the receiver's own cap + clock (pinned at benchWallBase)
-// and a within-epsilon physical time so Admit accepts (exercising the
-// AdvanceLamportTo call on the accept path).
+// over b.N. It rebuilds a cap over the same synthetic clock (pinned at
+// benchWallBase) and a within-epsilon physical time so Admit accepts. The
+// ingress-admission fix (ADR-0067) removed the accept-path AdvanceLamportTo
+// (the advance moved to the receiver's step 8c); the ns/op measures the
+// drift compare alone, never an advance CAS (do not compare it against the
+// 71.4 us verify wall as if an advance were included).
 func benchMeasureAdmit(b *testing.B, r *Receiver) float64 {
 	// The receiver's cap is private; re-build an equivalent cap over the same
 	// synthetic clock so the measurement is independent of the receiver's
-	// already-advanced lamport state. Use a fresh engine so AdvanceLamportTo
-	// runs the real CAS path each accept.
+	// already-advanced lamport state. The fresh engine is constructor
+	// ballast post the admission and clock gate hygiene work (no advance runs in this bench; kept to avoid
+	// churning the setup).
 	benchOverrideDataDirToTmpfs(b)
 	sc := clock.NewSyntheticClock(benchWallBase)
 	eng2, err := eng.NewDeltaCRDTEngine(rcvOriginNodeID, 0, 64*1024*1024)
@@ -524,12 +525,11 @@ func benchMeasureAdmit(b *testing.B, r *Receiver) float64 {
 	defer eng2.Close()
 	cap := clock.NewIngressHLCScalarCap(sc, eng2)
 	const phys = benchWallBase + 1500 // 1500us-future, within the 2ms epsilon -> accept
-	const logical uint64 = 42
 	// Warm one accept.
-	_ = cap.Admit(phys, logical)
+	_ = cap.Admit(phys)
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
-		_ = cap.Admit(phys, logical)
+		_ = cap.Admit(phys)
 	}
 	elapsed := time.Since(start)
 	if b.N == 0 {
@@ -538,16 +538,15 @@ func benchMeasureAdmit(b *testing.B, r *Receiver) float64 {
 	return float64(elapsed) / float64(b.N)
 }
 
-// (Hygiene fix — Defect 3 of 94a8c9a: comment-lies-about-code.) The 94a8c9a
-// nanoNow() documented time.Since as the monotonic-correct path and then
-// returned time.Now().UnixNano(), which STRIPS Go's monotonic reading. Sub-
-// tracting two int64 UnixNano values is a wall-clock delta, NOT a monotonic
+// (Hygiene fix: the original nanoNow documented time.Since as the monotonic-correct
+// path and then returned time.Now().UnixNano(), which strips Go's monotonic reading.
+// Subtracting two int64 UnixNano values is a wall-clock delta, not a monotonic
 // delta — a future NTP slew would put the part loops on a different clock
-// family than the total path (b.Elapsed, which IS monotonic-correct) and bias
-// the residual an unknown amount. The fix removes nanoNow() entirely: the
-// standalone-part loops and the negative control now use start:= time.Now()
-// with elapsed:= time.Since(start), so parts and total share the SAME mono-
-// tonic clock family (time.Time carrying the monotonic reading,.Sub preserving
+// family than the total path (b.Elapsed, which is monotonic-correct) and bias
+// the residual an unknown amount. The fix removes nanoNow entirely: the
+// standalone-part loops and the negative control now use start := time.Now()
+// with elapsed := time.Since(start), so parts and total share the same mono-
+// tonic clock family (time.Time carrying the monotonic reading, .Sub preserving
 // it). No caller uses an int64 UnixNano delta anywhere in this file now.
 
 // benchNsPerOp returns the measured ns/op for the bench's timed region
@@ -561,12 +560,12 @@ func benchNsPerOp(b *testing.B) float64 {
 	return float64(b.Elapsed().Nanoseconds()) / float64(b.N)
 }
 
-// round2sf rounds a float64 to 2 significant figures for HONEST display of
+// round2sf rounds a float64 to 2 significant figures for display of
 // loop-overhead-bound cheap-part metrics (accept ~42 ns, admit ~4-5 ns): a
 // 4-sigfig report (4.367 ns) claims a precision a ~3% inter-run swing (confirmed
-// across two reproductions of 94a8c9a) cannot deliver. 2 sigfigs (4.5 ns) is
-// the honest display resolution. The residual is computed from FULL precision —
-// only the DISPLAYED cheap-part labels are rounded, so the residual math is not
+// across two reproductions) cannot deliver. 2 sigfigs (4.5 ns) is
+// the display resolution. The residual is computed from full precision —
+// only the displayed cheap-part labels are rounded, so the residual math is not
 // degraded by this display rounding. Used only for accept_ns/op + admit_ns/op;
 // the µs-class metrics (open3/verify/residual/total) stay full precision.
 func round2sf(x float64) float64 {
@@ -584,23 +583,22 @@ func round2sf(x float64) float64 {
 }
 
 // ---------------------------------------------------------------------------
-// §6 NEGATIVE CONTROL — proves Shape A measures real merge, not a bench artifact
+// Negative control — proves Shape A measures real merge, not a bench artifact
 // ---------------------------------------------------------------------------
 
 // TestReceiver_AcceptDedupBaitNegativeControl_4c proves Shape A's per-op cost
-// is real Join merge work, not a bench artifact, by CONTRAST: it runs the
-// ACCEPT path feeding IDENTICAL dots (same entityID, same dc) in a loop and
-// asserts (1) Join SKIPS — entriesSkipped increments (read via Stats()) — and
-// (2) the identical-dot per-frame cost is strictly LOWER than the unique-dot
-// (Shape A workload) per-frame cost. The asymmetry is the Defect-B-class
-// proof by contrast, not by assertion.
+// is real Join merge work, not a bench artifact, by contrast: it runs the
+// accept path feeding identical dots (same entityID, same dc) in a loop and
+// asserts (1) Join skips — entriesSkipped increments (read via Stats()) — and
+// (2) the identical-dot per-frame cost is strictly lower than the unique-dot
+// (Shape A workload) per-frame cost. The asymmetry is the proof by contrast, not by assertion.
 //
-// HONEST FINDING (measured on this box): the asymmetry is REAL but SMALL
+// Finding (measured on this box): the asymmetry is real but small
 // (~1-2% of the per-op cost) because the ~290 us Open+Verify crypto cost
 // dominates the total and buries the ~5 us Join insert-vs-skip delta. The
-// entriesSkipped observation is the ROBUST structural proof; the cost asymmetry
+// entriesSkipped observation is the reliable structural proof; the cost asymmetry
 // is the magnitude proof, reported at its measured (small) size — not inflated.
-// If entriesSkipped cannot be observed incrementing, the test FAILS (it does
+// If entriesSkipped cannot be observed incrementing, the test fails (it does
 // not fake the control).
 func TestReceiver_AcceptDedupBaitNegativeControl_4c(t *testing.T) {
 	benchOverrideDataDirToTmpfs(t)
@@ -650,52 +648,51 @@ func TestReceiver_AcceptDedupBaitNegativeControl_4c(t *testing.T) {
 	idNs := float64(time.Since(start).Nanoseconds()) / float64(M)
 	stI := engine2.Stats()
 
-	// (1) Structural proof: Join MUST skip on the identical-dot loop.
+	// (1) Structural proof: Join must skip on the identical-dot loop.
 	if stI["entries_skipped"] == 0 {
-		t.Fatalf("NEGATIVE CONTROL FAILED: entriesSkipped did not increment on the identical-dot loop (Join did not skip) — cannot fake the control; stop and report")
+		t.Fatalf("negative control failed: entriesSkipped did not increment on the identical-dot loop (Join did not skip) — cannot fake the control; stop and report")
 	}
-	// The unique-dot loop should have ~0 skips (every dot is new); a small
-	// nonzero count is the warmup re-feed (the warmup frames are re-fed in the
-	// measured loop only for the identical path; the unique path's warmup dots
-	// are NOT re-fed, so skipped should be ~0 here).
-	t.Logf("unique: %.0f ns/op, inserted=%d skipped=%d", uniqNs, stU["entries_inserted"], stU["entries_skipped"])
+	// The unique-dot loop shows a small nonzero skip count (~50 of 2000) from the
+	// warmup re-feed: uniq[0..49] are re-fed in the measured loop and counted as
+	// dot-equal skips.
+	t.Logf("unique:    %.0f ns/op, inserted=%d skipped=%d", uniqNs, stU["entries_inserted"], stU["entries_skipped"])
 	t.Logf("identical: %.0f ns/op, inserted=%d skipped=%d", idNs, stI["entries_inserted"], stI["entries_skipped"])
 
-	// (2) Magnitude proof (tolerance-banded, hygiene fix — Defect 4 of 94a8c9a):
-	// the structural proof above (entriesSkipped > 0) is the PRIMARY guard —
-	// it is unflakable (an exact counter increment, not a timing observation).
-	// The magnitude proof here is SECONDARY and tolerance-banded: the Join
-	// insert-vs-skip signal is ~5 us buried under ~290 us of crypto per frame,
-	// so a strict `idNs < uniqNs` (the 94a8c9a form) flips on a single GC pause
-	// or scheduler hiccup in one loop but not the other. The robust assertion is
-	// `idNs < uniqNs * 1.05`: the identical path may pay up to 5% MORE than the
-	// unique path and still pass (crypto noise), but if it exceeds the unique
-	// path by MORE than 5%, Join is no longer genuinely skipping — that is a real
-	// regression, not noise. The 5% band is generous against crypto/GC noise and
-	// tight against a lost dedup signal (the signal itself is ~1.7% of the
-	// ~290us crypto floor at the measured delta).
+	// (2) Magnitude proof (tolerance-banded assertion):
+	//   the structural proof above (entriesSkipped > 0) is the primary guard —
+	//   it is unflakable (an exact counter increment, not a timing observation).
+	//   The magnitude proof here is secondary and tolerance-banded: the Join
+	//   insert-vs-skip signal is ~5 us buried under ~290 us of crypto per frame,
+	//   so a strict `idNs < uniqNs` flips on a single GC pause
+	//   or scheduler hiccup in one loop but not the other. The calibrated assertion is
+	//   `idNs < uniqNs * 1.05`: the identical path may pay up to 5% more than the
+	//   unique path and still pass (crypto noise), but if it exceeds the unique
+	//   path by more than 5%, Join is no longer genuinely skipping — that is a real
+	//   regression, not noise. The 5% band is generous against crypto/GC noise and
+	//   tight against a lost dedup signal (the signal itself is ~1.7% of the
+	//   ~290us crypto floor at the measured delta).
 	const tolerance = 1.05
 	if !(idNs < uniqNs*tolerance) {
-		t.Fatalf("NEGATIVE CONTROL FAILED: identical-dot per-frame cost (%.0f ns/op) exceeds unique-dot (%.0f ns/op) * %.2f tolerance — Join is no longer genuinely skipping (insert-vs-skip signal lost); stop and report", idNs, uniqNs, tolerance)
+		t.Fatalf("negative control failed: identical-dot per-frame cost (%.0f ns/op) exceeds unique-dot (%.0f ns/op) * %.2f tolerance — Join is no longer genuinely skipping (insert-vs-skip signal lost); stop and report", idNs, uniqNs, tolerance)
 	}
 	delta := uniqNs - idNs
 	pct := delta / uniqNs * 100
-	t.Logf("asymmetry: unique - identical = %.0f ns/op (%.2f%% of total) — SMALL because Open+Verify crypto (~290 us) dominates; the Join insert-vs-skip delta (~5 us) is the real-merge signal", delta, pct)
+	t.Logf("asymmetry: unique - identical = %.0f ns/op (%.2f%% of total) — small because Open+Verify crypto (~290 us) dominates; the Join insert-vs-skip delta (~5 us) is the real-merge signal", delta, pct)
 }
 
 // ---------------------------------------------------------------------------
-// MONOTONE-STREAM PROBE — TRAP-4 closure: monotone dc stream admits all on real metal
+// Probe: monotone dc stream admits all on real metal
 // ---------------------------------------------------------------------------
 
-// TestReceiver_MonotoneStreamAdmitsAllProbe runs the bench's EXACT dc-sequence
+// TestReceiver_MonotoneStreamAdmitsAllProbe runs the bench's exact dc-sequence
 // (dc=1..K, unique entityID each, via benchEntityID) on a fresh engine through
-// the FULL HandleFrame path and asserts ZERO drops. This empirically confirms
+// the full HandleFrame path and asserts zero drops. This empirically confirms
 // the simulation (200001/200001 admit at AbsoluteSlack=1000) on
 // real metal: the EWMA rate envelope outpaces any per-frame dc jump by the 60x
 // horizon factor, and AbsoluteSlack=1000 floors the first bound, so a monotone
-// dc=i stream never exceeds the skew bound. If any frame drops, the test STOPS
+// dc=i stream never exceeds the skew bound. If any frame drops, the test stops
 // and reports it as a finding (the engine's self-advance lags the snapshot
-// under the streaming regime) — it does NOT inflate AbsoluteSlack, reset
+// under the streaming regime) — it does not inflate AbsoluteSlack, reset
 // lamport, or otherwise permalink the bound to force admits. A drop here is a
 // real engine property, reported not buried.
 //
@@ -703,24 +700,24 @@ func TestReceiver_AcceptDedupBaitNegativeControl_4c(t *testing.T) {
 // independent of hop count; 1 hop keeps the frame count affordable (the dc-
 // sequence — dc + entityID — is unchanged, which is what the probe asserts).
 //
-// RACE-SAFE BUDGET (hygiene fix for an earlier false race-clean claim).
-// The original probe hard-coded K=10000 and the original report claimed both this
+// Race-safe budget (hygiene fix for a false race-clean claim).
+// The original probe hard-coded K=10000 and earlier benchmarks claimed both this
 // probe and the negative control "pass under -race." That claim was never
 // verified: K=10000 frames × HandleFrame (circl Ed25519 Verify per hop) × the
 // race detector's ~30-100x slowdown blows past the test timeout regardless of
-// the -timeout value, panicking with "test timed out." runtime/race exposes NO
+// the -timeout value, panicking with "test timed out." runtime/race exposes no
 // public Enabled symbol on Go 1.26.1 (go doc runtime/race = "No public
 // interface"), so a build-time race detector const cannot single-file scope,
 // and testing.Short() needs an explicit -short flag the verification harness
-// does not always pass. The mechanically-robust, scope-compliant fix is a
+// does not always pass. The calibrated fix is a
 // framework-native budget: read t.Deadline() (Go 1.16+), run as many of the
-// K=10000 endurance frames as fit in 60% of the remaining deadline, and STOP
-// cleanly. The probe's load-bearing assertion is the BINARY skew-bound claim
-// (ZERO drops), not the endurance count; the count reached is honestly logged.
+// K=10000 endurance frames as fit in 60% of the remaining deadline, and stop
+// cleanly. The probe's load-bearing assertion is the binary skew-bound claim
+// (zero drops), not the endurance count; the count reached is logged.
 // minProbeK is the floor below which the skew-bound sample is too thin to
 // assert (a sub-floor stop reports "budget-exhausted, undersampled" rather than
-// the dishonest "confirmed"). This eliminates the hang class for ANY slowdown,
-// not just race, and does NOT soften the gate on a fast box (the deadline budget
+// an unearned "confirmed"). This eliminates the hang class for any slowdown,
+// not just race, and does not soften the gate on a fast box (the deadline budget
 // is far larger than K=10000 needs at non-race speed).
 func TestReceiver_MonotoneStreamAdmitsAllProbe(t *testing.T) {
 	benchOverrideDataDirToTmpfs(t)
@@ -735,9 +732,9 @@ func TestReceiver_MonotoneStreamAdmitsAllProbe(t *testing.T) {
 	// Frame acquisition (~290 us/frame crypto under race) dominates, so a
 	// deadline-unaware loop blows past the harness -timeout under race. t.Deadline
 	// (Go 1.16+) returns the framework's own -timeout deadline; run as many of
-	// the K endurance frames as fit in `frac` of the REMAINING budget, then stop
+	// the K endurance frames as fit in `frac` of the remaining budget, then stop
 	// cleanly. The binary skew-bound (zero drops) is the load-bearing assertion;
-	// the endurance count reached is honestly logged, not asserted.
+	// the endurance count reached is logged, not asserted.
 	now := time.Now()
 	deadline, hasDL := t.Deadline()
 	if !hasDL {
@@ -745,7 +742,7 @@ func TestReceiver_MonotoneStreamAdmitsAllProbe(t *testing.T) {
 	}
 	window := deadline.Sub(now)
 	if window <= 0 {
-		t.Fatalf("PROBE: test deadline already exceeded before the probe started — rerun with a larger -timeout")
+		t.Fatalf("probe: test deadline already exceeded before the probe started — rerun with a larger -timeout")
 	}
 	stopAt := now.Add(time.Duration(float64(window) * frac))
 	processed := 0
@@ -759,25 +756,29 @@ func TestReceiver_MonotoneStreamAdmitsAllProbe(t *testing.T) {
 		if v.Verdict != Accept {
 			drops++
 			if drops <= 5 {
-				t.Errorf("PROBE FINDING: frame i=%d (dc=%d) dropped: %v: %v — the engine's self-advance may lag the snapshot under the monotone streaming regime (report, do not workaround)", i, i, v.Verdict, v.Reason)
+				t.Errorf("probe finding: frame i=%d (dc=%d) dropped: %v: %v — the engine's self-advance may lag the snapshot under the monotone streaming regime (report, do not workaround)", i, i, v.Verdict, v.Reason)
 			}
 		}
 	}
 	if drops != 0 {
-		t.Fatalf("PROBE: %d/%d frames dropped under the monotone dc=1..%d stream (unique entityID each) — a real engine property, reported not buried", drops, processed, processed)
+		t.Fatalf("probe: %d/%d frames dropped under the monotone dc=1..%d stream (unique entityID each) — a real engine property, reported not buried", drops, processed, processed)
 	}
 	if processed < minProbeK {
-		t.Fatalf("PROBE: budget-exhausted after only %d frames (< floor %d) — the box was too slow (likely -race) to gather a meaningful skew-bound sample in 60%% of the test deadline; rerun with a larger -timeout or on a faster box. NOT a skew-bound failure.", processed, minProbeK)
+		t.Fatalf("probe: budget-exhausted after only %d frames (< floor %d) — the box was too slow (likely -race) to gather a meaningful skew-bound sample in 60%% of the test deadline; rerun with a larger -timeout or on a faster box. not a skew-bound failure.", processed, minProbeK)
 	}
-	t.Logf("PROBE: %d/%d frames ADMIT under the monotone dc=1..%d stream (unique entityID each) — TRAP-4 empirically confirmed on real metal (AbsoluteSlack=1000, EWMA horizon 60x) [endurance reached %d of %d ceiling under this gear]", processed-drops, processed, processed, processed, K)
+	t.Logf("probe: %d/%d frames admit under the monotone dc=1..%d stream (unique entityID each) — trap-4 empirically confirmed on real metal (AbsoluteSlack=1000, EWMA horizon 60x) [endurance reached %d of %d ceiling under this gear]", processed-drops, processed, processed, processed, K)
 }
 
+// ---------------------------------------------------------------------------
+// Source guards: benchStripStringsAndComments, gear check, desync check
+// ---------------------------------------------------------------------------
+
 // benchStripStringsAndComments returns src with // comments and "..." string
-// literals removed (replaced with spaces), so the desync / gear guards can scan
-// actual CODE for forbidden tokens without self-triggering on their own
+// literals removed (replaced with spaces), so the desync and gear checks can scan
+// actual code for forbidden tokens without self-triggering on their own
 // detection-pattern string literals or on prose comments that mention the
 // tokens. It is a line-oriented stripper: per line, it drops `//` to end-of-
-// line, then erases `"..."` spans (honoring `\"` escapes). It does NOT handle
+// line, then erases `"..."` spans (honoring `\"` escapes). It does not handle
 // backtick raw strings or /* */ blocks — bench_test.go uses neither (verified:
 // 0 block-comment markers; all backticks are inside // comments, which the
 // comment strip removes first). A bare forbidden token in real code (e.g.
@@ -820,16 +821,16 @@ func benchStripStringsAndComments(src string) string {
 }
 
 // ---------------------------------------------------------------------------
-// HONEST GEAR: NumCPU==4 || skip; no _32c in pkg/receive bench source
+// Gear check: NumCPU==4 || skip; no _32c in pkg/receive bench source
 // ---------------------------------------------------------------------------
 
-// TestBench_GearHonesty_4c asserts the honest 4c gear and skips (with a
-// rationale) if the box reports a different core count, rather than tagging a
-// false gear. It mirrors TestGate_GearHonesty (gate_test.go).
+// TestBench_GearHonesty_4c asserts the 4c gear and skips (with a
+// rationale) if the box reports a different core count, rather than tagging an
+// incorrect gear. It mirrors TestGate_GearHonesty (gate_test.go).
 func TestBench_GearHonesty_4c(t *testing.T) {
 	n := runtime.NumCPU()
 	gmp := runtime.GOMAXPROCS(0)
-	t.Logf("honest gear: NumCPU=%d GOMAXPROCS=%d (tag: _4c)", n, gmp)
+	t.Logf("gear: NumCPU=%d GOMAXPROCS=%d (tag: _4c)", n, gmp)
 	if n != 4 {
 		t.Skipf("box reports NumCPU=%d, not the 4c gear this track targets; refusing to tag a false core count", n)
 	}
@@ -838,12 +839,12 @@ func TestBench_GearHonesty_4c(t *testing.T) {
 	}
 }
 
-// TestBench_No32cTagInBenchSource greps bench_test.go CODE (comments + string
-// literals stripped) for a "_32c" tag (the mislabel class). The benches
-// in this file read "_4c"; a "_32c" tag on this source is detector-banned.
+// TestBench_No32cTagInBenchSource greps bench_test.go code (comments + string
+// literals stripped) for a "_32c" tag (the admission and clock gate hygiene work mislabel class). The 3.5b
+// benches read "_4c"; a "_32c" tag on this source is detector-banned.
 // (gate_test.go's TestGate_No32cTagInReceiveSource scans only non-test source;
-// this sibling scans the bench file's CODE — stripping comments/strings so the
-// guard does not self-trigger on its own prose that mentions "_32c".)
+// this sibling scans the bench file's code — stripping comments/strings so the
+// check does not self-trigger on its own prose that mentions "_32c".)
 func TestBench_No32cTagInBenchSource(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -856,24 +857,41 @@ func TestBench_No32cTagInBenchSource(t *testing.T) {
 	}
 	code := benchStripStringsAndComments(string(b))
 	if strings.Contains(code, "_32c") {
-		t.Errorf("forbidden \"_32c\" tag in bench_test.go code (these benches read \"_4c\"; the 32c figure is the PROVEN publication number, NOT this 4c gear)")
+		t.Errorf("forbidden \"_32c\" tag in bench_test.go code (benches read \"_4c\"; the 32c figure is the 32-core Graviton4 silicon benchmark's proven publication number, not this 4c gear)")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// DESYNC guard: bench_test.go sources layout from attribution
-// consts / buildCRDTDeltaWire, NOT re-derived offset/field-order literals
+// Source guard (diff check, amended): receiver_test.go diff matches
+// the expected set: (A) the five T->TB widens + (B) the
+// buildCRDTDeltaWire signature widen + ~13 call-site rcvEntityID additions +
+// the single SetEntityId substitution. Any hunk line outside (A)+(B) fails.
 // ---------------------------------------------------------------------------
 
-// TestBenchDesyncGuard scans bench_test.go CODE (comments + string literals
+// ---------------------------------------------------------------------------
+// Scope check: verify benchmark constraints
+// ---------------------------------------------------------------------------
+
+// The earlier scope check was deleted: it was
+// permanently inert — exec.Command ran without Dir, so the pkg/ pathspec
+// resolved against pkg/receive/ and matched nothing; the check passes with
+// any file dirty. The working replacement is the scope check in the cross-check test
+// (repoRoot-resolved pathspecs); see its
+// repoRoot doc for this check's post-mortem.
+
+// ---------------------------------------------------------------------------
+// Desync check: bench_test.go sources layout from attribution
+// consts / buildCRDTDeltaWire, not re-derived offset/field-order literals
+// ---------------------------------------------------------------------------
+
+// TestBenchDesyncGuard scans bench_test.go code (comments + string literals
 // stripped) for the forbidden envelope byte-offset literals ("2 + 2 + 4 + 64",
 // "32 + 64 + 8" and their spaceless forms) and for an inline rebuild of
-// buildCRDTDeltaWire's capnp field layout. The bench MUST source every layout
+// buildCRDTDeltaWire's capnp field layout. The bench must source every layout
 // from attribution's exported consts (HeaderLen/HopSize/PubSize/SigSize) and
-// the existing buildCRDTDeltaWire helper, NOT re-derive. A forbidden literal or
-// a full field-order rebuild fires the desync guard. (This extends
+// the existing buildCRDTDeltaWire helper, not re-derive. A forbidden literal or a full field-order rebuild fails the test. (This extends
 // TestReceiver_SourceGuard's desync scan to the bench file, which the source
-// guard skips as a _test.go. Stripping comments/strings lets the guard carry
+// guard skips as a _test.go. Stripping comments/strings lets the check carry
 // its own detection-pattern literals without self-triggering.)
 func TestBenchDesyncGuard(t *testing.T) {
 	wd, err := os.Getwd()
@@ -894,13 +912,13 @@ func TestBenchDesyncGuard(t *testing.T) {
 	}
 	for _, off := range forbiddenOffsets {
 		if strings.Contains(code, off) {
-			t.Errorf("desync guard: forbidden byte-offset literal %q in bench_test.go code (source from attribution.HeaderLen/HopSize; a hardcoded duplicate silently misattributes on envelope layout drift)", off)
+			t.Errorf("forbidden byte-offset literal %q in bench_test.go code (source from attribution.HeaderLen/HopSize; a hardcoded duplicate silently misattributes on envelope layout drift)", off)
 		}
 	}
-	// The bench must NOT re-derive the capnp field layout: it must NOT issue the
+	// The bench must not re-derive the capnp field layout: it must not issue the
 	// full sequence of buildCRDTDeltaWire's Set* calls inline (which would
-	// duplicate the field-order and drift if the wire schema changes). The
-	// bench builds inner wires via buildCRDTDeltaWire ONLY; a full inline
+	// duplicate the field-order and drift if the schema changes). The
+	// bench builds inner wires via buildCRDTDeltaWire only; a full inline
 	// rebuild is detected by the presence of the temporal-sentinel literals
 	// buildCRDTDeltaWire owns (H3Index 0x8928308280fffff, the 0x1111..5555
 	// temporal sentinels) or the capnp root/field-set calls — the signature of
@@ -919,7 +937,7 @@ func TestBenchDesyncGuard(t *testing.T) {
 	}
 	for _, m := range rebuildMarkers {
 		if strings.Contains(code, m) {
-			t.Errorf("desync guard: forbidden inline rebuild marker %q in bench_test.go code (the bench must build inner wires via buildCRDTDeltaWire, NOT re-derive the capnp field layout — a clone drifts if the wire schema changes)", m)
+			t.Errorf("forbidden inline rebuild marker %q in bench_test.go code (the bench must build inner wires via buildCRDTDeltaWire, not re-derive the capnp field layout — a clone drifts if the schema changes)", m)
 		}
 	}
 }

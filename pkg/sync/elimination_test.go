@@ -16,46 +16,9 @@ import (
 	"unsafe"
 )
 
-// ---------------------------------------------------------------------------
-// — Elimination Backoff Array Verification (AWS Graviton Crucible)
-// ---------------------------------------------------------------------------
-//
-// This file is the verification suite for the Elimination Backoff Array
-// (elimination.go). It contains three classes of test:
-//
-// 1. ZERO-GC MICROSCOPE
-// TestEliminationHotPathZeroAllocations — the unyielding CI gate
-// that proves the push/pop hot path allocates zero heap objects.
-// Uses testing.AllocsPerRun, identical to the /
-// patterns in physics_test.go.
-//
-// 2. LINEARIZABILITY / CORRECTNESS
-// TestEliminationLinearizability — a concurrent stress test that
-// runs P pushers and P poppers against the ElimStack for a fixed
-// duration. After all goroutines quiesce, the remaining stack
-// contents are drained and cross-checked against a per-value
-// occurrence counter. Because push and pop are exact inverses,
-// the multiset of "pushed but not popped" values must exactly
-// equal the multiset of values drained from the central stack.
-// Any lost, duplicated, or phantom value proves a linearizability
-// violation — the elimination exchange corrupted stack semantics.
-//
-// 3. LINEAR SCALING CRUCIBLE
-// BenchmarkEliminationStackScaling — measures push/pop throughput
-// at GOMAXPROCS = 4, 8, 16, 32. The CI gate
-// TestEliminationCrucibleScalingGate asserts:
-// (a) Throughput at 32 cores >= 1,000,000 ops/sec
-// (b) Parallel efficiency at 32 cores >= 85%
-// efficiency = throughput(32) / (throughput(4) * 8)
-//
-// This mirrors the design doc's mandate: "If the ratio falls below
-// 85% efficiency at 32 cores, the elimination array sizing
-// parameters or the dynamic wait duration must be heavily
-// retuned to prevent slot starvation."
-//
-// RUN: go test -run TestElimination -v./pkg/sync/
-// RUN: go test -bench BenchmarkElimination -benchmem./pkg/sync/
-// ---------------------------------------------------------------------------
+// Elimination stack tests cover zero-allocation push/pop operations, LIFO
+// order, concurrent value conservation, slot layout, and scaling measurements.
+// The scaling gate is superseded by the sharded stack gate and is skipped.
 
 // elimTestPoolSize is 2× the maximum working set so the ElimNodePool
 // never exhausts during a test. The elimination array converts push/pop
@@ -70,20 +33,12 @@ const elimTestPoolSize = 1 << 16 // 65536 nodes
 const elimTestDuration = 200 * time.Millisecond
 
 // ---------------------------------------------------------------------------
-// 1. ZERO-GC MICROSCOPE
+// 1. Zero-GC verification
 // ---------------------------------------------------------------------------
 
-// TestEliminationHotPathZeroAllocations is the unyielding CI gate for
-// the Zero-GC mandate on the elimination stack hot path. It uses
-// testing.AllocsPerRun to measure heap allocations performed ONLY
-// inside the closure, averaged across N invocations — isolated from
-// benchmark framework noise, exactly as permitted by the PM directive.
-//
-// The closure exercises BOTH push and pop (a push immediately followed
-// by a pop is the elimination-dominated path — the most contended
-// scenario). Because the ElimNodePool is pre-allocated and the slot
-// array is embedded by value, zero allocations should escape to the
-// Go heap. 1 allocation = a critical architectural failure.
+// TestEliminationHotPathZeroAllocations measures an alternating push/pop pair
+// with testing.AllocsPerRun. The node pool and slot array are preallocated, so
+// the measured operation must not allocate on the Go heap.
 func TestEliminationHotPathZeroAllocations(t *testing.T) {
 	stack := NewEliminationStack()
 	pool := NewElimNodePool(elimTestPoolSize)
@@ -105,9 +60,9 @@ func TestEliminationHotPathZeroAllocations(t *testing.T) {
 
 	if allocs != 0 {
 		t.Fatalf(
-			"CRITICAL FAILURE: Elimination hot path breached Zero-GC mandate. "+
-				"Expected 0 AllocsPerOp, got %v. "+
-				"Context: {iterations=%d, allocs/op=%v}",
+			"elimination push/pop allocated %.2f objects per run, want 0. "+
+				"Iterations: %d. "+
+				"Measured allocs/op: %.2f",
 			allocs, iterations, allocs,
 		)
 	}
@@ -117,21 +72,10 @@ func TestEliminationHotPathZeroAllocations(t *testing.T) {
 // 2. LINEARIZABILITY / CORRECTNESS
 // ---------------------------------------------------------------------------
 
-// TestEliminationLinearizability stresses the ElimStack with concurrent
-// pushers and poppers. After all goroutines finish, it verifies that
-// the multiset of values still on the central stack exactly equals the
-// net imbalance of pushes-minus-pops reported by each goroutine.
-//
-// INVARIANT: Each goroutine tracks (pushedCount - poppedCount) and the
-// sum of all values it pushed minus all values it popped. When the
-// stack quiesces, the remaining values (drained via sequential pops)
-// must form exactly the multiset {v: pushed(v) > popped(v)} weighted
-// by the surplus. If any value is lost, duplicated, or fabricated by
-// the elimination exchange, this invariant fails.
-//
-// Each goroutine uses a distinct value range so we can attribute any
-// discrepancy to a specific goroutine — turning a generic "data
-// corruption" failure into a precise diagnostic.
+// TestEliminationLinearizability runs concurrent alternating pushes and pops.
+// Once they finish, the number of values drained from the stack must equal the
+// total push count minus the total successful pop count. A lost or duplicated
+// exchange breaks this conservation check.
 func TestEliminationLinearizability(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping linearizability stress in short mode")
@@ -141,10 +85,8 @@ func TestEliminationLinearizability(t *testing.T) {
 	stack := NewEliminationStack()
 	pool := NewElimNodePool(elimTestPoolSize)
 
-	// Each goroutine pushes values in range [gid*1000, gid*1000+999].
-	// It tracks net surplus (pushed - popped) per value it still "owns".
-	// At the end, the aggregate multiset of surplus values must match
-	// the drained stack contents exactly.
+	// Each goroutine uses a disjoint value range. Its net surplus is the number
+	// of pushes minus all successful pops, including pops of other ranges.
 
 	type goroutineStats struct {
 		netSurplus int64          // total pushed - popped
@@ -182,31 +124,26 @@ func TestEliminationLinearizability(t *testing.T) {
 				localPushed++
 				stats.surplus[v]++
 
-				// Pop — may return our own value or another goroutine's.
+				// The pop may return a value from any goroutine.
 				pv, ok := stack.pop(pool, prng)
 				if ok {
 					localPopped++
 					stats.popped.Add(1)
-					// If we popped our own value, decrement surplus.
+					// A pop in this goroutine's range decrements its surplus.
 					if pv >= base && pv < base+1000 {
 						stats.surplus[pv]--
 						if stats.surplus[pv] == 0 {
 							delete(stats.surplus, pv)
 						}
 					}
-					// If we popped ANOTHER goroutine's value, that's fine —
-					// the stack is a global structure; ownership of values
-					// transfers. The global invariant is checked below by
-					// draining the central stack and comparing total counts.
+					// Popping another goroutine's range is valid; the final check
+					// compares global counts rather than per-value ownership.
 					_ = pv
 				}
 				val++
 			}
-			// Record our net surplus as pushed - popped. Values we popped
-			// from OTHER goroutines reduce our surplus below the "values
-			// we pushed but haven't popped" count — the difference is
-			// exactly the values WE consumed from others (net consumer).
-			// The global check below uses total counts, not per-value.
+			// Net surplus includes all pops, including values from other
+			// goroutines. The final check uses these global totals.
 			atomic.AddInt64(&stats.netSurplus, localPushed-localPopped)
 		}()
 	}
@@ -214,12 +151,8 @@ func TestEliminationLinearizability(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Drain the central stack. Every value remaining should be a value
-	// that was pushed but never popped. We verify the COUNT matches the
-	// sum of all goroutines' net surpluses.
-	//
-	// Total pushed across all goroutines - total popped across all
-	// goroutines = number of values on the central stack at quiescence.
+	// Drain the central stack after the workers finish. Total pushes minus
+	// total successful pops must equal the number drained.
 	prng := &ElimPRNG{}
 	_ = prng.next()
 
@@ -244,38 +177,35 @@ func TestEliminationLinearizability(t *testing.T) {
 	// This is the fundamental stack invariant.
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ ELIMINATION LINEARIZABILITY STRESS TEST ║")
+	fmt.Println("║  Elimination linearizability stress test                         ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" Goroutines: %16d\n", numGoroutines)
-	fmt.Printf(" Total popped: %16d\n", totalPopped)
-	fmt.Printf(" Drained from stack: %16d\n", drainedCount)
-	fmt.Printf(" Net surplus: %16d\n", totalNetSurplus)
-	fmt.Printf(" GOMAXPROCS: %16d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  Goroutines:         %16d\n", numGoroutines)
+	fmt.Printf("  Total popped:       %16d\n", totalPopped)
+	fmt.Printf("  Drained from stack: %16d\n", drainedCount)
+	fmt.Printf("  Net surplus:        %16d\n", totalNetSurplus)
+	fmt.Printf("  GOMAXPROCS:         %16d\n", runtime.GOMAXPROCS(0))
 	fmt.Println()
 
-	// The stack invariant: total_popped + drained == total_pushed.
-	// Since total_pushed = total_popped + drained (every push either gets
-	// popped or remains on the stack), and net_surplus = pushed - popped,
-	// we must have: drained == net_surplus.
+	// Every pushed value was either popped or remains to be drained, so
+	// drainedCount must equal totalNetSurplus.
 	if drainedCount != totalNetSurplus {
 		t.Fatalf(
-			"LINEARIZABILITY VIOLATION: drained count (%d) != net surplus (%d). "+
-				"The elimination exchange lost or duplicated %d values. "+
-				"This proves the elimination array corrupted stack semantics.",
+			"drained count %d != net surplus %d. "+
+				"The exchange count differs by %d. "+
+				"Check value collection and slot ownership.",
 			drainedCount, totalNetSurplus, drainedCount-totalNetSurplus,
 		)
 	}
 
 	t.Logf(
-		"✓ LINEARIZABILITY VERIFIED: %d values drained == %d net surplus "+
+		"value conservation passed: drained=%d net surplus=%d "+
 			"(popped=%d, GOMAXPROCS=%d)",
 		drainedCount, totalNetSurplus, totalPopped, runtime.GOMAXPROCS(0),
 	)
 }
 
-// TestEliminationSequentialCorrectness is a simple, deterministic sanity
-// check: push N values, pop them, verify they come out in LIFO order.
-// This catches basic stack-logic bugs before the concurrent stress test.
+// TestEliminationSequentialCorrectness pushes 1,000 values and checks LIFO
+// order, then verifies that the stack is empty.
 func TestEliminationSequentialCorrectness(t *testing.T) {
 	stack := NewEliminationStack()
 	pool := NewElimNodePool(1024)
@@ -322,7 +252,7 @@ func TestEliminationSlotSize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. LINEAR SCALING CRUCIBLE
+// 3. Linear scaling verification
 // ---------------------------------------------------------------------------
 
 // elimScalingOpsPerGoroutine is the number of push/pop pairs each
@@ -331,14 +261,9 @@ func TestEliminationSlotSize(t *testing.T) {
 // the L1/L2 hierarchy and reach steady-state contention.
 const elimScalingOpsPerGoroutine = 50_000
 
-// elimBenchmarkScaling measures push/pop throughput at a given
-// goroutine count. Each goroutine performs alternating push/pop pairs,
-// so the elimination array sees 50% push / 50% pop traffic — the
-// worst-case contention pattern for the central Treiber CAS, and the
-// best-case pattern for elimination (every push has a matching pop).
-//
-// This is a Go benchmark function; it is called directly by
-// testing.Benchmark in TestEliminationCrucibleScalingGate.
+// elimBenchmarkScaling measures alternating push/pop throughput with the
+// requested goroutine count. Each worker performs elimScalingOpsPerGoroutine
+// pairs for every b.N iteration.
 func elimBenchmarkScaling(b *testing.B, goroutines int) {
 	stack := NewEliminationStack()
 	pool := NewElimNodePool(goroutines*4 + elimTestPoolSize)
@@ -380,52 +305,31 @@ func elimBenchmarkScaling16(b *testing.B) { elimBenchmarkScaling(b, 16) }
 func elimBenchmarkScaling32(b *testing.B) { elimBenchmarkScaling32internal(b) }
 
 // elimBenchmarkScaling32internal ramps GOMAXPROCS to 32 for the
-// crucible measurement, then restores the original value.
+// scaling measurement, then restores the original value.
 func elimBenchmarkScaling32internal(b *testing.B) {
 	orig := runtime.GOMAXPROCS(32)
 	defer runtime.GOMAXPROCS(orig)
 	elimBenchmarkScaling(b, 32)
 }
 
-// TestEliminationCrucibleScalingGate is the AWS Graviton Crucible CI
-// gate. It runs the scaling benchmark at GOMAXPROCS = 4, 8, 16, 32 and
-// asserts:
-//
-//	(a) Throughput at 32 cores >= 1,000,000 ops/sec
-//	(b) Parallel efficiency at 32 cores >= 85%
-//
-// efficiency = throughput(32) / (throughput(4) * 8)
-//
-// This is the design doc's mandate: "If the ratio falls below
-// 85% efficiency at 32 cores, the elimination array sizing parameters
-// or the dynamic wait duration must be heavily retuned to prevent slot
-// starvation."
+// TestEliminationCrucibleScalingGate contains the former scaling check for the
+// single-locus elimination stack. It measured throughput at 4, 8, 16, and 32
+// cores and required at least 1,000,000 ops/s with 85% parallel efficiency.
+// The sharded allocator supersedes this design, so the test is skipped.
 func TestEliminationCrucibleScalingGate(t *testing.T) {
-	// LEGACY — deliberately superseded. The commit
-	// (095935e "Home-Shard SEC allocator, test gating, and
-	// verification") REPLACED the single-locus SEC elimination array this
-	// gate measures with the Home-Shard SEC sharded allocator, whose gate is
-	// TestScalingGate (run with RUN_CRUCIBLE=1; passes at
-	// 57.63M ops/s @32c, linearizable at every tier). This legacy gate is
-	// retained as a historical record of the pre-sharded design it retired.
-	//
-	// It is SKIPPED, not deleted: it fails by design on the sharded tree
-	// (the single-locus array it measures bounded out at ~2% parallel
-	// efficiency on the 32-core CMN-700 mesh — exactly the collapse the
-	// Home-Shard allocator was built to defeat). Running it would assert a
-	// property of a data structure nobody executes anymore. The authoritative
-	// crucible is TestScalingGate.
-	t.Skip("LEGACY: deliberately superseded by TestScalingGate (Home-Shard SEC); kept as a historical record of the pre-sharded elimination array. Fails by design on the sharded tree.")
+	// The sharded allocator replaced the single-locus design measured here.
+	// TestScalingGate covers the current implementation.
+	t.Skip("single-locus scaling check superseded by TestScalingGate")
 
 	if testing.Short() {
-		t.Skip("Skipping scaling crucible in short mode")
+		t.Skip("Skipping scaling verification in short mode")
 	}
 
-	// Detect core count. The crucible requires >= 4 physical cores to
+	// Detect core count. The verification requires >= 4 physical cores to
 	// run meaningfully. On a 2-core CI box, skip with a clear message.
 	ncpu := runtime.NumCPU()
 	if ncpu < 4 {
-		t.Skipf("Skipping scaling crucible: NumCPU=%d < 4, no multi-core scaling to verify", ncpu)
+		t.Skipf("Skipping scaling verification: NumCPU=%d < 4, no multi-core scaling to verify", ncpu)
 	}
 
 	// Available core tiers, capped to the machine's physical capability.
@@ -436,7 +340,7 @@ func TestEliminationCrucibleScalingGate(t *testing.T) {
 		}
 	}
 	if len(tiers) < 2 {
-		t.Skipf("Skipping scaling crucible: only %d eligible tiers (need >= 2)", len(tiers))
+		t.Skipf("Skipping scaling verification: only %d eligible tiers (need >= 2)", len(tiers))
 	}
 
 	type tierResult struct {
@@ -480,20 +384,20 @@ func TestEliminationCrucibleScalingGate(t *testing.T) {
 	// Print the scaling table.
 	fmt.Println()
 	fmt.Println("╔═══════════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ ELIMINATION BACKOFF ARRAY — AWS GRAVITON CRUCIBLE ║")
-	fmt.Println("║ LINEAR SCALING VERIFICATION (1M RPS @ ≥85% efficiency @ 32 cores) ║")
+	fmt.Println("║  Elimination Backoff Array — Graviton scaling verification            ║")
+	fmt.Println("║  Linear scaling check (1M ops/s at >=85% efficiency, 32 cores)       ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" %-12s %18s %18s %12s\n", "GOMAXPROCS", "Throughput (ops/s)", "Speedup vs 4c", "Efficiency")
-	fmt.Println(" ────────────────────────────────────────────────────────────────────")
+	fmt.Printf("  %-12s %18s %18s %12s\n", "GOMAXPROCS", "Throughput (ops/s)", "Speedup vs 4c", "Efficiency")
+	fmt.Println("  ────────────────────────────────────────────────────────────────────")
 
 	baseOps := results[0].opsPerSec
 	for _, r := range results {
 		speedup := r.opsPerSec / baseOps
 		efficiency := speedup / float64(r.goroutines/tiers[0])
-		fmt.Printf(" %-12d %18.0f %18.2fx %11.1f%%\n",
+		fmt.Printf("  %-12d %18.0f %18.2fx %11.1f%%\n",
 			r.goroutines, r.opsPerSec, speedup, efficiency*100)
 	}
-	fmt.Printf(" NumCPU: %d, GOMAXPROCS at test entry: %d\n",
+	fmt.Printf("  NumCPU: %d, GOMAXPROCS at test entry: %d\n",
 		ncpu, runtime.GOMAXPROCS(0))
 	fmt.Println()
 
@@ -501,25 +405,25 @@ func TestEliminationCrucibleScalingGate(t *testing.T) {
 	maxTier := results[len(results)-1]
 	if maxTier.opsPerSec < 1_000_000 {
 		t.Errorf(
-			"CRUCIBLE THROUGHPUT FAILURE: At %d cores, throughput = %.0f ops/s, "+
-				"below the 1,000,000 ops/s mandate. The elimination array is "+
-				"not converting contention to parallel throughput fast enough.",
+			"throughput at %d cores = %.0f ops/s. "+
+				"The minimum is 1,000,000 ops/s. "+
+				"Check elimination contention behavior.",
 			maxTier.goroutines, maxTier.opsPerSec,
 		)
 	}
 
 	// Gate (b): Parallel efficiency at the highest tier must be >= 85%.
 	// efficiency = throughput(max) / (throughput(base) * (max/base))
-	// This is the design doc's ≥85% efficiency-at-32-cores gate.
+	// This is the architecture's ≥85% efficiency-at-32-cores gate.
 	maxOps := maxTier.opsPerSec
 	efficiency := maxOps / (baseOps * float64(maxTier.goroutines/tiers[0]))
 
 	if efficiency < 0.85 {
 		t.Errorf(
-			"CRUCIBLE EFFICIENCY FAILURE: Parallel efficiency at %d cores = %.1f%%, "+
-				"below the 85%% mandate. The elimination array's slot sizing or "+
-				"spin budget must be retuned to prevent slot starvation. "+
-				"(throughput_%d=%.0f, throughput_%d=%.0f, expected >= %.0f for 85%%)",
+			"parallel efficiency at %d cores = %.1f%%, want at least 85%%. "+
+				"Check the slot sizing and spin budget. "+
+				"(throughput_%d=%.0f, throughput_%d=%.0f, "+
+				"expected >= %.0f)",
 			maxTier.goroutines, efficiency*100,
 			maxTier.goroutines, maxOps, tiers[0], baseOps,
 			baseOps*float64(maxTier.goroutines/tiers[0])*0.85,
@@ -528,9 +432,9 @@ func TestEliminationCrucibleScalingGate(t *testing.T) {
 
 	if maxTier.opsPerSec >= 1_000_000 && efficiency >= 0.85 {
 		t.Logf(
-			"✓ CRUCIBLE PASSED: %.0f ops/s at %d cores (%.1f%% efficiency). "+
-				"Linear scaling verified — elimination array converts contention "+
-				"to parallel throughput.",
+			"scaling passed: %.0f ops/s at %d cores "+
+				"(%.1f%% efficiency). "+
+				"The legacy threshold was met.",
 			maxTier.opsPerSec, maxTier.goroutines, efficiency*100,
 		)
 	}

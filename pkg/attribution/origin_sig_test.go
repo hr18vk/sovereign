@@ -28,12 +28,10 @@ func originSigArray(sig []byte) [OriginSigSize]byte {
 	return a
 }
 
-// buildSignedRelayChain is the version-2 build path: the origin signs the
-// inner wire (originSig rides ON the envelope, not test-computed out-of-band),
-// then each relay signs the chain-of-custody material and appends its Hop.
-// Returns the signed envelope, the origin's public key (for the receiver's
-// Directory), and the relay public keys. This is the production build path
-// the live receiver consumes (GAP-1 closed: originSig is on the wire).
+// buildSignedRelayChain signs the inner wire with the origin key and builds
+// the requested relay hops. It returns the signed envelope, the origin public
+// key, and the relay public keys. The origin signature travels in the envelope
+// header, as it does on the production wire.
 func buildSignedRelayChain(t *testing.T, innerWire []byte, nHops int) (*RelayEnvelope, ed25519.PublicKey, []ed25519.PublicKey) {
 	t.Helper()
 	originPub, originPriv := genKey(t)
@@ -55,14 +53,12 @@ func buildSignedRelayChain(t *testing.T, innerWire []byte, nHops int) (*RelayEnv
 }
 
 // ---------------------------------------------------------------------------
-// — originSig framing field EXISTS and is surfaced (positive + negative)
+// OriginSig framing field exists and is surfaced (positive and negative tests)
 // ---------------------------------------------------------------------------
 
-// TestOriginSig_RoundTrip proves the originSig slot rides the wire: a signed
-// envelope Marshal's to its deterministic form, UnmarshalRelayEnvelope parses
-// it back, and OriginSig() returns the byte-identical origin signature the
-// caller feeds to VerifyCRDTFrame. This is the GAP-1 contract: the live
-// receiver resolves originSig from the wire, not from a test-computed cheat.
+// TestOriginSig_RoundTrip checks that Marshal and UnmarshalRelayEnvelope
+// preserve originSig byte for byte. The parsed signature then verifies against
+// the inner wire returned by Open and the origin public key.
 func TestOriginSig_RoundTrip(t *testing.T) {
 	inner := fakeInnerWire()
 	env, originPub, _ := buildSignedRelayChain(t, inner, 2)
@@ -75,8 +71,7 @@ func TestOriginSig_RoundTrip(t *testing.T) {
 	if !bytes.Equal(got.originSig[:], env.originSig[:]) {
 		t.Fatalf("originSig must round-trip byte-identical through Marshal/Unmarshal")
 	}
-	// The surfaced originSig MUST verify against the verified inner wire under
-	// the origin's public key — the load-bearing composition seam.
+	// Verify the parsed signature with the origin key and returned inner wire.
 	gotInner, _, err := got.Open(MaxHopsForBudget(1 * time.Millisecond))
 	if err != nil {
 		t.Fatalf("Open outer hops: %v", err)
@@ -86,10 +81,9 @@ func TestOriginSig_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestOriginSig_ZeroOnVersion1Envelope proves NewRelayEnvelope (the version-1
-// build path) carries an all-zero originSig, surfaced by OriginSig(). The
-// production receiver treats a zero originSig as a DropVerify (an unsigned
-// origin is never admitted); this test documents that contract.
+// TestOriginSig_ZeroOnVersion1Envelope checks that NewRelayEnvelope leaves
+// originSig zero. The production receiver treats that value as DropVerify,
+// and VerifyCRDTFrame rejects it even for a zero-hop envelope.
 func TestOriginSig_ZeroOnVersion1Envelope(t *testing.T) {
 	inner := fakeInnerWire()
 	env := NewRelayEnvelope(inner, nil)
@@ -97,7 +91,7 @@ func TestOriginSig_ZeroOnVersion1Envelope(t *testing.T) {
 	if got := env.OriginSig(); got != zero {
 		t.Fatalf("NewRelayEnvelope must carry all-zero originSig, got non-zero")
 	}
-	// A zero originSig MUST fail VerifyCRDTFrame (the production receiver's
+	// A zero originSig fails VerifyCRDTFrame (the production receiver's
 	// DropVerify contract).
 	gotInner, _, err := env.Open(MaxHopsForBudget(1 * time.Millisecond))
 	if err != nil {
@@ -111,15 +105,14 @@ func TestOriginSig_ZeroOnVersion1Envelope(t *testing.T) {
 	}
 }
 
-// TestOriginSig_ForgedOriginSig proves a FORGED originSig (signed by a
-// DIFFERENT key than the one the receiver resolves via the Directory) fails
-// the caller's VerifyCRDTFrame after Open succeeds. This is the forge guard:
-// an attacker cannot substitute their own origin signature for the origin's.
+// TestOriginSig_ForgedOriginSig signs the inner wire with a different key
+// from the one the receiver resolves through the Directory. Open accepts the
+// intact relay chain, but VerifyCRDTFrame rejects the substituted signature.
 func TestOriginSig_ForgedOriginSig(t *testing.T) {
 	inner := fakeInnerWire()
 	env, originPub, _ := buildSignedRelayChain(t, inner, 1)
 
-	// Attacker signs the inner wire with a DIFFERENT key.
+	// Sign the inner wire with a key other than the resolved origin key.
 	_, attackerPriv := genKey(t)
 	forgedSig := ed25519.Sign(attackerPriv, inner)
 	env.originSig = originSigArray(forgedSig)
@@ -129,15 +122,14 @@ func TestOriginSig_ForgedOriginSig(t *testing.T) {
 		t.Fatalf("outer hops intact; Open must succeed (origin sig is the caller's job): %v", err)
 	}
 	// The receiver resolves originPub (the real origin) via the Directory;
-	// the forged sig under the attacker's key MUST fail VerifyCRDTFrame.
+	// the forged sig under the attacker's key fails VerifyCRDTFrame.
 	if identity.VerifyCRDTFrame(originPub, gotInner, env.originSig[:]) {
 		t.Fatalf("forged originSig (different key) must fail VerifyCRDTFrame")
 	}
 }
 
-// TestOriginSig_TamperedOriginSig proves a single-bit flip in the on-wire
-// originSig fails the caller's VerifyCRDTFrame after Open succeeds. This is
-// the tamper guard: an attacker cannot mutate the origin signature in flight.
+// TestOriginSig_TamperedOriginSig flips one bit in originSig. The relay chain
+// still opens, but the caller's VerifyCRDTFrame rejects the changed signature.
 func TestOriginSig_TamperedOriginSig(t *testing.T) {
 	inner := fakeInnerWire()
 	env, originPub, _ := buildSignedRelayChain(t, inner, 1)
@@ -154,10 +146,9 @@ func TestOriginSig_TamperedOriginSig(t *testing.T) {
 	}
 }
 
-// TestOriginSig_OmittedFromWire proves an OMITTED originSig (all-zero on the
-// wire) fails the caller's VerifyCRDTFrame — the production receiver's
-// DropVerify contract. An attacker cannot strip the origin signature and
-// have the frame admitted.
+// TestOriginSig_OmittedFromWire replaces originSig with zero bytes. The
+// caller's VerifyCRDTFrame rejects the result, so stripping the origin
+// signature does not admit the frame.
 func TestOriginSig_OmittedFromWire(t *testing.T) {
 	inner := fakeInnerWire()
 	env, originPub, _ := buildSignedRelayChain(t, inner, 1)
@@ -175,11 +166,9 @@ func TestOriginSig_OmittedFromWire(t *testing.T) {
 	}
 }
 
-// TestOriginSig_TamperedOnWire proves a bit-flip in the originSig slot ON THE
-// WIRE (after Marshal, before Unmarshal) is surfaced byte-differently by
-// UnmarshalRelayEnvelope and fails the caller's Verify. This proves the
-// originSig slot is integrity-checked end-to-end through the wire, not just
-// in-memory.
+// TestOriginSig_TamperedOnWire changes originSig after Marshal and before
+// UnmarshalRelayEnvelope. The parsed signature differs from the original and
+// fails the caller's VerifyCRDTFrame after the relay chain opens.
 func TestOriginSig_TamperedOnWire(t *testing.T) {
 	inner := fakeInnerWire()
 	env, originPub, _ := buildSignedRelayChain(t, inner, 1)
@@ -204,24 +193,15 @@ func TestOriginSig_TamperedOnWire(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// NEGATIVE CONTROL — removing the originSig slot from the framing
-// fails the build (the slot is load-bearing; a production receiver cannot
-// verify the inner origin without it). This static guard greps the
-// pkg/attribution non-test source for the originSig framing field and FAILS
-// if it is absent.
-// ---------------------------------------------------------------------------
+// The source check below verifies that the originSig field and its wire copy
+// operations remain present. Without them, the receiver cannot verify the
+// inner origin from the wire.
 
-// TestOriginSig_FramingSlotPresent is the negative-control guard: it
-// parses pkg/attribution non-test Go source and FAILS if the originSig slot
-// is absent from the envelope framing. The framing is load-bearing: without
-// the [OriginSigSize]byte field on RelayEnvelope AND the wire write/read of
-// it in Marshal/UnmarshalRelayEnvelope, the production receiver has no
-// on-wire origin signature and the probe cheat (HC1) ships as production.
-//
-// Negative control: delete the `originSig [OriginSigSize]byte` field from
-// RelayEnvelope (or the copy in Marshal/Unmarshal) and this test MUST FAIL;
-// re-add -> PASS.
+// TestOriginSig_FramingSlotPresent checks the non-test source for each part
+// of the origin-signature wire path: the size constant, the RelayEnvelope
+// field, the Marshal write, and the UnmarshalRelayEnvelope read. Removing any
+// of them leaves the receiver without an on-wire origin signature and makes
+// this test fail.
 func TestOriginSig_FramingSlotPresent(t *testing.T) {
 	dir := "."
 	fset := token.NewFileSet()
@@ -233,16 +213,10 @@ func TestOriginSig_FramingSlotPresent(t *testing.T) {
 		t.Fatalf("parse pkg/attribution: %v", err)
 	}
 
-	// 1. The RelayEnvelope struct MUST carry an originSig field of array
-	// type [OriginSigSize]byte (the framing slot).
+	// Check the field, its size constant, and the two wire-copy operations.
 	haveField := false
-	// 2. The OriginSigSize const MUST be declared (the slot size).
 	haveConst := false
-	// 3. Marshal MUST write the originSig slot to the wire (a copy call whose
-	// destination is out[8:...] and source references e.originSig).
 	haveMarshalWrite := false
-	// 4. UnmarshalRelayEnvelope MUST read the originSig slot from the wire
-	// (a copy call whose source is wire[8:...] and dest references originSig).
 	haveUnmarshalRead := false
 
 	// sliceLowIsLiteral8 reports whether a slice expression's low bound is
@@ -273,7 +247,7 @@ func TestOriginSig_FramingSlotPresent(t *testing.T) {
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			for _, decl := range file.Decls {
-				// const OriginSigSize =...
+				// const OriginSigSize = ...
 				if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
 					for _, spec := range gd.Specs {
 						if vs, ok := spec.(*ast.ValueSpec); ok {
@@ -323,14 +297,14 @@ func TestOriginSig_FramingSlotPresent(t *testing.T) {
 					}
 					dst, src := call.Args[0], call.Args[1]
 					// Marshal: copy(out[8:8+OriginSigSize], e.originSig[:])
-					// dst is a slice with low literal 8; src refs originSig.
+					//   dst is a slice with low literal 8; src refs originSig.
 					if isMarshal {
 						if dsl, ok := dst.(*ast.SliceExpr); ok && sliceLowIsLiteral8(dsl) && exprRefsOriginSig(src) {
 							haveMarshalWrite = true
 						}
 					}
 					// Unmarshal: copy(originSig[:], wire[8:8+OriginSigSize])
-					// src is a slice with low literal 8; dst refs originSig.
+					//   src is a slice with low literal 8; dst refs originSig.
 					if isUnmarshal {
 						if ssl, ok := src.(*ast.SliceExpr); ok && sliceLowIsLiteral8(ssl) && exprRefsOriginSig(dst) {
 							haveUnmarshalRead = true
@@ -343,19 +317,19 @@ func TestOriginSig_FramingSlotPresent(t *testing.T) {
 	}
 
 	if !haveConst {
-		t.Errorf(": OriginSigSize const MISSING from pkg/attribution framing " +
+		t.Errorf("OriginSigSize const missing from pkg/attribution framing " +
 			"(originSig slot absent from envelope framing; production receiver cannot verify inner origin)")
 	}
 	if !haveField {
-		t.Errorf(": originSig [OriginSigSize]byte field MISSING from RelayEnvelope " +
+		t.Errorf("originSig [OriginSigSize]byte field missing from RelayEnvelope " +
 			"(originSig slot absent from envelope framing; production receiver cannot verify inner origin)")
 	}
 	if !haveMarshalWrite {
-		t.Errorf(": Marshal does NOT write the originSig slot to the wire " +
+		t.Errorf("Marshal does not write the originSig slot to the wire " +
 			"(originSig absent from envelope framing; production receiver cannot verify inner origin)")
 	}
 	if !haveUnmarshalRead {
-		t.Errorf(": UnmarshalRelayEnvelope does NOT read/surface the originSig slot " +
+		t.Errorf("UnmarshalRelayEnvelope does not read/surface the originSig slot " +
 			"(originSig absent from envelope framing; production receiver cannot verify inner origin)")
 	}
 }

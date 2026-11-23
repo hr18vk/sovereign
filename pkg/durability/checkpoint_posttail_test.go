@@ -6,16 +6,15 @@
 
 package durability
 
-//checkpoint_posttail_test.go — the guards (ADR-0045): T18, T19, T20,
-// T21, and T22 (the mid-batch anchor handling). The single-pinned-walk design
-// kills the skew at its source: ONE EBR-pinned walk (CaptureShardsPinned) produces the
-// checkpoint's root, watermark, AND image — no State() (the N1 arena blowup),
-// no LamportCounter() watermark (the T1-vs-T2 skew).
+// These tests cover the exact-dot checkpoint path (ADR-0045): image watermarks
+// under concurrent writes, holes below the recovery cut, arena allocation, EBR
+// pinning, and anchors that contain mutations absent from the WAL.
 //
-// RED discipline: every guard here REDs by a ONE-LINE bug-inject on the new
-// mechanism (named in each doc comment) — no HEAD-revert is needed because
-// the guards reference-only API (CaptureShardsPinned, Arena().HighWater,
-// LastCheckpointArenaHighWater).
+// CaptureShardsPinned produces the root, watermark, and image in one EBR-pinned
+// walk. It avoids both the arena growth caused by rebuilding State() and the
+// skew caused by reading LamportCounter separately from the image. Each test
+// names a fault injection that makes its assertion fail if the guarded
+// mechanism is removed.
 
 import (
 	"context"
@@ -30,10 +29,9 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// ckptWatermarks walks the RAW WAL bytes (the code under test is never its own
-// check) and returns the LamportHigh of every WALRecCheckpoint record, in
-// file order. Checkpoint payload layout: MerkleRoot(32) || LamportHigh(8)
-// (wal.go:633-641).
+// ckptWatermarks parses the raw WAL and returns every checkpoint's LamportHigh
+// in file order. Both checkpoint layouts store MerkleRoot(32) followed by
+// LamportHigh(8).
 func ckptWatermarks(t *testing.T, walPath string) []uint64 {
 	t.Helper()
 	data, err := os.ReadFile(walPath)
@@ -42,10 +40,10 @@ func ckptWatermarks(t *testing.T, walPath string) []uint64 {
 	}
 	var out []uint64
 	for off := 8; off < len(data); {
-		// (C1): records are now 0x06 CRC-framed; walRecordAtForTest
-		// verifies the CRC and unwraps to the inner checkpoint payload, so this
-		// scanner matches the inner 0x02/0x05 exactly as before — WITHOUT
-		// weakening it (a bad CRC Fatalf's inside the helper).
+		// Records are now CRC-framed (0x06); walRecordAtForTest verifies the CRC
+		// and unwraps to the inner checkpoint payload, so this scanner matches
+		// the inner 0x02/0x05 exactly as before, without weakening it (a bad
+		// CRC causes Fatalf inside the helper).
 		innerType, innerPayload, recLen, complete := walRecordAtForTest(t, data, off)
 		if !complete {
 			break // torn tail — end of clean records (a crash boundary, not a record)
@@ -53,9 +51,9 @@ func ckptWatermarks(t *testing.T, walPath string) []uint64 {
 		// Both checkpoint record types (legacy 0x02, 40-byte payload; horizon
 		// 0x05, 48-byte) carry LamportHigh at the same offset.
 		if innerType == byte(WALRecCheckpoint) || innerType == byte(WALRecCheckpointV2) {
-			// 40 = legacy 0x02 (root+watermark); 48 = pre-0x05
-			// (+CutSeq); 56 = 0x05 +ClockHigh; 88 = 0x05
-			// +ClockHigh +StateFingerprint.
+			// 40 = legacy 0x02 (root+watermark); 48 = 0x05 (+CutSeq);
+			// 56 = 0x05 +ClockHigh (no image); 88 = 0x05 +ClockHigh +StateFingerprint
+			// (the image-backed form).
 			if len(innerPayload) != 40 && len(innerPayload) != 48 && len(innerPayload) != 56 && len(innerPayload) != 88 {
 				t.Fatalf("checkpoint record with inner payloadLen=%d, want 40, 48, 56, or 88", len(innerPayload))
 			}
@@ -67,27 +65,20 @@ func ckptWatermarks(t *testing.T, walPath string) []uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// T18 — zero post-watermark local dots in the image (the skew is dead)
+// Post-watermark local dots
 // ---------------------------------------------------------------------------
 
-// TestZeroPostWatermarkDotsInImage: under REAL concurrent writer load,
-// every checkpoint image must contain ZERO records
-// with DotNodeID == local && DotCounter > image.LamportHigh — the watermark is
-// the walk's own max-local, so "the image holds a dot above its watermark" is
-// impossible by construction. The pre-path leaked 184–3,193 such dots
-// per image on 10/10 measured images (the observed skew).
+// TestZeroPostWatermarkDotsInImage checks that no local entry in a checkpoint
+// image has DotCounter above image.LamportHigh. Both values come from the same
+// walk, whose maximum local dot bounds every entry it captured. Reading the
+// watermark before the walk instead would admit later dots; the older path
+// leaked 184–3,193 such dots in each of 10 measured images.
 //
-// NON-VACUITY: the guard asserts the checkpoints INTERLEAVED with the writes
-// (first watermark < final clock) — otherwise "zero leaks" was measured on a
-// quiescent engine and proves nothing.
-//
-// RED (bug-inject): in AppendCheckpoint read the watermark from
-// LamportCounter() BEFORE the walk (the old T1c ordering) instead of the
-// walk's max-local → writers mint during the walk → the image carries dots
-// above the watermark → this guard fires.
+// The first watermark must be below the final clock, proving that checkpoints
+// overlapped writer activity rather than running only after quiescence.
 func TestZeroPostWatermarkDotsInImage(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t18.wal")
+	walPath := filepath.Join(t.TempDir(), "post-watermark.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -107,7 +98,7 @@ func TestZeroPostWatermarkDotsInImage(t *testing.T) {
 			}
 		}(g)
 	}
-	// Fire checkpoints WHILE the writers run — the interleave is the test.
+	// Fire checkpoints while the writers run — the interleave is the test.
 	for c := 0; c < 12; c++ {
 		if err := live.AppendCheckpoint(); err != nil {
 			t.Fatalf("AppendCheckpoint %d: %v", c, err)
@@ -124,7 +115,7 @@ func TestZeroPostWatermarkDotsInImage(t *testing.T) {
 	}
 	finalClock := live.Engine().LamportCounter()
 	if wms[0] >= finalClock {
-		t.Fatalf("NON-VACUITY: first checkpoint watermark %d not below final clock %d — the checkpoints never interleaved with the writes", wms[0], finalClock)
+		t.Fatalf("first checkpoint watermark %d not below final clock %d — the checkpoints did not interleave with the writes", wms[0], finalClock)
 	}
 
 	seen := make(map[uint64]bool)
@@ -144,7 +135,7 @@ func TestZeroPostWatermarkDotsInImage(t *testing.T) {
 			}
 		}
 		if leaked != 0 {
-			t.Errorf("SKEW: image ckpt/%d carries %d local dot(s) ABOVE its watermark", wm, leaked)
+			t.Errorf("skew: image ckpt/%d carries %d local dot(s) above its watermark", wm, leaked)
 		}
 	}
 	if img := wms[len(wms)-1]; img != finalClock {
@@ -153,39 +144,24 @@ func TestZeroPostWatermarkDotsInImage(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T19 — the HOLE direction: every durable local dot ≤ watermark is in the image
+// Holes below the checkpoint cut
 // ---------------------------------------------------------------------------
 
-// TestNoHoleBelowWatermark is the hole-direction guard — and the one that
-// REFUTED an earlier residual claim. That claim held the
-// HOLE direction was "closed only by the exact-dot replay"; this guard's
-// first draft caught a LIVE hole on the tree (WAL local dot counter=94
-// at seq=96, checkpoint watermark=95 with its record at seq=104 — durable,
-// below the legacy record-seq cut, absent from the image: an ACKed write
-// bounded recovery would have LOST). The seq cut did NOT close it. The
-// closure is the V2 checkpoint record (0x05) carries the PRE-WALK NextSeq
-// horizon, so "below the cut ⇒ in the image" holds BY CONSTRUCTION, plus a
-// defensive recovery-side repair pass (witness.HolesRepaired) that heals the
-// window on legacy 0x02 logs.
+// TestNoHoleBelowWatermark checks that every local mutation below a
+// checkpoint's CutSeq is present in its image. Capturing NextSeq before the walk
+// closes the append/walk window: a completed append implies that InsertLocal had
+// already run when the walk began. The older record-sequence cut could omit a
+// durable dot, as in counter=94 at seq=96 with watermark=95 and checkpoint
+// seq=104. Legacy 0x02 logs instead use a recovery repair pass, reported through
+// witness.HolesRepaired.
 //
-// The guard asserts BOTH layers on a load-hammered log:
-// 1. SOURCE: for every checkpoint, every local mutation below its cut is in
-// its image (raw WAL parse vs raw store — the code under test is the
-// checkpoint capture, never its own check).
-// 2. CLOSURE: bounded recovery of the final checkpoint reproduces the live
-// root EXACTLY with HolesRepaired == 0 and no fallback.
-//
-// NON-VACUITY: the checked-dot count is required nonzero (hundreds here), and
-// the checkpoints are proven mid-flight (the writer goroutines race them).
-//
-// RED (bug-inject): the AppendCheckpoint capture callback drops every 7th
-// entity (a synthetic hole below the horizon — the frozen InsertLocal
-// mint/CAS window cannot be widened, so the hole is injected at the capture,
-// which is code) → the SOURCE invariant fires with the exact dropped
-// dots named AND the recovery meter goes nonzero.
+// The test compares raw WAL records with the stored images while writers are
+// active, then requires bounded recovery to reproduce the live root without a
+// fallback or repairs on a V2 log. Dropping entities from the capture callback
+// provides a negative control for both observations.
 func TestNoHoleBelowWatermark(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t19.wal")
+	walPath := filepath.Join(t.TempDir(), "below-watermark.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -238,11 +214,11 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 			}{dot{rec.Mutation.NodeID, rec.Mutation.Counter}, rec.Seq})
 		}
 	}
-	// Every checkpoint (seq, watermark, CUT) from the RAW bytes — NOT just the
+	// Every checkpoint (seq, watermark, cut) from the raw bytes — not just the
 	// final one: the final checkpoint is quiesced and trivially hole-free; the
-	// MID-FLIGHT ones are the guard's target. The cut is the V2 record's
+	// mid-flight ones are the test's target. The cut is the V2 record's
 	// CutSeq horizon (0x05) or, for a legacy 0x02 record, its own seq + 1.
-	// DISCLOSED LIMIT: two checkpoints that observe the same watermark share
+	// Disclosed limit: two checkpoints that observe the same watermark share
 	// one image key (the later walk's image overwrites), so for a shared
 	// watermark only the surviving (later, strictly larger) image is checkable
 	// — an add-wins set grows monotonically, so the surviving image satisfies
@@ -256,10 +232,10 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 		t.Fatalf("read WAL: %v", err)
 	}
 	for off := 8; off < len(raw); {
-		// (C1): records are now 0x06 CRC-framed; walRecordAtForTest
+		// Records are now 0x06 CRC-framed; walRecordAtForTest
 		// verifies the CRC and unwraps to the inner checkpoint payload. The seq
-		// is the OUTER header's (identical framed or not); the watermark + CutSeq
-		// come from the INNER payload. A bad CRC Fatalf's inside the helper.
+		// is the outer header's (identical framed or not); the watermark + CutSeq
+		// come from the inner payload. A bad CRC causes Fatalf inside the helper.
 		innerType, innerPayload, recLen, complete := walRecordAtForTest(t, raw, off)
 		if !complete {
 			break // torn tail — end of clean records (a crash boundary, not a record)
@@ -279,8 +255,8 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 		t.Fatalf("expected >=2 checkpoints, got %d", len(ckpts))
 	}
 
-	// THE SOURCE INVARIANT (by construction on the V2 horizon cut):
-	// every local mutation whose WAL record sits BELOW a checkpoint's cut is
+	// The source invariant, by construction on the V2 horizon cut:
+	// every local mutation whose WAL record sits below a checkpoint's cut is
 	// present in that checkpoint's image. Its append completed before the
 	// walk began ⇒ its insert landed before the walk ⇒ the walk saw it.
 	totalChecked, totalHoles := 0, 0
@@ -305,18 +281,18 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 			totalChecked++
 			if !inImage[m.d] {
 				totalHoles++
-				t.Errorf("HOLE: WAL local dot (counter=%d, seq=%d) sits BELOW the cut (seq<%d) of checkpoint at watermark %d yet is ABSENT from its image — bounded recovery would lose an ACKed write", m.d.counter, m.s, c.cut, c.wm)
+				t.Errorf("hole: WAL local dot (counter=%d, seq=%d) sits below the cut (seq<%d) of checkpoint at watermark %d yet is absent from its image — bounded recovery would lose an ACKed write", m.d.counter, m.s, c.cut, c.wm)
 			}
 		}
 	}
 	if totalChecked == 0 {
-		t.Fatalf("NON-VACUITY: checked set is empty — the guard inspected nothing")
+		t.Fatalf("checked set is empty — the test inspected nothing")
 	}
-	t.Logf("T19 source invariant: checkpoints=%d below-cut dots checked=%d holes=%d", len(ckpts), totalChecked, totalHoles)
+	t.Logf("below-cut source invariant: checkpoints=%d below-cut dots checked=%d holes=%d", len(ckpts), totalChecked, totalHoles)
 
-	// THE CLOSURE (the "or recovery restores it regardless" guarantee):
+	// The closure (the original claim was "or recovery restores it regardless"):
 	// bounded recovery of the final quiesced checkpoint must reproduce the
-	// live state byte-exactly, with ZERO repairs needed on a V2 log.
+	// live state byte-exactly, with zero repairs needed on a V2 log.
 	liveRoot := live.Engine().State().MerkleRoot()
 	if err := live.WAL().Close(); err != nil {
 		t.Fatalf("live WAL close: %v", err)
@@ -329,7 +305,7 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 		t.Errorf("unexpected fallback on a clean V2 log+image: %s", witness.FallbackReason)
 	}
 	if witness.HolesRepaired != 0 {
-		t.Errorf("HolesRepaired=%d on a horizon-cut V2 log — the R9c construction was violated at checkpoint time (the repair healed it, but the source invariant must hold)", witness.HolesRepaired)
+		t.Errorf("HolesRepaired=%d on a horizon-cut V2 log — the source invariant was violated at checkpoint time (the repair healed it, but the source invariant must hold)", witness.HolesRepaired)
 	}
 	if got := rec.State().MerkleRoot(); got != liveRoot {
 		t.Errorf("recovered root %x != live root %x — recovery did not restore the full state", got, liveRoot)
@@ -337,28 +313,20 @@ func TestNoHoleBelowWatermark(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T20 — AppendCheckpoint allocates ZERO arena (N1 stays closed)
+// Checkpoint arena allocation
 // ---------------------------------------------------------------------------
 
-// TestCheckpointAllocatesZeroArena is the TestShardedRootNoArenaGrowth
-// shape applied to the checkpoint path. The
-// earlier AppendCheckpoint built the merged view TWICE per checkpoint
-// (State().MerkleRoot() + SnapshotToLSM's State()); measured on the probe, 11
-// checkpoints exhausted a 768 MiB arena at a ~2,500-entity live set. The
-// single-pinned-walk path allocates ZERO arena: the bump high-water must be
-// FLAT across M checkpoints, and the bridge's witness accessor must report
-// exactly that flat value (T20 keeps the CHECK-I RSS bound honest).
+// TestCheckpointAllocatesZeroArena requires the arena high-water to remain
+// unchanged across M checkpoints and match LastCheckpointArenaHighWater. The
+// older path built State() twice per checkpoint; 11 checkpoints exhausted a
+// 768 MiB arena with approximately 2,500 live entities. CaptureShardsPinned
+// avoids those merged-view allocations.
 //
-// NON-VACUITY: the live set is 2,000 entities, so a merged-view build would
-// move the high-water by megabytes — flatness is a strong signal, not a
-// rounding artifact.
-//
-// RED (bug-inject): re-read the root via b.engine.State().MerkleRoot() inside
-// AppendCheckpoint (the pre-call) → the merged view bump-allocates →
-// the high-water moves → this guard fires.
+// The 2,000-entity live set would move the high-water by megabytes if State()
+// were reintroduced, providing a clear negative control.
 func TestCheckpointAllocatesZeroArena(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t20.wal")
+	walPath := filepath.Join(t.TempDir(), "checkpoint-arena.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -376,66 +344,41 @@ func TestCheckpointAllocatesZeroArena(t *testing.T) {
 	}
 	hw1 := live.Engine().Arena().HighWater()
 	if hw1 != hw0 {
-		t.Errorf("ARENA GREW across %d checkpoints: high-water %d → %d (+%d bytes) — the checkpoint path is building merged views again (N1)", M, hw0, hw1, hw1-hw0)
+		t.Errorf("arena grew across %d checkpoints: high-water %d → %d (+%d bytes) — the checkpoint path is building merged views again (arena growth defect)", M, hw0, hw1, hw1-hw0)
 	}
 	if got := live.LastCheckpointArenaHighWater(); got != hw0 {
-		t.Errorf("WITNESS: LastCheckpointArenaHighWater=%d, want the flat %d", got, hw0)
+		t.Errorf("witness: LastCheckpointArenaHighWater=%d, want the flat %d", got, hw0)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// T21 — the EBR pin is load-bearing (checkpoint walk vs concurrent State())
+// EBR pinning against concurrent State calls
 // ---------------------------------------------------------------------------
 
-// TestCheckpointWalkPinnedAgainstState: /v1/get calls
-// engine.State() (control.go:518), which retires the previous merged view and
-// advances the EBR epoch; writers CAS-retire shard roots. The checkpoint walk
-// reads those SAME shard roots. The pin AppendCheckpoint holds across the walk
-// is what makes the read formally race-free instead of
-// grace-window-lucky — without it a retired shard root can be reclaimed and
-// REUSED mid-walk (garbage records, or the "unexpected fault address" SIGSEGV
-// class the probe observed once).
+// TestCheckpointWalkPinnedAgainstState runs State() readers and writers during
+// 20 checkpoints over 3,000 entities. State() retires merged views and advances
+// the EBR epoch while writers retire shard roots. AppendCheckpoint's pin keeps
+// those roots from being reclaimed and reused during CaptureShardsPinned;
+// without it, the walk could read reclaimed memory.
 //
-// The guard: a State() hammer (the /v1/get pattern) + writers + 20 checkpoints
-// over a 3,000-entity live set, run under -race in the battery. GREEN =
-// completes clean, the final quiesced checkpoint round-trips through recovery
-// byte-exact (the walk captured a self-consistent image).
-//
-// RED (bug-inject): delete the Acquire/Enter/Release around AppendCheckpoint's
-// body → the walk is unpinned. The expected conviction is a -race report or a
-// fault; if the box cannot reproduce it, the artifact says so and the pin
-// stands on the documented hazard, NOT on a green-by-luck run.
+// The final quiesced checkpoint must round-trip through recovery with the live
+// root. Removing Acquire/Enter/Release supplies the negative control under the
+// race detector.
 func TestCheckpointWalkPinnedAgainstState(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t21.wal")
-	// Fold-era arena sizing (ADR-0045; comment CORRECTED):
-	// added the mandated payload-covering
-	// fingerprint fold to AppendCheckpoint. The fold allocates ZERO arena
-	// (heap-only — it is not a leak), but it extends the EBR pin per checkpoint
-	// (SHA-256 over the captured entries; measured +3.754 ms at
-	// 20,000 entries, +49.4% — see TestFoldCostMeasured for the in-tree
-	// reconciliation of the three published numbers). The pin is FORBIDDEN to
-	// narrow, so under
-	// this test's unpaced State() hammer (~560 MB/s of merged-view garbage that
-	// EBR cannot reclaim while the pin is held) that pin-time is unreclaimable
-	// arena: measured high-water over the 20-checkpoint storm is 50.9 MB without
-	// the fold vs 64.4 MB with it — over the 64 MiB testArenaSize. 128 MiB
-	// restores ~2x headroom for the identical workload and assertions; only the
-	// resource is sized for the mandated fold.
+	walPath := filepath.Join(t.TempDir(), "checkpoint-pin.wal")
+	// The payload fingerprint fold allocates on the heap, not in the engine
+	// arena, but it extends the EBR pin. At 20,000 entries TestFoldCostMeasured
+	// measured +3.754 ms, or +49.4%, for walk+capture+fold. During this test's
+	// unpaced State() reader, retired merged views cannot be reclaimed while the
+	// pin is held: the 20-checkpoint high-water measured 50.9 MB without the fold
+	// and 64.4 MB with it. The 128 MiB arena provides headroom instead of the
+	// shared 64 MiB default.
 	//
-	// WHY THIS IS A TEST ARTIFACT (the CORRECTED reason — the earlier text said
-	// "production checkpoints are not back-to-back", which is FALSE: measured
-	// 80 checkpoint records over 15 watermarks, worst repeat 66). The
-	// true reason: production has no concurrent arena-garbage
-	// producer on the checkpoint path. The 100-node orchestrator's root gauge is
-	// MerkleRootFromShards (pkg/sync/merkle_sharded.go:140) over
-	// CaptureShardsPinned (pkg/sync/merkle_sharded.go:210) — a ZERO-arena shard
-	// walk, not State(); Gossiper.LatestPayload's State() has ZERO callers (dead
-	// code); the only State() hammer is THIS TEST's. (Do NOT cite an ADR number
-	// for the sharded root — none exists as a file; the citations are the two
-	// functions above.) The pre-existing State() arena growth on the LIVE READ
-	// path (per-request /v1/get) is a SEPARATE, still-open production defect —
-	// one this resize neither fixes nor clears.
+	// This pressure comes from the test's deliberate State() loop. The fleet root
+	// gauge uses MerkleRootFromShards over CaptureShardsPinned without building
+	// State(), and Gossiper.LatestPayload has no callers. State() allocation on
+	// the /v1/get read path is a separate issue; this sizing does not address it.
 	live := newLiveBridgeArena(t, walPath, 0, 128*1024*1024)
 	live.SetSnapshotter(lfs, false)
 
@@ -448,7 +391,10 @@ func TestCheckpointWalkPinnedAgainstState(t *testing.T) {
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { // the /v1/get pattern: State() churns merged views + epochs
+	go func() {
+		// State() retires merged views and advances epochs against the pinned
+		// walk. Keep this reader rather than substituting MerkleRootFromShards,
+		// which would remove the reclamation pressure this test exercises.
 		defer wg.Done()
 		for {
 			select {
@@ -497,30 +443,22 @@ func TestCheckpointWalkPinnedAgainstState(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T22 — a mid-PutLocals (phantom-anchor) checkpoint must BOOT, not Fatalf
+// Phantom anchors during a batch
 // ---------------------------------------------------------------------------
 
-// TestMidBatchPhantomAnchorBootsClean covers ADR-0045: a
-// checkpoint taken between a batch's InsertLocal calls and its AppendMutations
-// fsync anchors a root covering dots the durable log never received.
-// Recovery discards that image (phantom local dots); the full-log rebuild then
-// legitimately CANNOT equal the torn anchor's root. Before the guard the
-// armed root assertion returned ErrRecoveryRootMismatch and main.go:822
-// Fatalf'd — the node REFUSED TO BOOT on a log that was not corrupt. Now the
-// assertion skips the torn anchor (loudly) and the node boots on exactly the
-// durable log: the phantom dots were never fsync'd, never ACKed — losing them
-// is the honest un-ACKed-write contract, not corruption.
+// TestMidBatchPhantomAnchorBootsClean simulates a checkpoint between a batch's
+// InsertLocal calls and AppendMutations. Its image contains local dots absent
+// from the durable log. Recovery must discard those phantom dots, report
+// ExactWALFallback, and boot from exactly the acknowledged writes rather than
+// returning ErrRecoveryRootMismatch for the incomplete anchor.
 //
-// The scenario is constructed, not raced: two local-identity dots are Joined
-// straight into the engine (never WAL-appended) — byte-for-byte the state a
-// mid-batch checkpoint observes.
-//
-// RED (bug-inject): remove `&& localPhantomsRejected == 0` from the root
-// assertion → recovery returns ErrRecoveryRootMismatch → the boot-succeeds
-// assertion fires with exactly that error.
+// Two local-identity dots are joined directly into the engine without WAL
+// appends, constructing the same state deterministically. Removing the
+// localPhantomsRejected condition from recovery's root guard supplies the
+// negative control.
 func TestMidBatchPhantomAnchorBootsClean(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t22.wal")
+	walPath := filepath.Join(t.TempDir(), "phantom-anchor.wal")
 	live := newLiveBridge(t, walPath, 0)
 	live.SetSnapshotter(lfs, false)
 
@@ -532,7 +470,7 @@ func TestMidBatchPhantomAnchorBootsClean(t *testing.T) {
 		}
 		dots[i] = d
 	}
-	// The "mid-batch" dots: live in the engine, NEVER in the WAL — exactly the
+	// The "mid-batch" dots: live in the engine, never in the WAL — exactly the
 	// InsertLocal→AppendMutations window. Local identity, high counters.
 	phantoms := []SnapshotRecord{
 		exactRec(utf8EntityID(900), testNodeID(), 900, stagedDigest(900)),
@@ -551,23 +489,23 @@ func TestMidBatchPhantomAnchorBootsClean(t *testing.T) {
 
 	rec, recWAL, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if err != nil {
-		t.Fatalf("BOOT REFUSED on a non-corrupt log (R9a false data-loss verdict): %v", err)
+		t.Fatalf("boot refused on a non-corrupt log (phantom-anchor false data-loss verdict): %v", err)
 	}
 	t.Cleanup(func() { _ = recWAL.Close() })
 	t.Cleanup(func() { _ = rec.Close() })
 	if !witness.ExactWALFallback {
-		t.Errorf("MARKER: ExactWALFallback=false — a phantom-bearing image was used")
+		t.Errorf("ExactWALFallback=false — a phantom-bearing image was used")
 	}
 	if witness.LocalPhantomsRejected != 2 {
-		t.Errorf("MARKER: LocalPhantomsRejected=%d, want 2", witness.LocalPhantomsRejected)
+		t.Errorf("LocalPhantomsRejected=%d, want 2", witness.LocalPhantomsRejected)
 	}
 	if !strings.Contains(witness.FallbackReason, "phantom") {
-		t.Errorf("MARKER: FallbackReason=%q, want it to name the phantom discard", witness.FallbackReason)
+		t.Errorf("FallbackReason=%q, want it to name the phantom discard", witness.FallbackReason)
 	}
 	if got := countDots(t, rec); got != 3 {
-		t.Errorf("recovered %d dots, want exactly the 3 durable ones (the 2 phantoms were never ACKed — honestly lost)", got)
+		t.Errorf("recovered %d dots, want only the 3 acknowledged durable writes; the 2 phantoms must be discarded", got)
 	}
-	// The recovered state is EXACTLY the three durable dots — the independent
+	// The recovered state is exactly the three durable dots — the independent
 	// reference is built from the PutLocal-returned dots, not the WAL parser.
 	ref := make([]SnapshotRecord, 3)
 	for i, d := range dots {
@@ -579,30 +517,21 @@ func TestMidBatchPhantomAnchorBootsClean(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T23 — legacy 0x02 log with a hole: the repair pass heals it, observably
+// Legacy checkpoint with a hole below its cut
 // ---------------------------------------------------------------------------
 
-// TestLegacyHoleHealed covers the LEGACY leg: a legacy WAL whose
-// 0x02 checkpoint cuts at its own record seq, carrying a dot below the cut
-// that the image missed (the walk→append window, frozen into an old log). The
-// bounded recovery must (a) USE the image (it is not torn — no phantom, no
-// watermark mismatch), (b) exact-restore the holed dot from its WAL record,
-// (c) count the repair in witness.HolesRepaired, (d) SKIP the root assertion
-// for the under-covering anchor (loudly, not ErrRecoveryRootMismatch), and
-// (e) reproduce the full durable state byte-exactly.
+// TestLegacyHoleHealed constructs three durable dots and a legacy 0x02
+// checkpoint whose root and image cover only the first two. Dot 3 is at seq 2,
+// below the checkpoint's cut at 4. Bounded recovery must use the image, restore
+// dot 3 from its WAL record, count one HolesRepaired repair, and reproduce the
+// full three-dot root without ErrRecoveryRootMismatch.
 //
-// Construction: 3 real PutLocals (durable); a HAND-WRITTEN legacy checkpoint
-// whose root covers only dots {1,2} (the walk "missed" dot 3); an image with
-// exactly {1,2}. Dot 3 is at seq 2 < cut 4 — the hole.
-//
-// RED (bug-inject): remove `&& holesRepaired == 0` from the root-assertion
-// guard → the rebuilt (3-dot) root is asserted against the under-covering
-// (2-dot) anchor → ErrRecoveryRootMismatch → the boot-succeeds assertion
-// fires. (A second valid RED: delete the repair pass → dot 3 is lost → the
-// root/dot-count assertions fire.)
+// Removing holesRepaired == 0 from the root guard would compare the three-dot
+// rebuild with the two-dot anchor and fail. Removing the repair pass would
+// instead lose dot 3; both are useful negative controls.
 func TestLegacyHoleHealed(t *testing.T) {
 	lfs := newSnapshotStore(t)
-	walPath := filepath.Join(t.TempDir(), "t23.wal")
+	walPath := filepath.Join(t.TempDir(), "legacy-hole.wal")
 	live := newLiveBridge(t, walPath, 0)
 
 	dots := make([]eng.CausalDot, 3)
@@ -614,7 +543,7 @@ func TestLegacyHoleHealed(t *testing.T) {
 		dots[i] = d
 	}
 	wm := live.Engine().LamportCounter()
-	// The LEGACY checkpoint: root of the 2-dot (hole-y) walked state, no CutSeq.
+	// The legacy checkpoint anchors only the first two dots and has no CutSeq.
 	twoDotRoot := referenceRoot(t, testNodeID(),
 		exactRec(utf8EntityID(0), dots[0].NodeID, dots[0].Counter, stagedDigest(0)),
 		exactRec(utf8EntityID(1), dots[1].NodeID, dots[1].Counter, stagedDigest(1)))
@@ -637,15 +566,15 @@ func TestLegacyHoleHealed(t *testing.T) {
 
 	rec, recWAL, _, witness, err := RecoverEngineWithSnapshot(testNodeID(), walPath, lfs, testArenaSize)
 	if err != nil {
-		t.Fatalf("BOOT REFUSED on a legacy log with a hole (the repair pass must heal it): %v", err)
+		t.Fatalf("boot refused on a legacy log with a hole (the repair pass must heal it): %v", err)
 	}
 	t.Cleanup(func() { _ = recWAL.Close() })
 	t.Cleanup(func() { _ = rec.Close() })
 	if witness.ExactWALFallback {
-		t.Errorf("ExactWALFallback=true — the holed image is not TORN, it must be USED (the WAL record heals the hole)")
+		t.Errorf("ExactWALFallback=true — the holed image is not torn, it must be used (the WAL record heals the hole)")
 	}
 	if witness.HolesRepaired != 1 {
-		t.Errorf("METER: HolesRepaired=%d, want exactly 1 (dot 3)", witness.HolesRepaired)
+		t.Errorf("HolesRepaired=%d, want exactly 1 (dot 3)", witness.HolesRepaired)
 	}
 	if got := countDots(t, rec); got != 3 {
 		t.Errorf("recovered %d dots, want 3 (the holed dot restored)", got)
@@ -659,13 +588,11 @@ func TestLegacyHoleHealed(t *testing.T) {
 	}
 }
 
-// TestFoldCostMeasured reconciles three published numbers for
-// the fingerprint fold's per-checkpoint cost that disagreed
-// (~1.2 ms, 5.142 ms, and +3.754 ms / +49.4% at 20,000
-// entries). This measures BOTH halves on THIS tree at that exact scale: the
-// CaptureShardsPinned walk alone vs walk+fold. It is a MEASUREMENT (the number
-// is reported, never gated), but it is not vacuous: the record counts must
-// match or the two passes measured different state.
+// TestFoldCostMeasured reports three measurements at 20,000 entries:
+// CaptureShardsPinned alone, the walk plus record capture, and the walk plus
+// capture plus fingerprinting. The third minus the second isolates the fold's
+// per-checkpoint cost. Every arm must visit the same number of records; timings
+// are logged without a performance threshold.
 func TestFoldCostMeasured(t *testing.T) {
 	const entries = 20_000
 	eng.DataDir = t.TempDir()
@@ -678,7 +605,7 @@ func TestFoldCostMeasured(t *testing.T) {
 		e.InsertLocal(utf8EntityID(i), stagedEntry(i))
 	}
 	const reps = 5
-	// Arm 1: walk only (the pre-checkpoint cost).
+	// Arm 1: walk only (the pre-fold checkpoint cost).
 	var walkOnly time.Duration
 	for r := 0; r < reps; r++ {
 		start := time.Now()
@@ -708,8 +635,8 @@ func TestFoldCostMeasured(t *testing.T) {
 			t.Fatalf("walk+capture covered %d records, want %d", len(recs), entries)
 		}
 	}
-	// Arm 3: walk + capture + FOLD (the fingerprint). The pure fold
-	// cost is arm3 − arm2 — the heap append is NOT the fold.
+	// Arm 3: walk + capture + fold (the fingerprint). The pure fold
+	// cost is arm3 − arm2 — the heap append is not the fold.
 	var walkCaptureFold time.Duration
 	for r := 0; r < reps; r++ {
 		start := time.Now()
@@ -729,6 +656,6 @@ func TestFoldCostMeasured(t *testing.T) {
 	walkMs := float64(walkOnly.Microseconds()) / 1000 / reps
 	captureMs := float64(walkCapture.Microseconds()) / 1000 / reps
 	bothMs := float64(walkCaptureFold.Microseconds()) / 1000 / reps
-	t.Logf("T21 FOLD COST at %d entries (%d reps, this box): walk-only %.3f ms; walk+capture %.3f ms; walk+capture+fold %.3f ms => PURE FOLD %+.3f ms/checkpoint (%+.1f%% over walk+capture) — reconciles the 1.2 / 5.142 / +3.754 ms dispute",
+	t.Logf("fingerprint fold cost at %d entries (%d reps on this host): walk-only %.3f ms; walk+capture %.3f ms; walk+capture+fold %.3f ms => fold %+.3f ms/checkpoint (%+.1f%% over walk+capture)",
 		entries, reps, walkMs, captureMs, bothMs, bothMs-captureMs, 100*(bothMs-captureMs)/captureMs)
 }

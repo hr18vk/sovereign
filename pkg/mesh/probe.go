@@ -4,36 +4,27 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package mesh — probe.go is the convergence-after-heal probe: a COMPOSER of
-// the PeerSet/Gossiper + convergence-lag machinery that proves a
-// 2-node mesh heals a network partition and re-converges to equal MerkleRoot
-// inside a wall-clock SLO an operator reads from /metrics.
+// The convergence probe composes peer sets, gossipers, and engines to check
+// that a two-node mesh heals a transport partition and returns to equal Merkle
+// roots within a wall-clock deadline (ADR-0009).
 //
-// The probe does NOT reimplement the sweep (it STARTS the SweepLoop at
-// the tick arg) NOR convergence detection (it reads MerkleRoot directly via
-// engine.State.MerkleRoot — the SAME path the gauge seeds from via
-// stampConvergence). It does NOT touch the frozen receive gate stack: a frame
-// that arrives after heal STILL flows HandleFrame -> VerifyCRDTFrame ->
-// ApplyCRDTDeltaEvent. The partition is at the TRANSPORT layer
-// (PeerSet.ClosePeer), NOT the receive gate.
+// StartSweepLoops runs the ordinary sweep loop; WaitForConvergence reads roots
+// through engine.MerkleRootFromShards, which does not grow the arena
+// (ADR-0051). The probe closes connections with PeerSet.ClosePeer but leaves
+// the receive path unchanged: frames still pass through HandleFrame,
+// VerifyCRDTFrame, and ApplyCRDTDeltaEvent.
 //
-// THE SLO CLOCK (the §0 three facts, recorded in ADR-0009):
-//   - FACT 1: the <100ms SLO decomposes as sweep-wait + (RTT + IBLT-peel + apply).
-//     The sweep-wait is a UNIFORM [0, tick) random variable with worst-case =
-//     tick. At --gossip-tick=50ms the worst-case sweep-wait is 50ms; at the
-//     100ms default the SLO is EXHAUSTED by the tick alone. WaitForConvergence
-//     therefore takes the tick as an arg and the gate HARDCODES 50ms (the §0
-//     FACT-1 fixture — a test precondition, NOT a hidden assumption).
-//   - FACT 2: the SLO clock starts at RESTORE-OF-CONNECTIVITY (healAt — the
-//     re-dial returning), NOT at the SG-CLI-return. The silicon harness excludes
-//     AWS control-plane latency; the in-process probe has no SG layer, so
-//     healAt IS the connectivity-restored timestamp. The wall-clock the probe
-//     returns is time.Since(healAt).
-//   - FACT 3 (honest-labeling): the in-process probe runs over loopback TLS (RTT
-//     ~10us, NOT the ~0.3-1.0ms of intra-AZ). It proves the CONVERGENCE
-//     PROPERTY (the mesh heals + roots equal + the 50ms tick fires the sweep +
-//     the latency is bounded by the tick not the apply), NOT the silicon
-//     <100ms number. The gate's t.Logf records this boundary honestly.
+// The measured interval starts when connectivity returns, not when a cloud
+// control-plane request returns. It includes the wait for the next sweep, then
+// the network round trip, IBLT reconciliation, and delta application. With a
+// running sweep, the first term is in [0, tick). A 100 ms tick can consume the
+// entire 100 ms target, so the in-process test uses a 50 ms tick and passes it
+// explicitly to the probe.
+//
+// Loopback TLS has a round trip of roughly 10 us, compared with approximately
+// 0.3-1.0 ms within an availability zone. The probe checks partition recovery
+// and the effect of the tick on convergence time; it does not reproduce the
+// sub-100 ms result measured on cloud hardware.
 package mesh
 
 import (
@@ -44,23 +35,20 @@ import (
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 )
 
-// ErrSLONotMet is returned by WaitForConvergence when the ctx deadline elapses
-// before the two engines' MerkleRoots equal. It carries the measured wall-clock
-// from healAt so the gate records the honest number (ACCEPTED-with-NEGATIVE-perf
-// when roots converge but the SLO is exceeded — a real finding, NOT a defect).
+// ErrSLONotMet is returned by WaitForConvergence when the context deadline
+// elapses before the engines' Merkle roots match. WaitForConvergence also
+// returns the elapsed time since healAt, allowing a caller to distinguish a
+// missed latency target from a failure to converge.
 var ErrSLONotMet = errors.New("mesh: convergence-after-heal SLO not met before ctx deadline")
 
-// ConvergenceProbe composes two in-process Gossipers (gA, gB) over their
-// PeerSets + engines and drives a partition/heal/converge sequence against a
-// single peer. It is the in-process survival gate: a mesh that loses data on
-// partition FAILS the engine's reason to exist; the probe PROVES it does not
-// (CRDT idempotency: the divergence A injects while partitioned is REPLICATED
-// to B after heal via the IBLT-delta Join — zero data loss by construction).
+// ConvergenceProbe drives a partition, heal, and convergence sequence between
+// two gossipers and their peer sets. It checks that updates injected while the
+// nodes are partitioned replicate through the ordinary IBLT delta join after
+// connectivity returns.
 //
-// The probe stores the two dial addresses so Heal can re-Dial both sides
-// (PeerSet.Dial is the existing re-dial seam; the probe composes it, it does
-// NOT add a Heal method to PeerSet). The peerID is the remote's CRDT-delta
-// signing nodeID (the same [16]byte the PeerSet keys its peers map by).
+// Heal re-dials both sides through PeerSet.Dial; no separate heal operation is
+// added to PeerSet. The stored peer IDs are the nodes' CRDT signing identities,
+// which are also the keys in each peer set's peers map.
 type ConvergenceProbe struct {
 	gA      *Gossiper
 	gB      *Gossiper
@@ -68,27 +56,24 @@ type ConvergenceProbe struct {
 	psB     *PeerSet
 	engine  *eng.DeltaCRDTEngine // A's engine (MerkleRoot source for the A side)
 	engineB *eng.DeltaCRDTEngine // B's engine (MerkleRoot source for the B side)
-	// addrA/addrB are the loopback TLS listener addresses; Heal re-Dials the
-	// OTHER side from each (A dials addrB, B dials addrA) — the bidirectional
-	// heal that mirrors the bidirectional Partition.
+	// addrA and addrB are the loopback TLS listener addresses. Heal dials
+	// addrB from A and addrA from B, mirroring the bidirectional partition.
 	addrA string
 	addrB string
-	// peerA/peerB are the two nodeIDs (A's and B's); Partition/Heal close +
-	// re-dial the peer each side sees (A's peer is B's nodeID and vice versa).
+	// peerA and peerB are the node IDs. Each side closes and re-dials the
+	// other's ID.
 	peerA [16]byte
 	peerB [16]byte
 
-	// partitionAt is when Partition closed the conns; healAt is when Heal's
-	// re-dial returned (the SLO clock start — FACT 2). WaitForConvergence
-	// returns time.Since(healAt).
+	// partitionAt records when Partition closed the connections. healAt records
+	// when Heal finished restoring them and starts the measured interval.
 	partitionAt time.Time
 	healAt      time.Time
 }
 
-// NewConvergenceProbe binds the two Gossipers + PeerSets + engines + the two
-// loopback addresses + the two nodeIDs. The caller (the gate) has ALREADY
-// dialed both sides and registered the peer pubkeys (the harness shape);
-// the probe takes ownership of the partition/heal/converge sequence only.
+// NewConvergenceProbe binds two connected gossipers, peer sets, engines,
+// loopback addresses, and node IDs. The caller retains ownership of the
+// components; the probe drives only the partition and heal sequence.
 func NewConvergenceProbe(gA, gB *Gossiper, psA, psB *PeerSet, engineA, engineB *eng.DeltaCRDTEngine, addrA, addrB string, peerA, peerB [16]byte) *ConvergenceProbe {
 	return &ConvergenceProbe{
 		gA:      gA,
@@ -104,17 +89,16 @@ func NewConvergenceProbe(gA, gB *Gossiper, psA, psB *PeerSet, engineA, engineB *
 	}
 }
 
-// Partition closes ONE peer's conn on BOTH PeerSets (A closes its conn to B, B
-// closes its conn to A — a bidirectional partition). It is the per-peer
-// transport-layer partition primitive: a frame A ships to B after Partition
-// fails to reach B (the conn is closed); B's sweep to A likewise stalls. The
-// frozen receive gate stack is NEVER bypassed — a frame that arrives after
-// heal STILL flows HandleFrame -> VerifyCRDTFrame -> ApplyCRDTDeltaEvent.
-// Records partitionAt (the divergence-injection window starts here).
+// Partition closes A's connection to B and B's connection to A. Writes on
+// those connections then fail, and a sweep with no remaining peers returns
+// early. Frames exchanged after Heal still pass through the ordinary receive
+// verification and apply path. partitionAt marks the start of the divergence
+// window.
 func (p *ConvergenceProbe) Partition(ctx context.Context, peerID [16]byte) error {
-	// Bidirectional: A closes its conn to peerID, B closes its conn to peerID.
-	// In the 2-node probe peerID is the OTHER node's ID on each side, so the
-	// caller passes the remote's nodeID and we close it on both PeerSets.
+	// Bidirectional: A closes its connection to peerID, B closes its connection
+	// to peerID. In the 2-node probe peerID is the other node's ID on each
+	// side, so the caller passes the remote's nodeID and we close it on both
+	// peer sets.
 	if err := p.psA.ClosePeer(peerID); err != nil {
 		return err
 	}
@@ -133,11 +117,9 @@ func (p *ConvergenceProbe) Partition(ctx context.Context, peerID [16]byte) error
 	return nil
 }
 
-// Heal re-Dials BOTH sides (A re-dials B at addrB, B re-dials A at addrA) via
-// the existing PeerSet.Dial seam, then waits for both readLoops to plumb. It
-// does NOT add a Heal method to PeerSet (re-dial IS PeerSet.Dial; the probe
-// composes it). Records healAt — the SLO clock start (FACT 2: restore-of-
-// connectivity, NOT SG-CLI-return; the in-process probe has no SG layer).
+// Heal re-dials A to B and B to A through PeerSet.Dial, then waits until both
+// peers maps contain the restored edges. It records healAt after this wait so
+// the convergence interval starts with connectivity restored.
 func (p *ConvergenceProbe) Heal(ctx context.Context, peerID [16]byte) error {
 	// A re-dials B (addrB, SNI localhost, B's nodeID); B re-dials A (addrA).
 	if err := p.psA.Dial(ctx, p.addrB, "localhost", p.peerB); err != nil {
@@ -146,9 +128,8 @@ func (p *ConvergenceProbe) Heal(ctx context.Context, peerID [16]byte) error {
 	if err := p.psB.Dial(ctx, p.addrA, "localhost", p.peerA); err != nil {
 		return err
 	}
-	// Wait for both reader goroutines to plumb through the TLS handshake. The
-	// readLoop installs the peerConn under the PeerSet's write lock before the
-	// handshake completes, so we poll peers-map presence (the asyncWait shape).
+	// Dial installs each peer before starting its read loop. Poll both maps so
+	// healAt does not include either installation wait.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		p.psA.mu.RLock()
@@ -166,15 +147,10 @@ func (p *ConvergenceProbe) Heal(ctx context.Context, peerID [16]byte) error {
 	return nil
 }
 
-// StartSweepLoops starts BOTH SweepLoops at the tick (the §0 FACT-1 fixture;
-// the gate HARDCODES 50ms) on a derived context the probe owns. The sweep runs
-// CONTINUOUSLY — the production model: the sweep is already running when a
-// partition stalls it (no live peers -> AntiEntropySweep returns early) and
-// resumes within [0, tick) when Heal re-dials. This is the FACT-1 physics: the
-// sweep-wait is a UNIFORM [0, tick) random variable ONLY when the sweep is
-// already running at heal; starting the sweep AT healAt would bill a full tick
-// that production excludes (the first ticker fire is tick elapsed, not 0).
-// The gate calls StartSweepLoops ONCE at mesh setup, before Partition.
+// StartSweepLoops starts both sweep loops on a derived context. Call it before
+// Partition so a sweep is already running at heal: the next sweep then arrives
+// within [0, tick), matching the production loop. Starting at heal would always
+// add a full tick before the first run. The test uses a 50 ms tick.
 func (p *ConvergenceProbe) StartSweepLoops(ctx context.Context, tick time.Duration) context.CancelFunc {
 	sweepCtx, cancel := context.WithCancel(ctx)
 	go p.gA.SweepLoop(sweepCtx, tick)
@@ -182,22 +158,15 @@ func (p *ConvergenceProbe) StartSweepLoops(ctx context.Context, tick time.Durati
 	return cancel
 }
 
-// WaitForConvergence polls MerkleRoot(A)==MerkleRoot(B) at <=tick cadence until
-// equal OR ctx timeout. It returns the wall-clock from healAt (the SLO clock —
-// FACT 2) and ErrSLONotMet if ctx elapses first. The probe does NOT reimplement
-// the sweep (StartSweepLoops started the SweepLoop at setup) NOR
-// convergence detection (it reads MerkleRoot directly — the SAME path the
-// gauge seeds from via stampConvergence).
-//
-// The returned healToConv is the OPERATOR-FACING TOTAL: wall-clock from
-// restored-connectivity to roots-equal, INCLUDING the sweep-wait (games that
-// exclude the tick from the SLO clock are rejected as hidden assumptions). The
-// sweep-wait is genuinely [0, tick) because the sweep is already running.
+// WaitForConvergence polls both engines' Merkle roots until they match or ctx
+// expires. It returns the wall-clock interval from restored connectivity to
+// equal roots, including the wait for the next sweep, or ErrSLONotMet on
+// timeout. StartSweepLoops must already be running for the sweep wait to lie
+// in [0, tick). Roots are read with MerkleRootFromShards, as in the convergence
+// gauge's stampConvergence path.
 func (p *ConvergenceProbe) WaitForConvergence(ctx context.Context, slo, tick time.Duration) (healToConv time.Duration, err error) {
-	// Poll roots at <=tick cadence until equal OR ctx timeout. The poll interval
-	// is tick/4 so a convergence that lands mid-tick is observed well within the
-	// tick budget (the sweep-wait is the dominant term; the poll overhead is
-	// sub-tick and does not gate the SLO).
+	// Poll four times per tick so polling adds little latency to the dominant
+	// wait for the next sweep.
 	poll := tick / 4
 	if poll <= 0 {
 		poll = tick
@@ -205,8 +174,10 @@ func (p *ConvergenceProbe) WaitForConvergence(ctx context.Context, slo, tick tim
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
-		ra := p.engine.State().MerkleRoot()  // crdt.go:1225 + hamt.go:265
-		rb := p.engineB.State().MerkleRoot() // crdt.go:1225 + hamt.go:265
+		// Read shard roots directly; rebuilding a merged view with State would
+		// allocate arena memory on every poll (ADR-0051).
+		ra := p.engine.MerkleRootFromShards()
+		rb := p.engineB.MerkleRootFromShards()
 		if ra == rb {
 			healToConv = time.Since(p.healAt)
 			return healToConv, nil
@@ -224,6 +195,6 @@ func (p *ConvergenceProbe) WaitForConvergence(ctx context.Context, slo, tick tim
 // window start). Zero before Partition is called.
 func (p *ConvergenceProbe) PartitionAt() time.Time { return p.partitionAt }
 
-// HealAt returns when Heal's re-dial returned (the SLO clock start — FACT 2).
-// Zero before Heal is called.
+// HealAt returns when Heal finished restoring both connections, which is the
+// start of the measured convergence interval. It is zero before Heal is called.
 func (p *ConvergenceProbe) HealAt() time.Time { return p.healAt }

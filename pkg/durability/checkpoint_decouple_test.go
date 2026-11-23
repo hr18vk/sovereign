@@ -6,20 +6,14 @@
 
 package durability
 
-//checkpoint_decouple_test.go — the HALF-A guards (decouple
-// the checkpoint flush from the commit path). Three non-vacuous, bug-injection-
-// proven guards:
+// These tests cover the asynchronous checkpoint runner. A stalled image flush
+// must not block a committing write; Close must drain in-flight and pending
+// checkpoints; and tests must wait for that drain before counting WAL anchors.
 //
-//	T-A1 the decouple guard: a parked image flush must NOT block PutLocals.
-//	T-A2 the Close-drain guard (I5): Close must wait for an in-flight checkpoint.
-//	T-A3 the test-synchrony guard: the drain is load-bearing for the WAL-anchor
-// count (without it the async runner reads short).
-//
-// Every guard carries a NEGATIVE CONTROL / bug-injection so it is falsifiable,
-// not a tautology. The park point is the TEST-ONLY LocalFS upload hook
-// (SetUploadHookForTest) — the image/index write the register names as the
-// stall (the WAL syncHook parks only the 0x05 anchor, NOT the image, so it is
-// NOT a substitute).
+// SetUploadHookForTest parks the image or index upload. The WAL sync hook is
+// not interchangeable here because it stalls the 0x05 anchor rather than the
+// image write. Inline scheduling and an early WAL close provide negative
+// controls for the asynchronous and drain behavior.
 
 import (
 	"context"
@@ -29,23 +23,22 @@ import (
 	"time"
 )
 
-// TestDecoupleCommitNotBlockedByFlush is the decouple guard.
-// With the image/index upload PARKED (a slow/blocked flush), the committing
-// PutLocal must still return — the checkpoint is a replay-length optimization
-// with no business on the durability-ACK path. NEGATIVE CONTROL: with the
-// decouple reverted (debugInlineCheckpoint = the pre-inline shape), the
-// SAME parked flush DOES block PutLocal — so the guard provably detects the
-// coupling it exists to remove.
+// TestDecoupleCommitNotBlockedByFlush parks an image or index upload and checks
+// that PutLocal returns while the upload remains stalled. Checkpoints bound
+// replay work but are not part of the mutation's durability acknowledgement.
+// The inline negative control must block under the same conditions, showing
+// that the asynchronous runner is responsible for the result.
 func TestDecoupleCommitNotBlockedByFlush(t *testing.T) {
-	// run parks the FIRST image/index upload and reports whether a PutLocal
-	// returns while the park is held. inline selects the pre-decouple shape.
+	// run parks the first image or index upload and reports whether PutLocal
+	// returns before the upload is released. inline selects synchronous
+	// scheduling.
 	run := func(t *testing.T, inline bool) (returnedWhileParked bool) {
-		walPath := filepath.Join(t.TempDir(), "ta1.wal")
+		walPath := filepath.Join(t.TempDir(), "decouple.wal")
 		lfs := newSnapshotStore(t)
 		live := newLiveBridge(t, walPath, 1) // K=1: one Put designates a checkpoint
 		live.SetSnapshotter(lfs, true)       // recovery image + Arrow index (the flush)
 		if inline {
-			live.debugInlineCheckpoint.Store(true) // NEGATIVE CONTROL: revert the decouple
+			live.debugInlineCheckpoint.Store(true) // negative control: schedule the checkpoint inline
 		}
 
 		parked := make(chan struct{})        // closed to release the park
@@ -65,13 +58,13 @@ func TestDecoupleCommitNotBlockedByFlush(t *testing.T) {
 			close(putReturned)
 		}()
 
-		// Wait until the checkpoint's flush is actually PARKED (in flight).
+		// Wait until the checkpoint's upload is in flight before observing
+		// PutLocal.
 		select {
 		case <-uploadStarted:
 		case <-time.After(10 * time.Second):
 			t.Fatalf("inline=%v: checkpoint flush never reached the upload", inline)
 		}
-		// The flush is now parked. Does the commit return without waiting for it?
 		select {
 		case <-putReturned:
 			returnedWhileParked = true
@@ -83,21 +76,21 @@ func TestDecoupleCommitNotBlockedByFlush(t *testing.T) {
 
 	t.Run("Decoupled", func(t *testing.T) {
 		if !run(t, false) {
-			t.Fatal("DECOUPLE ABSENT: PutLocal blocked behind the parked checkpoint flush — the commit path is still coupled to the flush ")
+			t.Fatal("PutLocal blocked behind the parked checkpoint flush; asynchronous scheduling must keep it off the commit path")
 		}
 	})
 	t.Run("InlineNegativeControl", func(t *testing.T) {
 		if run(t, true) {
-			t.Fatal("NEGATIVE CONTROL BROKEN: with the decouple reverted (inline), PutLocal returned despite the parked flush — the guard cannot detect the coupling")
+			t.Fatal("inline negative control: PutLocal returned despite the parked flush, so the test did not exercise the coupling")
 		}
 	})
 }
 
-// TestDecoupleFlushCompletesAndIsDurable proves the decoupled
-// checkpoint still COMPLETES and is DURABLE after the park is released — the
-// decouple defers the flush, it does not drop it.
+// TestDecoupleFlushCompletesAndIsDurable releases a parked upload and requires
+// the checkpoint runner to finish both its WAL anchor and recovery image.
+// Asynchronous scheduling defers the flush without dropping it.
 func TestDecoupleFlushCompletesAndIsDurable(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "ta1b.wal")
+	walPath := filepath.Join(t.TempDir(), "decouple-durable.wal")
 	lfs := newSnapshotStore(t)
 	live := newLiveBridge(t, walPath, 1)
 	live.SetSnapshotter(lfs, true)
@@ -117,7 +110,7 @@ func TestDecoupleFlushCompletesAndIsDurable(t *testing.T) {
 	close(parked)   // release it
 	live.waitCheckpointsIdle()
 
-	// The anchor landed AND the image was written (the flush completed).
+	// The anchor landed and the image was written (the flush completed).
 	if got := countCheckpoints(t, walPath); got != 1 {
 		t.Fatalf("anchor count = %d, want 1 (the decoupled checkpoint must still append its 0x05 anchor)", got)
 	}
@@ -127,36 +120,23 @@ func TestDecoupleFlushCompletesAndIsDurable(t *testing.T) {
 		t.Fatalf("SnapshotExists: %v", err)
 	}
 	if !exists {
-		t.Fatalf("recovery image missing at ckpt/%d — the decoupled flush did NOT complete after the park released", wm)
+		t.Fatalf("recovery image missing at ckpt/%d — the decoupled flush did not complete after the park released", wm)
 	}
 }
 
-// TestCloseDrainsCheckpointRunner is the I5 Close-drain guard (the
-// lesson). With a checkpoint parked MID-FLUSH and a second PENDING, Close
-// must NOT tear down the WAL/engine until both have drained.
+// TestCloseDrainsCheckpointRunner parks one checkpoint with another pending,
+// then calls Close. Close must wait for both and leave two WAL anchors before
+// closing the WAL and engine. Waiting also prevents checkpoint access to closed
+// resources.
 //
-// NON-VACUOUS: the load-bearing assertion is the post-Close anchor count == 2.
-// The PENDING checkpoint (checkpoint 2) only gets its anchor on disk if the
-// drain runs it to completion BEFORE Bridge.Close closes the WAL — without the
-// drain, wal.Close() lands while checkpoint 2 is still pending and its anchor is
-// LOST (count == 1). The "Close does not return while parked" check is a
-// secondary observation (the engine Quiesce independently blocks on the
-// parked checkpoint's EBR pin); the COUNT is what isolates the drain.
-//
-// BUG-INJECT (the hazard the drain guards against), demonstrated SAFELY:
-// ClosedWalLosesPendingCheckpoint closes the WAL while a checkpoint is still
-// pending and shows its anchor is lost. The engine is left OPEN there so the
-// pending checkpoint's walk cannot UAF — the drain's unique, isolable value is
-// the WAL-close ORDERING, and that is what the bug-inject strips. (Removing the
-// drain AND closing the engine under a live checkpoint is the raw UAF: it
-// faults the whole test binary with `fatal error: fault`, so it is verified in
-// development — flip a skip-drain — not shipped as an always-on crash.)
+// ClosedWalLosesPendingCheckpoint is the negative control: it closes the WAL
+// early but leaves the engine open, isolating anchor loss from memory safety.
+// Only the first anchor survives in that run.
 func TestCloseDrainsCheckpointRunner(t *testing.T) {
-	// setup wires a snapshotter-backed bridge at K=1 and drives TWO checkpoints:
-	// the first parks mid-flush (its 0x05 anchor is already on disk), the second
-	// is PENDING behind the busy runner.
+	// setup configures K=1 and drives two checkpoints. The first parks after its
+	// 0x05 anchor is durable; the second remains pending behind the runner.
 	setup := func(t *testing.T) (live *Bridge, walPath string, parked chan struct{}) {
-		walPath = filepath.Join(t.TempDir(), "ta2.wal")
+		walPath = filepath.Join(t.TempDir(), "close-drain.wal")
 		lfs := newSnapshotStore(t)
 		live = newLiveBridge(t, walPath, 1)
 		live.SetSnapshotter(lfs, true)
@@ -184,7 +164,7 @@ func TestCloseDrainsCheckpointRunner(t *testing.T) {
 		// While checkpoint 1 is parked, Close must not have torn down yet.
 		select {
 		case <-closeReturned:
-			t.Fatal("Close returned while a checkpoint was in flight — the I5 drain is broken (the UAF class)")
+			t.Fatal("Close returned while a checkpoint was in flight; it must drain before releasing resources")
 		case <-time.After(500 * time.Millisecond):
 		}
 		close(parked) // release checkpoint 1
@@ -193,42 +173,36 @@ func TestCloseDrainsCheckpointRunner(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("Close did not return after the checkpoint was released")
 		}
-		// NON-VACUOUS: BOTH anchors durable — the drain ran the in-flight AND the
-		// pending checkpoint to completion BEFORE closing the WAL.
+		// Both anchors must be durable before Close releases the WAL.
 		if got := countCheckpoints(t, walPath); got != 2 {
-			t.Fatalf("anchor count = %d, want 2 (the drain must run the in-flight AND the pending checkpoint before the WAL close)", got)
+			t.Fatalf("anchor count = %d, want 2 (the drain must run the in-flight and the pending checkpoint before the WAL close)", got)
 		}
 	})
 
 	t.Run("ClosedWalLosesPendingCheckpoint", func(t *testing.T) {
 		live, walPath, parked := setup(t)
-		// THE HAZARD the drain guards against: close the WAL while checkpoint 2
-		// is still PENDING. The engine stays OPEN, so checkpoint 2's walk is safe;
-		// only the WAL-close ORDERING is stripped — exactly what the drain orders.
+		// Close the WAL while checkpoint 2 is pending but leave the engine open,
+		// isolating the lost anchor from checkpoint access to freed engine memory.
 		if err := live.WAL().Close(); err != nil {
 			t.Fatalf("WAL close: %v", err)
 		}
-		close(parked)              // checkpoint 1 finishes (its anchor was already durable)
-		live.waitCheckpointsIdle() // checkpoint 2 runs: walks the open engine, anchor hits the CLOSED WAL
+		close(parked)              // checkpoint 1 finishes; its anchor is already durable
+		live.waitCheckpointsIdle() // checkpoint 2 walks the open engine and appends to the closed WAL
 		if got := live.CheckpointErrors(); got < 1 {
-			t.Fatalf("BUG-INJECT VACUOUS: a checkpoint pending across a WAL close did NOT error (CheckpointErrors=%d) — the hazard is not observable", got)
+			t.Fatalf("checkpoint pending across WAL close did not report an error; CheckpointErrors=%d", got)
 		}
 		if got := countCheckpoints(t, walPath); got != 1 {
-			t.Fatalf("anchor count after early WAL close = %d, want 1 (checkpoint 2's anchor lost — the I5 drain prevents this by draining BEFORE the WAL close)", got)
+			t.Fatalf("anchor count after early WAL close=%d, want 1 because the pending checkpoint's anchor is lost", got)
 		}
 	})
 }
 
-// TestAsyncCheckpointRequiresDrain is the test-synchrony guard ().
-// It proves the drain is LOAD-BEARING for the WAL-anchor count, deterministically
-// (no timing race): park checkpoint 1 mid-flush so checkpoint 2 stays PENDING
-// behind the busy runner. Reading the WAL WITHOUT draining then yields a SHORT
-// count (1, not 2) — exactly the false RED T17/T7 would hit under the decouple.
-// After waitCheckpointsIdle the count is exact (2). The pre-drain short count is
-// an artifact of ASYNC completion, not an exact-count break — which is precisely
-// why T17/T7/T16 now drain before asserting.
+// TestAsyncCheckpointRequiresDrain parks the first checkpoint with the second
+// pending. The WAL contains one anchor before waitCheckpointsIdle and two after
+// it, deterministically showing why asynchronous checkpoint tests must drain
+// before counting.
 func TestAsyncCheckpointRequiresDrain(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "ta3.wal")
+	walPath := filepath.Join(t.TempDir(), "async-drain.wal")
 	lfs := newSnapshotStore(t)
 	live := newLiveBridge(t, walPath, 1)
 	live.SetSnapshotter(lfs, true)
@@ -241,25 +215,23 @@ func TestAsyncCheckpointRequiresDrain(t *testing.T) {
 		<-parked
 	})
 
-	// Two crossings → two checkpoints. Checkpoint 1 parks mid-flush (its 0x05
-	// anchor is already fsync'd, bridge.go:461 precedes the image); checkpoint 2
-	// is pending behind the busy runner.
+	// Checkpoint 1 parks after its 0x05 anchor is durable; checkpoint 2 remains
+	// pending behind the busy runner.
 	for i := 1; i <= 2; i++ {
 		if _, err := live.PutLocal(utf8EntityID(i), stagedPayload(i), stagedEntry(i)); err != nil {
 			t.Fatalf("PutLocal %d: %v", i, err)
 		}
 	}
-	<-uploadStarted // checkpoint 1 parked; checkpoint 2 has NOT run
+	<-uploadStarted
 
-	// WITHOUT the drain: a SHORT count — the async runner has not appended
-	// checkpoint 2's anchor. Deterministic (the park holds checkpoint 2 back).
+	// The second anchor cannot arrive until the first upload is released.
 	if got := countCheckpoints(t, walPath); got != 1 {
-		t.Fatalf("pre-drain anchor count = %d, want 1 (checkpoint 2 pending behind the parked checkpoint 1 — async completion made observable)", got)
+		t.Fatalf("pre-drain anchor count=%d, want 1 with checkpoint 2 pending", got)
 	}
 
 	close(parked)
-	live.waitCheckpointsIdle() // the drain: observe completion before counting
+	live.waitCheckpointsIdle()
 	if got := countCheckpoints(t, walPath); got != 2 {
-		t.Fatalf("post-drain anchor count = %d, want 2 (the drain makes async completion observable before the count)", got)
+		t.Fatalf("post-drain anchor count=%d, want 2 after both checkpoints complete", got)
 	}
 }

@@ -110,7 +110,7 @@ func TestSubmitAndCollect_MockConsumer(t *testing.T) {
 				// tight spin for test
 			}
 
-			// Simulate READY → PROCESSING → DONE (matching C++ state machine).
+			// Simulate the state transitions: ready → processing → done (matching the C++ state machine).
 			atomic.StoreUint32(&slot.State, SlotProcessing)
 
 			// Simulate H3 computation.

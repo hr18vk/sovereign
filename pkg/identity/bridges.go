@@ -6,15 +6,14 @@
 
 package identity
 
-// Bridge pins for the ML-DSA fallback and the Cedar bench.
+// Bridge pins for ML-DSA fallback and Cedar benchmarking.
 //
 // These blank imports ensure go.sum contains pinned hash lines for each
-// module per the specification's dependency-pinning gate. The actual
-// symbol calls land in their respective changes (out of scope here).
-// go mod tidy records hashes for all imported modules regardless
-// of whether their symbols are exercised, so a blank import is the
-// mechanical way to keep the pin without polluting the default build
-// with unused symbols.
+// module. The actual symbol calls land in their respective work. go mod
+// tidy records hashes for all imported modules regardless of whether
+// their symbols are exercised, so a blank import is the mechanical way
+// to keep the pin without polluting the default build with unused
+// symbols.
 //
 // filippo.io/mldsa exposes ML-DSA-44/65/87 (FIPS 204) via
 // mldsa.MLDSA44/65/87, mldsa.GenerateKey, mldsa.Verify,

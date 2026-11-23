@@ -6,75 +6,28 @@
 
 package identity
 
-// ADR-0037: the hybrid (Ed25519 + ML-DSA-65) SIGN complement to
-// VerifyCRDTFrame_Hybrid (ADR-0036). This change wired the VERIFY half of
-// the PQ moat — the both-required gate — but disclosed an honest NOT-YET: under
-// --hybrid-verify EVERY v1 frame is REJECTED today, because the v1 wire
-// (pkg/attribution/wire_v1.go MarshalBatchEnvelope) carries ONE 64-byte Ed25519
-// originSig and the Directory (directory.go) carries ONLY ed25519.PublicKey. A
-// hybrid-verify that never accepts a real frame is a DEFENSE without a USE.
-// This change closes the SIGN half: SignCRDTFrame_Hybrid signs the SAME batch wire
-// under BOTH Ed25519 + ML-DSA-65, producing the two sigs a hybrid frame carries
-// on the wire; VerifyBatchHybrid is the receiver-side counterpart that pads the
-// batch wire to the 120-byte hybrid frame size and feeds the single msg to the
-// UNCHANGED VerifyCRDTFrame_Hybrid gate (the both-required contract).
+// Package identity provides the hybrid (Ed25519 + ML-DSA-65) signing API
+// complementing VerifyCRDTFrame_Hybrid (ADR-0036, ADR-0037). Because
+// VerifyCRDTFrame_Hybrid expects a 120-byte payload while CRDT-delta batch
+// wires have variable length, HashBatchWireToFrame120 hashes batchWire to a
+// deterministic 120-byte SHAKE256 pad so both signatures cover identical bytes
+// while the receiver applies the verbatim batchWire.
 //
-// THE PAD (the load-bearing integrity binding).
+// Why SHAKE256: SHA-512 outputs 64 bytes rather than 120 bytes, whereas
+// SHAKE256 (golang.org/x/crypto/sha3) is a NIST FIPS 202 XOF that outputs
+// 120 bytes directly.
 //
-// VerifyCRDTFrame_Hybrid (hybrid_verify.go:82) takes ONE msg, verifies the
-// Ed25519 sig over that msg, and HARD-REJECTS if len(msg) != hybridFrameSize
-// (120). The CRDT-delta batch wire is arbitrarily long (hundreds+ bytes), so
-// it CANNOT be the single msg directly. The naive "Ed25519 signs the raw wire,
-// ML-DSA-65 signs a 120B pad" (two-sign-input asymmetry) is NON-FUNCTIONAL: a
-// gate that takes one 120-byte msg cannot verify an Ed25519 sig computed over
-// a different-length raw wire. The ADR-0037 §3 draft named SHA-512
-// (batchWire)[:120] as the pad — REFUTED: SHA-512 produces 64 bytes, NOT >=120.
-// The byte-faithful design: BOTH sigs cover the SAME 120-byte pad of the batch
-// wire, so the single msg the gate verifies is the SAME 120 bytes both sigs
-// signed (the symmetric contract the design named — "the batch wire is the
-// SIGNED payload for BOTH" — realized through the pad).
+// Contract:
+//   - SignCRDTFrame_Hybrid(edSeed, pqSk, batchWire, ctx) -> edSig [64], pqSig [3309]
+//     Both randomized-nonce Ed25519 (SignCRDTFrame) and ML-DSA-65
+//     (SignCRDTFrame_PostQuantum) sign the 120-byte pad.
+//   - VerifyBatchHybrid(edPub, pqPub, batchWire, edSig, pqSig, ctx) -> bool
+//     Recomputes the pad and checks both signatures via VerifyCRDTFrame_Hybrid.
 //
-// The pad is SHAKE256(batchWire)[:120] — a FIPS 202 extendable-output function
-// (XOF) paired with the FIPS 204 ML-DSA-65 signature layer (both NIST PQ
-// standards; the XOF reaches >=120 bytes, which SHA-512 cannot). SHAKE256 is
-// golang.org/x/crypto/sha3 at v0.53.0 — ALREADY an indirect dependency in
-// go.sum (the transport layer pulls it), available in the module cache, NO new
-// dependency added (grep-verified in go.sum). The pad is
-// DETERMINISTIC (a pure function of batchWire) — the sign and the verify
-// compute the IDENTICAL 120 bytes, so there is NO sign-vs-verify divergence
-// (the integrity binding; an ad-hoc or randomized pad would diverge and the
-// gate would reject a valid frame — the sign-vs-verify divergence the
-// asymmetric draft would have introduced).
-//
-// THE CONTRACT (symmetric):
-// - SignCRDTFrame_Hybrid(edSeed, pqSk, batchWire, ctx) ->
-// edSig [64], pqSig [3309]
-// Ed25519 signs pad(batchWire) (via the hedged SignCRDTFrame — eddsa_hedge.go:90,
-// which is hash-then-sign internally; the pad IS the msg it hashes).
-// ML-DSA-65 signs the [120]byte pad (SignCRDTFrame_PostQuantum — pq_mldsa.go:100,
-// which takes a [120]byte frame). BOTH sigs over the SAME 120-byte pad.
-// - VerifyBatchHybrid(edPub, pqPub, batchWire, edSig, pqSig, ctx) ->
-// bool (edOK && pqOK) via VerifyCRDTFrame_Hybrid(edPub, pqPub, pad, edSig, pqSig, ctx).
-// The receiver recomputes the SAME pad from the batch wire + feeds it to
-// the UNCHANGED gate. The 6 hybrid-verify guards (which pass a
-// 120-byte frame directly — for them the frame IS the pad) stay
-// byte-identical; VerifyBatchHybrid is a NEW sibling, NOT an edit to the
-// existing gate (the add-not-replace discipline).
-//
-// FRAME-SIZE ECONOMICS (the honest number, recorded not predicted). The pad
-// collapses the arbitrarily-long batch wire to a FIXED 120-byte signed payload,
-// so BOTH sigs cover 120 bytes (the same size the PQ benchmark's frame factory
-// mints + the guards sign). The wire cost of the hybrid frame is the
-// header + the [64] Ed25519 sig + the [3309] ML-DSA-65 sig + the batchWire
-// (carried verbatim for ApplyCRDTDeltaBatch — the pad is for SIGNING only; the
-// receiver applies the ORIGINAL wire, NOT the pad, so Join sees the real
-// bytes). The 3309B ML-DSA-65 sig is 51.7x the 64B Ed25519 sig (the recorded
-// size figure). The Sign 585,837 ns/op (4-core) is the recorded ML-DSA-65 sign
-// benchmark figure — NOT re-recorded on the hybrid path. There is no dedicated
-// sign-cost guard on this path; the 585,837 number is the honest recorded bench
-// figure, not a fresh measurement, and it is a loopback 4-core figure, not
-// silicon. The VERIFY cost (73,662 ns/op ~73.7us) is a SEPARATE, smaller number
-// — do NOT conflate the two (the sign is ~585us, the verify is ~73.7us).
+// Wire cost: 3,309 bytes per ML-DSA-65 signature (51.7x the 64-byte Ed25519
+// signature) plus the 64-byte Ed25519 signature and verbatim batchWire. In
+// pkg/pqecobench (GOMAXPROCS=4, 120 B payload), ML-DSA-65 signing measures
+// ~585.8 us/op and verification measures ~73.7 us/op.
 
 import (
 	"errors"
@@ -87,41 +40,25 @@ import (
 
 // ErrHybridSignBadSeed is returned by SignCRDTFrame_Hybrid when the Ed25519
 // seed is not 32 bytes (ed25519.SeedSize). It mirrors SignCRDTFrame's seed
-// guard (eddsa_hedge.go:91) — a short/long seed cannot derive a valid Ed25519
-// keypair and MUST NOT silently truncate.
+// guard — a short or long seed cannot derive a valid Ed25519 keypair and
+// must not silently truncate.
 var ErrHybridSignBadSeed = errors.New("identity: hybrid sign Ed25519 seed is not 32 bytes")
 
 // ErrHybridSignNilPQSk is returned when the ML-DSA-65 private key is nil. The
-// hybrid contract is BOTH sigs; a nil PQ signer cannot produce the PQ half.
+// hybrid contract requires both signatures; a nil PQ signer cannot produce
+// the PQ half.
 var ErrHybridSignNilPQSk = errors.New("identity: hybrid sign ML-DSA-65 private key is nil")
 
 // ErrHybridSignNilBatchWire is returned when batchWire is empty. The pad of an
-// empty wire is a constant; signing a constant is a no-op signature that covers
-// no state — rejected pre-sign (the unsigned-batch guard, sibling to
-// envelope.go's zero-originSig rule + wire_v1.go's ErrBatchUnsigned).
+// empty wire is a constant; signing a constant is a no-op signature that
+// covers no state — rejected pre-sign (the unsigned-batch negative-control
+// test, sibling to envelope.go's zero-originSig rule and wire_v1.go's
+// ErrBatchUnsigned).
 var ErrHybridSignNilBatchWire = errors.New("identity: hybrid sign batch wire is empty")
 
-// HashBatchWireToFrame120 is the DETERMINISTIC 120-byte pad of a CRDT-delta
-// batch wire — the single msg BOTH the Ed25519 + ML-DSA-65 signatures cover in
-// the hybrid sign/verify contract. It is
-// SHAKE256(batchWire)[:120] (a FIPS 202 XOF; the 120-byte output is the ADR-10
-// CRDTEntry shape the ML-DSA-65 seam signs — hybridFrameSize in hybrid_verify.go).
-//
-// The pad is the INTEGRITY binding: the sign and the verify compute the IDENTICAL
-// 120 bytes from the SAME batch wire, so the single msg the
-// VerifyCRDTFrame_Hybrid gate verifies is the SAME 120 bytes both sigs signed.
-// An empty batchWire is rejected by the caller (SignCRDTFrame_Hybrid returns
-// ErrHybridSignNilBatchWire); the pad of an empty wire is never computed.
-//
-// SHAKE256 is golang.org/x/crypto/sha3 (v0.53.0 — already an indirect dep in
-// go.sum, grep-verified; NO new dependency). The XOF reaches >=120 bytes (SHA-512
-// cannot — it produces 64B), which is why SHAKE256 — NOT SHA-512 — is the pad
-// (the ADR-0037 draft named SHA-512; refuted by the 64B output cap).
-//
-// The function is exported so the receiver (pkg/receive/receiver.go) computes
-// the SAME pad a hybrid frame's verifier re-derives, single-sourced here (NOT
-// re-implemented in two files: a re-derived pad that drifts from the signer's
-// pad is a sign-vs-verify divergence the gate would reject).
+// HashBatchWireToFrame120 returns the deterministic 120-byte SHAKE256 digest of
+// batchWire signed and verified by SignCRDTFrame_Hybrid and VerifyBatchHybrid
+// (ADR-0037). Using a single shared helper keeps signer and verifier aligned.
 func HashBatchWireToFrame120(batchWire []byte) [hybridFrameSize]byte {
 	s := sha3.NewShake256()
 	s.Write(batchWire)
@@ -130,37 +67,15 @@ func HashBatchWireToFrame120(batchWire []byte) [hybridFrameSize]byte {
 	return pad
 }
 
-// SignCRDTFrame_Hybrid signs a CRDT-delta batch wire under BOTH the hedged
-// Ed25519 signature AND the ML-DSA-65 signature — the SIGN complement to
-// VerifyCRDTFrame_Hybrid (ADR-0037, the load-bearing deliverable).
-// It returns the 64-byte Ed25519 sig + the 3309-byte ML-DSA-65 sig; BOTH cover
-// the SAME 120-byte SHAKE256 pad of batchWire (the symmetric contract). The
-// hybrid frame carries BOTH sigs + the [16] originNodeID + the
-// batchWire (verbatim, for the receiver's ApplyCRDTDeltaBatch).
+// SignCRDTFrame_Hybrid signs a CRDT-delta batch wire under both
+// randomized-nonce Ed25519 and ML-DSA-65 (ADR-0037), returning the 64-byte
+// Ed25519 signature and 3309-byte ML-DSA-65 signature over the 120-byte
+// SHAKE256 pad of batchWire.
 //
-// - edSeed — the origin's 32-byte Ed25519 seed (the SAME seed SignCRDTFrame
-// takes; the hedged sign derives the keypair from it).
-// - pqSk — the origin's ML-DSA-65 private key (the SAME key
-// SignCRDTFrame_PostQuantum takes; nil -> ErrHybridSignNilPQSk).
-// - batchWire — the marshaled CRDTDeltaBatch wire BOTH sigs cover (via the
-// 120-byte pad); empty -> ErrHybridSignNilBatchWire.
-// - ctx — the FIPS 204 context string for the ML-DSA-65 sign (domain
-// separation; the Ed25519 hedge ignores ctx — it is hash-then-sign over
-// the pad, NOT ctx-bound — the SAME asymmetry the verify documents
-// at hybrid_verify.go:72-74, preserved by construction).
-//
-// The Ed25519 sign is the EXISTING hedged SignCRDTFrame (eddsa_hedge.go:90) over
-// the pad — the randomized-nonce construction that verifies under the UNCHANGED
-// circl VerifyCRDTFrame. The ML-DSA-65 sign is the EXISTING
-// SignCRDTFrame_PostQuantum (pq_mldsa.go:100) over the [120]byte pad. NEITHER
-// sign seam is edited (the add-not-replace discipline); this
-// function COMPOSES them over the shared pad.
-//
-// The returned pqSig is EXACTLY mldsa.MLDSA65SignatureSize (3309) bytes —
-// asserted by SignCRDTFrame_PostQuantum's size invariant (pq_mldsa.go:112). The
-// returned edSig is EXACTLY ed25519.SignatureSize (64) bytes — asserted by
-// SignCRDTFrame's encoding (eddsa_hedge.go:166). The caller (the mesh
-// MarshalHybridFrame) copies both into the fixed [64]/[3309] frame slots.
+//   - edSeed    — 32-byte Ed25519 seed passed to SignCRDTFrame.
+//   - pqSk      — ML-DSA-65 private key passed to SignCRDTFrame_PostQuantum.
+//   - batchWire — marshaled CRDTDeltaBatch wire (must be non-empty).
+//   - ctx       — FIPS 204 context string for ML-DSA-65 (ignored by Ed25519).
 func SignCRDTFrame_Hybrid(edSeed []byte, pqSk *mldsa.PrivateKey, batchWire []byte, ctx string) (edSig [ed25519.SignatureSize]byte, pqSig [mldsa.MLDSA65SignatureSize]byte, err error) {
 	if len(edSeed) != ed25519.SeedSize {
 		return edSig, pqSig, ErrHybridSignBadSeed
@@ -171,20 +86,16 @@ func SignCRDTFrame_Hybrid(edSeed []byte, pqSk *mldsa.PrivateKey, batchWire []byt
 	if len(batchWire) == 0 {
 		return edSig, pqSig, ErrHybridSignNilBatchWire
 	}
-	// THE PAD — the single 120-byte payload BOTH sigs cover.
 	pad := HashBatchWireToFrame120(batchWire)
 
-	// (1) Ed25519 — the hedged sign over the pad (the pad IS the msg the hedge
-	// hashes-then-signs; circl Verify checks the same equation the hedge built).
+	// (1) Ed25519 randomized-nonce signature over the pad.
 	edSigSlice, serr := SignCRDTFrame(edSeed, pad[:])
 	if serr != nil {
 		return edSig, pqSig, fmt.Errorf("identity: hybrid sign Ed25519: %w", serr)
 	}
 	copy(edSig[:], edSigSlice)
 
-	// (2) ML-DSA-65 — the PQ sign over the [120]byte pad (the SAME pad the Ed25519
-	// half signed; the symmetric contract). SignCRDTFrame_PostQuantum asserts the
-	// 3309-byte size invariant.
+	// (2) ML-DSA-65 signature over the same [120]byte pad.
 	pqSigSlice, qerr := SignCRDTFrame_PostQuantum(pqSk, pad, ctx)
 	if qerr != nil {
 		return edSig, pqSig, fmt.Errorf("identity: hybrid sign ML-DSA-65: %w", qerr)
@@ -193,33 +104,12 @@ func SignCRDTFrame_Hybrid(edSeed []byte, pqSk *mldsa.PrivateKey, batchWire []byt
 	return edSig, pqSig, nil
 }
 
-// VerifyBatchHybrid verifies a hybrid-signed CRDT-delta batch wire under BOTH
-// the hedged Ed25519 signature AND the ML-DSA-65 signature — the receiver-side
-// counterpart to SignCRDTFrame_Hybrid. It recomputes the 120-byte SHAKE256 pad
-// of batchWire + feeds it to the UNCHANGED VerifyCRDTFrame_Hybrid gate
-// (the both-required contract; the SAME gate the 6 guards exercise). It
-// returns true IFF BOTH sigs verify over the SAME pad; EITHER failure returns
-// false (the frame is REJECTED).
-//
-// - edPub — the origin's Ed25519 public key (resolved via Directory.LookupBoth).
-// - pqPub — the origin's ML-DSA-65 public key (resolved via Directory.LookupBoth;
-// nil -> the gate's nil-pqPub reject fires — a hybrid verifier NEVER accepts
-// a frame with no PQ key, the STRICT mode).
-// - batchWire — the marshaled CRDTDeltaBatch wire the hybrid frame carries
-// (verbatim; the receiver applies the ORIGINAL wire via ApplyCRDTDeltaBatch,
-// NOT the pad — the pad is for SIGNING only).
-// - edSig — the 64-byte Ed25519 signature (the hybrid frame's [64] slot).
-// - pqSig — the 3309-byte ML-DSA-65 signature (the hybrid frame's [3309] slot).
-// - ctx — the FIPS 204 context string (the SAME ctx the sign used).
-//
-// This is a NEW sibling to VerifyCRDTFrame_Hybrid (NOT an edit) — the 6
-// guards pass a 120-byte frame directly (for them the frame IS the pad) + call
-// VerifyCRDTFrame_Hybrid; the production hybrid-BATCH path carries a long
-// batchWire + calls VerifyBatchHybrid, which pads internally. Both paths share
-// the SAME underlying both-required gate (single-sourced in hybrid_verify.go).
+// VerifyBatchHybrid verifies a hybrid-signed CRDT-delta batch wire under both
+// randomized-nonce Ed25519 and ML-DSA-65 by hashing batchWire to its 120-byte
+// SHAKE256 pad and delegating to VerifyCRDTFrame_Hybrid.
 func VerifyBatchHybrid(edPub ed25519.PublicKey, pqPub *mldsa.PublicKey, batchWire, edSig, pqSig []byte, ctx string) bool {
 	if len(batchWire) == 0 {
-		return false // an empty wire has no pad; a hybrid verifier rejects (the unsigned-batch guard).
+		return false // an empty wire has no pad; a hybrid verifier rejects (the unsigned-batch negative-control test).
 	}
 	pad := HashBatchWireToFrame120(batchWire)
 	return VerifyCRDTFrame_Hybrid(edPub, pqPub, pad[:], edSig, pqSig, ctx)

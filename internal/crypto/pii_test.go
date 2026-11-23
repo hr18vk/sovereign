@@ -14,7 +14,7 @@ import (
 
 // TestMaskPII_NoPII_ReturnsInputUnchanged verifies the zero-alloc equality fast
 // path: when the payload contains no 12-digit run, the returned string must be
-// byte-equal AND share the same data pointer as the input, so the MemTable
+// byte-equal and share the same data pointer as the input, so the MemTable
 // `maskedStr == payloadStr` reuse path fires.
 func TestMaskPII_NoPII_ReturnsInputUnchanged(t *testing.T) {
 	in := "User applied for service enrollment, no PII here."
@@ -59,7 +59,7 @@ func TestMaskPII_Deterministic(t *testing.T) {
 	a := MaskPII("x" + run + "y")
 	b := MaskPII("z" + run + "w")
 	// Extract the marker substring from each.
-	// Extract ONLY the marker substring: marker + "_" + 16 hex (no trailing suffix).
+	// Extract only the marker substring: marker + "_" + 16 hex (no trailing suffix).
 	extract := func(s string) string {
 		idx := strings.Index(s, redactionMarker)
 		end := idx + len(redactionMarker) + 1 + digestHexLen // "_" + 16 hex
@@ -106,7 +106,7 @@ func TestMaskPII_ShortPayloadNoAlloc(t *testing.T) {
 // BenchmarkMaskPII_NoPII measures the common hot path: scan a 1KB payload,
 // find no PII, return the input string unchanged. Must report 0 allocs.
 func BenchmarkMaskPII_NoPII(b *testing.B) {
-	// 1KB payload, no 12-digit run, mirroring the dossier's stated workload.
+	// 1KB payload, no 12-digit run — the common hot-path workload.
 	payload := strings.Repeat("User applied for welfare schemes today. ", 25)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
@@ -143,7 +143,7 @@ func BenchmarkMaskPII_KB_Parallel(b *testing.B) {
 // TestMaskPII_MemtableContract verifies the exact call pattern used by
 // internal/database/memtable.go (Override O2.5): build a string view of a
 // []byte payload via unsafe.String, mask it, and confirm the == reuse path
-// fires when no PII is present, with ZERO allocations on the no-PII path.
+// fires when no PII is present, with zero allocations on the no-PII path.
 // This replaces the jemalloc-dependent memtable integration test for the
 // crypto package's own verification.
 func TestMaskPII_MemtableContract(t *testing.T) {

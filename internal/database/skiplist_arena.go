@@ -19,30 +19,27 @@ const (
 	nodeSize      = 64 // bytes per node, cache-line aligned
 	offsetNil     = 0  // sentinel: no next node (offset 0 is the head node)
 	pValue        = 4  // 1/pValue probability of height increase
-	keySize       = 40 // Override 8.4: 16B hash + 8B system + 8B valid + 8B assertion
+	keySize       = 40 // 16B entity hash + 8B system + 8B valid + 8B assertion
 	nodeNextStart = 20 // byte offset where Next[] array begins in node
-	keyHashLen    = 16 // Override 8.4: 128-bit hash prefix (was 8)
+	keyHashLen    = 16 // 128-bit SHA-256 entity ID prefix
 )
 
-// Ensure architectural constants remain in the AST for future sprint consumption.
+// Retain package-level constants used by tests and external callers.
 var (
 	_ = offsetNil
 	_ = keyHashLen
 )
 
 // SkipListArena is a pointerless, array-backed concurrent SkipList.
-// All memory is off-heap (jemalloc). The Go GC sees zero pointers.
+// All memory is off-heap (jemalloc) so Go GC scans zero pointers.
 //
-// The arena layout:
+// Arena layout:
 //
 //	[0..nodeSize)             = head sentinel node
 //	[nodeSize..nodeSize*N)    = allocated nodes
-//	[...                      = key/value data region (grows from end)
+//	[...                      = key/value data region (grows downward from end)
 //
-// Override 7.1: sync.RWMutex REMOVED. The SkipList is now fully lock-free.
-// Concurrent inserts use CAS-based splicing on 32-bit arena offsets.
-// This matches the Sprint Directive mandate: "lock-free Compare-And-Swap (CAS)"
-// and the Research Document: "Concurrency: Lock-free CAS on offsets".
+// Concurrent inserts use lock-free CAS splicing on 32-bit arena offsets.
 type SkipListArena struct {
 	arena      []byte // jemalloc-backed contiguous buffer
 	allocator  *JemallocAllocator
@@ -104,28 +101,26 @@ func (sl *SkipListArena) nodeKeyLen(offset uint32) uint32 {
 	return binary.LittleEndian.Uint32(sl.arena[offset+12 : offset+16])
 }
 
-// nodeValLen reads the value length for the node (Override O2.1).
+// nodeValLen reads the value length for the node.
 func (sl *SkipListArena) nodeValLen(offset uint32) uint32 {
 	return binary.LittleEndian.Uint32(sl.arena[offset+16 : offset+20])
 }
 
-// nodeNext atomically reads the next-node offset at the given level.
-// Override 7.1: Uses atomic.LoadUint32 for safe lock-free concurrent reads.
+// nodeNext atomically reads the next-node offset at the given level for lock-free reads.
 func (sl *SkipListArena) nodeNext(offset uint32, level int) uint32 {
 	off := offset + uint32(nodeNextStart) + uint32(level)*4
 	return atomic.LoadUint32((*uint32)(unsafe.Pointer(&sl.arena[off])))
 }
 
 // setNodeNext stores the next-node offset at the given level.
-// ONLY safe during node initialization (before the node is visible to readers).
+// Safe only during node initialization (before the node is visible to readers).
 func (sl *SkipListArena) setNodeNext(offset uint32, level int, next uint32) {
 	off := offset + uint32(nodeNextStart) + uint32(level)*4
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&sl.arena[off])), next)
 }
 
 // casNodeNext atomically compares-and-swaps the next-node offset at the given level.
-// Override 7.1: This is the core lock-free primitive for concurrent splicing.
-// Returns true if the swap succeeded (old value matched `expected`).
+// Returns true if the swap succeeded (old value matched expected).
 func (sl *SkipListArena) casNodeNext(offset uint32, level int, expected, next uint32) bool {
 	off := offset + uint32(nodeNextStart) + uint32(level)*4
 	return atomic.CompareAndSwapUint32((*uint32)(unsafe.Pointer(&sl.arena[off])), expected, next)
@@ -144,9 +139,9 @@ func (sl *SkipListArena) nodeKey(offset uint32) []byte {
 	return sl.arena[keyOff : keyOff+keyLen]
 }
 
-// Override 5.4: SkipList Arena Wrap-Around Panic (CAS-bounded allocation)
+// allocNode reserves space for a node header (growing upward) and its key/value
+// data (growing downward) using CAS bounds checks to prevent wrap-around.
 func (sl *SkipListArena) allocNode(height uint32, keyLen, valLen uint32) (uint32, uint32, error) {
-	// Prevent uint32 wrap-around and allocate node space (grows upward).
 	var nodeOff uint32
 	for {
 		currTop := sl.nodeTop.Load()
@@ -182,7 +177,7 @@ func (sl *SkipListArena) allocNode(height uint32, keyLen, valLen uint32) (uint32
 	binary.LittleEndian.PutUint32(sl.arena[nodeOff+4:nodeOff+8], dataOff)
 	binary.LittleEndian.PutUint32(sl.arena[nodeOff+8:nodeOff+12], dataOff+keyLen)
 	binary.LittleEndian.PutUint32(sl.arena[nodeOff+12:nodeOff+16], keyLen)
-	binary.LittleEndian.PutUint32(sl.arena[nodeOff+16:nodeOff+20], valLen) // O2.1: store value length
+	binary.LittleEndian.PutUint32(sl.arena[nodeOff+16:nodeOff+20], valLen)
 
 	// Initialize next pointers to nil sentinel.
 	for i := 0; i < maxHeight; i++ {
@@ -197,15 +192,15 @@ func (sl *SkipListArena) allocNode(height uint32, keyLen, valLen uint32) (uint32
 }
 
 // Put inserts a key-value pair into the SkipList.
-// The key must be the 32-byte tri-temporal composite key.
-// The valFn writes the packed event data directly into the arena (Zero-GC).
+// The key must be the 40-byte tri-temporal composite key.
+// The valFn writes the packed event data directly into the arena (zero-GC).
 //
-// Override 7.1: TRUE LOCK-FREE implementation using CAS-based splicing.
-// No sync.Mutex or sync.RWMutex. Multiple goroutines can insert concurrently.
-// Algorithm: Find predecessors at each level, then splice using CAS.
-// If a CAS fails (concurrent insert modified a predecessor's next pointer),
-// re-search from the predecessor at that level and retry.
-// This is the same algorithm used by CockroachDB's arenaskl and Badger's skiplist.
+// Lock-free implementation using CAS-based splicing. No sync.Mutex or
+// sync.RWMutex; multiple goroutines can insert concurrently. Algorithm: find
+// predecessors at each level, then splice using CAS. If a CAS fails
+// (concurrent insert modified a predecessor's next pointer), re-search from
+// the predecessor at that level and retry. This is the same algorithm used
+// by CockroachDB's arenaskl and Badger's skiplist.
 func (sl *SkipListArena) Put(key []byte, valLen int, valFn func(buf []byte)) error {
 	height := randomHeight()
 
@@ -235,7 +230,7 @@ func (sl *SkipListArena) Put(key []byte, valLen int, valFn func(buf []byte)) err
 	var prev [maxHeight]uint32
 	var next [maxHeight]uint32
 
-	// : Find predecessors and successors at all levels.
+	// First phase: find predecessors and successors at all levels.
 	listHeight := int(sl.height.Load())
 	x := uint32(0) // start at head (offset 0)
 
@@ -261,7 +256,7 @@ func (sl *SkipListArena) Put(key []byte, valLen int, valFn func(buf []byte)) err
 		next[i] = sl.nodeNext(0, i)
 	}
 
-	// : CAS-splice at each level from bottom to top.
+	// Second phase: CAS-splice at each level from bottom to top.
 	// Bottom-up insertion ensures that level-0 is linked first,
 	// so iterators (which only traverse level 0) see the node atomically.
 	for i := 0; i < int(height); i++ {
@@ -296,68 +291,18 @@ func (sl *SkipListArena) Put(key []byte, valLen int, valFn func(buf []byte)) err
 	return nil
 }
 
-// Seek returns an iterator positioned at the LOWER-BOUND of target: the first
-// node whose composite key >= target. It is NOT a point lookup — the returned
-// node's key is >= target; if target > all keys the iterator is exhausted
-// (Valid()==false, current == the 0xFFFFFFFF end-of-list sentinel).
+// Seek returns an iterator positioned at the first node whose composite key
+// is >= target, or an exhausted iterator (Valid() == false, current ==
+// 0xFFFFFFFF) if target exceeds all keys.
 //
-// Seek IS the Put descent WITHOUT the splice (skiplist_arena.go Put:236-250):
-// top->bottom, advance while bytes.Compare(nextKey, target) < 0, break on >= OR
-// the 0xFFFFFFFF end-of-level sentinel. The descent visits the SAME nodes in
-// the SAME order as Put's search phase; the ONLY difference is Seek stores no
-// prev[i]/next[i] for i>0 (it needs just prev[0] — the level-0 predecessor of
-// the lower-bound). The returned iterator's current is nodeNext(prev[0], 0) =
-// the first node whose key >= target. If target <= the first key, prev[0] is
-// the head (x stayed 0) + current = nodeNext(0, 0) — the SAME node NewIterator
-// returns (byte-identity with the full-scan lower-bound).
-//
-// CONCURRENCY (Override 7.1): Seek is LOCK-FREE. It takes no mutex + no
-// allocator lock; it reads nodeNext via the SAME atomic.LoadUint32 path Put's
-// search uses. Put's search is correct under concurrent inserts ONLY because
-// its Phase-2 CAS-splice FAILS + re-searches when a predecessor's next moved
-// (skiplist_arena.go Put:273-287) — the CAS is the self-correction. A READ-ONLY
-// descent has no CAS to detect a moved predecessor, so the multi-level descent
-// can observe a transiently-inconsistent snapshot: the high-level predecessor
-// prev[0] may reach a level-0 successor whose key is < target at the read
-// moment (a concurrent Put's bottom-up splice linked a node between the
-// descent's high-level view + the level-0 read; the per-step key comparison
-// can read a transient over the still-settling level-0 chain). A NAIVE
-// `nodeNext(prev[0], 0)` can therefore return a node whose key is < target — a
-// LOWER-BOUND VIOLATION (the §0.c sentinel class fires when target > all keys:
-// the descent returns the last node instead of the sentinel). This was PROVEN
-// empirically (the concurrent-seek guard caught it before the fix: ~1-2% of seeks
-// returned a node < target under a 100k-key concurrent Put workload; the
-// level-0-only linear scan NEVER violated — only the multi-level descent did).
-//
-// THE FIX (honest, lock-free): after the descent, VERIFY the level-0 result —
-// current is accepted iff it is the sentinel OR nodeKey(current) >= target. If
-// the descent produced a stale node (key < target), Seek falls back to a FRESH
-// level-0 linear walk from head (seekLowerBoundLinear). The level-0 chain is
-// the STABLE total order — a node is linked at level 0 only after its
-// predecessor (bottom-up splice), so a level-0 walk from head never returns a
-// node < target (the keys are monotone along the chain; the first >= target is
-// the lower-bound, the sentinel if target > all). The fallback makes Seek's
-// RESULT a valid lower-bound under concurrency at the cost of an O(N) re-walk
-// on the rare transient (~1-2% of seeks under a heavy concurrent writer). On a
-// QUIESCENT skiplist — the production precondition (Seek's only consumer today
-// is l0_flusher.go:198 FlushArenaToIPC over a frozen arena; the intended Range
-// wiring reads frozen/durable data) — the descent is consistent, the fallback
-// NEVER fires, and Seek is O(maxHeight) (the §6.c capped-asymptotic).
-//
-// WINDOW LOWER-BOUND TARGET SHAPE: the skiplist does NOT know the schema; the
-// CALLER builds a 40-byte target [entityHash16 | sysTimeFloor8 | vLo8 | 0]
-// (the assertion field zeroed — the minimum — so the lower-bound is the FIRST
-// row of the entity at-or-after validTimeStart=vLo, any assertion, any sysTime
-// >= floor). Seek skips the rows before the window's low end in O(maxHeight)
-// (quiescent) rather than scanning them at O(N) (the gain this primitive exists
-// for).
-//
-// ALLOCATION: the descent reads nodeKey (a zero-copy slice header into the
-// arena — nodeKey returns arena[off:off+len], NOT a copy). Seek allocates the
-// ONE *SkipListIterator struct it returns (the NewIterator precedent — the
-// disclosed read-path residual, NOT the write-path zero-alloc gate); the
-// per-descent-step count is 0. A target built as a stack [keySize]byte + slice
-// header (the memtable.go:159 precedent) keeps the target off the heap.
+// Seek performs a lock-free top-down descent using atomic.LoadUint32 without
+// acquiring locks or mutating links. Under concurrent Put calls, multi-level
+// reads can transiently observe an upper-level predecessor whose level-0
+// successor is < target before bottom-up CAS splicing completes. Seek verifies
+// the landed node against target and falls back to seekLowerBoundLinear along
+// the stable level-0 chain if needed. On a quiescent arena, descent completes
+// in O(maxHeight) steps with one *SkipListIterator allocation and zero
+// per-step allocations.
 func (sl *SkipListArena) Seek(target []byte) *SkipListIterator {
 	listHeight := int(sl.height.Load())
 	x := uint32(0) // head (offset 0)
@@ -375,13 +320,13 @@ func (sl *SkipListArena) Seek(target []byte) *SkipListIterator {
 		// (Put stores prev[i]=x + next[i]=nodeNext(x,i) here; Seek needs only
 		// prev[0], captured by the level-0 read after the loop.)
 	}
-	// x is prev[0] — the level-0 predecessor of the lower-bound. nodeNext(x, 0)
-	// is the first node whose key >= target (the LOWER-BOUND), or 0xFFFFFFFF if
+	// x is prev[0] — the level-0 predecessor of the lower bound. nodeNext(x, 0)
+	// is the first node whose key >= target (the lower bound), or 0xFFFFFFFF if
 	// target > all keys (the sentinel Valid() checks).
 	cur := sl.nodeNext(x, 0)
-	// HONEST CONCURRENCY GUARD (see the doc above): a read-only multi-level
+	// Concurrency guard (see the doc above): a read-only multi-level
 	// descent has no CAS to self-correct a moved predecessor, so the result can
-	// transiently be a node whose key < target. Verify + fall back to the
+	// transiently be a node whose key < target. Verify and fall back to the
 	// level-0 linear walk (the stable total order) when that happens. The guard
 	// is a no-op on a quiescent skiplist (the production precondition).
 	if cur != 0xFFFFFFFF && bytes.Compare(sl.nodeKey(cur), target) < 0 {
@@ -390,11 +335,11 @@ func (sl *SkipListArena) Seek(target []byte) *SkipListIterator {
 	return &SkipListIterator{sl: sl, current: cur}
 }
 
-// seekLowerBoundLinear is the O(N) level-0-only lower-bound: a fresh walk from
+// seekLowerBoundLinear is the O(N) level-0-only lower bound: a fresh walk from
 // head returning the offset of the first node whose key >= target, or 0xFFFFFFFF
-// if target > all keys. The level-0 chain is the STABLE total order (a node is
+// if target > all keys. The level-0 chain is the stable total order (a node is
 // linked at level 0 only after its predecessor — the bottom-up splice), so this
-// walk is a valid lower-bound even under concurrent Puts (the multi-level
+// walk is a valid lower bound even under concurrent Puts (the multi-level
 // descent's transient inconsistency does not arise here — there is no upper
 // level to go stale). Seek's concurrency guard falls back to this on the rare
 // transient; on a quiescent skiplist it is never called.
@@ -411,7 +356,7 @@ func (sl *SkipListArena) seekLowerBoundLinear(target []byte) uint32 {
 
 // NewSeekIterator is a one-liner symmetry with NewIterator: the caller picks
 // "full scan" (NewIterator) vs "lower-bound scan" (NewSeekIterator(target)) by
-// constructor. Equivalent to `sl.Seek(target)`. A FRESH iterator is returned
+// constructor. Equivalent to `sl.Seek(target)`. A fresh iterator is returned
 // (the NewIterator precedent — construct once, iterate; no stateful re-position
 // on an existing iterator, which would add a re-init hazard).
 func (sl *SkipListArena) NewSeekIterator(target []byte) *SkipListIterator {
@@ -436,15 +381,14 @@ func (it *SkipListIterator) Valid() bool {
 }
 
 // Key returns the current node's key bytes.
-// Layout: [16B hash][8B sysTime][8B validTime][8B assertTime] = 40 bytes
-// (Override 8.4: the 128-bit hash prefix; was 8B/32B pre-Override).
+// Layout: [16B hash][8B sysTime][8B validTime][8B assertTime] = 40 bytes.
 func (it *SkipListIterator) Key() []byte {
 	return it.sl.nodeKey(it.current)
 }
 
-// Value returns the current node's raw value bytes (Override 4.1).
-// Layout: [2B entityIDLen][entityID string][8B H3Index][8B ValidTimeEnd][4B payloadLen][payload bytes].
-// The L0Flusher parses this binary layout directly — zero intermediate Go structs.
+// Value returns the current node's raw value bytes.
+// Layout: [2B entityIDLen][entityID string][8B H3Index][8B ValidTimeEnd][32B payloadDigest][4B payloadLen][payload bytes].
+// L0Flusher parses this binary layout directly without intermediate Go structs.
 func (it *SkipListIterator) Value() []byte {
 	if it.current == 0 || it.current == 0xFFFFFFFF {
 		return nil

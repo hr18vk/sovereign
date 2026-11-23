@@ -4,9 +4,8 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// raceEnabled is false in clean builds. The race-tagged companion file
-// race_enabled_test.go declares the true form, selected only under
-// `go test -race`. See race_enabled_test.go for the perturbation rationale.
+// raceEnabled selects the non-race latency assertion in the ingest test. The
+// race-tagged companion file selects the more permissive assertion instead.
 
 //go:build !race
 // +build !race

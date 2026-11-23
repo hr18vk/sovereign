@@ -6,43 +6,16 @@
 
 package telemetry
 
-// In-package guards (ADR-0026) for the OTel Init path: init() builds
-// QueryL0ListCapped exactly once (dedup 2 → 1), rebuildCounters() fills the
-// same construction (0 → 1), and telemetry.Init arms a real OTel SDK
-// MeterProvider at boot. The guards prove the landmines are closed at the
-// construction site AND the use site, and that the two-exporter separation is
-// intact. See ADR-0026.
+// These tests cover OpenTelemetry initialization and the QueryL0ListCapped
+// registry invariants (ADR-0026). init constructs the counter once,
+// rebuildCounters binds counters to the Meter supplied to Init, and the
+// counters remain usable afterward.
 //
-// - DedupInit: init() builds QueryL0ListCapped EXACTLY ONCE (a source-parse
-// guard counting the `QueryL0ListCapped = newCounter(m,` construction
-// sites — the dedup halves the init double from 2 → 1). The allCounters()
-// slice is unchanged, so the bridge keeps working without a bridge edit.
-//
-// - DedupFill (load-bearing): rebuildCounters via a real test Meter leaves
-// QueryL0ListCapped NON-nil. This proves the fill is load-bearing — run in
-// a fresh subprocess because Init's once-per-process guard makes a second
-// Init a rejected no-op in-process. Without the fill, an Init(realMeter)
-// call reassigns the var to the new Meter's counter and the omitted fill
-// would leave it nil. The guard drives the ACTUAL rebuildCounters via Init
-// and asserts the var is the new Meter's object (non-nil + connected to the
-// new Meter, asserted via Collect).
-//
-// - CountersDistinct (regression guard): Counters() STILL carries exactly the
-// distinct counters (the dedup did not leak a duplicate name into the
-// bridge feed).
-//
-// - OmissionFired (the headline guard): drives
-// telemetry.QueryL0ListCapped.Add(1) AFTER Init(testMeter); asserts the
-// counter ADVANCES (the use-site guard keeps counting). Run in a fresh
-// subprocess (the once-guard); the guard observes the LIVE counter
-// post-Init, not the init() object.
-//
-// - OtelExport (the arm-end guard): a real sdkmetric MeterProvider with a
-// ManualReader; a Counter.Inc is OBSERVED via Collect; the observed value
-// EQUALS the cumulative Counter.Value() (the double-count trap is disarmed
-// — the OTel callback reads DELTA via lastReported, the bridge reads
-// CUMULATIVE via Value(); the two DO NOT double-count at /metrics because
-// they export through DIFFERENT destinations). Run in a subprocess.
+// Init may run only once per process, so tests that need a real MeterProvider
+// reinvoke the test binary. The subprocesses check registration, counter
+// updates, and collection. They also verify that OpenTelemetry's delta stream
+// and the Prometheus bridge's cumulative reads remain independent: the OTel
+// callback advances lastReported, while the bridge reads Value.
 
 import (
 	"context"
@@ -59,19 +32,14 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 )
 
-// otelInitSubprocessMarker is the env var the Init-driving guards set when they
-// re-invoke the test binary as a subprocess so a dedicated entry function
-// drives Init ONCE in a fresh process (the once-per-process guard rejects a
-// second Init in-process — the subprocess-vs-singleton choice).
+// otelInitSubprocessMarker selects the subprocess entry point. Each mode gets
+// a fresh process because Init accepts only its first call.
 const otelInitSubprocessMarker = "SUPREMUM_OTEL_INIT_SUBPROC"
 
-// TestQueryL0ListCappedConstructedOnce asserts init() builds QueryL0ListCapped
-// EXACTLY ONCE (the dedup 2 → 1). A source-parse guard reads registry.go and
-// counts the `	QueryL0ListCapped = newCounter(m,` construction-site lines; the
-// count MUST be 1. This REFUSES a refactor that hides the construction behind
-// a helper (the count is at the construction site, not the indirect call). The
-// allCounters() slice survives with the distinct counters — the dedup did not
-// touch the slice (it reads the package var).
+// TestQueryL0ListCappedConstructedOnce checks that init constructs
+// QueryL0ListCapped once and rebuildCounters constructs it once. Counting the
+// construction sites makes duplicate registration visible even though
+// allCounters contains each package variable only once.
 func TestQueryL0ListCappedConstructedOnce(t *testing.T) {
 	repoRoot, err := filepath.Abs("../..")
 	if err != nil {
@@ -83,10 +51,8 @@ func TestQueryL0ListCappedConstructedOnce(t *testing.T) {
 		t.Fatalf("read registry.go: %v", rerr)
 	}
 	const constructionLine = "	QueryL0ListCapped = newCounter(m,"
-	// Count across the WHOLE file (init + rebuildCounters); the dedup guard
-	// ALSO checks init() specifically below. The whole-file count after the
-	// fill is 2 (one in init, one in rebuildCounters) — consistent with the 11
-	// siblings that ALSO appear in both sites. The init() count alone is 1.
+	// Both construction functions use the same package variable. init must
+	// contain one construction site, and the whole file must contain two.
 	wholeFileCount := strings.Count(string(data), constructionLine)
 	// Isolate the init() function body to assert the single-site dedup.
 	initCount := 0
@@ -104,32 +70,23 @@ func TestQueryL0ListCappedConstructedOnce(t *testing.T) {
 		t.Fatalf("func init() not found in registry.go")
 	}
 	if wholeFileCount != 2 {
-		t.Fatalf("dedup-init: whole-file construction count=%d, want 2 (one in init, one in rebuildCounters — the 11 siblings use the same shape); init() count=%d", wholeFileCount, initCount)
+		t.Fatalf("QueryL0ListCapped construction count=%d, want 2 (one in init and one in rebuildCounters); init count=%d", wholeFileCount, initCount)
 	}
 	if initCount != 1 {
-		t.Fatalf("dedup-init: init() QueryL0ListCapped construction count=%d, want 1 (the dedup 2 → 1); whole-file count=%d", initCount, wholeFileCount)
+		t.Fatalf("init QueryL0ListCapped construction count=%d, want 1; whole-file count=%d", initCount, wholeFileCount)
 	}
-	t.Logf("dedup-init PASS: init() builds QueryL0ListCapped exactly ONCE (count=%d); whole-file count=%d (init + rebuildCounters, consistent with the 11 siblings)", initCount, wholeFileCount)
+	t.Logf("init QueryL0ListCapped construction count=%d; whole-file count=%d", initCount, wholeFileCount)
 }
 
-// TestCountersDistinctAfterDedup asserts the dedup did NOT leak a duplicate
-// name into the bridge feed. Counters() carries exactly the DISTINCT counter
-// vars (the var-slice is the unwavering gate; the dedup is at the construction
-// SITE, not the slice), so the bridge keeps working without a bridge edit.
-//
-// The asserted distinct count grew across the ADR series as disclosure counters
-// were added (the T_gc auto-inference counters, the download-skip counters, and
-// later the mesh/PKI/PQ disclosures — each disclosed, not hidden). The scope of
-// this guard (the dedup-doesn't-leak invariant) is UNCHANGED; only the asserted
-// count shifted. A companion guard asserts the count + 0 dups + the bridge
-// enumeration of the new names WITHOUT a bridge edit (the slice auto-surface
-// property). This guard stays the dedup invariant (the construction-site
-// dedup); the increased count is the honest growth, NOT a regression.
+// TestCountersDistinctAfterDedup checks the registry cardinality and rejects
+// duplicate metric names. Counters enumerates package variables rather than
+// construction calls, so rebuilding the instruments must not add duplicate
+// series to the Prometheus bridge.
 func TestCountersDistinctAfterDedup(t *testing.T) {
 	cs := Counters()
-	const wantDistinct = 24 // distinct counters; grew across the ADR series as disclosure counters were added
+	const wantDistinct = 25
 	if len(cs) != wantDistinct {
-		t.Fatalf("distinct-counters: len(Counters())=%d, want %d (ADR-0036 grew 21->22 — PQHandshakeNegotiated — the PQ-KEM disclosure grew the counter; ADR-0035 grew 19->21 — TWO counters: CertRotationTriggered + CertRevokedRejected — the PKI leaf-rotation + revocation-reject disclosure grew the counter; the dedup is at the construction site, not the var-slice; the bridge feed must NOT lose a slot)", len(cs), wantDistinct)
+		t.Fatalf("len(Counters())=%d, want %d", len(cs), wantDistinct)
 	}
 	seen := map[string]int{}
 	for _, c := range cs {
@@ -143,29 +100,23 @@ func TestCountersDistinctAfterDedup(t *testing.T) {
 		}
 	}
 	if dups != 0 {
-		t.Fatalf("distinct-counters: %d duplicate names — the dedup leaked into the bridge feed (MustRegister would PANIC at boot)", dups)
+		t.Fatalf("Counters() contains %d duplicate names; Prometheus registration would fail", dups)
 	}
 	if len(seen) != wantDistinct {
-		t.Fatalf("distinct-counters: distinct names=%d, want %d", len(seen), wantDistinct)
+		t.Fatalf("distinct names=%d, want %d", len(seen), wantDistinct)
 	}
-	t.Logf("distinct-counters PASS: Counters() carries %d DISTINCT (grew 16->17), %d distinct names, %d dups — the bridge feed is unchanged (the manifest-skip counter auto-surfaced)", len(cs), len(seen), dups)
+	t.Logf("Counters() contains %d metrics and %d distinct names; duplicate names=%d", len(cs), len(seen), dups)
 }
 
-// TestDedupFill_Subproc drives a REAL telemetry.Init(testMeter) in a fresh
-// subprocess and asserts QueryL0ListCapped is NON-nil post-Init (the omission
-// landmine is closed). The subprocess re-invokes the test binary with a
-// sentinel entry function because Init's once-per-process guard makes a second
-// Init a rejected no-op in-process. Negative control: a stale tree where
-// rebuildCounters OMITTED the fill would leave QueryL0ListCapped nil post-Init
-// (the var the init() object was assigned to gets reassigned by
-// rebuildCounters; without the fill the new assignment is nil). The guard
-// PROVES the fill at the construction site is load-bearing.
+// TestDedupFill_Subproc initializes a real Meter in a fresh subprocess and
+// checks that rebuildCounters leaves QueryL0ListCapped non-nil. Without that
+// construction, the package variable would be nil after Init and the query
+// cap-hit path would stop recording increments.
 func TestDedupFill_Subproc(t *testing.T) {
 	if os.Getenv(otelInitSubprocessMarker) == "dedupfill" {
 		runDedupFillSubproc(t)
 		return
 	}
-	// Parent: re-invoke the test binary as a subprocess for a fresh process.
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDedupFill_Subproc$")
 	cmd.Env = append(os.Environ(), otelInitSubprocessMarker+"=dedupfill")
 	cmd.Args = append(cmd.Args, "-test.v")
@@ -173,16 +124,14 @@ func TestDedupFill_Subproc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dedup-fill subprocess failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "dedup-fill PASS") {
+	if !strings.Contains(string(out), "dedup-fill pass") {
 		t.Fatalf("dedup-fill subprocess did not pass:\n%s", out)
 	}
-	t.Logf("dedup-fill PASS (subprocess): rebuildCounters via a real test Meter leaves QueryL0ListCapped NON-nil — the omission landmine is closed")
+	t.Logf("dedup-fill subprocess passed with QueryL0ListCapped bound to the test Meter")
 }
 
-// runDedupFillSubproc is the subprocess entry: it constructs a real MeterProvider
-// + ManualReader, calls telemetry.Init(meter) ONCE, then asserts QueryL0ListCapped
-// is NON-nil (the fill in rebuildCounters reconstructed it against the new Meter;
-// the omission would have left it nil).
+// runDedupFillSubproc constructs a MeterProvider and ManualReader, calls Init,
+// and checks the counter allocated by rebuildCounters.
 func runDedupFillSubproc(t *testing.T) {
 	mr := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(mr))
@@ -190,17 +139,14 @@ func runDedupFillSubproc(t *testing.T) {
 	meter := mp.Meter("internal/telemetry")
 	Init(meter)
 	if QueryL0ListCapped == nil {
-		t.Fatalf("dedup-fill: QueryL0ListCapped is nil post-Init — the rebuildCounters fill is MISSING (the omission landmine is OPEN); the cap-hit guard at internal/database/query.go:493 would silently stop counting")
+		t.Fatalf("QueryL0ListCapped is nil after Init; rebuildCounters did not reconstruct it")
 	}
-	t.Logf("dedup-fill PASS: QueryL0ListCapped NON-nil post-Init — rebuildCounters reconstructed it against the real Meter (the omission is closed)")
+	t.Logf("dedup-fill pass: rebuildCounters reconstructed QueryL0ListCapped against the test Meter")
 }
 
-// TestOmissionFired_Subproc drives telemetry.QueryL0ListCapped.Add(1) AFTER
-// Init(testMeter) and asserts the counter ADVANCES (the use-site guard keeps
-// counting). The negative control: a rebuildCounters WITHOUT the fill →
-// QueryL0ListCapped stays nil post-Init → Add is skipped by the use-site
-// nil-guard. The guard PROVES the omission is closed at the USE site, not just
-// the construction site. Run in a subprocess (the once-guard).
+// TestOmissionFired_Subproc checks increments on the counter rebuilt by Init,
+// rather than the object originally allocated during package initialization.
+// This exercises the nil guard used by the query cap-hit path.
 func TestOmissionFired_Subproc(t *testing.T) {
 	if os.Getenv(otelInitSubprocessMarker) == "omissionfired" {
 		runOmissionFiredSubproc(t)
@@ -213,13 +159,14 @@ func TestOmissionFired_Subproc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("omission-fired subprocess failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "omission-fired PASS") {
+	if !strings.Contains(string(out), "omission-fired pass") {
 		t.Fatalf("omission-fired subprocess did not pass:\n%s", out)
 	}
-	t.Logf("omission-fired PASS (subprocess): QueryL0ListCapped.Add(1) ADVANCES post-Init — the use-site guard keeps counting")
+	t.Logf("omission-fired subprocess passed: QueryL0ListCapped advances after Init")
 }
 
-// runOmissionFiredSubproc is the subprocess entry: Init then Add then check.
+// runOmissionFiredSubproc initializes the registry, adds two increments, and
+// checks the cumulative value.
 func runOmissionFiredSubproc(t *testing.T) {
 	mr := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(mr))
@@ -227,28 +174,22 @@ func runOmissionFiredSubproc(t *testing.T) {
 	meter := mp.Meter("internal/telemetry")
 	Init(meter)
 	if QueryL0ListCapped == nil {
-		t.Fatalf("omission-fired: QueryL0ListCapped nil post-Init — the omission is OPEN")
+		t.Fatalf("QueryL0ListCapped is nil after Init")
 	}
 	before := QueryL0ListCapped.Value()
 	QueryL0ListCapped.Add(1)
 	QueryL0ListCapped.Add(1)
 	after := QueryL0ListCapped.Value()
 	if after-before < 2 {
-		t.Fatalf("omission-fired: counter advanced by %v, want >=2 after two Add(1) calls (the use-site guard silently skipped — the omission is OPEN at the use site)", after-before)
+		t.Fatalf("counter advanced by %v after two Add(1) calls, want at least 2", after-before)
 	}
-	t.Logf("omission-fired PASS: counter advanced %v -> %v under a real Meter (Add via the use-site guard is counted)", before, after)
+	t.Logf("omission-fired pass: counter advanced from %v to %v under a real Meter", before, after)
 }
 
-// TestOtelExport_Subproc constructs a REAL sdkmetric MeterProvider +
-// ManualReader, drives a Counter.Inc, then Collects and asserts the observed
-// value EQUALS the cumulative Counter.Value(). This PROVES the two-exporter
-// separation is intact: the bridge reads CUMULATIVE via Value(), the OTel
-// callback reads DELTA via lastReported, and cumulative == sum-of-deltas. The
-// guard is run in a subprocess (the once-guard + a fresh MeterProvider). The
-// negative hazard wiring the OTel reader onto the bridge's prometheus Registry
-// would DOUBLE-COUNT — the guard refuses that class by NOT registering the OTel
-// reader with any prometheus Registry (the otel reader is a ManualReader, a
-// separate destination).
+// TestOtelExport_Subproc uses a real MeterProvider and ManualReader to check
+// that OpenTelemetry observes increments and advances lastReported. The
+// ManualReader is separate from the Prometheus registry, whose bridge continues
+// to read cumulative values through Value.
 func TestOtelExport_Subproc(t *testing.T) {
 	if os.Getenv(otelInitSubprocessMarker) == "otelexport" {
 		runOtelExportSubproc(t)
@@ -261,21 +202,18 @@ func TestOtelExport_Subproc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("otel-export subprocess failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "otel-export PASS") {
+	if !strings.Contains(string(out), "otel-export pass") {
 		t.Fatalf("otel-export subprocess did not pass:\n%s", out)
 	}
-	t.Logf("otel-export PASS (subprocess): OTel Collect observed the counter; cumulative == sum-of-deltas (two-exporter separation intact)")
+	t.Logf("otel-export subprocess passed: OpenTelemetry observed the counter and advanced lastReported")
 }
 
-// runOtelExportSubproc is the subprocess entry. It builds a ManualReader (a
-// SEPARATE destination from the bridge's prometheus Registry), Init's the
-// Meter against it, Inc's a counter, Collects, and asserts the observed sum
-// matches the cumulative Value(). lastReported advances (the OTel callback
-// fires inside Collect) — proving the OTel stream is live under a real Meter.
+// runOtelExportSubproc increments a counter, collects the OpenTelemetry delta,
+// and checks that the callback advanced lastReported. Value remains the
+// cumulative reading used by the Prometheus bridge.
 func runOtelExportSubproc(t *testing.T) {
 	mr := sdkmetric.NewManualReader()
-	// Build a resource so Collect returns a populated ResourceMetrics (a
-	// future change attributes per-region; today a fixed service.name).
+	// Attach a fixed service name to the collected resource.
 	res, rerr := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes("https://opentelemetry.io/schemas/1.40.0",
@@ -283,14 +221,14 @@ func runOtelExportSubproc(t *testing.T) {
 		),
 	)
 	if rerr != nil {
-		t.Fatalf("otel-export: resource merge: %v", rerr)
+		t.Fatalf("merge OpenTelemetry resource: %v", rerr)
 	}
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithResource(res), sdkmetric.WithReader(mr))
 	defer mp.Shutdown(context.Background())
 	meter := mp.Meter("internal/telemetry")
 	Init(meter)
 	if CompactionRowsPruned == nil {
-		t.Fatalf("otel-export: CompactionRowsPruned nil post-Init")
+		t.Fatalf("CompactionRowsPruned is nil after Init")
 	}
 	const inc = 7
 	for i := 0; i < inc; i++ {
@@ -298,32 +236,28 @@ func runOtelExportSubproc(t *testing.T) {
 	}
 	cumulative := CompactionRowsPruned.Value()
 	if cumulative < float64(inc) {
-		t.Fatalf("otel-export: cumulative Value()=%v, want >=%d after %d Inc", cumulative, inc, inc)
+		t.Fatalf("cumulative Value()=%v after %d Inc calls, want at least %d", cumulative, inc, inc)
 	}
-	// Collect the OTel stream — the int64-observable callback fires inside
-	// Collect, reading delta via lastReported + advancing lastReported.
+	// Collect invokes the int64 observable callback, which reports a delta and
+	// advances lastReported.
 	var rm metricdata.ResourceMetrics
 	if cerr := mr.Collect(context.Background(), &rm); cerr != nil {
-		t.Fatalf("otel-export: Collect: %v", cerr)
+		t.Fatalf("collect OpenTelemetry metrics: %v", cerr)
 	}
-	// The observed sum across the collected scope metrics for our counter.
 	observed, found := sumObservedCounter(&rm, "supremum.compaction.l1_rows_pruned")
 	if !found {
-		t.Fatalf("otel-export: counter 'supremum.compaction.l1_rows_pruned' NOT found in the OTel Collect output (the observable callback did not register — Init did not bind the Meter to the counter)")
+		t.Fatalf("counter supremum.compaction.l1_rows_pruned is absent from OpenTelemetry output")
 	}
 	if observed < float64(inc) {
-		t.Fatalf("otel-export: OTel observed value=%v, want >=%d (cumulative == sum-of-deltas; the first delta == the cumulative since lastReported was 0 pre-Init) observed=%v cumulative=%v", observed, inc, observed, cumulative)
+		t.Fatalf("OpenTelemetry observed value=%v, want at least %d after increments; observed=%v cumulative=%v", observed, inc, observed, cumulative)
 	}
-	// The double-count trap is DISARMED by the two-exporter separation:
-	// the bridge would read cumulative via Value(); the OTel callback read
-	// delta via lastReported. The guard asserts lastReported ADVANCED (the
-	// OTel stream is live) — the bridge never touches lastReported (the
-	// field-level invariant asserted by the in-package bridge guard).
+	// A nonzero lastReported shows that collection ran the callback. The bridge
+	// does not use this field; it reads the cumulative value independently.
 	lr := CompactionRowsPruned.lastReported.Load()
 	if lr == 0 {
-		t.Fatalf("otel-export: lastReported == 0 after Collect — the OTel callback did NOT advance it (the observable is not wired under the Meter)")
+		t.Fatalf("lastReported is zero after Collect; the OpenTelemetry callback did not advance it")
 	}
-	t.Logf("otel-export PASS: cumulative=%v observed=%v lastReported=%d — cumulative == sum-of-deltas; the OTel stream is live under a real Meter (lastReported advanced), the bridge reads cumulative + never lastReported (two-exporter separation intact)", cumulative, observed, lr)
+	t.Logf("otel-export pass: cumulative=%v observed=%v lastReported=%d", cumulative, observed, lr)
 }
 
 // sumObservedCounter walks a ResourceMetrics for a named int64 sum instrument
@@ -358,7 +292,7 @@ func sumObservedCounter(rm *metricdata.ResourceMetrics, name string) (float64, b
 					total += dp.Value
 				}
 			default:
-				// Unknown aggregation kind — surface in the caller via found=true + total=0.
+				// Keep found=true so the caller reports the unexpected zero total.
 				fmt.Fprintf(os.Stderr, "otel-export: %s data type %T\n", name, m.Data)
 			}
 		}
@@ -366,15 +300,9 @@ func sumObservedCounter(rm *metricdata.ResourceMetrics, name string) (float64, b
 	return total, found
 }
 
-// TestLastReportedObservableUnderInit documents that arming Init makes
-// lastReported OBSERVABLE under OTel (it is 0 while Init is uncalled). The
-// in-package bridge guard asserts lastReported == 0 (the bridge never touches
-// it); that guard STAYS GREEN for the BRIDGE because it ran BEFORE any Init in
-// the test process. If a future change binds a test-Meter in the SAME process
-// as the bridge guard, the baseline assertion needs a note (lastReported can be
-// non-zero; the bridge invariant is the bridge never TOUCHES lastReported, not
-// that it is 0). This guard runs in a subprocess so it does NOT contaminate the
-// in-package bridge-guard baseline in this process.
+// TestLastReportedObservableUnderInit checks that OpenTelemetry collection
+// advances lastReported after Init. It runs in a subprocess so the bridge test
+// in the parent process retains its zero baseline.
 func TestLastReportedObservableUnderInit(t *testing.T) {
 	if os.Getenv(otelInitSubprocessMarker) == "lastreported" {
 		runLastReportedSubproc(t)
@@ -385,9 +313,9 @@ func TestLastReportedObservableUnderInit(t *testing.T) {
 	cmd.Args = append(cmd.Args, "-test.v")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("lastreported subprocess failed: %v\n%s", err, out)
+		t.Fatalf("last-reported subprocess failed: %v\n%s", err, out)
 	}
-	t.Logf("lastreported PASS (subprocess): lastReported is observable under Init (the OTel callback advances it); the bridge invariant (never touches lastReported) is UNAFFECTED")
+	t.Logf("last-reported subprocess passed: collection advanced lastReported after Init")
 }
 
 func runLastReportedSubproc(t *testing.T) {
@@ -400,22 +328,19 @@ func runLastReportedSubproc(t *testing.T) {
 		t.Fatal("CompactionRowsPruned nil post-Init")
 	}
 	lrPre := c.lastReported.Load()
-	// Baseline lastReported (synchronous-nop default): 0; the synchronous-nop
-	// default means that any injection of the counter will set the lastReported
-	// to zero before the first callback fires, and then the callback stores the
-	// observed value. If multiple counters are tracked, the lastReported is
-	// per-counter. This is the initial state.
+	// Inc updates only the stripes. The collector callback advances the separate
+	// lastReported field when it observes their cumulative value.
 	for i := 0; i < 5; i++ {
 		c.Inc()
 	}
 	lrAfterInc := c.lastReported.Load()
 	var rm metricdata.ResourceMetrics
 	if cerr := mr.Collect(context.Background(), &rm); cerr != nil {
-		t.Fatalf("Collect: %v", cerr)
+		t.Fatalf("collect OpenTelemetry metrics: %v", cerr)
 	}
 	lrAfterCollect := c.lastReported.Load()
-	t.Logf("lastreported: lrPre=%d lrAfterInc=%d lrAfterCollect=%d (the callback fired on Collect — lastReported advanced; the synchronous-nop default kept it 0 pre-Init; arming Init makes the OTel stream live)", lrPre, lrAfterInc, lrAfterCollect)
+	t.Logf("lastReported before Inc=%d, after Inc=%d, after Collect=%d", lrPre, lrAfterInc, lrAfterCollect)
 	if lrAfterCollect == 0 || lrAfterCollect < lrAfterInc {
-		t.Fatalf("lastreported: lastReported did NOT advance on Collect (lrPre=%d lrAfterInc=%d lrAfterCollect=%d) — the OTel callback did not fire", lrPre, lrAfterInc, lrAfterCollect)
+		t.Fatalf("lastReported did not advance on Collect: before Inc=%d, after Inc=%d, after Collect=%d", lrPre, lrAfterInc, lrAfterCollect)
 	}
 }

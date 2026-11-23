@@ -31,7 +31,7 @@ func genDirKey(t *testing.T) ([16]byte, ed25519.PublicKey, ed25519.PrivateKey) {
 
 // TestDirectory_RegisterAndLookup proves the golden path: a registered
 // originNodeID resolves to its public key, and the resolved key verifies a
-// signature the receiver would feed to VerifyCRDTFrame. This is the GAP-3
+// signature the receiver would feed to VerifyCRDTFrame. This is the directory
 // contract the receiver's hot path depends on between Open and the inner
 // origin Verify.
 func TestDirectory_RegisterAndLookup(t *testing.T) {
@@ -44,7 +44,7 @@ func TestDirectory_RegisterAndLookup(t *testing.T) {
 	require.True(t, ok, "registered nodeID must resolve")
 	assert.Equal(t, pub, got, "Lookup must return the registered key")
 
-	// The resolved key MUST verify a signature the receiver would feed to
+	// The resolved key must verify a signature the receiver would feed to
 	// VerifyCRDTFrame (the load-bearing composition seam).
 	msg := make([]byte, 120)
 	sig := ed25519.Sign(priv, msg)
@@ -134,8 +134,8 @@ func TestDirectory_Overwrite(t *testing.T) {
 
 // TestDirectory_ConcurrentRegisterLookup proves the RWMutex makes the
 // directory safe for concurrent use: 32 goroutines hammer Lookup while
-// writers register distinct nodeIDs, with no race (the -race gate
-// exercises this over the composed receiver; this isolates the directory).
+// writers register distinct nodeIDs, with no race (the -race gate exercises
+// this over the composed receiver; this isolates the directory).
 func TestDirectory_ConcurrentRegisterLookup(t *testing.T) {
 	d := NewDirectory()
 	const goroutines = 32

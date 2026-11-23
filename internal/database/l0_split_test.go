@@ -4,18 +4,17 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// The per-entity L0 split-merge guards (ADR-0018).
+// Per-entity L0 split-merge tests (ADR-0018).
 //
-// These guards CLOSE the silent multi-entity read-miss class that every earlier
-// single-entity guard hid: the old L0 flush co-located a checkpoint's ENTIRE
-// multi-entity slice into ONE file keyed under the SMALLEST-hash entity, while
-// AsOf lists under the QUERIED entity's hash — so every co-located non-smallest
-// entity was a silent ErrEntityNotFound for data that IS on disk.
-//
-// The headline RED→GREEN: pre-fix the 3-entity drive sees only
-// "wonder" (smallest hash); post-fix all three return. Law-V covers digest
-// verbatim (no fabricated payload). The remaining guards cover one-blob-per-entity
-// (no empty/dup keys), single-entity back-compat, and the MaxL0Files cap disclosure.
+// Flushing multi-entity SkipList arenas previously wrote one file keyed under
+// the smallest entity hash while Resolver.AsOf listed under the queried entity's
+// hash, causing read misses for co-located entities. L0Flusher now splits each
+// flush into one Arrow IPC file per entity hash:
+//   - TestMultiEntityFlushRoundTripAllRetrievable verifies all entities resolve
+//   - TestLawVDigestVerbatim checks stored SHA-256 payload digests match writes
+//   - TestOneBlobPerEntityNoEmptyOrDuplicate verifies one non-empty file per entity
+//   - TestSingleEntityBackwardCompat verifies the single-entity case
+//   - TestMaxL0FilesCapDisclosed verifies MaxL0Files truncation triggers telemetry
 package database
 
 import (
@@ -36,11 +35,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// memStore is an in-memory S3 simulator that implements ALL THREE
-// store interfaces (S3Uploader, S3Lister, S3Downloader) so a flush→query
+// memStore is an in-memory S3 simulator that implements all three
+// store interfaces (S3Uploader, S3Lister, S3Downloader) so a flush-to-query
 // round-trip can be driven against a single object key-space. Thread-safe:
-// the per-entity split-merge uploads from a background goroutine (#emit
-// uploads per checkpoint), so the map needs a Mutex (unlike the old
+// the per-entity split-merge uploads from a background goroutine (one emit
+// upload per checkpoint), so the map needs a mutex (unlike the old
 // single-upload one-blob path whose race window was negligible).
 type memStore struct {
 	mu      sync.Mutex
@@ -63,9 +62,8 @@ func (m *memStore) Upload(_ context.Context, key string, data io.Reader, _ int64
 	return nil
 }
 
-// ListObjects (S3Lister) — prefix-match, ascending sort, maxKeys cap.
-// This mirrors LocalFS.ListObjects (the production path) including the
-// MaxL0Files silent-truncation cap that T5 exercises.
+// ListObjects (S3Lister) returns matching keys sorted ascending up to maxKeys,
+// mirroring LocalFS.ListObjects including MaxL0Files cap behavior.
 func (m *memStore) ListObjects(_ context.Context, _ string, prefix string, maxKeys int) ([]string, error) {
 	m.mu.Lock()
 	var keys []string
@@ -112,11 +110,9 @@ func (r *bytesReaderCopy) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// --- Test helpers ---
-
 // hash8PrefixBytes returns sha256(entityID)[:8] — the 8-byte hex prefix AsOf
-// and the per-entity flusher key BOTH use (the two keying contracts the
-// split-merge aligns).
+// and the per-entity flusher key both use (the two keying contracts that
+// ADR-0018 aligns).
 func hash8PrefixBytes(entityID string) [8]byte {
 	h := sha256.Sum256([]byte(entityID))
 	var b [8]byte
@@ -136,16 +132,11 @@ func insertEntityRow(sl *SkipListArena, entityID string, sysNs, validNs, assertN
 	_ = sl.Put(key, len(val), func(buf []byte) { copy(buf, val) })
 }
 
-// --- The headline RED→GREEN: every entity in a multi-entity checkpoint
-// is retrievable through the production write→flush→AsOf path. ---
-//
-// At the pre-fix tree (stash the l0_flusher.go split), this guard RED-proves that
-// only "wonder" (the smallest-hash) returns; toast + victor miss with
-// ErrEntityNotFound. Post-fix, all three return.
+// TestMultiEntityFlushRoundTripAllRetrievable verifies every entity in a
+// multi-entity checkpoint resolves through flush and Resolver.AsOf.
 func TestMultiEntityFlushRoundTripAllRetrievable(t *testing.T) {
 	ctx := context.Background()
-	// hash8 ordering, computed in the test (NOT asserted from memory):
-	//   wonder < toast < victor under sha256(id)[:8] as BigEndian.
+	// Expected sha256(id)[:8] big-endian ordering: wonder < toast < victor.
 	entities := []string{"wonder", "toast", "victor"}
 	for _, e := range entities {
 		t.Logf("entity=%-8s hash8=%x", e, hash8PrefixBytes(e))
@@ -154,24 +145,19 @@ func TestMultiEntityFlushRoundTripAllRetrievable(t *testing.T) {
 	alloc := NewJemallocAllocator()
 	store := newMemStore()
 	flusher := NewL0Flusher(alloc, store, "split-bucket")
-	// Per- semantics: open-ended ValidTimeEnd sentry = 9e18 (int64-safe).
 	const openEnd int64 = 9_000_000_000_000_000_000
 	now := time.Now().UnixNano()
 	sl := NewSkipListArena(alloc, 8*1024*1024)
 	defer sl.Free()
 
-	// Insert one row per entity, all sharing the SAME checkpoint pointer (the
-	// multi-entity case the production SnapshotToLSM flushes in ONE round).
 	for _, e := range entities {
 		insertEntityRow(sl, e, now, now, now, openEnd, []byte("payload-for-"+e))
 	}
 
-	// Drive the production flush path (the split-merge).
 	uploaded, err := flusher.FlushFromArena(ctx, sl)
 	require.NoError(t, err)
 	assert.Equal(t, len(entities), uploaded, "one upload per entity (the split-merge)")
 
-	// Drive the production READ path (Resolver.AsOf) for EACH entity.
 	resolver := NewResolver(store, store, alloc, "split-bucket", DefaultResolverConfig())
 	qtValid := time.Unix(0, now+1)
 	qtTx := time.Unix(0, now+1)
@@ -180,12 +166,12 @@ func TestMultiEntityFlushRoundTripAllRetrievable(t *testing.T) {
 		got, qerr := resolver.AsOf(ctx, e, qtValid, qtTx)
 		require.NoErrorf(t, qerr, "entity %q: AsOf returned an error (silent read-miss class)", e)
 		require.NotNilf(t, got, "entity %q: nil result", e)
-		assert.Equalf(t, e, got.EntityID, "entity %q: returned a DIFFERENT entity's row — keying collision", e)
+		assert.Equalf(t, e, got.EntityID, "entity %q: returned a different entity row", e)
 	}
 }
 
-// --- Law V: echo the digest the WRITE stamped, NOT a fabricated payload
-// (the collision-guard discipline) ---
+// TestLawVDigestVerbatim checks that queries return the payload digest stamped
+// during the original write without altering or recomputing it.
 func TestLawVDigestVerbatim(t *testing.T) {
 	ctx := context.Background()
 	alloc := NewJemallocAllocator()
@@ -212,11 +198,12 @@ func TestLawVDigestVerbatim(t *testing.T) {
 	for _, e := range entities {
 		got, qerr := resolver.AsOf(ctx, e, qt, qt)
 		require.NoErrorf(t, qerr, "entity %q: AsOf err", e)
-		assert.Equalf(t, wantDigest[e], got.PayloadDigest, "entity %q: PayloadDigest != sha256(payload) the write stamped (Law V)", e)
+		assert.Equalf(t, wantDigest[e], got.PayloadDigest, "entity %q: PayloadDigest != sha256(payload) stamped on write", e)
 	}
 }
 
-// --- One arrow blob per entity; no empty blobs; no duplicate keys ---
+// TestOneBlobPerEntityNoEmptyOrDuplicate verifies each entity receives one
+// non-empty Arrow IPC upload with no empty or duplicate keys.
 func TestOneBlobPerEntityNoEmptyOrDuplicate(t *testing.T) {
 	ctx := context.Background()
 	alloc := NewJemallocAllocator()
@@ -224,21 +211,16 @@ func TestOneBlobPerEntityNoEmptyOrDuplicate(t *testing.T) {
 	flusher := NewL0Flusher(alloc, store, "split-bucket")
 	const openEnd int64 = 9_000_000_000_000_000_000
 	now := time.Now().UnixNano()
-	// 4 entities — verify the partition count == entity count, and that no
-	// entity gets a 2nd upload (no (hash8, sysNs) duplicate).
 	entities := []string{"wonder", "toast", "victor", "zulu"}
 	for _, e := range entities {
 		t.Logf("entity=%-8s hash8=%x", e, hash8PrefixBytes(e))
 	}
-	// Insert 3 rows for TWO of the entities (multi-row partition) + 1 each for
-	// the others; verify the FILE count == entity count, not row count.
 	sl := NewSkipListArena(alloc, 16*1024*1024)
 	defer sl.Free()
 	for i := range entities {
 		e := entities[i]
 		insertEntityRow(sl, e, now, now, now, openEnd, []byte("p1-"+e))
 	}
-	// wonder gets 2 extra rows (different sys times)
 	insertEntityRow(sl, "wonder", now+1_000_000, now, now, openEnd, []byte("p2-wonder"))
 	insertEntityRow(sl, "wonder", now+2_000_000, now, now, openEnd, []byte("p3-wonder"))
 
@@ -246,14 +228,12 @@ func TestOneBlobPerEntityNoEmptyOrDuplicate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, len(entities), uploaded, "one file per entity, regardless of per-entity row count")
 
-	// Count distinct entity prefixes among the uploaded keys — must == entities.
 	store.mu.Lock()
 	prefixes := make(map[string]int)
 	for k := range store.objects {
 		if !strings.HasPrefix(k, "l0/") {
 			continue
 		}
-		// key format: l0/{16-hex}/{sysNs}.arrow
 		parts := strings.SplitN(k[3:], "/", 2)
 		if len(parts) != 2 {
 			continue
@@ -263,7 +243,6 @@ func TestOneBlobPerEntityNoEmptyOrDuplicate(t *testing.T) {
 	store.mu.Unlock()
 	assert.Len(t, prefixes, len(entities), "distinct entity prefixes == entity count")
 
-	// No empty blob: each uploaded object must be non-empty (a valid Arrow IPC File).
 	store.mu.Lock()
 	emptyKeys := []string{}
 	for k, v := range store.objects {
@@ -275,9 +254,7 @@ func TestOneBlobPerEntityNoEmptyOrDuplicate(t *testing.T) {
 	assert.Empty(t, emptyKeys, "no empty Arrow IPC blobs")
 }
 
-// --- Single-entity back-compat: the split path is the N=1 degenerate
-// case. The existing single-entity guards (which key under the queried
-// entity's own hash) MUST stay green. ---
+// TestSingleEntityBackwardCompat verifies single-entity flushes emit one upload.
 func TestSingleEntityBackwardCompat(t *testing.T) {
 	ctx := context.Background()
 	alloc := NewJemallocAllocator()
@@ -293,7 +270,7 @@ func TestSingleEntityBackwardCompat(t *testing.T) {
 
 	uploaded, err := flusher.FlushFromArena(ctx, sl)
 	require.NoError(t, err)
-	assert.Equal(t, 1, uploaded, "single entity → exactly ONE per-entity upload (N=1 degenerate)")
+	assert.Equal(t, 1, uploaded, "single entity must produce one per-entity upload")
 
 	resolver := NewResolver(store, store, alloc, "split-bucket", DefaultResolverConfig())
 	got, qerr := resolver.AsOf(ctx, entity, time.Unix(0, now+1), time.Unix(0, now+1))
@@ -302,11 +279,8 @@ func TestSingleEntityBackwardCompat(t *testing.T) {
 	assert.Equal(t, entity, got.EntityID)
 }
 
-// --- The MaxL0Files silent-truncation cap DISCLOSED, not fake-fixed
-// (ADR-0018 §6). The cap is HONEST: AsOf returns the best match within the
-// capped scan and the telemetry.QueryL0ListCapped counter increments so an
-// operator can surface it. The structural fix (level-overwrite compaction)
-// is future work. ---
+// TestMaxL0FilesCapDisclosed verifies MaxL0Files truncation updates
+// telemetry.QueryL0ListCapped while returning the best match within the cap.
 func TestMaxL0FilesCapDisclosed(t *testing.T) {
 	ctx := context.Background()
 	alloc := NewJemallocAllocator()
@@ -315,10 +289,8 @@ func TestMaxL0FilesCapDisclosed(t *testing.T) {
 	const openEnd int64 = 9_000_000_000_000_000_000
 	const entity = "maxl0test"
 
-	// Write MORE than MaxL0Files per-entity checkpoints, one event each across N
-	// flushes (each FlushArenaToIPC produces ONE per-entity file with that event).
 	const maxL0 = 20
-	const writeCount = maxL0 + 5 // 25 per-entity files (all keyed under the same entity-hash8 prefix)
+	const writeCount = maxL0 + 5
 	for i := 0; i < writeCount; i++ {
 		sl := NewSkipListArena(alloc, 2*1024*1024)
 		now := time.Now().UnixNano() + int64(i)
@@ -327,7 +299,6 @@ func TestMaxL0FilesCapDisclosed(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Confirm the store actually holds writeCount per-entity files under the entity's prefix.
 	h8 := hash8PrefixBytes(entity)
 	prefix := fmt.Sprintf("l0/%x", h8)
 	store.mu.Lock()
@@ -340,19 +311,13 @@ func TestMaxL0FilesCapDisclosed(t *testing.T) {
 	store.mu.Unlock()
 	require.Equalf(t, writeCount, countFiles, "store should hold %d per-entity files; got %d", writeCount, countFiles)
 
-	// A resolver WITH MaxL0Files=20 should observe the cap (the cap-disclosure
-	// counter increments). The AsOf still returns a valid (best-within-cap)
-	// dominant — it does NOT silently lie by returning an OLDER row under the
-	// pretense of being complete; the disclosure is the metric, the returned
-	// result is honest-as-capped.
 	resolver := NewResolver(store, store, alloc, "split-bucket", ResolverConfig{MaxL0Files: maxL0})
 	before := int64(0)
 	if telemetry.QueryL0ListCapped != nil {
 		before = int64(telemetry.QueryL0ListCapped.Value())
 	}
 	got, err := resolver.AsOf(ctx, entity, time.Unix(0, time.Now().UnixNano()+10_000_000_000), time.Unix(0, time.Now().UnixNano()+10_000_000_000))
-	// The query may resolve to a row within the capped scan OR not:
-	require.NoError(t, err, "AsOf must return SOME row within the cap if one exists in the scanned window")
+	require.NoError(t, err, "AsOf must return a matching row within the cap")
 	require.NotNil(t, got)
 	require.Equal(t, entity, got.EntityID)
 
@@ -360,5 +325,5 @@ func TestMaxL0FilesCapDisclosed(t *testing.T) {
 	if telemetry.QueryL0ListCapped != nil {
 		after = int64(telemetry.QueryL0ListCapped.Value())
 	}
-	assert.Greaterf(t, after, before, "QueryL0ListCapped should have incremented (%d→%d) — the cap was hit and DISCLOSED, not silently lied about", before, after)
+	assert.Greaterf(t, after, before, "QueryL0ListCapped must increment when MaxL0Files cap is hit (%d->%d)", before, after)
 }

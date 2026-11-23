@@ -5,7 +5,7 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // Package network implements the peer-reconnect HTTP transport for the
-// Sovereign δ-CRDT ledger, with ADR 4 jittered backoff and a bounded
+// Sovereign Engine δ-CRDT ledger, with ADR 4 jittered backoff and a bounded
 // connection pool of standard-library *http.Client handles.
 //
 // ADR 4 MANDATE: 1,000,000 edge nodes reconnecting to a coordinator after
@@ -16,7 +16,7 @@
 // to uniformly distribute reconnects across temporal windows, collapsing
 // peak coordinator load from O(N) to O(N / 2^attempt).
 //
-// The transport is a thin, honest wrapper over the Go standard library
+// The transport is a thin wrapper over the Go standard library
 // net/http client. There is no TLS fingerprint shaping, no header-order
 // forging, and no proxy evasion: the ledger is a legitimate distributed
 // system that participates openly on the network.
@@ -258,7 +258,7 @@ type PeerClient struct {
 // NewPeerClient initializes a standard-library HTTP client with the ADR 4
 // backoff configuration.
 //
-// The returned client is a thin, honest net/http client. There is no TLS
+// The returned client is a thin net/http client. There is no TLS
 // fingerprint shaping and no header-order forging — the ledger participates
 // openly on the network.
 func NewPeerClient(timeout time.Duration) (*PeerClient, error) {
@@ -302,9 +302,9 @@ var ErrMaxRetriesExceeded = errors.New("max retries exceeded after jittered back
 // DoWithRetry executes an HTTP request with ADR 4 jittered exponential backoff.
 //
 // Mathematical guarantee:
-// - Full Jitter: N clients spread uniformly over [0, min(cap, base*2^i)]
-// Peak load per ms = N / min(cap, base*2^i) → exponential decay
-// - Decorrelated: Markovian chain breaks temporal synchronization completely
+//   - Full Jitter: N clients spread uniformly over [0, min(cap, base*2^i)]
+//     Peak load per ms = N / min(cap, base*2^i) → exponential decay
+//   - Decorrelated: Markovian chain breaks temporal synchronization completely
 //
 // The shouldRetry function determines if a response warrants a retry (e.g.,
 // HTTP 429, 503, 5xx). If nil, only network errors trigger retries.

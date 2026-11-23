@@ -4,33 +4,10 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Command sovereign-node is the FIRST production binary of the Sovereign
-// Engine. It binds a TLS 1.3 listener (the encrypted pipe), constructs
-// the frozen δ-CRDT engine + the receive gate stack, and drives the
-// length-prefixed frame reassembler into Receiver.HandleFrame per accepted
-// connection. It also serves a plain-HTTP /livecheck control surface.
-//
-// Scope: the accept loop runs and serves /livecheck; the dial loop, gossip
-// sweep, /metrics Prometheus surface, AF_XDP, and the eBPF --steering flag
-// were layered on after the encrypted listener (the --peers flag is parsed
-// and logged here, then dialed by the dial loop). This binary is the
-// encryption ground — every wire is encrypted by default.
-//
-// Symbol gate (every constructor below is grep-verified against the real
-// package APIs; see ADR-0006 §Symbol Gate):
-//
-//	eng.NewDeltaCRDTEngine(nodeID [16]byte, initialCounter uint64, arenaSize uintptr) (*eng.DeltaCRDTEngine, error) // pkg/sync/crdt.go:244
-//	clock.NewIngressHLCScalarCap(clock clock.WallClock, engine clock.LogicalAdvancer) *clock.IngressHLCScalarCap // pkg/clock/admission.go:72 (NO epsilon arg; CONSTRAINT Z is a compile-time const)
-//	admission.NewPeerBucket() *admission.PeerBucket // pkg/admission/ewma.go:150 (zero args)
-//	identity.NewDirectory() *identity.Directory // pkg/identity/directory.go:47 (zero args)
-//	receive.NewReceiver(bucket, cap, wallClock, dir, engine, budget) *receive.Receiver // pkg/receive/receiver.go:173
-//	receive.NewFrameReader(r io.Reader) *receive.FrameReader // pkg/receive/receiver.go:474
-//	(*receive.FrameReader).ReadFrame() ([]byte, error) // pkg/receive/receiver.go:486
-//	(*receive.Receiver).HandleFrame(frameBytes []byte) receive.AcceptVerdict // pkg/receive/receiver.go:350
-//
-// The DeltaCRDTEngine satisfies clock.LogicalAdvancer via its pointer
-// receiver method AdvanceLamportTo(uint64) (pkg/sync/crdt.go:1639); the
-// engine value is passed as the advancer arg.
+// Command sovereign-node runs a Sovereign Engine node. It accepts TLS 1.3 peer
+// connections, reassembles length-prefixed frames, and passes them to the
+// receive gate and CRDT engine. Separate listeners serve the metrics, debugging,
+// and optional JSON-over-mTLS control surfaces.
 package main
 
 import (
@@ -55,10 +32,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hr18vk/sovereign/internal/database"
+	"github.com/hr18vk/sovereign/internal/index"
 	"github.com/hr18vk/sovereign/internal/telemetry"
 	"github.com/hr18vk/sovereign/pkg/admission"
 	"github.com/hr18vk/sovereign/pkg/attribution"
@@ -71,6 +51,7 @@ import (
 	"github.com/hr18vk/sovereign/pkg/receive"
 	eng "github.com/hr18vk/sovereign/pkg/sync"
 	"github.com/hr18vk/sovereign/pkg/transport"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // defaultArenaSize is the off-heap HAMT arena size for the engine. It
@@ -78,10 +59,9 @@ import (
 // overridable via --arena-mib.
 const defaultArenaSize uintptr = 64 * 1024 * 1024
 
-// defaultAdmissionBudget is the receive admission budget in nanoseconds that
-// the 3.2 MaxHopsForBudget transform converts to a max hop-count. It is
-// INJECTED, never baked into the gate (the forbidden-budget guard,
-// receiver.go:173 doc). Overridable via --admission-budget-ns.
+// defaultAdmissionBudget is the receive admission budget in nanoseconds. The
+// 3.2 MaxHopsForBudget transform converts it to a maximum hop count.
+// --admission-budget-ns overrides it.
 const defaultAdmissionBudget int64 = 50_000_000 // 50 ms
 
 func main() {
@@ -108,229 +88,147 @@ type nodeConfig struct {
 	identitySeed    string
 	selftest        bool
 	batchSize       int
-	// lamportAbsoluteSlack (ADR-0045 cold-boot catch-up) is the
-	// operator knob wired to eng.DeltaCRDTEngine.SetLamportAbsoluteSlack (the
-	// skew-bound policy field; crdt.go:525). Default 1000 = the
-	// production floor that keeps the A1 far-future-stamp defense CLOSED on the
-	// real wire (the documented default in crdt_reconstruct_skew.go:51). A
-	// deployment that ingests a LARGE bulk batch to COLD peers (a fresh mesh
-	// bootstrap, a new region joining a mesh that already has N≫1000 keys) raises
-	// it so a cold-booted receiver's bound (Lamport + rate-envelope + slack)
-	// admits the origin's DotCounters — a documented, opt-IN tradeoff the guard
-	// already supports ("Raising it widens the bound; the production default
-	// stays small so A1 stays closed"). The GENERAL cold-boot catch-up class —
-	// a verified-origin bulk transfer that trusts the origin's frontier WITHOUT
-	// widening the A1 slack — is a committed verified-origin change
-	// (ADR-0045); this flag is the scoped, disclosed stop-gap, NOT the close.
-	// Default 1000 = byte-identical production behavior; 0 is trapped to 1000
-	// below (a slack of 0 would brick ALL inbound deltas — a misconfiguration MUST
-	// be loud, NOT a silent zero-receive).
+	// lamportAbsoluteSlack adds an allowance to the engine's Lamport and
+	// rate-envelope bound (ADR-0045). The default 1000 rejects far-future
+	// stamps while permitting normal clock skew. A cold peer receiving a large
+	// batch may need a larger allowance. Zero is coerced to 1000 at startup.
+	// This flag does not implement a separate verified-origin transfer protocol.
 	lamportAbsoluteSlack uint64
-	// ADR-0034: --stratified-anti-entropy (opt-IN, default false).
-	// OFF keeps the sweep byte-identical to HEAD's oversend path; ON switches to
-	// the two-phase digest-exchange (the minimal-delta proportional to |A−B|
-	// instead of the full set). See the flag help.
+	// stratifiedAntiEntropy selects digest-based reconciliation. When false,
+	// each sweep sends the full set; when true, GenerateDelta sends the computed
+	// difference after a StrataEstimator and IBLT exchange (ADR-0034).
 	stratifiedAntiEntropy bool
-	// durability: --wal-path empty (default) = in-memory research mode =
-	// back-compat (the silicon bench path UNTOUCHED). Durability is OPT-IN,
-	// never claimed by default. When set, the node boots from the WAL via
-	// RecoverEngine and the origin write path fsyncs to it.
+	// deferHandler defers a peer for one round after a digest-exchange failure,
+	// then sends a bounded rotating slice instead of the full keyset. The slice
+	// is limited to 608 received entries per peer per round. It requires
+	// --stratified-anti-entropy.
+	deferHandler bool
+	// deferCrossover permits one bounded full-keyset send per divergence episode
+	// after a capacity-class peel failure. It requires --defer-handler.
+	deferCrossover bool
+	// digestWaitTimeout bounds each stratified digest exchange. A peer answers
+	// a digest request immediately, so the wait is governed by round-trip time,
+	// not the sweep period. The 500 ms default suits a LAN; wide-area links may
+	// need a larger value. Convergence timings are not round-trip measurements.
+	digestWaitTimeout time.Duration
+	// digestWaitAdaptive replaces the fixed wait with a per-peer value clamped
+	// between --digest-wait-timeout and 15 seconds: twice the response-latency
+	// EWMA plus 230 ms. Completed and drained exchanges feed the EWMA, samples
+	// expire after 60 seconds, and an unobserved pair uses the configured floor.
+	// It requires both stratified anti-entropy and the defer handler.
+	digestWaitAdaptive bool
+	// ibltV2 selects decorrelated key placement, bounded dynamic sizing, and
+	// the IBL2 wire format. It requires --stratified-anti-entropy. Mixed v1/v2
+	// peers oversend until they use the same version.
+	ibltV2           bool
+	ibltV2MinBuckets int
+	// meshWriteTimeout applies to every mesh frame write through PeerSet.Publish.
+	// Zero disables the deadline. The 10-second default bounds a stalled write;
+	// a timeout closes the connection so reconnect logic establishes a fresh one.
+	meshWriteTimeout time.Duration
+	// walPath enables WAL recovery and an fsync for each origin mutation when
+	// non-empty. The empty default uses an in-memory engine. The checkpoint
+	// interval bounds the replay tail; zero leaves checkpoints to the caller.
 	walPath               string
 	walCheckpointInterval uint64
 
-	// bounded recovery: --lsm-root is the directory for the dot-bearing
-	// recovery snapshot ("ckpt/<LamportHigh>") + the Arrow query index ("l0/").
-	// When non-empty (and --wal-path is set), RecoverEngineWithSnapshot + the
-	// Bridge's SetSnapshotter bound recovery to O(post-checkpoint). Empty (or
-	// --wal-path empty) = the back-compat full-replay path.
+	// secondaryIndexEnable wires the optional cross-entity H3 and system-time
+	// index, its write feeds, and its query routes. The maximum entity count is
+	// uncapped at zero. At a positive ceiling, new-entity records are dropped and
+	// counted, and queries return 503 rather than an incomplete answer.
+	secondaryIndexEnable      bool
+	secondaryIndexMaxEntities int
+
+	// lsmRoot stores recovery snapshots under ckpt/<LamportHigh> and the Arrow
+	// query index under l0/. With --wal-path set, recovery loads the snapshot and
+	// replays only its tail. An empty value retains full WAL replay.
 	lsmRoot string
 
-	// ADR-0020: the Level-2 superseded-row prune knobs — the
-	// transaction-time GC horizon T_gc an operator sets to opt the compaction
-	// merge into dropping provably-dead rows. --compaction-prune-enable=false
-	// (the DEFAULT) -> Preserve-All (byte-identical behavior); the engine
-	// NEVER auto-prunes. --compaction-prune-enable=true WITHOUT a positive
-	// --compaction-prune-horizon-ns is SILENTLY WRONG (the txTime-gap
-	// class); NewL1Compactor traps it with a WARN + coerce-to-Preserve-All.
+	// compactionPruneEnable opts into dropping superseded rows during L0-to-L1
+	// compaction (ADR-0020). Pruning also requires a positive transaction-time
+	// horizon; otherwise NewL1Compactor logs a warning and preserves every row.
 	compactionPruneEnable  bool
 	compactionPruneHorizon int64
-	// ADR-0027: the T_gc auto-inference backoff — how far behind the
-	// observed live-query txTime frontier the effective DominancePrune floor
-	// sits. The inferrer computes effective = max(operatorFloor, observedFrontier
-	// - backoff); the backoff tolerates forensic queries `backoff` into the
-	// recent past, so a burst of stale-txTime queries does NOT collapse the
-	// floor. The operator's role moves from "guess the frontier" (static
-	// horizon) to "set the safety floor + the backoff window" (the §0.a knob-
-	// promotion). --compaction-prune-backoff-ns wires this; default 5m (a
-	// HONEST conservative default — see the flag help). 0 = track the frontier
-	// directly (no backoff); the operator floor still backstops it.
+	// compactionPruneBackoff keeps the effective prune horizon behind the
+	// observed query frontier (ADR-0027). The horizon is max(operator floor,
+	// observed frontier - backoff). The default is five minutes; zero follows
+	// the frontier directly while retaining the operator floor.
 	compactionPruneBackoff time.Duration
 
-	// ADR-0021: the L0 reaper knobs. The reaper reclaims the
-	// manifest-listed superseded L0 files (the cross-entity disk leak ADR-0020
-	// §6c deferred) AFTER verifying the L1 still exists — the Stage C safety
-	// guard. --compaction-reap-enable=false (the DEFAULT) -> byte-identical
-	// behavior: the superseded L0 files STAY on disk as the crash-
-	// recovery backstop (reap OFF = the honest backstop-forever posture). The
-	// reaper MUST NEVER be auto-ON: the Stage C L1-exists check IS the safety
-	// constraint, and a storage layer that EVER reports a present L1 as missing
-	// would ALSO be one the compactor trusted to WRITE the L1 — the operator
-	// turns the reaper on ONLY once they trust their storage. --compaction-
-	// reap-interval is the sweep cadence (default 5m, deliberately slower than
-	// compaction's 30s — the superseded L0s are a safety net, zero urgency).
+	// compactionReapEnable opts into deleting superseded L0 files and manifests
+	// after confirming that the replacement L1 exists (ADR-0021). The default
+	// retains them as recovery backstops. The five-minute reaper interval is
+	// deliberately longer than the 30-second compaction interval.
 	compactionReapEnable   bool
 	compactionReapInterval time.Duration
-	// ADR-0026: arm telemetry.Init at boot with a real OTel SDK
-	// MeterProvider (--otel=false, the DEFAULT, keeps the bridge-alone
-	// behavior — the OTel-OFF research node; honest-disabled is the 503-precedent
-	// sister, NOT a silent no-op). When ON, the package-level counters are
-	// rebuilt against a real sdk Meter whose observable callbacks fire on the
-	// periodic reader's cadence — the change that makes the cap-hit disclosure
-	// counter + the Level-2 prune telemetry honest under a real Meter (the
-	// omission landmine ADR-0023 §6 named is closed ADR-0026). The OTel reader
-	// (a PeriodicReader over a logOutputExporter) is a SEPARATE destination from
-	// the bridge's prometheus Registry (§0.d — the two never double-count at
-	// /metrics; cumulative bridge == sum-of-OTel-deltas).
+	// otelEnabled arms telemetry.Init with an SDK MeterProvider. Its periodic
+	// log exporter is separate from the cumulative Prometheus bridge, so the two
+	// exporters do not double-count at /metrics (ADR-0023, ADR-0026).
 	otelEnabled  bool
 	otelInterval time.Duration
 
-	// ADR-0035: the PKI leaf-rotation trigger + the CRL revocation
-	// consult — the dormant security gate wires (the design doc
-	// "zero-downtime leaf cert rotation every 30 days" + "a node presenting an
-	// expired or revoked cert is rejected at the TLS handshake"). The rotation
-	// trigger is OPT-IN (--cert-rotation-enable, default false = byte-identical
-	// the SIGHUP seam + TestTLSCertRotation_SIGHUP stay byte-identical;
-	// the opt-IN precedent). --cert-rotation-poll is the goroutine
-	// poll interval (coarse; default 1h); --cert-rotation-lifetime is the
-	// pre-expiry threshold at which the rotation fires (default 30d — the
-	// design doc's 30-day cadence is the LIFETIME, NOT the poll — the honest
-	// calibration: poll at 1h, the leaf lives 1 year, rotate 30d before NotAfter).
-	// --crl-path is the on-disk CRL the transport hot-reloads (opt-IN; empty =
-	// no revocation consult = byte-identical; a node with NO revoked
-	// serials needs no CRL). The flags are documented in the flag block below.
+	// certRotationEnable starts the optional leaf-rotation manager (ADR-0035).
+	// It polls hourly by default and rotates 30 days before NotAfter. The current
+	// in-process minter is available only in --selftest; an operator-supplied PEM
+	// setup needs an external transport.RotationMinter. crlPath optionally loads
+	// a revoked-serial list that SIGHUP can reload.
 	certRotationEnable   bool
 	certRotationPoll     time.Duration
 	certRotationLifetime time.Duration
 	crlPath              string
-	// ADR-0036: the post-quantum transport readiness knobs — the
-	// hybrid (Ed25519 + ML-DSA-65) signature verify gate + the PQ-KEM
-	// disclosure counter. BOTH are OPT-IN (the opt-IN
-	// precedent); the DEFAULTS leave the node byte-identical.
-	//
-	// --hybrid-verify=false (the DEFAULT) keeps the receive path on the
-	// classical-only identity.VerifyCRDTFrame seam (verify.go:68, the circl
-	// Ed25519 check + the RejectSmallOrderKey cofactor gate) — byte-identical
-	// to the prior default. ON switches the receive path's two verify call sites
-	// (receiver.go:350 HandleFrame +:586 HandleBatchFrame) to the hybrid
-	// VerifyCRDTFrame_Hybrid seam (identity/hybrid_verify.go) — BOTH-sigs-
-	// required, defense-in-depth (a classical break does NOT compromise a PQ
-	// frame; a PQ break does NOT compromise a classical frame; the EITHER-or
-	// gate is the BUG-INJECT control PQ hybrid-verify-dual PROVES the BOTH
-	// gate rejects). The hybrid SIGN (a frame carries BOTH sigs) is future
-	// work (the CRDT-delta wire shape change — disclosed ADR-0036 §6; the
-	// crdt.go seam is the HONEST question a future change answers); this
-	// flag wires the VERIFY + the KEM proof, NOT the production sign.
-	//
-	// The PQ-KEM counter (PQHandshakeNegotiated) is wired UNCONDITIONALLY (the
-	// SetRevocationReporter precedent — the reporter seam is bound at
-	// boot; the flag gates the SIGNATURE verify, NOT the KEM disclosure). The
-	// counter fires on the transport.Dial seam (RecordHandshake reads
-	// ConnectionState().CurveID==4588) — a classical fallback for a non-MLKEM
-	// peer does NOT increment (PQ-KEM-only, NOT every handshake).
+	// hybridVerifyEnable requires both Ed25519 and ML-DSA-65 signatures on the
+	// receive path (ADR-0036). The default retains classical Ed25519 verification.
+	// Hybrid signing is controlled independently by hybridSignEnable. The PQ-KEM
+	// handshake counter is always wired and increments only for X25519MLKEM768.
 	hybridVerifyEnable bool
 
-	// hybridSignEnable is the ADR-0037 hybrid-SIGN opt-IN flag.
-	// --hybrid-sign=false (the DEFAULT) keeps the self-originated delta path on
-	// the v1 BatchEnvelope (one Ed25519 per batch) — byte-identical (NO
-	// hybrid frame is produced; the receive-side --hybrid-verify gate never
-	// sees one). --hybrid-sign=true switches shipBatchedDelta's self-originated
-	// path to ShipBatchHybrid: one Ed25519 + one ML-DSA-65 sig over the SAME
-	// 120-byte SHAKE256 pad of batchWire, carried in a HybridEnvelope. The owner
-	// identity is constructed via NewNodeIdentityHybrid when this is true (the
-	// PQ key is minted from the SAME --identity-seed); the PQ pubkey is
-	// registered in the Directory via RegisterPQ so peers' hybrid verify
-	// resolves it. The relay/foreign path stays per-frame regardless (the
-	// self-origin boundary — a relayer holds ONLY its own PQ key, CANNOT
-	// re-origin-sign a foreign delta under EITHER sig).
+	// hybridSignEnable signs self-originated batches with both Ed25519 and
+	// ML-DSA-65 over the same 120-byte SHAKE256 pad (ADR-0037). Both keys derive
+	// from --identity-seed, and the public PQ key is registered for verification.
+	// Relayed foreign deltas keep their original signatures.
 	hybridSignEnable bool
 
-	// regionAwareEnable is the ADR-0039 region-aware gossip data-plane
-	// opt-IN flag. --region-aware=false (the DEFAULT) keeps AntiEntropySweep on
-	// the full-mesh peers.Peers() path — byte-identical (the topology-off
-	// byte-identical guard; NO topology selector runs). --region-aware=true
-	// switches the sweep's iteration source to topology.Select(ctx) (intra-
-	// region full-mesh + inter-region fan-out-N, prefer cross-region, seeded-
-	// deterministic — the O(log N) rounds convergence the design doc names). The
-	// knob is INDEPENDENT of the per-peer region tags: a node can set
-	// --region-aware=true with NO peers tagged (all peers RegionUnset = SAME-
-	// region = intra-only = the full-mesh path with the topology seam armed but
-	// idle — the honest "arm first, tag later" discipline). opt-IN (NOT opt-OUT)
-	// per the opt-IN discipline.
+	// regionAwareEnable selects peers through TopologyManager instead of the
+	// full peer set (ADR-0039). Selection retains the intra-region mesh and uses
+	// seeded cross-region fan-out. RegionUnset peers are treated as local, so
+	// enabling the flag without region tags retains full-mesh behavior.
 	regionAwareEnable bool
 
-	// selfRegion is the ADR-0039 --self-region flag value — this node's
-	// OWN region tag (the intra/inter split key). A uint8 parsed from the flag
-	// string (e.g. "1" for region-1); 0 (the DEFAULT — RegionUnset) makes EVERY
-	// peer intra-region (sameRegion returns true for RegionUnset on either side)
-	// = byte-identical to the full-mesh path. A production deployment that wants named
-	// regions (us-east, eu-west) ships a registry uint8→string in a SEPARATE
-	// change (the opt-IN discipline: ship the SIMPLE thing first).
+	// partialIntraViewEnable limits each intra-region sweep to eight targets,
+	// or fewer for a small region. A deterministic per-sweep seed rotates the
+	// selection so every pair is eventually checked. It requires --region-aware.
+	partialIntraViewEnable bool
+
+	// sweepPhaseJitterEnabled offsets each node's sweeps by a deterministic
+	// fraction of the active tick, reducing synchronized responder load. For
+	// overlap window W and tick T, the overlap factor is 2W/T - (W/T)^2. The
+	// default performs no offset; SOVEREIGN_SWEEP_PHASE_JITTER=1 also enables it.
+	sweepPhaseJitterEnabled bool
+
+	// selfRegion is this node's numeric region tag. Zero is RegionUnset, which
+	// treats untagged peers as local rather than assigning them a foreign region.
 	selfRegion int
 
-	// regionFanout is the ADR-0039 --region-fanout flag value — the
-	// inter-region fan-out N (the design doc's default 3 — the O(log_3 N) rounds
-	// convergence at fan-out 3). Clamped to [0, MaxFanout] by the TopologyManager;
-	// 0 = intra-region full-mesh only (the honest degenerate case — the
-	// topology connection-cut guard asserts fan-out 0 -> intra-only).
-	regionFanout int
-
-	// peerDir is the ADR-0040 --peer-dir flag value — the OOB peer-
-	// Directory pubkey provisioning config path (Seam A). OPT-IN (default "" =
-	// no provisioning = the dial loop keeps the zero peerID = byte-identical).
-	// When set, cmd/sovereign-node/provisioning.go's applyProvisioning
-	// parses the line-oriented config (addr → {nodeID, ed25519_pubkey, optional
-	// mldsa65_pubkey, optional region}) + calls gossiper.RegisterPeer
-	// (+ dir.RegisterPQ for the optional PQ arm) + topo.SetRegion under the REAL
-	// nodeID — retiring the §7.1 zero-peerID hazard. A NON-EMPTY path that
-	// does not exist OR a malformed entry FAILS THE BOOT (a deploy
-	// misconfiguration MUST surface loudly, NOT silently fall back to
-	// zero-peerID — the honest-negative posture). See provisioning.go for the
-	// FAILSAFE parser + the OOB config-parse bug-inject control.
+	// regionFanout bounds cross-region targets per sweep. TopologyManager clamps
+	// it to MaxFanout; zero disables cross-region selection.
+	regionFanout      int
+	gatewaysPerRegion int
+	// peerDir names the optional out-of-band peer directory (ADR-0040). Each
+	// entry supplies an address, real node ID, verification keys, and optional
+	// region for provisioning. A missing or malformed named file fails startup;
+	// an empty path leaves peer IDs to dialing and reconciliation.
 	peerDir string
 
-	// autoReconcile is the ADR-0040 --peer-auto-reconcile flag value —
-	// the runtime TLS-leaf reconcile (Seam B). OPT-IN (default false = byte-
-	// identical — the dial loop keys peers under the caller-supplied
-	// peerID; reconcilePeerID is NOT called). ON switches PeerSet.Dial to read
-	// the peer's TLS leaf CommonName (hex.DecodeString the 32-char CN → [16]byte)
-	// + re-key the peerConn under the REAL nodeID so the topology selector HITS
-	// even WITHOUT a --peer-dir config (the ROUTING bonus — a deploy that
-	// opts into --peer-auto-reconcile alone ROUTES via the handshake; it does
-	// NOT CONVERGE — the receiver's Directory.Lookup MISSES without the OOB
-	// verification pubkey → DropVerify → deltas DROPPED LOUD; convergence
-	// REQUIRES --peer-dir's RegisterPQ/RegisterPeer. The binary harness's
-	// honest-negative control PROVES reconcile-only does NOT converge). ROUTING-only:
-	// the reconcile re-keys the ROUTING map; it NEVER touches the
-	// verification pubkey (the Directory's OOB-provisioned key is the
-	// verification anchor; a self-announced node with NO OOB pubkey is ROUTED but
-	// NOT VERIFIED → its deltas DROPPED LOUD via VerifyFail). See pkg/mesh/peer.go
-	// reconcilePeerID for the leaf-CN decode + the OOB reconcile control.
+	// autoReconcile re-keys an unprovisioned connection from the node ID in the
+	// peer's TLS leaf CommonName. This repairs routing state only: it does not
+	// install a verification key, so --peer-dir is still required to accept the
+	// peer's deltas.
 	autoReconcile bool
 
-	// (silicon observability, ADR-0048 §5): the NON-DESTRUCTIVE
-	// profiler. The 2026-09-04 stall was a 300s black box because the only
-	// stack dump was kill -QUIT (destructive — it kills the seed mid-run, so no
-	// capture-then-continue). pprofAddr is the --pprof-addr override (PORT or
-	// host:port; the host is ALWAYS forced to 127.0.0.1 — the FORBIDDEN rule is
-	// "never expose pprof beyond loopback"). Empty = derive 127.0.0.1:
-	// (metricsPort+1000), which keeps 34-nodes-per-host collision-free (each
-	// node's metrics port is distinct, so its derived pprof port is too). The
-	// listener is loopback-ONLY and on a SEPARATE mux+listener from the 0.0.0.0
-	// metrics mux (that bind is load-bearing for the cross-host /metrics scrape
-	// and is UNTOUCHED). diagProfile (--diag-profile / SOVEREIGN_DIAG_PROFILE=1)
-	// arms the EXPENSIVE mutex+block COLLECTION (runtime.SetMutexProfileFraction /
-	// SetBlockProfileRate) — DEFAULT OFF because it instruments every mutex/block
-	// event (catastrophic on the hot path). The goroutine endpoint needs NO toggle.
+	// pprofAddr selects the dedicated loopback profile port, or derives it from
+	// the metrics port plus 1000. The listener is separate from the metrics mux.
+	// diagProfile enables mutex and block sampling; it is disabled by default
+	// because it instruments their hot paths. Goroutine profiles need no flag.
 	pprofAddr   string
 	diagProfile bool
 }
@@ -339,214 +237,60 @@ func parseFlags(args []string) (*nodeConfig, error) {
 	fs := flag.NewFlagSet("sovereign-node", flag.ContinueOnError)
 	cfg := &nodeConfig{}
 	fs.StringVar(&cfg.bind, "bind", "127.0.0.1:7430", "TLS listener bind address (host:port)")
-	fs.StringVar(&cfg.peers, "peers", "", "comma-separated peer addresses (dial loop; parsed + logged)")
+	fs.StringVar(&cfg.peers, "peers", "", "comma-separated peer addresses; each may carry an @region suffix")
 	fs.StringVar(&cfg.tlsCert, "tls-cert", "", "leaf certificate PEM path")
 	fs.StringVar(&cfg.tlsKey, "tls-key", "", "leaf private key PEM path")
 	fs.StringVar(&cfg.tlsCA, "tls-ca", "", "CA certificate PEM path (trust root)")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "16-byte node identity (hex); defaults to a random 16-byte id")
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", "127.0.0.1:7431", "/livecheck control surface bind address (plain HTTP, ops debug)")
-	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "loopback-ONLY /debug/pprof bind (PORT or host:port; the host is ALWAYS forced to 127.0.0.1 — never exposed beyond loopback). Empty = derive 127.0.0.1:(metrics-port+1000). Served on a SEPARATE listener from the 0.0.0.0 metrics mux (whose bind is load-bearing for the cross-host /metrics scrape and is left untouched).")
-	fs.BoolVar(&cfg.diagProfile, "diag-profile", false, "arm EXPENSIVE mutex+block profiling (runtime.SetMutexProfileFraction(1)+SetBlockProfileRate(1)) for the convoy-vs-device stack verdict. DEFAULT OFF — it instruments every mutex/block event (a real hot-path cost); enable on the ONE node under diagnosis only. Also armed by SOVEREIGN_DIAG_PROFILE=1. The goroutine endpoint needs NO toggle.")
-	fs.StringVar(&cfg.controlAddr, "control-addr", "", "JSON-over-mTLS client control port bind address (host:port; empty=disabled — no accidental exposure; a SEPARATE TLS listener from --bind)")
+	fs.StringVar(&cfg.pprofAddr, "pprof-addr", "", "loopback /debug/pprof port or host:port; the host is discarded, and empty uses the metrics port + 1000")
+	fs.BoolVar(&cfg.diagProfile, "diag-profile", false, "enable mutex and block profiling (also SOVEREIGN_DIAG_PROFILE=1); disabled by default because of runtime overhead")
+	fs.StringVar(&cfg.controlAddr, "control-addr", "", "JSON-over-mTLS client control listener (host:port); empty disables it")
 	fs.IntVar(&cfg.arenaMib, "arena-mib", 64, "off-heap HAMT arena size in MiB")
 	fs.Int64Var(&cfg.admissionBudget, "admission-budget-ns", defaultAdmissionBudget, "receive admission budget in nanoseconds (3.2 max-hops transform)")
-	fs.StringVar(&cfg.gossipTick, "gossip-tick", "100ms", "anti-entropy sweep tick (steady-state default 100ms; the heal-control-plane override is 50ms — one knob, two documented workloads)")
+	fs.StringVar(&cfg.gossipTick, "gossip-tick", "100ms", "anti-entropy sweep interval (default 100ms; healing workloads may use 50ms)")
 	fs.StringVar(&cfg.identitySeed, "identity-seed", "", "32-byte hex Ed25519 seed for this node's CRDT-delta signing identity (defaults to a random seed; the derived nodeID dominates --node-id)")
 	fs.BoolVar(&cfg.selftest, "selftest", false, "run the built-in self-test (mint a dev CA + leaf, serve /livecheck, exit)")
-	fs.IntVar(&cfg.batchSize, "batch-size", 100, "batched delta transport: number of self-originated deltas per signed batch (1=per-frame back-compat; max 256; one Ed25519 verify amortizes over N deltas — the arithmetic unlock)")
-	// ADR-0045 --lamport-absolute-slack wires the existing
-	// SetLamportAbsoluteSlack setter (crdt.go:525) — the skew-bound
-	// AbsoluteSlack knob. Default 1000 = the production floor (A1 CLOSED on the
-	// real wire). Raise it for a cold-booted mesh that ingests a bulk batch
-	// larger than Lamport+rate-envelope+slack can admit (the 10K-key gate, a new
-	// region joining an N-key mesh). 0 is TRAPPED to 1000 below (slack 0 bricks
-	// all inbound deltas — a misconfig MUST be loud, not a silent zero-receive).
-	// The general verified-origin catch-up is a future change (this is the
-	// scoped disclosed stop-gap, NOT the close).
-	fs.Uint64Var(&cfg.lamportAbsoluteSlack, "lamport-absolute-slack", 1000, "ADR-0045 cold-boot catch-up: the Lamport skew-bound AbsoluteSlack (default 1000 = production floor, A1 far-future-stamp defense CLOSED; raise to admit a bulk batch to cold peers; 0 is trapped to 1000; the general verified-origin catch-up is a future change — this is the scoped disclosed stop-gap, NOT the close)")
-	// ADR-0034: stratified anti-entropy is OPT-IN. --stratified-anti-
-	// entropy=false (the DEFAULT) keeps the sweep byte-identical to HEAD's
-	// oversend path (GenerateDelta against an empty IBLT — every entry to every
-	// peer every round; the CRDT-idempotent Join converges in one round). When
-	// set, the sweep runs the two-phase digest-exchange per peer: SEND the
-	// local StrataEstimator + the full local IBLT digest, RECEIVE the peer's,
-	// call GenerateDelta(remoteIBLT) (the frozen set-reconciliation primitive
-	// that subtracts the peer's POPULATED IBLT — the fix; the broken
-	// GenerateDeltaStratified that subtracted an EMPTY remote IBLT is DELETED)
-	// for a minimal delta proportional to |A−B| instead of the full set. The
-	// fallback to oversend on a digest timeout / malformed digest / peel failure
-	// is the honest path (counted via sovereign_mesh_stratified_fallback).
-	fs.BoolVar(&cfg.stratifiedAntiEntropy, "stratified-anti-entropy", false, "stratified anti-entropy: per-peer StrataEstimator digest-exchange before the GenerateDelta (a minimal delta proportional to |A−B| instead of the full set). OFF (default) = byte-identical oversend; ON = the two-phase digest-exchange with oversend fallback on timeout/malformed/peel-failure (counted via sovereign_mesh_stratified_fallback).")
-	// durability is OPT-IN. --wal-path empty (default) = in-memory
-	// research mode = back-compat (the silicon bench path UNTOUCHED, no
-	// fsync on the origin write path). When set, the node boots from the WAL
-	// (RecoverEngine) and the origin write path fsyncs the engine-STAMPED dot
-	// per mutation. --wal-checkpoint-interval bounds replay length (a periodic
-	// MerkleRoot+LamportHigh anchor every K mutations); 0 = caller-driven only.
-	fs.StringVar(&cfg.walPath, "wal-path", "", "engine WAL path (empty=in-memory research mode, back-compat, durability OFF; set to a file path to enable fsync-per-mutation durability + WAL recovery on boot)")
-	fs.Uint64Var(&cfg.walCheckpointInterval, "wal-checkpoint-interval", 1000, "periodic WAL checkpoint interval in mutations (bounds replay length; 0=caller-driven checkpoints only; the fsync-per-mutation floor is NOT downgraded)")
-	// bounded recovery is OPT-IN alongside durability. --lsm-root empty
-	// (default) = full-replay back-compat (unchanged). Set to a dir
-	// to enable the LSM↔DURABILITY snapshot seam: recovery loads the dot-bearing
-	// snapshot at "ckpt/<LamportHigh>" + replays only the post-checkpoint tail
-	// (O(post-ckpt), not O(writes-since-boot)). Created if missing. A missing or
-	// corrupt snapshot silently falls back to full replay (recovery always
-	// rebuilds; boundedness is best-effort).
-	fs.StringVar(&cfg.lsmRoot, "lsm-root", "", "recovery snapshot directory (empty=full-replay back-compat; set to a dir to bound WAL recovery to the post-checkpoint tail via the snapshot seam)")
-	// ADR-0020: the Level-2 superseded-row prune knobs. The default
-	// is Preserve-All (EnableDominancePruning=false) — byte-identical
-	// compaction; the engine NEVER auto-prunes. An operator opts in by setting
-	// BOTH --compaction-prune-enable=true AND a positive
-	// --compaction-prune-horizon-ns (the transaction-time GC horizon T_gc — a
-	// monotone non-decreasing tx-time at/after which no live query looks back;
-	// ADR-0020 §2). ENABLED + horizon<=0 is SILENTLY WRONG (the txTime
-	// gap); NewL1Compactor traps it with a WARN + coerce-to-Preserve-All.
-	fs.BoolVar(&cfg.compactionPruneEnable, "compaction-prune-enable", false, "Level-2 superseded-row prune: enable dropping provably-dead merged rows at the compaction seam under the (C1)&&(C2)&&(C3) SAFE-DROP rule (default false=Preserve-All, the byte-identical behavior)")
-	fs.Int64Var(&cfg.compactionPruneHorizon, "compaction-prune-horizon-ns", 0, "transaction-time GC horizon T_gc in nanoseconds (the (C3) claw; REQUIRES --compaction-prune-enable; <=0 with prune enabled is trapped as silently-wrong + coerced to Preserve-All)")
-	// ADR-0027: the T_gc auto-inference backoff. The observed live-query
-	// txTime frontier the Resolver tracks (queried at every AsOf) is fed to the
-	// compaction scheduler's HorizonInferrer; the effective DominancePrune floor
-	// is max(--compaction-prune-horizon-ns, observedFrontier - this-backoff).
-	// The horizon flag becomes the operator's HARD floor backstop (the inferrer
-	// FLOORS the knob, it does NOT replace it); this backoff is the operator's
-	// "I may query up to T now - backoff into the past" contract. Default 5m
-	// tolerates forensic queries 5min into the recent past (a HONEST conservative
-	// default; an operator whose workload queries deeper over-retains, one that
-	// NEVER queries the past can lower it OR raise the hard floor — §6.a).
-	fs.DurationVar(&cfg.compactionPruneBackoff, "compaction-prune-backoff-ns", 5*time.Minute, "T_gc auto-inference backoff: how far behind the observed live-query txTime frontier the effective DominancePrune floor sits (effective = max(--compaction-prune-horizon-ns, observedFrontier - backoff); tolerates forensic queries `backoff` into the recent past; default 5m; 0=track the frontier directly, the operator floor still backstops)")
-	// ADR-0021: the L0 reaper. Default OFF — byte-identical
-	// (the superseded L0s stay as the crash-recovery backstop). The reaper
-	// deletes a manifest-listed L0 ONLY after verifying the L1 still exists
-	// (Stage C); turning it ON reclaims disk but requires trusting the storage
-	// layer's existence-probe (a layer that EVER reports a present L1 as
-	// missing would make the reaper delete the sole durable copy). NEVER auto-ON.
-	fs.BoolVar(&cfg.compactionReapEnable, "compaction-reap-enable", false, "L0 reaper: reclaim manifest-listed superseded L0 files + the manifest AFTER verifying the L1 still exists (default false=backstop-forever byte-identical; the reaper is NEVER auto-ON — Stage C L1-exists guard is the safety constraint)")
-	fs.DurationVar(&cfg.compactionReapInterval, "compaction-reap-interval", 5*time.Minute, "L0 reaper sweep cadence (slower than compaction's 30s — the superseded L0s are a safety net, zero urgency to delete)")
-	fs.BoolVar(&cfg.otelEnabled, "otel", false, "arm telemetry.Init at boot with a real OTel SDK MeterProvider (default false= bridge-alone; OTel reader is a SEPARATE destination from the bridge's prometheus Registry)")
-	fs.DurationVar(&cfg.otelInterval, "otel-interval", 60*time.Second, "OTel periodic reader export interval (the cadence the int64-observable callbacks fire on; the bridge scrapes cumulatively at the /metrics cadence)")
-	// ADR-0035: --cert-rotation-enable (OPT-IN, default false). OFF
-	// keeps the transport byte-identical (the SIGHUP seam +
-	// TestTLSCertRotation_SIGHUP stay byte-identical; the automated trigger is a
-	// NEW goroutine that OFF never starts). ON launches a goroutine
-	// (transport.StartRotationManager) that polls the live leaf's NotAfter +
-	// fires the rotation when the leaf is within --cert-rotation-lifetime of
-	// expiry (the pre-expiry threshold). The rotation mints a NEW Ed25519 leaf
-	// via the in-process dev-mesh CA + Reloads the SAME transport (the existing
-	// seam — the NEXT handshake presents the NEW serial). The trigger fires the
-	// CertRotationTriggered counter (the operator-visible audit trail). The
-	// design doc's 30-day cadence is the LIFETIME (the pre-expiry window), NOT
-	// the poll — the goroutine polls at --cert-rotation-poll (default 1h, coarse)
-	// and the leaf lives 1 year (certgen IssueLeaf); the rotation fires 30 days
-	// before the 1-year NotAfter. A production deployment that rotates via an
-	// out-of-process minter (KMS/HSM) substitutes the minter — the trigger's
-	// polling + reload mechanism is the load-bearing wiring this flag arms.
-	fs.BoolVar(&cfg.certRotationEnable, "cert-rotation-enable", false, "automated leaf-cert rotation: launch the poll goroutine that mints a NEW leaf + Reloads the transport when the live leaf is within --cert-rotation-lifetime of expiry (default false=SIGHUP-only manual rotation, byte-identical; the goroutine fires the supremum_pki_cert_rotation_triggered counter)")
-	fs.DurationVar(&cfg.certRotationPoll, "cert-rotation-poll", time.Hour, "rotation goroutine poll interval (how often the trigger checks the live leaf's NotAfter; coarse — default 1h; MUST be > 0 or the trigger traps; a smaller poll rotates sooner but burns a goroutine tick more often)")
-	fs.DurationVar(&cfg.certRotationLifetime, "cert-rotation-lifetime", 30*24*time.Hour, "rotation pre-expiry threshold: fire the rotation when the live leaf's NotAfter is within this duration of now (default 30d = the design doc's 30-day cadence; the lifetime is the pre-expiry GRACE window, NOT the poll interval, NOT the leaf's actual 1-year validity — the honest-calibration)")
-	// ADR-0035: --crl-path is the on-disk CRL (PEM, type "X509 CRL") the
-	// transport hot-reloads into an in-memory revoked-serial set; the
-	// VerifyPeerCertificate callback rejects a presented leaf whose serial is in
-	// the set (the design doc revocation gate). OPT-IN: empty (the
-	// DEFAULT) = no revocation consult = byte-identical (the callback
-	// returns nil on an empty set). A SIGHUP re-reads the CRL live
-	// (transport.ReloadCRL) so an operator revokes a serial by publishing a NEW
-	// crl.pem + sending SIGHUP — the NEXT handshake against the revoked serial
-	// aborts (the CertRevokedRejected counter fires). The CRL is signed by the
-	// dev-mesh CA (certgen.IssueCRL); a production deployment ships a CRL from an
-	// out-of-process CA (the Ed25519-CheckSignatureFrom stdlib quirk is disclosed
-	// ADR-0035 §6 — the consult is serial-scoped, NOT a per-handshake signature
-	// re-verify).
-	fs.StringVar(&cfg.crlPath, "crl-path", "", "on-disk CRL PEM path (empty=no revocation consult=byte-identical; set to a crl.pem to arm the VerifyPeerCertificate serial-reject; a SIGHUP re-reads it live via ReloadCRL)")
-	// ADR-0036: --hybrid-verify (OPT-IN, default false). OFF keeps
-	// the receive path on the classical-only identity.VerifyCRDTFrame seam
-	// (verify.go:68) — byte-identical (the production default stays
-	// classical-only; the hybrid is a defense-in-depth ADD, NOT a replace).
-	// ON switches the receive path's two verify call sites (receiver.go:350
-	// HandleFrame +:586 HandleBatchFrame) to the hybrid
-	// VerifyCRDTFrame_Hybrid seam — BOTH Ed25519 + ML-DSA-65 sigs required
-	// (defense-in-depth; the EITHER-or gate is the BUG-INJECT control the
-	// PQ hybrid-verify-dual guard PROVES the BOTH gate rejects). The hybrid
-	// SIGN (a frame carries BOTH sigs) is future work — the CRDT-delta wire
-	// shape change — disclosed ADR-0036 §6; the crdt.go seam is the
-	// HONEST question a future change answers. The PQ-KEM counter
-	// (PQHandshakeNegotiated) is wired UNCONDITIONALLY regardless of this flag
-	// (the KEM disclosure is the transport seam, NOT the signature verify).
-	fs.BoolVar(&cfg.hybridVerifyEnable, "hybrid-verify", false, "hybrid (Ed25519 + ML-DSA-65) signature verify: switch the receive path to the BOTH-sigs-required VerifyCRDTFrame_Hybrid seam (defense-in-depth — a classical break does NOT compromise a PQ frame, a PQ break does NOT compromise a classical frame; default false=classical-only byte-identical; the hybrid SIGN is a future change)")
-	// ADR-0037: --hybrid-sign (OPT-IN, default false). OFF keeps the
-	// self-originated delta path on the v1 BatchEnvelope (one Ed25519 per batch)
-	// — byte-identical (NO hybrid frame is produced; the receive-side
-	// --hybrid-verify gate never sees one — PQ hybrid-off byte-identical).
-	// ON switches shipBatchedDelta's self-originated path to ShipBatchHybrid: one
-	// Ed25519 + one ML-DSA-65 sig over the SAME 120-byte SHAKE256 pad of
-	// batchWire, carried in a HybridEnvelope (attribution.MarshalHybridFrame).
-	// The owner identity is constructed via NewNodeIdentityHybrid when this is
-	// true (the PQ key is minted from the SAME --identity-seed); the PQ pubkey
-	// is registered in the Directory via RegisterPQ. The relay/foreign path
-	// stays per-frame regardless (the self-origin boundary). A misconfigured
-	// --hybrid-sign on a non-PQ owner returns an error from ShipBatchHybrid's
-	// nil-pqPriv guard (logged + the batch skipped, NOT a panic).
-	fs.BoolVar(&cfg.hybridSignEnable, "hybrid-sign", false, "hybrid-PQ SIGN: switch the self-originated delta path to ShipBatchHybrid (one Ed25519 + one ML-DSA-65 sig over the SAME 120-byte SHAKE256 pad of batchWire, carried in a HybridEnvelope; the owner is minted via NewNodeIdentityHybrid + the PQ pubkey is registered via RegisterPQ; default false=v1 BatchEnvelope byte-identical; the relay/foreign path stays per-frame regardless)")
-	// ADR-0039: --region-aware (OPT-IN, default false). OFF keeps
-	// AntiEntropySweep on the full-mesh peers.Peers() path — byte-identical
-	// (NO topology selector runs; the topology-off byte-identical
-	// guard). ON switches the sweep's iteration source to topology.Select(ctx)
-	// (intra-region full-mesh + inter-region fan-out-N, prefer cross-region,
-	// seeded-deterministic — the O(log N) rounds convergence the design doc
-	// names). The fan-out is the design doc's default 3 (override via
-	// --region-fanout); the self-region is --self-region (0 = RegionUnset =
-	// every peer intra = byte-identical full-mesh); the per-peer region tags
-	// are parsed from the --peers addr@region suffix (a peer with NO @region
-	// suffix is RegionUnset = SAME-region = intra). The knob is INDEPENDENT of
-	// the per-peer tags: --region-aware=true with NO peers tagged = the full-
-	// mesh path with the topology seam armed but idle (the honest "arm first,
-	// tag later" discipline). NO new module dep (stdlib only); NO AWS this change
-	// (the 100-node silicon convergence gate is the AWS arc — the
-	// loopback gate is the SIMULATED N=100 mesh round-count, NOT silicon wall-
-	// time).
-	fs.BoolVar(&cfg.regionAwareEnable, "region-aware", false, "region-aware gossip data-plane: switch AntiEntropySweep's iteration source from the full-mesh peers.Peers() (O(N²) connections at N nodes) to topology.Select(ctx) (intra-region full-mesh + inter-region fan-out-N, prefer cross-region, seeded-deterministic — the O(log N) rounds convergence the design doc names). default false=full-mesh Peers() byte-identical; the per-peer region tags are parsed from --peers addr@region suffixes; --self-region is this node's own region (0=RegionUnset=every-peer-intra=byte-identical full-mesh); --region-fanout is the inter-region fan-out N (default 3)")
-	// ADR-0039: --self-region is this node's OWN region tag (the
-	// intra/inter split key). A uint8 (0-255); 0 (the DEFAULT — RegionUnset)
-	// makes EVERY peer intra-region (sameRegion returns true for RegionUnset on
-	// either side) = byte-identical to the full-mesh path. A production deployment
-	// that wants named regions (us-east, eu-west) ships a registry uint8→string
-	// in a SEPARATE change (the opt-IN discipline: ship the SIMPLE thing
-	// first). The honest call is the uint8 (cache-friendly — the spec's
-	// "the honest call is the uint8"; a string is human-readable but a uint8 is a
-	// single-byte compare).
-	fs.IntVar(&cfg.selfRegion, "self-region", 0, "this node's own region tag (the intra/inter split key; a uint8 0-255; 0=RegionUnset=every-peer-intra=byte-identical full-mesh; peers with the SAME region are intra=full-mesh, peers with a DIFFERENT region are inter=fan-out-N candidates)")
-	// ADR-0039: --region-fanout is the inter-region fan-out N (the
-	// design doc's default 3 — the O(log_3 N) rounds convergence at fan-out 3).
-	// Clamped to [0, MaxFanout] by the TopologyManager; 0 = intra-region full-
-	// mesh only (the honest degenerate case — the topology connection-cut guard
-	// asserts fan-out 0 -> intra-only). A larger fan-out converges faster but
-	// burns more per-sweep bandwidth (the trade-off the operator dials).
-	fs.IntVar(&cfg.regionFanout, "region-fanout", 3, "inter-region fan-out N (the design doc's default 3 — the O(log_3 N) rounds convergence; clamped to [0, MaxFanout]; 0=intra-region full-mesh only — the honest degenerate case)")
-	// ADR-0040: --peer-dir is the OOB peer-Directory pubkey provisioning
-	// config path (Seam A — the deterministic gate). OPT-IN (default "" = no
-	// provisioning = the dial loop keeps the zero peerID = byte-identical).
-	// The config is line-oriented (zero-dependency: no TOML/YAML dep): one peer per
-	// line, whitespace-separated positional columns `addr nodeID ed25519_pubkey
-	// [mldsa65_pubkey|-] [region|-]`; `#` comments; a NON-EMPTY path that does not
-	// exist OR a malformed entry FAILS THE BOOT (a deploy misconfiguration MUST
-	// surface loudly, NOT silently fall back to zero-peerID). See
-	// cmd/sovereign-node/provisioning.go's parsePeerDir for the FAILSAFE parser +
-	// the column contract.
-	fs.StringVar(&cfg.peerDir, "peer-dir", "", "OOB peer-Directory pubkey provisioning config path (Seam A — the deterministic gate; OPT-IN default \"\"=no provisioning=byte-identical). Line-oriented: `addr nodeID ed25519_pubkey [mldsa65_pubkey|-] [region|-]` per line, `#` comments; a non-empty-but-absent OR malformed entry FAILS the boot (a deploy misconfiguration MUST be loud, NOT a silent zero-peerID fallback)")
-	// ADR-0040: --peer-auto-reconcile is the runtime TLS-leaf reconcile
-	// (Seam B — the routing complement to Seam A). OPT-IN (default false =
-	// byte-identical). ON switches PeerSet.Dial to read the peer's TLS leaf
-	// CommonName (hex.DecodeString the 32-char CN → [16]byte) + re-key the
-	// peerConn under the REAL nodeID so the topology selector HITS for a peer
-	// whose dial supplied the zero peerID. ROUTING-only: the reconcile
-	// re-keys the ROUTING map; it NEVER touches the verification pubkey (the
-	// Directory's OOB-provisioned key is the verification anchor). A self-announced
-	// node with NO OOB pubkey is ROUTED but NOT VERIFIED → its deltas DROPPED LOUD
-	// via VerifyFail (the correct zero-trust posture). The binary harness's
-	// honest-negative control PROVES reconcile-only does NOT converge (the receiver's
-	// Directory.Lookup at receiver.go:436 MISSES without --peer-dir's RegisterPeer
-	// → DropVerify → no convergence); Seam B is a routing COMPLEMENT to Seam A,
-	// NOT a standalone convergence path. See pkg/mesh/peer.go reconcilePeerID.
-	fs.BoolVar(&cfg.autoReconcile, "peer-auto-reconcile", false, "runtime TLS-leaf reconcile (Seam B — the routing complement to Seam A; OPT-IN default false=byte-identical). ON switches PeerSet.Dial to read the peer leaf CommonName (hex.DecodeString → [16]byte) + re-key the peerConn under the REAL nodeID so the topology selector HITS. ROUTING-only (the verification pubkey stays the deploy's OOB concern via --peer-dir; reconcile ALONE routes but does NOT converge — Directory.Lookup misses → DropVerify)")
+	fs.IntVar(&cfg.batchSize, "batch-size", 100, "self-originated deltas per signed batch (1-256; one signature verification per batch)")
+	fs.Uint64Var(&cfg.lamportAbsoluteSlack, "lamport-absolute-slack", 1000, "additional Lamport skew allowance for admitting batches to cold peers (default 1000; zero is coerced to 1000)")
+	fs.BoolVar(&cfg.stratifiedAntiEntropy, "stratified-anti-entropy", false, "exchange StrataEstimator and IBLT digests to send differences instead of full sets; digest failures fall back to full-set sends")
+	fs.BoolVar(&cfg.deferHandler, "defer-handler", false, "defer one round after a digest failure, then send a bounded rotating slice instead of the full keyset; requires --stratified-anti-entropy")
+	fs.BoolVar(&cfg.deferCrossover, "defer-crossover", false, "allow one full-keyset send per divergence after a capacity peel failure within the 20,000-entry bound; requires --defer-handler")
+	fs.DurationVar(&cfg.digestWaitTimeout, "digest-wait-timeout", 500*time.Millisecond, "digest response timeout per peer (default 500ms; increase for wide-area round trips)")
+
+	fs.BoolVar(&cfg.digestWaitAdaptive, "digest-wait-adaptive", false, "adapt each peer's digest wait using its response-latency EWMA, clamped to 15s; requires --stratified-anti-entropy and --defer-handler")
+	// Decorrelated placement avoids the double-hash stopping-set floor; the
+	// 2-core threshold is B > 1.295*D. Dynamic sizing is capped at 21,845
+	// buckets, and mixed v1/v2 peers oversend until they use the same version.
+	fs.BoolVar(&cfg.ibltV2, "iblt-v2", false, "use decorrelated IBLT placement, dynamic bucket sizing, and the IBL2 wire format; requires --stratified-anti-entropy and fleet-wide version alignment")
+	fs.IntVar(&cfg.ibltV2MinBuckets, "iblt-v2-min-buckets", 0, "minimum starting and decay bucket count for IBLT v2 (0 uses 1024; 21845 supports 10,000 differences at 2.1845x); requires --iblt-v2")
+	fs.DurationVar(&cfg.meshWriteTimeout, "mesh-write-timeout", 10*time.Second, "per-frame TLS write timeout; zero disables it, and a timeout closes the connection for redial")
+	fs.StringVar(&cfg.walPath, "wal-path", "", "WAL file path; empty uses an in-memory engine without fsync or WAL recovery")
+	fs.Uint64Var(&cfg.walCheckpointInterval, "wal-checkpoint-interval", 1000, "mutations between periodic WAL checkpoints (0 = caller-driven checkpoints only)")
+	fs.StringVar(&cfg.lsmRoot, "lsm-root", "", "snapshot directory; with --wal-path, recovery replays only the post-checkpoint tail")
+	fs.BoolVar(&cfg.compactionPruneEnable, "compaction-prune-enable", false, "drop superseded rows during compaction when they fall before the transaction-time prune horizon")
+	fs.Int64Var(&cfg.compactionPruneHorizon, "compaction-prune-horizon-ns", 0, "transaction-time prune horizon in nanoseconds; requires --compaction-prune-enable and must be positive")
+	fs.DurationVar(&cfg.compactionPruneBackoff, "compaction-prune-backoff-ns", 5*time.Minute, "distance behind the observed query frontier for the inferred prune horizon (default 5m; 0 tracks the frontier)")
+	fs.BoolVar(&cfg.compactionReapEnable, "compaction-reap-enable", false, "delete superseded L0 files and manifests after verifying that the replacement L1 exists")
+	fs.DurationVar(&cfg.compactionReapInterval, "compaction-reap-interval", 5*time.Minute, "superseded L0 reaper interval (default 5m)")
+	fs.BoolVar(&cfg.otelEnabled, "otel", false, "enable OpenTelemetry log export alongside the Prometheus /metrics bridge")
+	fs.DurationVar(&cfg.otelInterval, "otel-interval", 60*time.Second, "OpenTelemetry periodic export interval")
+	fs.BoolVar(&cfg.certRotationEnable, "cert-rotation-enable", false, "enable automated leaf rotation; the in-process minter requires --selftest")
+	fs.DurationVar(&cfg.certRotationPoll, "cert-rotation-poll", time.Hour, "leaf rotation poll interval (default 1h; must be positive)")
+	fs.DurationVar(&cfg.certRotationLifetime, "cert-rotation-lifetime", 30*24*time.Hour, "rotate this long before leaf NotAfter (default 720h)")
+	fs.StringVar(&cfg.crlPath, "crl-path", "", "PEM CRL path for rejecting revoked leaf serials; empty disables revocation checks, and SIGHUP reloads it")
+	fs.BoolVar(&cfg.hybridVerifyEnable, "hybrid-verify", false, "require Ed25519 and ML-DSA-65 signatures on the receive path; classical-only v1 frames are rejected")
+	fs.BoolVar(&cfg.hybridSignEnable, "hybrid-sign", false, "sign self-originated batches with Ed25519 and ML-DSA-65; derive both keys from --identity-seed")
+	fs.BoolVar(&cfg.regionAwareEnable, "region-aware", false, "select gossip peers by region; untagged peers are treated as local")
+	fs.IntVar(&cfg.selfRegion, "self-region", 0, "numeric region tag for this node (0 = unset)")
+	fs.IntVar(&cfg.regionFanout, "region-fanout", 3, "cross-region gossip targets per sweep (default 3; 0 = intra-region only)")
+	fs.IntVar(&cfg.gatewaysPerRegion, "gateways-per-region", 0, "regional gateways per region, selected from the first entries in --peer-dir file order; requires --region-aware")
+	fs.BoolVar(&cfg.partialIntraViewEnable, "partial-intra-view", false, "limit each intra-region sweep to a rotating subset of up to eight peers; requires --region-aware")
+	fs.BoolVar(&cfg.sweepPhaseJitterEnabled, "sweep-phase-jitter", false, "offset sweeps by a deterministic per-node phase; also enabled by SOVEREIGN_SWEEP_PHASE_JITTER=1")
+	fs.BoolVar(&cfg.secondaryIndexEnable, "secondary-index", false, "enable the cross-entity H3 and system-time index and its query routes")
+	fs.IntVar(&cfg.secondaryIndexMaxEntities, "secondary-index-max-entities", 0, "maximum distinct indexed entities (0 = uncapped; excess new entities are dropped and queries return 503)")
+	fs.StringVar(&cfg.peerDir, "peer-dir", "", "out-of-band peer directory: `addr nodeID ed25519_pubkey [mldsa65_pubkey|-] [region|-]` per line; missing or malformed files fail startup")
+	fs.BoolVar(&cfg.autoReconcile, "peer-auto-reconcile", false, "re-key unprovisioned peers from their TLS leaf node ID for routing; verification keys still require --peer-dir")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -558,8 +302,7 @@ func parseFlags(args []string) (*nodeConfig, error) {
 	return cfg, nil
 }
 
-// resolveNodeID parses the --node-id hex (or mints a random 16-byte id) and
-// returns the [16]byte the frozen engine constructor expects.
+// resolveNodeID parses --node-id or generates a random 16-byte node ID.
 func resolveNodeID(cfg *nodeConfig) ([16]byte, error) {
 	if cfg.nodeID == "" {
 		var id [16]byte
@@ -580,15 +323,9 @@ func resolveNodeID(cfg *nodeConfig) ([16]byte, error) {
 	return id, nil
 }
 
-// parsePeers splits the --peers comma list into a slice of host:port strings
-// for the dial loop. ADR-0039: a peer
-// may carry an `addr@region` suffix (the per-peer region tag for the region-
-// aware sweep); parsePeers STRIPS the `@region` suffix so the addr passed to
-// peerSet.Dial is a clean host:port (net.SplitHostPort would reject the `@`
-// suffix). The region suffix is parsed SEPARATELY by parsePeerRegions (which
-// reads the SAME --peers string + extracts the addr→region map). A peer with
-// NO `@region` suffix is RegionUnset (the honest conservative default — an
-// untagged peer routes as SAME-region = intra, NOT foreign).
+// parsePeers splits --peers into host:port addresses. It strips each optional
+// @region suffix before dialing; parsePeerRegions reads the suffix separately.
+// An untagged peer remains RegionUnset and is treated as local.
 func parsePeers(peers string) []string {
 	if peers == "" {
 		return nil
@@ -599,8 +336,8 @@ func parsePeers(peers string) []string {
 		if p == "" {
 			continue
 		}
-		// strip the `@region` suffix (if present) so the dial addr is
-		// a clean host:port. The region is parsed separately by parsePeerRegions.
+		// Strip the region suffix before dialing; parsePeerRegions reads it
+		// separately from the original flag value.
 		if at := strings.IndexByte(p, '@'); at >= 0 {
 			p = strings.TrimSpace(p[:at])
 		}
@@ -611,17 +348,9 @@ func parsePeers(peers string) []string {
 	return out
 }
 
-// parsePeerRegions parses the --peers comma list's `addr@region` suffixes into
-// an addr→RegionTag map (the per-peer region registry). A peer with NO
-// `@region` suffix is OMITTED (RegionUnset — the honest conservative default;
-// an untagged peer routes as SAME-region = intra via the TopologyManager's
-// untagged=local default). The region is a uint8 parsed from the suffix string
-// (e.g. "1.2.3.4:7430@1" → region 1); a parse error (non-numeric, out of
-// uint8 range) is silently skipped (RegionUnset — the honest FAILSAFE: a
-// malformed region tag NEVER crashes the boot; the peer routes as local, NOT
-// foreign, the conservative default). Called once at boot; the returned map is
-// the TopologyManager's region registry (keyed by peerIDForAddr(addr), the
-// deterministic addr-derived [16]byte).
+// parsePeerRegions returns address-to-region mappings from --peers suffixes.
+// Addresses without a valid numeric uint8 suffix are omitted and therefore
+// remain RegionUnset. Zero is accepted and has the same unset meaning.
 func parsePeerRegions(peers string) map[string]mesh.RegionTag {
 	if peers == "" {
 		return nil
@@ -634,17 +363,13 @@ func parsePeerRegions(peers string) map[string]mesh.RegionTag {
 		}
 		at := strings.IndexByte(p, '@')
 		if at < 0 {
-			continue // no region suffix -> RegionUnset (untagged = local)
+			continue
 		}
 		addr := strings.TrimSpace(p[:at])
 		regionStr := strings.TrimSpace(p[at+1:])
 		if addr == "" || regionStr == "" {
 			continue
 		}
-		// Parse the region tag as a uint8 (0-255). A parse error OR an
-		// out-of-range value is silently skipped (RegionUnset — the honest
-		// FAILSAFE; a malformed region tag NEVER crashes the boot). A value of
-		// 0 is RegionUnset (the same as no suffix) — accepted but inert.
 		r, err := strconv.ParseUint(regionStr, 10, 8)
 		if err != nil {
 			continue
@@ -654,19 +379,10 @@ func parsePeerRegions(peers string) map[string]mesh.RegionTag {
 	return out
 }
 
-// peerIDForAddr derives a DETERMINISTIC [16]byte peerID surrogate from a peer
-// addr (SHA-256 of the addr, truncated to 16 bytes). The dial loop stores
-// peers under a PLACEHOLDER zero peerID (the peer's real nodeID is unknown until
-// the peer presents its leaf — the honest gap; real peer provisioning
-// ships the OOB arc). The TopologyManager is keyed by [16]byte peerID,
-// so the cmd path registers region tags under this deterministic addr-derived
-// surrogate — a STABLE key the future OOB-provisioning change reconciles with the
-// real nodeID (once the dial loop carries real peerIDs, the same topology
-// works under the real keys). The HONEST N=2 NO-OP: the cmd dial loop's zero
-// peerID does NOT match this addr-derived key, so the region lookup misses →
-// every peer routes as RegionUnset = intra = byte-identical full-mesh; the
-// loopback gate is the SIMULATED N=100 mesh (in-process, REAL peerIDs), NOT the
-// 2-node binary run (the spec's §III gate honest residual).
+// peerIDForAddr returns the first 16 bytes of SHA-256(addr). This deterministic
+// surrogate keys topology state for an unprovisioned address; it is not proof
+// of the peer's identity. applySurrogateRegions omits provisioned addresses,
+// whose real node IDs key the topology instead.
 func peerIDForAddr(addr string) [16]byte {
 	sum := sha256.Sum256([]byte(addr))
 	var id [16]byte
@@ -674,20 +390,10 @@ func peerIDForAddr(addr string) [16]byte {
 	return id
 }
 
-// applySurrogateRegions registers the --peers addr@region suffixes as
-// TopologyManager region tags keyed by peerIDForAddr(addr) — the
-// SHA-256 surrogate — EXCEPT for any addr in provisionedAddr (a peer
-// --peer-dir provisions under the REAL nodeID). The
-// surrogate-pollution fix: a peer tagged @region
-// in --peers AND provisioned in --peer-dir would otherwise leave a DEAD
-// surrogate in topo.regions (no live peerConn keys it) → topology.Select
-// iterates BOTH the surrogate + the real nodeID → the dead surrogate consumes
-// an inter-region fan-out slot, evicting a real cross-region peer →
-// convergence slows/stalls + the telemetry counter over-counts. The gate
-// skips the surrogate for a provisioned addr; its region comes from
-// applyProvisioning's SetRegion(realNodeID, region) instead. Extracted to a
-// helper so the surrogate-pollution fix is FALSIFIABLE (the OOB
-// surrogate-retirement guard calls this directly, NOT a re-implementation).
+// applySurrogateRegions registers address-derived region keys only for
+// addresses absent from --peer-dir. A provisioned peer is registered under its
+// real node ID; retaining its surrogate as well could consume a cross-region
+// fan-out slot even though no connection uses that surrogate.
 func applySurrogateRegions(topo *mesh.TopologyManager, peers string, provisionedAddr map[string]bool) {
 	for addr, region := range parsePeerRegions(peers) {
 		if provisionedAddr[addr] {
@@ -697,21 +403,168 @@ func applySurrogateRegions(topo *mesh.TopologyManager, peers string, provisioned
 	}
 }
 
+// disableAsyncBootDialFault restores sequential boot dialing for the negative
+// control used by the boot-dial tests.
+var disableAsyncBootDialFault atomic.Bool
+
+// bootDialConcurrency bounds the initial dial worker pool. Same-region targets
+// are queued before cross-region targets.
+const bootDialConcurrency = 32
+
+// validatePartialIntraViewConfig rejects flags whose behavior requires the
+// region-aware topology selector. Without it, a partial-view or gateway flag
+// would not affect peer selection.
+func validatePartialIntraViewConfig(cfg *nodeConfig) error {
+	if cfg.partialIntraViewEnable && !cfg.regionAwareEnable {
+		return fmt.Errorf("--partial-intra-view requires --region-aware: the intra view is drawn inside the topology Select path")
+	}
+	if cfg.gatewaysPerRegion < 0 {
+		return fmt.Errorf("--gateways-per-region must be >= 0 (got %d)", cfg.gatewaysPerRegion)
+	}
+	if cfg.gatewaysPerRegion > 0 && !cfg.regionAwareEnable {
+		return fmt.Errorf("--gateways-per-region requires --region-aware: hierarchical regional gateway routing operates inside the region-aware topology selector")
+	}
+	return nil
+}
+
+var disableArenaMiBMinBucketsGuardFault atomic.Bool
+
+func validateConfig(cfg *nodeConfig) error {
+	if err := validatePartialIntraViewConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.ibltV2 && !cfg.stratifiedAntiEntropy {
+		return fmt.Errorf("--iblt-v2 requires --stratified-anti-entropy: the v2 digest scheme arms inside the stratified digest-exchange; without stratified the flag is a silent no-op and every digest stays the legacy double-hash at the fixed 1024")
+	}
+	if cfg.ibltV2MinBuckets < 0 {
+		return fmt.Errorf("--iblt-v2-min-buckets must be >= 0 (got %d)", cfg.ibltV2MinBuckets)
+	}
+	if cfg.ibltV2MinBuckets > 0 && !cfg.ibltV2 {
+		return fmt.Errorf("--iblt-v2-min-buckets requires --iblt-v2: the v2 bucket floor applies only to the v2 IBLT ladder")
+	}
+	if !disableArenaMiBMinBucketsGuardFault.Load() && os.Getenv("SOVEREIGN_TEST_FAULT_IBLT_ARENA") != "skip_arena_mib_guard" {
+		if cfg.ibltV2MinBuckets > 8192 && cfg.arenaMib < 256 {
+			return fmt.Errorf("--iblt-v2-min-buckets %d (> 8192) requires --arena-mib >= 256 (got %d): 21845-bucket v2 digests allocate 512 KiB arena slabs and exhaust a 64 MiB arena under 1,000-node concurrency", cfg.ibltV2MinBuckets, cfg.arenaMib)
+		}
+	}
+	return nil
+}
+
+type bootDialTarget struct {
+	pa            string
+	host          string
+	dialPeerID    [16]byte
+	isProvisioned bool
+}
+
+func startMeshBootDialAndSweep(
+	meshCtx context.Context,
+	cfg *nodeConfig,
+	peers []string,
+	provisioned provisionedMap,
+	topo *mesh.TopologyManager,
+	peerSet *mesh.PeerSet,
+	gossiper *mesh.Gossiper,
+) error {
+	peerSet.SetAutoReconcile(cfg.autoReconcile)
+	tickDur, err := time.ParseDuration(cfg.gossipTick)
+	if err != nil {
+		return fmt.Errorf("--gossip-tick %q: %w", cfg.gossipTick, err)
+	}
+	intraDialTargets := make([]bootDialTarget, 0, len(peers))
+	interDialTargets := make([]bootDialTarget, 0, len(peers))
+	for _, pa := range peers {
+		host, _, herr := net.SplitHostPort(pa)
+		if herr != nil {
+			host = "localhost"
+		}
+		var dialPeerID [16]byte
+		isProvisioned := false
+		if pid, ok := provisioned[pa]; ok {
+			dialPeerID = pid
+			isProvisioned = true
+		} else if len(provisioned) > 0 {
+			log.Printf("sovereign-node: peer %s is in --peers but not --peer-dir; dialing with a zero node ID prevents topology routing and publication. Use the same address string in both settings.", pa)
+		}
+		if topo != nil && !topo.ShouldDialPeer(dialPeerID) {
+			continue
+		}
+		dt := bootDialTarget{
+			pa:            pa,
+			host:          host,
+			dialPeerID:    dialPeerID,
+			isProvisioned: isProvisioned,
+		}
+		if topo != nil && topo.IsInterRegion(dialPeerID) {
+			interDialTargets = append(interDialTargets, dt)
+		} else {
+			intraDialTargets = append(intraDialTargets, dt)
+		}
+	}
+	dialTargets := append(intraDialTargets, interDialTargets...)
+	dialOneTarget := func(dt bootDialTarget) {
+		dialErr := peerSet.Dial(meshCtx, dt.pa, dt.host, dt.dialPeerID)
+		if dialErr != nil {
+			log.Printf("peer dial %s: %v (accept loop still serving; ReconnectLoop retries with backoff)", dt.pa, dialErr)
+		} else if dt.isProvisioned {
+			log.Printf("sovereign-node: dialed provisioned peer %x at %s", dt.dialPeerID, dt.pa)
+		}
+		go peerSet.ReconnectLoop(meshCtx, dt.pa, dt.host, dt.dialPeerID, time.Second, 10*time.Second)
+	}
+	syncBootDialFault := disableAsyncBootDialFault.Load() || os.Getenv("SOVEREIGN_TEST_FAULT_TOPOLOGY_BOOT") == "sync_boot_dial"
+	if syncBootDialFault {
+		for _, dt := range dialTargets {
+			dialOneTarget(dt)
+		}
+	}
+	go gossiper.SweepLoop(meshCtx, tickDur)
+	if len(peers) > 0 {
+		log.Printf("sovereign-node: mesh gossip sweep started, tick=%s, peers=%d (dial_targets=%d)", cfg.gossipTick, len(peers), len(dialTargets))
+	} else {
+		log.Printf("sovereign-node: no peers configured (single-node); sweep idle")
+	}
+	if !syncBootDialFault && len(dialTargets) > 0 {
+		go func(targets []bootDialTarget) {
+			workers := bootDialConcurrency
+			if workers > len(targets) {
+				workers = len(targets)
+			}
+			var nextIdx atomic.Int64
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for w := 0; w < workers; w++ {
+				go func() {
+					defer wg.Done()
+					for {
+						if meshCtx.Err() != nil {
+							return
+						}
+						idx := int(nextIdx.Add(1) - 1)
+						if idx >= len(targets) {
+							return
+						}
+						dialOneTarget(targets[idx])
+					}
+				}()
+			}
+			wg.Wait()
+		}(dialTargets)
+	}
+	return nil
+}
+
 func run(args []string) error {
 	cfg, err := parseFlags(args)
 	if err != nil {
 		return err
 	}
-	// arm the EXPENSIVE mutex+block profiling ONLY when explicitly
-	// requested (--diag-profile or SOVEREIGN_DIAG_PROFILE=1). This instruments every
-	// mutex/block event — a real hot-path cost — so it is DEFAULT OFF and must be on
-	// for the ONE node under diagnosis (the seed), never the fleet. Armed here, at
-	// the top of boot, so the profile covers the whole run. The goroutine endpoint
-	// is always cheap and needs no toggle.
+	// Enable mutex and block sampling before startup work so the profiles cover
+	// the full run. Collection has runtime overhead; goroutine profiles do not
+	// require this flag.
 	if cfg.diagProfile || os.Getenv("SOVEREIGN_DIAG_PROFILE") == "1" {
 		runtime.SetMutexProfileFraction(1)
 		runtime.SetBlockProfileRate(1)
-		log.Printf("diag-profile: ON — mutex+block profiling armed (SetMutexProfileFraction(1)+SetBlockProfileRate(1)); EXPENSIVE, diagnostic-only, NOT a production setting")
+		log.Printf("diag-profile: mutex and block profiling enabled; intended for diagnosis because of runtime overhead")
 	}
 	nodeID, err := resolveNodeID(cfg)
 	if err != nil {
@@ -719,13 +572,9 @@ func run(args []string) error {
 	}
 	peers := parsePeers(cfg.peers)
 
-	// --selftest: mint a dev CA + leaf into a temp dir, point the transport
-	// at them, serve /livecheck, and exit after a short window so the gate
-	// can curl it. This is box-independent (no silicon required).: the
-	// in-process CA is ALSO returned so the automated rotation trigger can mint
-	// NEW leaves via the SAME CA under --selftest (the operator path has NO
-	// in-process CA — it loads PEMs from disk — so rotation on the operator
-	// path needs an out-of-process minter, disclosed ADR-0035 §6).
+	// The self-test mints a temporary CA and leaf, serves /livecheck briefly,
+	// and exits. Retaining the CA lets the rotation manager issue replacement
+	// leaves. The normal PEM-based path has no in-process CA (ADR-0035).
 	certPath, keyPath, caPath := cfg.tlsCert, cfg.tlsKey, cfg.tlsCA
 	var selftestCA *crypto.MeshCA
 	if cfg.selftest {
@@ -741,50 +590,22 @@ func run(args []string) error {
 		return fmt.Errorf("tls transport: %w", err)
 	}
 
-	// ADR-0035: the PKI revocation consult + the automated rotation
-	// trigger — wired on the transport the binary just constructed. Both are
-	// OPT-IN (the opt-IN precedent); a node with --crl-path empty
-	// AND --cert-rotation-enable=false (the DEFAULTS) leaves the transport
-	// byte-identical (the VerifyPeerCertificate callback returns nil on
-	// an empty revoked set; no rotation goroutine starts).
-	//
-	// (1) The CRL revocation consult: --crl-path set arms the on-disk CRL the
-	// transport hot-reloads. LoadCRL parses it once at boot (the construction-
-	// time arm); a SIGHUP re-reads it live (ReloadCRL, wired in the SIGHUP
-	// handler below). The VerifyPeerCertificate callback (wired inside the
-	// transport's ServerConfig/ClientConfig) rejects a presented leaf whose
-	// serial is in the set + fires the CertRevokedRejected counter.
+	// A configured CRL must load successfully before the listener starts.
+	// VerifyPeerCertificate rejects listed serials, and SIGHUP reloads the file.
 	if cfg.crlPath != "" {
 		tr.SetCRLPath(cfg.crlPath)
 		if err := tr.LoadCRL(); err != nil {
-			return fmt.Errorf("CRL load %q: %w (the transport will NOT start with a configured-but-unloadable CRL — the honest-negative posture; a corrupt CRL is NEVER silently dropped to 'trust everything')", cfg.crlPath, err)
+			return fmt.Errorf("CRL load %q: %w; refusing to start without the configured revocation list", cfg.crlPath, err)
 		}
-		log.Printf("CRL loaded from %q — revoked-serial consult armed (VerifyPeerCertificate rejects a presented leaf whose serial is in the CRL)", cfg.crlPath)
+		log.Printf("CRL loaded from %q; revoked leaf serials will be rejected", cfg.crlPath)
 	}
-	// (2) The revocation-reject counter seam: the transport's
-	// VerifyPeerCertificate callback fires the reporter on each CRL reject.
-	// nil (the default) leaves the reject silent; the binding here wires the
-	// telemetry counter so the operator SEES the rejects on /metrics.
 	tr.SetRevocationReporter(telemetry.CertRevokedRejected.Inc)
-	// (2b) ADR-0036: the PQ-KEM-negotiated counter seam. The
-	// transport's RecordHandshake (fired by transport.Dial after each
-	// completed TLS handshake) increments the reporter IFF the negotiated
-	// CurveID is X25519MLKEM768 (the PQ KEM — a classical fallback does NOT
-	// increment). nil (the default) leaves the negotiation silent; the
-	// binding here wires the telemetry counter so the operator SEES the PQ KEM
-	// happening on /metrics (the prove-NOT-enable disclosure: the
-	// engine ALREADY negotiates X25519MLKEM768 by Go 1.24+ default; the
-	// counter is the PROOF, NOT the mechanism). Wired UNCONDITIONALLY (the
-	// --hybrid-verify flag gates the SIGNATURE verify, NOT the KEM disclosure).
+	// Go negotiates X25519MLKEM768 by default when both peers support it. This
+	// reporter observes that negotiation; it does not enable the KEM or depend
+	// on hybrid signature verification.
 	tr.SetPQHandshakeReporter(telemetry.PQHandshakeNegotiated.Inc)
-	// (3) The automated leaf-rotation trigger: --cert-rotation-enable arms the
-	// poll goroutine. The minter is the in-process dev-mesh CA (the selftest
-	// path mints one in mintSelftestCerts; the operator path uses on-disk PEMs
-	// the operator provides — NO in-process CA — so the rotation minter is
-	// wired ONLY for the selftest path here; a production deployment that wants
-	// automated rotation on the operator path supplies an out-of-process minter
-	// via the certMinter seam, disclosed ADR-0035 §6). The trigger fires the
-	// CertRotationTriggered counter.
+	// The rotation manager needs a certificate minter. buildRotationMinter
+	// provides one for --selftest and returns an error for the PEM-only path.
 	if cfg.certRotationEnable {
 		minter, minterErr := buildRotationMinter(selftestCA, nodeID, certPath, keyPath, tr)
 		if minterErr != nil {
@@ -795,56 +616,59 @@ func run(args []string) error {
 			return fmt.Errorf("cert rotation manager: %w", rotErr)
 		}
 		defer stopRot()
-		log.Printf("automated leaf-cert rotation armed (poll=%s, pre-expiry-lifetime=%s; the goroutine mints a NEW leaf + Reloads when the live leaf is within %s of its NotAfter)",
+		log.Printf("automated leaf-cert rotation enabled (poll=%s, rotation window=%s; leaf reloads within %s of NotAfter)",
 			cfg.certRotationPoll, cfg.certRotationLifetime, cfg.certRotationLifetime)
 	}
 
-	// Construct the frozen engine + the receive gate stack. Every constructor
-	// here is grep-verified (see the package doc above + ADR-0006).
 	arenaSize := uintptr(cfg.arenaMib) * 1024 * 1024
 	if arenaSize == 0 {
 		arenaSize = defaultArenaSize
 	}
-	// durability is OPT-IN. --wal-path empty (default) = in-memory
-	// research mode = back-compat: a fresh engine at initialCounter=1, NO
-	// WAL, NO fsync on the origin write path (the silicon bench path UNTOUCHED).
-	// When --wal-path is set, boot from the WAL via RecoverEngine: replay the
-	// durable log into a fresh engine, assert crash-consistency against the last
-	// checkpoint, and reopen the WAL for append. ErrRecoveryRootMismatch is
-	// FATAL — a sick engine that fails Merkle-equality on recovery MUST NOT
-	// start (every error path must be loud). The bridge binds the
-	// recovered engine + WAL so InsertLocalEvents fsyncs the engine-STAMPED dot
-	// per mutation (the physical order, §6).
+	// An empty WAL path constructs a fresh in-memory engine. Otherwise recovery
+	// replays the log and checks it against the checkpoint before opening the
+	// WAL for append. A root or fingerprint mismatch prevents startup. The
+	// durability bridge appends each accepted local mutation before returning.
 	var engine *eng.DeltaCRDTEngine
 	var bridge *durability.Bridge
-	// queryResolver is the bitemporal query tier over the persisted
-	// Arrow index (Resolver.AsOf → /v1/query). It is nil by default: a
-	// research/in-memory node (--wal-path empty) OR a durable node started
-	// WITHOUT --lsm-root never constructs it, so /v1/query returns the honest
-	// 503 (control.go handleQuery). Only the --lsm-root snapshot-store branch
-	// below constructs it. ADR-0017.
-	// queryCompactor is the L0→L1 per-entity compaction tier over the
-	// SAME *LocalFS the resolver reads. Nil by default (same gate as
-	// queryResolver — --lsm-root + enableIndex=true). ADR-0019.
+	// The query resolver, compactor, and reaper are constructed only when a
+	// durable node has --lsm-root. Without a resolver, /v1/query returns 503.
+	// The reaper additionally requires --compaction-reap-enable; otherwise
+	// superseded L0 files remain available for recovery (ADR-0017, ADR-0019,
+	// ADR-0021).
 	var queryResolver *database.Resolver
 	var queryCompactor *database.L1Compactor
-	// ADR-0021: the L0 reaper. nil (the default — --compaction-reap-
-	// enable=false) means byte-identical behavior (superseded L0s stay as
-	// the backstop). Non-nil only when --lsm-root + --compaction-reap-enable.
 	var queryReaper *database.L0Reaper
-	// bootWitness (ADR-0045): the recovery witness captured AT
-	// recovery time so /debug/memstats can close over it — the endpoint cannot
-	// answer during replay (the harness asserts recovery logs PRECEDE
-	// startLivecheck), so the terms are read from this frozen struct, NOT
-	// recomputed at scrape time. nil for a research node (--wal-path empty);
-	// the handler reports witness_present=false, never a zero-filled fiction.
+	// bootWitness records recovery facts for /debug/memstats. The HTTP server
+	// starts after replay, so the handler reads this record rather than
+	// recomputing recovery state. An in-memory node has no witness and reports
+	// witness_present=false.
+	//
+	// The secondary index is constructed before recovery so replay can feed it.
+	// Other packages depend on feeder interfaces rather than this concrete type.
+	// With --secondary-index=false, feedSecondary remains an unattached no-op.
+	var secondaryIndex *index.Index
+	feedSecondary := func(entityID string, h3Index uint64, systemTime int64) {}
+	if cfg.secondaryIndexEnable {
+		secondaryIndex = index.NewWith(index.DefaultShards, index.DefaultEpochNs)
+		secondaryIndex.SetEntityCeiling(cfg.secondaryIndexMaxEntities)
+		feedSecondary = func(entityID string, h3Index uint64, systemTime int64) {
+			secondaryIndex.Apply(index.Record{EntityID: entityID, H3Index: h3Index, SystemTime: systemTime})
+		}
+	}
+
+	// Select the process-global digest scheme before constructing an engine;
+	// each IBLT captures the scheme at construction. Validation also rejects
+	// dependent flags without the features that make them effective.
+	if err := validateConfig(cfg); err != nil {
+		return err
+	}
+	eng.SetIBLTSchemeV2(cfg.ibltV2)
+
 	var bootWitness *durability.RecoveryWitness
 	if cfg.walPath != "" {
-		// when --lsm-root is a directory, bounded recovery loads the
-		// dot-bearing snapshot + replays only the post-checkpoint tail. The
-		// snapshot store is a *LocalFS over cfg.lsmRoot; a failing/absent
-		// snapshot there silently falls back to full replay (store != nil but
-		// image missing → fallbackReason logged by RecoverEngineWithSnapshot).
+		// With --lsm-root, recovery loads the dot-bearing snapshot and replays
+		// only the post-checkpoint tail. A missing or unusable snapshot falls
+		// back to full replay and records the reason in the recovery witness.
 		var snapshotStore durability.SnapshotStore
 		if cfg.lsmRoot != "" {
 			lfs, lerr := durability.NewLocalFS(cfg.lsmRoot)
@@ -853,208 +677,139 @@ func run(args []string) error {
 			}
 			snapshotStore = lfs
 		}
-		recEngine, wal, rep, witness, rerr := durability.RecoverEngineWithSnapshot(nodeID, cfg.walPath, snapshotStore, arenaSize)
+		// The fed recovery variant applies snapshot, tail, and repaired records
+		// to the secondary index. Without the index, use ordinary recovery.
+		var recEngine *eng.DeltaCRDTEngine
+		var wal *durability.WAL
+		var rep *durability.Replayed
+		var witness *durability.RecoveryWitness
+		var rerr error
+		if cfg.secondaryIndexEnable {
+			recEngine, wal, rep, witness, rerr = durability.RecoverEngineWithSnapshotFed(nodeID, cfg.walPath, snapshotStore, arenaSize, feedSecondary)
+		} else {
+			recEngine, wal, rep, witness, rerr = durability.RecoverEngineWithSnapshot(nodeID, cfg.walPath, snapshotStore, arenaSize)
+		}
 		if rerr != nil {
 			if errors.Is(rerr, durability.ErrRecoveryRootMismatch) {
-				log.Fatalf("sovereign-node: %v — sick engine refuses boot (rebuilt Merkle root != checkpoint root; data loss)", rerr)
+				log.Fatalf("sovereign-node: %v; refusing to start because the rebuilt Merkle root differs from the checkpoint root", rerr)
 			}
 			if errors.Is(rerr, durability.ErrRecoveryFingerprintMismatch) {
-				log.Fatalf("sovereign-node: %v — sick engine refuses boot (rebuilt state bytes != checkpoint fingerprint; same dots, wrong bytes — corruption)", rerr)
+				log.Fatalf("sovereign-node: %v; refusing to start because the rebuilt state differs from the checkpoint fingerprint", rerr)
 			}
 			return fmt.Errorf("recovery: %w", rerr)
 		}
 		engine = recEngine
 		bootWitness = witness
 		bridge = durability.NewBridge(engine, wal, cfg.walCheckpointInterval)
-		// the recovered engine's scratch data dir is owned by
-		// the bridge so Close RemoveAll's it (no /tmp leak across restarts).
+		// Durable local writes feed the index synchronously after InsertLocal.
+		if cfg.secondaryIndexEnable {
+			bridge.SetIndexFeeder(feedSecondary)
+		}
+		// The bridge owns the recovered engine's scratch directory and removes
+		// it on Close.
 		bridge.SetScratchDir(rep.ScratchDir)
-		// wire the snapshot into the bridge's checkpoint path so future
-		// AppendCheckpoint calls (explicit + periodic inside PutLocal) write
-		// the dot-bearing image + Arrow index, keeping bounded recovery useful
-		// across the node's lifetime (not just the first boot). enableIndex=true
-		// writes the query-tier Arrow snapshot too (wires internal/database).
+		// Later checkpoints write both the dot-bearing image and the Arrow query
+		// index, so subsequent recoveries can also use the post-checkpoint tail.
 		if snapshotStore != nil {
 			lfs := snapshotStore.(*durability.LocalFS)
 			bridge.SetSnapshotter(lfs, true)
-			// construct the bitemporal query Resolver over the SAME
-			// *LocalFS the snapshotter writes the l0/*.arrow index to (one root,
-			// one FS handle — avoids divergent dir state; ADR-0017 §2.2). The
-			// Resolver is the off-heap READ buffer allocator for AsOf's Arrow
-			// file scan. It is gated on enableIndex=true — the SAME flag
-			// SetSnapshotter flips — so a research node (no --lsm-root) keeps
-			// queryResolver nil and /v1/query returns the honest 503.
-			//
-			// Allocator lifecycle: JemallocAllocator is a stateless handle
-			// (struct{bytesAllocated atomic.Int64}; NewJemallocAllocator is a
-			// trivial ctor, no arena init — the same handle NewSnapshotMemTable
-			// constructs per-checkpoint). It has NO Close: AsOf releases each
-			// read buffer per scanFile via defer (query.go:216-220), so no
-			// off-heap bytes survive a query; the handle itself holds nothing.
-			// Zero shutdown teardown needed; the per-buffer Free IS the
-			// lifecycle. ADR-0017 §4.
+			// The resolver and snapshotter share one LocalFS so queries see the
+			// Arrow files written beneath the same root (ADR-0017 §2.2). The
+			// allocator is a stateless handle: each Arrow scan releases its
+			// off-heap read buffers, so the handle needs no shutdown method.
 			queryAlloc := database.NewJemallocAllocator()
 			queryResolver = database.NewResolver(
 				lfs, lfs, queryAlloc, "local", database.DefaultResolverConfig(),
 			)
-			// ADR-0032: wire the read-your-writes live source. The
-			// resolver consults the live δ-CRDT HAMT (engine.State().Get, EBR-
-			// pinned by the adapter) AFTER its durable Arrow scan, merging the
-			// live dominant under the SAME bitemporal dominance so a POST
-			// /v1/insert is visible to /v1/query IMMEDIATELY — before the
-			// bridge's periodic AppendCheckpoint flushes SnapshotToLSM→L0
-			// (bridge.go:213, gated by checkpointInterval default 1000). With
-			// the default, every IMMEDIATE /v1/query → 404 without this seam
-			// (empirically confirmed; --wal-checkpoint-interval=1 was
-			// REQUIRED for the durable read path to work at all).
-			//
-			// The adapter wraps the recovered engine (the SAME engine handleGet
-			// reads through gossiper.engine — main.go:339 sets engine=recEngine).
-			// It is constructed ONLY here (--lsm-root set, the SAME gate that
-			// constructs the resolver), injected via SetLiveSource (the
-			// SetResolver precedent carried to the live source — NOT a NewResolver
-			// ctor arg, so NewResolver keeps its 5-arg signature). A research node
-			// (no --lsm-root) keeps queryResolver nil → SetLiveSource is never
-			// called → /v1/query returns the honest 503 (control.go:404), AND a
-			// durable node with the resolver but a nil live source keeps the
-			// durable-only behavior byte-identical to (the nil-guard in
-			// AsOf/Range — query.go:535/795).
+			// The resolver merges the live CRDT state after its durable Arrow
+			// scan, using the same dominance rules for both sources. A local
+			// insert is therefore visible to /v1/query before the next periodic
+			// checkpoint flushes it to L0 (ADR-0032). The adapter wraps the
+			// recovered engine and is installed only on this snapshot-store path.
 			queryResolver.SetLiveSource(&engineHAMTAdapter{engine: engine})
-			// ADR-0019: the L0→L1 per-entity compaction tier over the
-			// SAME *LocalFS the resolver reads + the snapshotter writes the
-			// l0/*.arrow index to. It is gated on enableIndex=true (the SAME
-			// flag SetSnapshotter flips) + --lsm-root: a research node (no
-			// --lsm-root) keeps queryCompactor nil. The compactor is a
-			// READ-L0 -> WRITE-L1 background job — it never touches the
-			// SkipList/HAMT/WAL write path. The scheduler goroutine (started
-			// below alongside the convergence poller) periodically lists the
-			// entity prefixes under l0/ and runs a Compaction job for any
-			// entity with >= L0FilesPerEntityTrigger L0 files, merging them into
-			// ONE sorted L1 file so AsOf's MaxL0Files cap bounds the TAIL (a
-			// perf cap), NOT the full history (the silent-data-loss cap form).
+			// The resolver owns the candidate-source interface; this is the
+			// concrete binding for cross-entity secondary-index queries.
+			if cfg.secondaryIndexEnable {
+				queryResolver.SetSecondaryIndexSource(secondaryIndex)
+			}
+			// Compaction reads L0 and writes L1 through the same LocalFS as the
+			// resolver. Its background scheduler merges an entity's L0 files at
+			// the configured trigger, keeping the uncompacted tail within the
+			// resolver's L0-file limit without discarding history (ADR-0019).
 			//
-			// ADR-0020: the config honors the operator Level-2
-			// superseded-row prune knobs. The DEFAULT is Preserve-All
-			// (cfg.compactionPruneEnable=false) -> byte-identical
-			// compaction. ENABLED + a positive horizon opts the merge into
-			// dropping provably-dead rows under the (C1)&&(C2)&&(C3) SAFE-DROP
-			// rule. ENABLED + horizon<=0 is trapped by NewL1Compactor (WARN +
-			// coerce-to-Preserve-All) — the loud path; the config is built with
-			// the operator's values VERBATIM so the WARN is honest.
+			// Pruning preserves every row by default. With pruning enabled, the
+			// supplied horizon controls which superseded rows compaction may
+			// drop; NewL1Compactor warns and preserves rows if the horizon is not
+			// positive (ADR-0020).
 			compactionCfg := database.DefaultCompactionConfig()
 			compactionCfg.EnableDominancePruning = cfg.compactionPruneEnable
 			compactionCfg.PruningHorizonInt64Ns = cfg.compactionPruneHorizon
-			// ADR-0027: the T_gc auto-inference backoff. The inferrer
-			// computes effective = max(operatorFloor, observedFrontier - backoff);
-			// the operator-set PruningHorizonInt64Ns is the HARD floor backstop
-			// (the inferrer FLOORS the knob, it does NOT replace it — §0.a). The
-			// scheduler reads the Resolver's observed txTime frontier + calls
-			// SetInferredHorizon BEFORE each per-entity CompactionByHash8, so the
-			// effective horizon advances with the workload, never an operator
-			// guess. Default 5m (the --compaction-prune-backoff-ns default);
-			// the operator can lower it OR raise the hard floor.
+			// Before each compaction sweep, the horizon inferrer uses the
+			// resolver's observed transaction-time frontier:
+			// max(operator floor, observed frontier - backoff). The configured
+			// horizon remains the lower bound (ADR-0027).
 			compactionCfg.PruneBackoffInt64Ns = cfg.compactionPruneBackoff.Nanoseconds()
 			queryCompactor = database.NewL1Compactor(
 				lfs, lfs, lfs, queryAlloc, "local", compactionCfg,
 			)
-			// ADR-0021: the L0 reaper over the SAME *LocalFS the
-			// compactor + resolver share (one FS root, one keyspace). The
-			// reaper injects the SAME lfs handle for all three seams (S3Lister
-			// to scan manifests, S3Downloader to read a manifest + probe its L1,
-			// the NEW S3Deleter to remove an L0 + the manifest). The reaper is
-			// GATED on --compaction-reap-enable (default false) — OFF means the
-			// superseded L0s stay on disk as the crash-recovery backstop (byte-
-			// identical). The reaper goroutine (started below alongside
-			// the compaction scheduler) reclaims the L0s the compactor
-			// superseded AFTER verifying the L1 still exists (Stage C). It is
-			// NEVER auto-ON: the operator opts in ONLY once they trust their
-			// storage layer's existence-probe.
+			// The reaper shares the compactor's LocalFS. When explicitly
+			// enabled, it deletes superseded L0 files and manifests only after
+			// confirming that the replacement L1 exists. Otherwise those files
+			// remain as recovery backstops (ADR-0021).
 			if cfg.compactionReapEnable {
 				queryReaper = database.NewL0Reaper(lfs, lfs, lfs, "local")
 			}
 		}
 		if witness != nil && witness.Bounded {
-			log.Printf("sovereign-node: durability ON — bounded recovery booted from WAL %s + snapshot ckpt/%d (replayed %d post-checkpoint record(s), bridge active)",
+			log.Printf("sovereign-node: durability enabled; recovered WAL %s from snapshot ckpt/%d (replayed %d post-checkpoint record(s), bridge active)",
 				cfg.walPath, witness.SnapshotLamportHigh, witness.ReplayedRecords)
 		} else if witness != nil && snapshotStore != nil && witness.FallbackReason != "" {
-			log.Printf("sovereign-node: durability ON — full-replay recovery booted from WAL %s (bounded recovery fallback: %s; bridge active)", cfg.walPath, witness.FallbackReason)
+			log.Printf("sovereign-node: durability enabled; recovered WAL %s by full replay (snapshot fallback: %s; bridge active)", cfg.walPath, witness.FallbackReason)
 		} else {
-			log.Printf("sovereign-node: durability ON — booted from WAL %s (bridge active, fsync-per-mutation)", cfg.walPath)
+			log.Printf("sovereign-node: durability enabled; recovered WAL %s (bridge active, fsync per mutation)", cfg.walPath)
 		}
 	} else {
-		engine, err = eng.NewDeltaCRDTEngine(nodeID, 1, arenaSize) // crdt.go:244
+		engine, err = eng.NewDeltaCRDTEngine(nodeID, 1, arenaSize)
 		if err != nil {
 			return fmt.Errorf("engine: %w", err)
 		}
-		log.Printf("sovereign-node: durability OFF — in-memory research mode (--wal-path empty, back-compat)")
+		log.Printf("sovereign-node: durability disabled; using an in-memory engine (--wal-path empty)")
 	}
-	// ADR-0045 apply --lamport-absolute-slack AFTER the engine
-	// is built (both the durable RecoverEngine + the in-memory NewDeltaCRDTEngine
-	// branches converge here) + BEFORE the engine feeds the receiver (receiver.go
-	// reads the bound via the snapshot at crdt_reconstruct_skew.go:190). The 0-trap:
-	// --lamport-absolute-slack=0 is a misconfiguration (a slack of 0 bricks ALL
-	// inbound deltas — the bound collapses to Lamport+rate-envelope alone, which
-	// on a cold boot is ~1, rejecting everything). Coerce to the production floor
-	// 1000 + log the coercion so the operator sees the misconfig was NOT honored
-	// silently (the honest-negative posture: a bad flag is loud, not a silent
-	// zero-receive). Default 1000 passes through unchanged (byte-identical
-	// production behavior — no coercion, no log).
+	// Set the skew allowance after either recovery or in-memory construction
+	// and before the receiver uses the engine. Zero would leave a cold receiver
+	// with only its Lamport and rate-envelope bounds, rejecting ordinary bulk
+	// catch-up, so zero uses the documented default of 1000 (ADR-0045).
 	if cfg.lamportAbsoluteSlack == 0 {
-		log.Printf("sovereign-node: --lamport-absolute-slack=0 is a misconfiguration (slack 0 bricks all inbound deltas) — coercing to the production floor 1000 (A1 stays closed)")
+		log.Printf("sovereign-node: --lamport-absolute-slack=0 would reject cold-peer catch-up; using 1000")
 		cfg.lamportAbsoluteSlack = 1000
 	}
-	engine.SetLamportAbsoluteSlack(cfg.lamportAbsoluteSlack)                              // crdt.go:525
-	wallClock := clock.NewSystemClock()                                                   // clock.go:48 (WallClock)
-	cap := clock.NewIngressHLCScalarCap(wallClock, engine)                                // admission.go:72 (engine IS the LogicalAdvancer)
-	bucket := admission.NewPeerBucket()                                                   // ewma.go:150 (zero args)
-	dir := identity.NewDirectory()                                                        // directory.go:47 (zero args)
-	recv := receive.NewReceiver(bucket, cap, wallClock, dir, engine, cfg.admissionBudget) // receiver.go:173
-	// ADR-0036: --hybrid-verify (opt-IN, default false). OFF keeps the
-	// receive path on the classical-only identity.VerifyCRDTFrame seam —
-	// byte-identical (the production default stays classical-only; the
-	// hybrid is a defense-in-depth ADD, NOT a replace). ON switches the two
-	// verify call sites (receiver.go HandleFrame + HandleBatchFrame) to the
-	// hybrid VerifyCRDTFrame_Hybrid seam — BOTH Ed25519 + ML-DSA-65 sigs
-	// required. The v1 envelope carries ONLY the Ed25519 sig, so under
-	// --hybrid-verify a v1 frame is REJECTED (the STRICT mode) until the hybrid-
-	// SIGN change ships a frame carrying BOTH sigs + the Directory carries the
-	// peer's ML-DSA-65 pubkey — disclosed ADR-0036 §6 (the honest NOT-YET).
+	engine.SetLamportAbsoluteSlack(cfg.lamportAbsoluteSlack)
+	wallClock := clock.NewSystemClock()
+	cap := clock.NewIngressHLCScalarCap(wallClock, engine)
+	bucket := admission.NewPeerBucket()
+	dir := identity.NewDirectory()
+	recv := receive.NewReceiver(bucket, cap, wallClock, dir, engine, cfg.admissionBudget)
+	// Hybrid verification requires both Ed25519 and ML-DSA-65 signatures;
+	// classical-only v1 frames are rejected in that mode (ADR-0036).
 	recv.SetHybridVerify(cfg.hybridVerifyEnable)
+	// Feed joined remote entries from all three frame handlers to the secondary
+	// index. Bind the feeder before the accept loop starts.
+	if cfg.secondaryIndexEnable {
+		recv.SetIndexFeeder(feedSecondary)
+	}
 
-	// SIGHUP -> cert rotation (the live-reload seam). A reload error is
-	// logged, not fatal — a stale cert keeps serving; a failed reload is an
-	// honest NEGATIVE recorded in the ADR.
-	// ── CRDT-delta signing identity + the mesh (dial + gossip sweep) ──
-	// The engine's localNodeID is the [16]byte the gate stack keys on. For the
-	// mesh's signed-envelope seam the gossiper signs with an Ed25519 seed whose
-	// derived pubkey's first 16 bytes MUST equal that localNodeID, so the
-	// receive-side Directory.Lookup(originNodeID) resolves back to this node's
-	// pubkey. If --identity-seed is provided it overrides (and --node-id must
-	// match its derived nodeID); otherwise a random seed is minted and its
-	// derived nodeID is what the engine runs under.
+	// The signing public key's first 16 bytes are the node ID used by the
+	// engine and receive gate. A supplied identity seed must therefore derive
+	// the configured node ID; without a seed, a random identity is generated.
 	ident := buildNodeIdentity(cfg, nodeID)
-	// Register this node's OWN pubkey in the Directory so it can verify its
-	// own loopback deltas (a peer that echoes a frame back to the origin still
-	// verifies). The peer pubkeys are registered out-of-band by the deploy
-	// (the dev-mesh CA's leaf CommonName carries the hex nodeID; a deploy-time
-	// directory provisioning step reads each peer's pubkey. The binary
-	// documents this honestly; programmatic peer-pubkey provisioning ships
-	// with the cluster deploy).
+	// Self-registration verifies loopback deltas. Peer verification keys come
+	// from --peer-dir; the TLS leaf CommonName supplies only the node ID.
 	_ = dir.Register(ident.NodeID, ident.Pub)
-	// ADR-0037: when --hybrid-sign is set, the owner was constructed
-	// via NewNodeIdentityHybrid (buildNodeIdentity) so it carries the ML-DSA-65
-	// keypair. Register the PQ pubkey in the Directory via RegisterPQ so this
-	// node's OWN loopback hybrid frames verify (a peer that echoes a hybrid
-	// frame back to the origin still verifies — the SAME self-registration
-	// discipline the classical Register above uses) AND so peers' hybrid verify
-	// resolves this origin's PQ key via LookupBoth. A non-hybrid-sign owner (the
-	// DEFAULT) has ident.PQPub == nil -> RegisterPQ is skipped (NO PQ key is
-	// registered; the Directory's mPQ map is unpopulated for this nodeID -> a
-	// hybrid verify from a peer would reject via the nil-pqPub STRICT mode —
-	// the honest posture under the default). The peer PQ pubkeys are
-	// provisioned out-of-band by the deploy (the SAME OOB model the classical
-	// peer pubkeys use — directory.go:20 comment; programmatic peer-PQ-pubkey
-	// provisioning ships with the future directory-gossip change).
+	// A hybrid identity carries an ML-DSA-65 keypair as well as Ed25519 keys.
+	// Register its public PQ key so loopback frames and frames relayed back to
+	// their origin pass hybrid verification through Directory.LookupBoth. Peer
+	// PQ keys still come from --peer-dir. Classical identities have no PQ key;
+	// RegisterPQ is skipped and hybrid frames from those origins are rejected.
 	if ident.PQPub != nil {
 		if err := dir.RegisterPQ(ident.NodeID, ident.PQPub); err != nil {
 			log.Fatalf("identity: RegisterPQ: %v", err)
@@ -1062,164 +817,141 @@ func run(args []string) error {
 	}
 	peerSet := mesh.NewPeerSet(tr, recv, ident, engine)
 	gossiper := mesh.NewGossiper(peerSet, ident, engine, dir)
-	// batched delta transport: --batch-size > 1 switches the self-originated
-	// delta path from per-frame shipDelta (one Ed25519 per delta) to shipBatchedDelta
-	// (one Ed25519 per N deltas — the arithmetic unlock). 1 keeps the per-frame
-	// path (back-compat); the relay/foreign path stays per-frame regardless (the
-	// self-origin boundary). SetBatchSize clamps to [1, MaxBatchSize].
+	// Batch sizes above one use shipBatchedDelta, which signs up to N local
+	// deltas together instead of signing each delta separately. Foreign deltas
+	// retain their original frames. SetBatchSize clamps to [1, MaxBatchSize].
 	gossiper.SetBatchSize(cfg.batchSize)
-	// ADR-0034: --stratified-anti-entropy (opt-IN, default false). OFF
-	// keeps the sweep byte-identical to HEAD's oversend path (the existing
-	// convergence + partition guards stay GREEN); ON switches to the two-phase
-	// digest-exchange (per-peer SE + full IBLT digest → GenerateDelta(remoteIBLT)
-	// for a minimal delta proportional to |A−B| — the fix; the broken
-	// GenerateDeltaStratified that subtracted an EMPTY remote IBLT is DELETED).
-	// The fallback to oversend on a
-	// digest timeout / malformed digest / peel failure is the honest path,
-	// counted via sovereign_mesh_stratified_fallback (the telemetry counter,
-	// bound below so the operator SEES the oversend-vs-stratified cut). The
-	// digest-exchange rides the peer-TLS data-plane (a WireDigestMagic-tagged
-	// frame), NOT a control-port route — the mesh is pure peer-TLS data-plane
-	// (the test infra builds NO ControlServer; a control route would be
-	// unreachable from the sweep).
+	// Local writes on an in-memory node feed the secondary index through the
+	// gossiper; durable writes use the bridge feeder installed above.
+	if cfg.secondaryIndexEnable {
+		gossiper.SetIndexFeeder(feedSecondary)
+	}
+	// Stratified anti-entropy is optional (ADR-0034). When enabled, a peer
+	// exchanges a StrataEstimator and IBLT digest before GenerateDelta computes
+	// their difference. Timeouts, malformed digests, and peel failures fall back
+	// to a full-set send and increment sovereign_mesh_stratified_fallback.
+	// Digests use tagged frames on the peer TLS connection, not the control port.
 	gossiper.SetStratifiedAntiEntropy(cfg.stratifiedAntiEntropy)
+	// SOVEREIGN_RESPOND_INDEG_DEBUG=1 enables per-arrival responder occupancy
+	// tracking and its debug route. When disabled, no tracker is allocated and
+	// the response-recording call is a nil-guarded no-op.
+	if os.Getenv("SOVEREIGN_RESPOND_INDEG_DEBUG") == "1" {
+		gossiper.SetRespondIndegArmed(true)
+		log.Printf("respond-indeg: per-arrival responder occupancy tracking enabled (SOVEREIGN_RESPOND_INDEG_DEBUG=1); /debug/responder-indegree")
+	}
+	// The gossiper reads this local setting for request, response, and sizing
+	// decisions. The engine's digest scheme is process-global and was selected
+	// before engine construction. A false value leaves v1 behavior unchanged.
+	gossiper.SetIBLTV2(cfg.ibltV2)
+	gossiper.SetIBLTV2MinBuckets(cfg.ibltV2MinBuckets)
 	gossiper.SetStratifiedFallbackReporter(telemetry.StratifiedAntiEntropyFallback.Inc)
-	// ADR-0037: --hybrid-sign (opt-IN, default false). OFF keeps the
-	// self-originated delta path on the v1 BatchEnvelope (one Ed25519 per batch)
-	// — byte-identical (NO hybrid frame is produced; the receive-side
-	// --hybrid-verify gate never sees one — PQ hybrid-off byte-identical).
-	// ON switches shipBatchedDelta's self-originated path to ShipBatchHybrid
-	// (one Ed25519 + one ML-DSA-65 sig over the SAME 120-byte SHAKE256 pad,
-	// carried in a HybridEnvelope). The owner was constructed via
-	// NewNodeIdentityHybrid when this is true (buildNodeIdentity) so the PQ key
-	// is minted + registered (above). The HybridFrameAccepted counter
-	// (the telemetry counter) is wired UNCONDITIONALLY regardless of this flag (the
-	// SetStratifiedFallbackReporter precedent — the reporter seam is bound at
-	// boot; the flag gates the SIGN, NOT the accept disclosure). The counter
-	// fires on the Receiver.HandleHybridFrame seam; a node with
-	// --hybrid-sign=false (the DEFAULT) never produces a hybrid frame so the
-	// counter stays 0 (a peer that dials it sends a v1 BatchEnvelope), but the
-	// counter is still PRESENT on /metrics (the bridge auto-surface §0.f —
-	// PRESENCE not value, the SAME discipline used).
+	// Deferral is implemented only in the stratified branch of
+	// generateSweepDelta. Reject --defer-handler without stratified
+	// anti-entropy rather than accepting a flag that cannot affect the sweep.
+	if cfg.deferHandler && !cfg.stratifiedAntiEntropy {
+		return fmt.Errorf("--defer-handler requires --stratified-anti-entropy: deferral runs only in the stratified digest exchange")
+	}
+	gossiper.SetDeferHandler(cfg.deferHandler)
+	// The saturation crossover runs in the defer handler's capacity-failure
+	// branch, so it is invalid without --defer-handler.
+	if cfg.deferCrossover && !cfg.deferHandler {
+		return fmt.Errorf("--defer-crossover requires --defer-handler: the saturation crossover runs in the defer handler's capacity-failure branch")
+	}
+	gossiper.SetDeferCrossover(cfg.deferCrossover)
+	// Digest requests are answered immediately, so this wait primarily covers
+	// network round-trip time rather than the peer's sweep period. It is used
+	// only by the stratified exchange.
+	gossiper.SetDigestWaitTimeout(cfg.digestWaitTimeout)
+
+	// Adaptive waits run inside the stratified exchange. Expiry defers the peer
+	// only when the defer handler is active; otherwise it takes the full-set
+	// fallback. Require both features so enabling this flag cannot change the
+	// timeout duration and expiry behavior independently.
+	if cfg.digestWaitAdaptive && (!cfg.stratifiedAntiEntropy || !cfg.deferHandler) {
+		return fmt.Errorf("--digest-wait-adaptive requires --stratified-anti-entropy and --defer-handler: adaptive waits run only in the stratified exchange, and expiry defers only with the handler")
+	}
+	gossiper.SetDigestWaitAdaptive(cfg.digestWaitAdaptive)
+	// All mesh writes pass through PeerSet.Publish and TransmitTLSFrame, so one
+	// deadline covers every frame. A timed-out peer is skipped for
+	// DefaultSuspectBackoff while ReconnectLoop establishes a fresh connection.
+	// The callback increments MeshWriteTimeouts for write timeouts only.
+	peerSet.SetWriteTimeout(cfg.meshWriteTimeout)
+	peerSet.SetSuspectBackoff(mesh.DefaultSuspectBackoff)
+	peerSet.SetWriteTimeoutReporter(telemetry.MeshWriteTimeouts.Inc)
+	// Hybrid signing is optional (ADR-0037). It changes locally originated
+	// batches from a v1 BatchEnvelope with one Ed25519 signature to a
+	// HybridEnvelope carrying Ed25519 and ML-DSA-65 signatures over the same
+	// 120-byte SHAKE256 pad. The acceptance counter is always registered so
+	// /metrics exposes it even when this node does not sign hybrid frames.
 	gossiper.SetHybridSign(cfg.hybridSignEnable)
 	recv.SetHybridAcceptReporter(telemetry.HybridFrameAccepted.Inc)
-	// ADR-0045: wire the receive-side relay-retention
-	// hook so a FOREIGN delta the gate stack Accepts + Join's is retained in
-	// the Gossiper's relayCache for onward re-publish by shipDelta. Before this
-	// wiring (a nil retainer = byte-identical to the pre-fix behavior) a foreign entry hit the
-	// origin-side payloadCache.lookup, MISSED, + was skipped — foreign deltas
-	// propagated AT MOST one hop (the foreign-delta half of the 100-node
-	// convergence blocker). RetainForeign filters self-vs-foreign (self stays in the
-	// payloadCache at InsertLocalEvents; only foreign is retained) + TAKES
-	// OWNERSHIP of the frame bytes (no copy — ReadFrame
-	// returns a fresh per-frame buffer). The SetRoundReporter
-	// + SetClockAdvanceRecorder precedent: wired once at construction before the
-	// accept loop starts (single-writer-before-reader).
-	// install BOTH relay hooks through the ONE shared wiring
-	// seam. This line previously read `recv.SetRelayRetainer(gossiper.RetainForeign)`
-	// — the per-frame hook ONLY — while SetRelayRetainerBatch had ZERO production
-	// callers. Production runs --batch-size=100, so the sweep routes through
-	// shipBatchedDelta → relayCache.lookupBatch, a cache nothing populated: the
-	// batch relay was DEAD on silicon (373K+ `relay miss` lines/receiver, zero
-	// cross-region frames, a hard stall at 64 divergent) while the in-test-wired
-	// RelayChain guard reported GREEN. WireRelayHooks is consumed by BOTH this
-	// binary and the production-wiring guard (TestProdWireLoadBearing), so the
-	// test and production cannot drift again.
+	// Accepted foreign deltas must be retained for both per-frame and batched
+	// relay publication. WireRelayHooks installs both receive callbacks before
+	// the accept loop starts. RetainForeign takes ownership of the fresh buffer
+	// returned by ReadFrame; self-originated payloads remain in payloadCache.
 	gossiper.WireRelayHooks(recv)
-	// ADR-0039: the region-aware gossip data-plane. --region-aware
-	// (OPT-IN, default false) switches AntiEntropySweep's iteration source from
-	// the full-mesh peers.Peers() (O(N²) connections at N nodes) to
-	// topology.Select(ctx) (intra-region full-mesh + inter-region fan-out-N,
-	// prefer cross-region, seeded-deterministic — the O(log N) rounds
-	// convergence the design doc names). The TopologyManager is built from
-	// --self-region (this node's own region tag — the intra/inter split key; 0 =
-	// RegionUnset = every peer intra = byte-identical full-mesh) + the per-peer
-	// region tags parsed from --peers' addr@region suffixes (a peer with NO
-	// @region suffix is RegionUnset = SAME-region = intra — the honest
-	// conservative default). SetTopology binds the seam; SetRegionAware arms the
-	// selector (the "wire first, arm later" discipline — both must be true);
-	// SetInterRegionReporter wires the disclosure counter (the telemetry counter —
-	// fires once per inter-region envelope shipped). The wiring is OPT-IN: with
-	// --region-aware=false (the DEFAULT), AntiEntropySweep takes the full-mesh
-	// peers.Peers() path — byte-identical (topology-off byte-identical;
-	// the topology is built + bound but the selector is NOT armed, so the sweep
-	// ignores it). NO new module dep (stdlib only); NO AWS this change.
+	// Region-aware gossip is optional (ADR-0039). When enabled,
+	// AntiEntropySweep uses topology.Select for the local region mesh and seeded
+	// cross-region fan-out instead of iterating the full peer set. RegionUnset
+	// peers are local. With the flag disabled, the bound topology is ignored.
+	// The reporter counts each inter-region envelope sent.
 	topo := mesh.NewTopologyManager(mesh.RegionTag(cfg.selfRegion))
 	topo.SetFanout(cfg.regionFanout)
-	// ADR-0040: parse --peer-dir ONCE here, BEFORE the
-	// surrogate region loop, so the loop can SKIP a peer that --peer-dir
-	// provisions (the surrogate-pollution finding). The loop keys region
-	// tags under peerIDForAddr(addr) —
-	// a SHA-256 surrogate — but a PROVISIONED peer's dial keys the peerConn
-	// under the REAL nodeID (applyProvisioning's SetRegion(realNodeID, region)),
-	// NEVER the surrogate. So a peer tagged @region in --peers AND provisioned in
-	// --peer-dir would leave a DEAD surrogate in topo.regions (no live peerConn
-	// keys it) → topology.Select iterates BOTH the surrogate + the real nodeID
-	// → the dead surrogate consumes an inter-region fan-out slot, evicting a
-	// real cross-region peer → convergence slows/stalls at scale + the telemetry counter
-	// counter over-counts (IsInterRegion(surrogate)=true fires the reporter
-	// though no envelope ships). The fix: the surrogate loop skips any addr
-	// --peer-dir provisions (the provisioned peer gets its region via
-	// applyProvisioning's SetRegion(realNodeID, region) instead). The provisioned
-	// peer's region column takes precedence over the @region suffix (the
-	// --peer-dir file is the authoritative OOB source). The side-effecting
-	// applyProvisioning runs LATER (the dial loop, line ~1232) with these same
-	// cfgs (the cheap FAILSAFE parse here is pure; no double side-effect).
+	topo.SetGatewaysPerRegion(cfg.gatewaysPerRegion)
+	topo.SetSelfNodeID(nodeID)
+	// Parse --peer-dir before registering address-derived region keys.
+	// Provisioned connections use their real node IDs, so retaining an
+	// address-derived surrogate for the same peer could consume a cross-region
+	// fan-out slot and increment the inter-region metric without a send.
+	// applyProvisioning later registers the real IDs and their directory keys;
+	// the directory's region column takes precedence over an @region suffix.
 	provCfgs, provParseErr := parsePeerDir(cfg.peerDir)
 	if provParseErr != nil && !errors.Is(provParseErr, ErrPeerDirEmpty) {
-		// A named-but-absent file OR a malformed entry FAILS the boot here (a
-		// deploy misconfiguration MUST be loud — the FAILSAFE discipline). The
-		// empty --peer-dir (ErrPeerDirEmpty) is the OPT-IN no-op: provCfgs stays
-		// empty + the surrogate loop runs for every peer (byte-identical).
+		// A named file must exist and parse successfully. ErrPeerDirEmpty is
+		// the no-provisioning case, not a startup failure.
 		return fmt.Errorf("--peer-dir: %w", provParseErr)
 	}
 	provisionedAddr := make(map[string]bool, len(provCfgs))
 	for _, c := range provCfgs {
 		provisionedAddr[c.addr] = true
 	}
-	// Register the per-peer region tags parsed from --peers' addr@region
-	// suffixes. The dial-side peerID is a PLACEHOLDER zero (the honest gap
-	// — the peer's nodeID is unknown until the peer presents its leaf; the
-	// Directory resolves the pubkey regardless), so the region tag is keyed by
-	// a DETERMINISTIC addr-derived [16]byte (SHA-256 of the peer addr,
-	// truncated — a STABLE peerID surrogate the future OOB-provisioning change
-	// reconciles with the real nodeID once the dial loop carries real peerIDs).
-	// A peer with NO @region suffix is RegionUnset (the honest conservative
-	// default — an untagged peer routes as SAME-region = intra, NOT foreign).
-	// The HONEST N=2 NO-OP: the cmd dial loop stores peers under the ZERO
-	// peerID (peer.go:267 ps.peers[zeroPeerID]), so peers.Peers() returns zero
-	// peerIDs that do NOT match the addr-derived keys the region tags are
-	// registered under → the region lookup misses → every peer routes as
-	// RegionUnset = intra = byte-identical full-mesh. --region-aware ON at N=2
-	// is therefore a NO-OP UNLESS the peers are tagged AND the dial loop carries
-	// real peerIDs (the OOB-provisioning arc). The loopback gate is the
-	// SIMULATED N=100 mesh (in-process, REAL peerIDs), NOT the 2-node binary
-	// run — the same honest residual the spec's §III gate names.
-	// ADR-0040: SKIP the surrogate for a PROVISIONED addr (the dead-
-	// surrogate-pollution fix above) — its region comes from --peer-dir.
+	// An unprovisioned address has no verified node ID at this point, so its
+	// region is keyed by the deterministic SHA-256 surrogate from
+	// peerIDForAddr. That surrogate is only topology state, not an identity.
+	// Region-aware selection needs real peer IDs from --peer-dir or
+	// --peer-auto-reconcile to match these connections. Untagged peers remain
+	// RegionUnset and are treated as local. Provisioned addresses are skipped.
 	applySurrogateRegions(topo, cfg.peers, provisionedAddr)
 	gossiper.SetTopology(topo)
 	gossiper.SetRegionAware(cfg.regionAwareEnable)
+	gossiper.SetGatewayMode(cfg.gatewaysPerRegion > 0)
 	gossiper.SetInterRegionReporter(telemetry.InterRegionEnvelopesShipped.Inc)
-	// bind the durability bridge so InsertLocalEvents routes the origin
-	// write through PutLocal (InsertLocal → AppendMutation fsync) when --wal-path
-	// is set. A nil bridge (the in-memory default) keeps the bare-
-	// engine.InsertLocal path UNTOUCHED.
+	// validateConfig has already rejected partial-view and gateway settings
+	// that are not accompanied by region-aware selection.
+	gossiper.SetPartialIntraView(cfg.partialIntraViewEnable)
+	// Set deterministic sweep offsets before SweepLoop starts. Either the flag
+	// or SOVEREIGN_SWEEP_PHASE_JITTER=1 enables them (ADR-0066).
+	envJitter := os.Getenv("SOVEREIGN_SWEEP_PHASE_JITTER") == "1"
+	if envJitter {
+		cfg.sweepPhaseJitterEnabled = true
+	}
+	gossiper.SetSweepPhaseJitter(cfg.sweepPhaseJitterEnabled)
+	// Log the selected mode at startup so environment-enabled offsets are
+	// visible without inspecting process flags.
+	if cfg.sweepPhaseJitterEnabled {
+		log.Printf("sweep-phase-jitter: enabled (flag=%t env=%t); deterministic per-node offsets active (ADR-0066)", cfg.sweepPhaseJitterEnabled && !envJitter, envJitter)
+	} else {
+		log.Printf("sweep-phase-jitter: disabled; sweep ticks are phase-aligned")
+	}
+	// A durability bridge routes local InsertLocalEvents calls through PutLocal
+	// so the mutation reaches the WAL before the local insert returns.
 	if bridge != nil {
 		gossiper.SetBridge(bridge)
-		// wire the receive-seam clock-advance recorder so a peer-driven
-		// Join (foreign AdvanceLamportTo inside the frozen engine) is WAL-recorded.
-		// Without this, a foreign clock jump is un-recorded → the recovery seed
-		// under-counts → replay re-mints different dots → Merkle diverges (the
-		// foreign-advance CRITICAL). The recorder fires post-Accept in
-		// Receiver.HandleFrame/HandleBatchFrame; nil (the in-memory default) is a
-		// no-op, so the research path is untouched. See ADR-0013 §7 for the
-		// over-record caveat (post-Accept high-water vs exact foreign counter).
+		// Record peer-driven Lamport advances after accepted joins. Without a
+		// record, recovery could reuse a dot counter and rebuild a different
+		// Merkle root. RecordClockAdvance reads the engine clock at record time;
+		// this can over-record the receiver's exact high-water (ADR-0013).
 		recv.SetClockAdvanceRecorder(func(uint64) error {
-			// ADR-0045: the ONE production path is Bridge.RecordClockAdvance
-			// (engine clock read at record time, >= the receiver's post-Join
-			// high-water — a monotone over-record, the ADR-0013 §7 caveat). The
-			// divergent bridge.WAL().AppendClockAdvance bypass is deleted.
 			return bridge.RecordClockAdvance()
 		})
 	}
@@ -1228,33 +960,24 @@ func run(args []string) error {
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	go func() {
 		for range sighupCh {
-			// ADR-0035: a SIGHUP reloads the FULL triple — leaf, CA
-			// pool, CRL — NOT just the leaf (the earlier leaf-only behavior the tls_transport.go:126
-			// comment named). Each reload is INDEPENDENT + atomic under the
-			// transport's RWMutex; a FAILED reload of one surface leaves the
-			// stale version in place (the honest-negative posture — the transport
-			// NEVER trust-degrades OR revocation-degrades on a failed reload).
-			// The leaf reload stays FIRST (the byte-identical pre-existing seam +
-			// the TestTLSCertRotation_SIGHUP contract). The CA + CRL reloads are
-			// BEST-EFFORT: a SIGHUP with no --crl-path leaves the CRL reload a
-			// no-op (ReloadCRL returns ErrNoCRLPath, logged + swallowed — the
-			// opt-OUT default). The CA reload is unconditional (caPath is always
-			// set at construction).
+			// SIGHUP reloads the leaf, CA pool, and configured CRL independently
+			// (ADR-0035). Each replacement is atomic under the transport lock. A
+			// failed reload leaves the previous material in use, and a leaf failure
+			// does not prevent the CA or CRL from being updated.
 			if err := tr.Reload(); err != nil {
-				log.Printf("SIGHUP: cert reload FAILED: %v (stale leaf still serving)", err)
-				// Continue to the CA + CRL reloads — a failed leaf reload does
-				// NOT block a CA or CRL update (the triple is independent).
+				log.Printf("SIGHUP: certificate reload failed: %v; previous leaf remains in use", err)
+				// Continue with CA and CRL reloads after a leaf failure.
 			} else {
 				log.Printf("SIGHUP: cert reloaded (new leaf live on next handshake)")
 			}
 			if err := tr.ReloadCA(); err != nil {
-				log.Printf("SIGHUP: CA reload FAILED: %v (stale CA pool still serving — the transport NEVER trust-degrades on a failed reload)", err)
+				log.Printf("SIGHUP: CA reload failed: %v; previous CA pool remains in use", err)
 			} else {
 				log.Printf("SIGHUP: CA pool reloaded (new trust root live on next handshake)")
 			}
 			if cfg.crlPath != "" {
 				if err := tr.ReloadCRL(); err != nil {
-					log.Printf("SIGHUP: CRL reload FAILED: %v (stale revoked-serial set still consulting)", err)
+					log.Printf("SIGHUP: CRL reload failed: %v; previous revoked-serial set remains in use", err)
 				} else {
 					log.Printf("SIGHUP: CRL reloaded (new revoked-serial set live on next handshake)")
 				}
@@ -1262,95 +985,71 @@ func run(args []string) error {
 		}
 	}()
 
-	// /livecheck + /metrics control surface: PLAIN net/http, no TLS. It is ops
-	// debug, NOT the data plane (named in ADR-0006; the C1 boundary — /metrics
-	// is the SAME plain-HTTP control surface as /livecheck, NOT the data
-	// plane). The surface serves the /metrics Prometheus scrape route on the
-	// SAME mux (one server, one mux, the --metrics-addr flag already binds it) +
-	// the per-process Registry (the duplicate-registration root-cause fix,
-	// ADR-0008 §3). A TLS-or + auth-hardened /metrics is future hardened-ops
-	// work, honestly deferred (ADR-0006 §8 item 3 + ADR-0008 §8).
+	// /livecheck and /metrics share one unauthenticated plain-HTTP debugging
+	// server, separate from the peer data plane (ADR-0006, ADR-0008 §3). The
+	// exporter uses a per-process Prometheus registry.
 	metricsExp := metrics.NewExporter()
-	// Wire the gossip-round counter seam: every executed sweep round increments
-	// sovereign_gossip_rounds_total (the datapath-restored signal the silicon
-	// partition harness reads). Bound before SweepLoop starts below.
+	// Count each executed sweep round before SweepLoop starts.
 	gossiper.SetRoundReporter(metricsExp.Recorder().IncGossipRound)
-	// ADR-0026: arm telemetry.Init at boot with a real OTel SDK
-	// MeterProvider when --otel is set. This MUST precede the bridge
-	// construction below: telemetry.Init triggers rebuildCounters, which
-	// reassigns the package-level *Counter pointers AND rebinds the telemetry counter slice
-	// (counters = allCounters()). The bridge calls telemetry.Counters() at
-	// NewTelemetryBridge() (the telemetry counter snapshot), so Init must run BEFORE that so
-	// the bridge captures the post-Init counter pointers. The OTel reader (a
-	// PeriodicReader over logOutputExporter) exports through a SEPARATE
-	// destination from the bridge's prometheus Registry — the two-exporter
-	// separation (§0.d): the bridge reads CUMULATIVE via Counter.Value() (never
-	// lastReported); the OTel callback reads DELTA via lastReported. cumulative
-	// == sum-of-deltas; the two never collide at /metrics because OTel is NOT a
-	// prometheus.Collector. --otel=false (the DEFAULT) keeps the
-	// bridge-alone behavior byte-identical (the synchronous-nop Meter fallback
-	// in registry.go governs; the bridge still scrapes 12 cumulative series).
+	// Expose secondary-index health through gauges evaluated at scrape time.
+	// Disabled nodes do not register these series.
+	if cfg.secondaryIndexEnable {
+		reg := metricsExp.Registry()
+		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "sovereign_secondary_index_entities",
+			Help: "Distinct entities currently held by the secondary index (--secondary-index).",
+		}, func() float64 { return float64(secondaryIndex.Stats().Entities) }))
+		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "sovereign_secondary_index_tie_drops_total",
+			Help: "Index records dropped by the MaxTieCells cap (the disclosed same-ns recall loss).",
+		}, func() float64 { _, tie, _, _ := secondaryIndex.IndexHealth(); return float64(tie) }))
+		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "sovereign_secondary_index_ceiling_drops_total",
+			Help: "Index records dropped by the --secondary-index-max-entities ceiling (nonzero = the query tier refuses 503).",
+		}, func() float64 { _, _, cd, _ := secondaryIndex.IndexHealth(); return float64(cd) }))
+	}
+	// Initialize OTel before constructing the Prometheus bridge (ADR-0026).
+	// telemetry.Init rebuilds the package counters, and NewTelemetryBridge must
+	// capture the rebuilt set. The bridge reads cumulative Counter.Value results;
+	// OTel callbacks export deltas through lastReported to a separate log
+	// destination. With OTel disabled, the nil-Meter fallback leaves the bridge
+	// as the only exporter.
 	otelShutdown, otelErr := armOTel(cfg.otelEnabled, hex.EncodeToString(nodeID[:]), cfg.otelInterval)
 	if otelErr != nil {
-		log.Printf("sovereign-node: OTel arming FAILED: %v — OTel dark, prometheus bridge unaffected (the bridge reads the SAME Counter.Value() it always did)", otelErr)
+		log.Printf("sovereign-node: OTel initialization failed: %v; OTel export disabled, prometheus bridge unaffected", otelErr)
 	}
 	defer otelShutdown(context.Background())
-	// ADR-0023: bridge the internal/telemetry LongAdder counters (the
-	// 12 distinct supremum.* counters surfaced since) onto the
-	// per-process /metrics Registry. Until today the data plane Add()/Inc() on
-	// every flush / compaction / prune / reap touched those counters but NONE
-	// reached /metrics — including the SAFETY-CRITICAL
-	// supremum_compaction_l0_reap_manifests_skipped_orphan (the Stage-C reaper
-	// guard's operator signal). The bridge is the prometheus.Collector that
-	// closes that operator-blindness defect: it enumerates
-	// telemetry.Counters() and emits one cumulative const series per counter
-	// (CUMULATIVE not delta — see the §0.b double-count trap in ADR-0023; the
-	// bridge reads Counter.Value() and NEVER touches lastReported). Registered
-	// into the SAME per-process Registry as the Recorder's sovereign_* series
-	// (the two series coexist by name — sovereign_* vs supremum_*, never
-	// colliding). NOTE the deliberate absence of telemetry.Init: wiring a real
-	// colliding). ADR-0026 ARMED telemetry.Init above (when --otel is
-	// set); the bridge stays SAFE whether or not that happens — the
-	// lastReported callback that arming Init fires is the OTel layer's concern,
-	// NOT the bridge's (the bridge reads only Counter.Value(), never
-	// lastReported — the §0.b trap is disarmed by the two-exporter separation
-	// in armOTel, not by sharing a value). Registering BEFORE startLivecheck
-	// fires the first scrape.
+	// NewTelemetryBridge adapts the internal/telemetry LongAdder counters to
+	// cumulative Prometheus series on the same registry as the Recorder's
+	// sovereign_* metrics (ADR-0023). It reads Counter.Value and never advances
+	// the OTel lastReported state. Register it before the HTTP server starts.
 	telemetryBridge := metrics.NewTelemetryBridge()
 	metricsExp.Registry().MustRegister(telemetryBridge)
-	metricsSrv := startLivecheck(cfg.metricsAddr, nodeID, peers, metricsExp, gossiper, bridge, bootWitness)
+	metricsSrv := startLivecheck(cfg.metricsAddr, nodeID, peers, metricsExp, gossiper, bridge, bootWitness, engine)
 	defer metricsSrv.Shutdown(context.Background())
 
-	// the NON-DESTRUCTIVE loopback pprof endpoint — the capture-
-	// then-continue stack dump the 2026-09-04 300s stall lacked (the only prior
-	// dump was kill -QUIT, which kills the seed). It rides a SEPARATE listener from
-	// the metrics mux above so the cross-host /metrics bind is untouched. A bind
-	// failure is logged loudly and does NOT stop the node (the profiler is
-	// diagnostic, never load-bearing); at silicon the derived port (metrics+1000)
-	// is collision-free across the 34 nodes on a host.
+	// The loopback pprof listener allows profile capture without stopping the
+	// process. It is separate from the metrics listener, and a bind failure only
+	// disables profiling; the node continues without it.
 	pprofSrv, pprofErr := startPprof(pprofBindAddr(cfg.metricsAddr, cfg.pprofAddr))
 	if pprofErr != nil {
-		log.Printf("pprof: UNAVAILABLE (%v) — the stack-capture endpoint is DOWN on this node", pprofErr)
+		log.Printf("pprof: unavailable (%v); profile capture disabled on this node", pprofErr)
 	} else {
 		defer pprofSrv.Shutdown(context.Background())
 	}
 
-	// the JSON-over-mTLS client control port. --control-addr defaults OFF
-	// (empty) — no client API unless the operator explicitly enables it, so a
-	// misconfigured node is still a peer in the mesh (the data plane is
-	// unaffected). When set, it is a SEPARATE *tls.Listener (NOT the --bind peer
-	// listener, NOT the --metrics-addr plain-HTTP surface) serving the /v1/* JSON
-	// routes with the SAME mTLS config as the peer path (RequireAndVerifyClientCert,
-	// Min==Max==1.3 — ADR-0006). Three surfaces, one trust root (ADR-0011 §3).
-	// The control port does NOT touch the receive gate stack (receiver.go /
-	// ingress_epoll.go stay untouched); it has its own http.Server.
+	// --control-addr enables a separate JSON-over-mTLS listener for /v1 routes.
+	// It uses the peer trust configuration and TLS 1.3 but has its own HTTP
+	// server, independent of the frame accept loop and plain-HTTP metrics port
+	// (ADR-0006, ADR-0011 §3). The empty default disables the client API.
 	var controlSrv *http.Server
 	if cfg.controlAddr != "" {
-		controlSrv = startControlPort(cfg.controlAddr, tr, gossiper, nodeID, peers, metricsExp, queryResolver)
+		controlSrv = startControlPort(cfg.controlAddr, tr, gossiper, nodeID, peers, metricsExp, queryResolver, cfg.secondaryIndexEnable)
 		defer controlSrv.Shutdown(context.Background())
 	}
 
-	// TLS listener (the encrypted pipe).
+	// Open the TLS peer listener after the optional diagnostic and control
+	// services have been configured.
 	ln, err := tr.Listen("tcp", cfg.bind)
 	if err != nil {
 		return fmt.Errorf("tls listen %s: %w", cfg.bind, err)
@@ -1358,79 +1057,45 @@ func run(args []string) error {
 	defer ln.Close()
 	log.Printf("sovereign-node: TLS 1.3 listener bound on %s (nodeID=%x)", cfg.bind, nodeID)
 	if len(peers) > 0 {
-		log.Printf("peers configured: %v — dial loop pending ", peers)
+		log.Printf("peers configured: %v", peers)
 	} else {
 		log.Printf("no peers configured (single-node)")
 	}
 
-	// Accept loop: per *tls.Conn, install a goroutine that reassembles
-	// length-prefixed frames and drives the gate stack. The gate-stack order
-	// at receiver.go:244 is PROVEN and UNTOUCHED; this binary is a CALLER.
-	// (Option B — the observer wrapper, ADR-0008 §3): the per-conn
-	// goroutine wraps HandleFrame with `start:= time.Now(); av:= HandleFrame;
-	// recorder.RecordIngest(time.Since(start), av.Verdict)`. receiver.go is left
-	// unmodified; the Verdict enum carries 100% of the per-gate
-	// signal, so the wrapper captures it at the caller, not in the gate stack.
+	// Each accepted connection gets a goroutine that reassembles length-prefixed
+	// frames and calls the receive gate. The caller observes HandleFrame's typed
+	// verdict and elapsed time, leaving instrumentation outside the gate stack
+	// (ADR-0008 §3).
 	acceptCtx, acceptCancel := context.WithCancel(context.Background())
 	defer acceptCancel()
-	// ADR-0034: thread the Gossiper as the digest sink so the
-	// accept-side serveConn can route a WireDigestMagic-tagged frame to
-	// DeliverDigest (the sweep's per-peer blocking-receive producer). The
-	// digestDemuxer is a nil-safe shim: a --selftest path that constructs no
-	// gossiper passes a nil digester + serveConn's digest branch is a no-op
-	// drop (the honest cold-start when stratified is OFF). The gossiper is
-	// constructed above (main.go:515) before the accept loop starts, so the
-	// sink is bound at accept-loop launch.
+	// Route tagged digest frames to the gossiper's DeliverDigest method through
+	// a nil-safe adapter. The sink is ready before the accept loop starts; a nil
+	// sink drops digests instead of sending them to the receive gate.
 	var acceptDigester mesh.DigestSink
 	if gossiper != nil {
 		acceptDigester = digestDemuxer{g: gossiper}
 	}
 	go acceptLoopWithDigest(acceptCtx, ln, recv, metricsExp.Recorder(), acceptDigester, peerSet)
 
-	// ── dial each configured peer + start the anti-entropy sweep ──
-	// The accept loop is already serving; this is the dial side. Each
-	// dial reuses the accept-side readLoop via the PeerSet, so a node that
-	// both dials and accepts converges symmetrically.
+	// Start outbound dials and anti-entropy after the accept loop is serving.
+	// Dialed connections use the same frame reader through PeerSet, so inbound
+	// and outbound connections converge through the same receive path.
 	meshCtx, meshCancel := context.WithCancel(context.Background())
 	defer meshCancel()
-	// ADR-0040: the OOB peer-Directory pubkey provisioning (Seam A).
-	// applyProvisioning parses --peer-dir (the line-oriented config mapping
-	// addr → {nodeID, ed25519_pubkey, optional mldsa65_pubkey, optional region}),
-	// calls gossiper.RegisterPeer (+ dir.RegisterPQ for the optional PQ arm) +
-	// topo.SetRegion under the REAL nodeID, + returns the addr→nodeID map the
-	// dial loop branches on. This retires the §7.1 zero-peerID hazard:
-	// the region tags now key on real nodeIDs (NOT peerIDForAddr surrogates),
-	// so the topology selector HITS → Publish(realNodeID) succeeds → the 2-node
-	// binary mesh converges → the telemetry counter fires A=1 B=1. OPT-IN: an
-	// empty --peer-dir (the default) returns an empty map + nil error (the
-	// honest no-op — the dial loop's ELSE arm runs for every peer, byte-
-	// identical). A NON-EMPTY path that does not exist OR a malformed
-	// entry FAILS THE BOOT (a deploy misconfiguration MUST surface loudly, NOT
-	// silently fall back to zero-peerID — the honest-negative posture; the
-	// §III guard OOB config-parse bug-inject-proves the FAILSAFE parser).
-	// gossiper (:947), dir (:893), + topo (:1007) are all guaranteed non-nil
-	// here (constructed unconditionally above); no nil-guard needed.
-	// pass THIS node's own nodeID so applyProvisioning skips
-	// the self entry a shared peerdir carries (the silicon gate ships ONE peerdir to
-	// all 100 nodes and its line 1 is the seed's own entry). Without it every node
-	// registered itself as a peer and the sweep tried to Publish to itself.
+	// applyProvisioning registers each directory entry under its real node ID,
+	// including optional PQ keys and region tags, and returns the address-to-ID
+	// map used for dialing (ADR-0040). This lets topology selection and Publish
+	// use the same identity. An empty directory returns an empty map; malformed
+	// or missing named files fail startup. Passing this node's ID skips its own
+	// entry when all nodes share one peer directory.
 	provisioned, provErr := applyProvisioning(gossiper, dir, topo, provCfgs, nodeID)
 	if provErr != nil {
 		return fmt.Errorf("--peer-dir: %w", provErr)
 	}
-	// A review finding: a
-	// --peer-dir addr NOT in --peers is registered (RegisterPeer/RegisterPQ +
-	// SetRegion fire for it) but NEVER dialed — the dial loop iterates ONLY
-	// --peers (parsePeers, main.go:655). The peer's pubkey sits in the Directory
-	// unused on the dial side; this node never ships deltas to it (a silent
-	// ONE-WAY partition — the peer can still send TO this node if IT dials out,
-	// but this node's sweep never Publishes to it). The FAILSAFE parser cannot
-	// catch this (each file is well-formed on its own); a strict subset check
-	// would fail a legitimate bootstrap-peer config (an operator MAY provision a
-	// peer's pubkey ahead of adding it to --peers). The honest posture: a
-	// WARNING per unmatched --peer-dir addr makes the silent one-way partition
-	// OBSERVABLE without failing a forward-provisioning deploy. `peers` is the
-	// parsePeers(cfg.peers) slice in scope at main.go:655.
+	// Provisioning alone does not dial an address: the dial loop iterates only
+	// --peers. Warn for directory entries omitted from that list because this
+	// node will not publish to them, although they can still dial in. This is a
+	// warning rather than an error so keys can be provisioned before dialing.
 	if len(provisioned) > 0 {
 		peersSet := make(map[string]bool, len(peers))
 		for _, pa := range peers {
@@ -1438,135 +1103,39 @@ func run(args []string) error {
 		}
 		for paddr := range provisioned {
 			if !peersSet[paddr] {
-				log.Printf("sovereign-node: WARNING: peer %s is in --peer-dir but NOT in --peers — it is registered (RegisterPeer/RegisterPQ/SetRegion) but the dial loop never dials it, so this node never ships deltas to it (a silent one-way partition). Add it to --peers to dial it, or remove it from --peer-dir.", paddr)
+				log.Printf("sovereign-node: peer %s is in --peer-dir but not --peers; its keys and region are registered, but this node will not dial or publish to it. Add it to --peers or remove the directory entry.", paddr)
 			}
 		}
 	}
-	// ADR-0040 Seam B: arm the runtime TLS-leaf reconcile. OPT-IN
-	// (default false = byte-identical — reconcilePeerID is NOT called,
-	// the peerConn stays keyed under the caller-supplied peerID). ON switches
-	// PeerSet.Dial to read the peer leaf CommonName + re-key under the REAL
-	// nodeID for an UN-PROVISIONED peer (the routing complement — a deploy that
-	// opts into --peer-auto-reconcile alone ROUTES via the handshake but does NOT
-	// CONVERGE; convergence REQUIRES --peer-dir's RegisterPeer verification
-	// pubkey, else the receiver's Directory.Lookup MISSES → DropVerify → no
-	// convergence; the binary harness's honest-negative control PROVES reconcile-only
-	// does NOT converge). ROUTING-only.
-	peerSet.SetAutoReconcile(cfg.autoReconcile)
-	for _, pa := range peers {
-		host, _, herr := net.SplitHostPort(pa)
-		if herr != nil {
-			host = "localhost"
-		}
-		// ADR-0040: the dial-peerID branch — the load-bearing fix that
-		// retires the zero-peerID hazard. IF the peer was provisioned via
-		// --peer-dir (Seam A), dial under the REAL nodeID so the topology
-		// selector HITS + Publish(realNodeID) succeeds → the 2-node binary mesh
-		// converges. ELSE keep the zero peerID (byte-identical back-
-		// compat — the honest "operator did not provision this peer" default).
-		// Seam B (--peer-auto-reconcile ON) further re-keys an UN-PROVISIONED
-		// peer's peerConn to the real nodeID at the handshake (reconcilePeerID
-		// in PeerSet.Dial); a PROVISIONED peer skips the reconcile (the peer is
-		// keyed correctly already — the leaf CN is a redundant signal).
-		var dialPeerID [16]byte
-		isProvisioned := false
-		if pid, ok := provisioned[pa]; ok {
-			dialPeerID = pid
-			isProvisioned = true
-		} else if len(provisioned) > 0 {
-			// A review pass: the addr-consistency
-			// WARNING. --peer-dir is set (provisioned is non-empty) BUT this --peers
-			// addr is NOT in the provisioned map → the peer dials under the ZERO
-			// peerID → topology.Select (keyed under the real nodeID by
-			// applyProvisioning) misses → Publish(real) finds no live peerConn → a
-			// SILENT PARTITION (the exact §7.1 no-op this change retires). The
-			// common cause: a --peers addr (DNS name, leading-zero port, trailing
-			// whitespace, IPv6 shorthand) that does not string-match the --peer-dir
-			// first column. The FAILSAFE parser cannot catch cross-file mismatches
-			// (each file is well-formed on its own); this WARNING makes the silent
-			// partition OBSERVABLE without failing a legitimate bootstrap-peer
-			// config (an operator MAY list a bootstrap peer in --peers not yet in
-			// --peer-dir). A deploy that wants strict consistency can grep the boot
-			// log for this WARNING. The honest posture: loud observation, not a
-			// silent fall back to zero-peerID.
-			log.Printf("sovereign-node: WARNING: peer %s is in --peers but NOT in --peer-dir — it will dial under the zero peerID (topology.Select will miss; Publish will find no live peerConn → silent partition). Verify the --peers addr string-matches the --peer-dir first column (DNS vs IP, port, whitespace).", pa)
-		}
-		// ADR-0040: the production reconnect watcher. The dial loop was
-		// ONE-SHOT — a peer not yet listening
-		// at boot (the inevitable 2-node startup race: whichever node boots
-		// first dials the second, which is not up yet) = a PERMANENT miss; the
-		// "dial loop pending " residual the boot log discloses. The
-		// ReconnectLoop primitive (peer.go:528, docstring: "the production
-		// binary wires it") re-dials with bounded exponential backoff until the
-		// peer connects, then watches the conn + re-dials on drop. This retires
-		// the RETRY half of the dial hazard (the peerID half is retired
-		// by the dial-peerID branch above) — the natural completion of "retire
-		// the dial hazard" so the 2-node binary mesh actually converges.
-		// Idempotent + safe in all three modes: (a) a PROVISIONED peer (Seam A)
-		// re-dials under the real nodeID; (b) an UN-PROVISIONED peer with
-		// --peer-auto-reconcile ON (Seam B) re-keys at each successful dial via
-		// reconcilePeerID; (c) an UN-PROVISIONED peer with reconcile OFF keeps
-		// the zero peerID (byte-identical — the reconnect just retries
-		// the same honest "operator did not provision" no-op). Bounded by
-		// meshCtx (cancels on shutdown) + a 10s backoff ceiling.
-		dialErr := peerSet.Dial(meshCtx, pa, host, dialPeerID)
-		if dialErr != nil {
-			log.Printf("peer dial %s: %v (accept loop still serving; ReconnectLoop retries with backoff)", pa, dialErr)
-		} else if isProvisioned {
-			log.Printf("sovereign-node: dialed provisioned peer %x at %s (Seam A — real nodeID; topology selector will HIT)", dialPeerID, pa)
-		}
-		go peerSet.ReconnectLoop(meshCtx, pa, host, dialPeerID, time.Second, 10*time.Second)
-	}
-	tickDur, err := time.ParseDuration(cfg.gossipTick)
-	if err != nil {
-		return fmt.Errorf("--gossip-tick %q: %w", cfg.gossipTick, err)
-	}
-	go gossiper.SweepLoop(meshCtx, tickDur)
-	if len(peers) > 0 {
-		log.Printf("sovereign-node: mesh gossip sweep started, tick=%s, peers=%d", cfg.gossipTick, len(peers))
-	} else {
-		log.Printf("sovereign-node: no peers configured (single-node); sweep idle")
+	// Optional TLS-leaf reconciliation re-keys an unprovisioned connection from
+	// the leaf CommonName to its real node ID. This fixes routing only; delta
+	// verification still requires the peer's public key from --peer-dir.
+	if err := startMeshBootDialAndSweep(meshCtx, cfg, peers, provisioned, topo, peerSet, gossiper); err != nil {
+		return err
 	}
 
-	// the 1s convergence-gauge poller. It reads the Gossiper's
-	// convergence-lag seed OFF the hot path (the SweepLoop is the single
-	// writer; this is the single reader) and feeds the three poller-driven
-	// gauges: sovereign_convergence_lag_seconds (time since the last stable
-	// root), sovereign_convergence_roots_equal (1.0 when the local root
-	// matches the last converged root, 0.0 otherwise), and sovereign_ingest_pps
-	// (instantaneous frames/sec from the verdict-counter delta). The poller
-	// does NOT touch the ingest hot path.
+	// Sample convergence lag, root equality, and ingest rate once per second.
+	// SweepLoop writes the convergence seed; this goroutine only reads it and
+	// the verdict counters, keeping gauge updates off the ingest path.
 	go convergenceGaugePoller(meshCtx, gossiper, metricsExp)
 
-	// ADR-0019: the L0→L1 per-entity compaction scheduler. It has its
-	// OWN goroutine (NOT the MemTable flush goroutine + NOT the sweep loop) so a
-	// slow merge stalls compaction but NOT writes and NOT the anti-entropy mesh.
-	// It periodically lists the l0/ entity prefixes; for each entity with ≥
-	// L0FilesPerEntityTrigger L0 files it runs a Compaction job (READ-L0 →
-	// WRITE-L1). The scheduler is nil (no --lsm-root) for a research node — no
-	// compaction, the MaxL0Files cap stays the silent-loss form
-	// (compaction is opt-in, honestly disclosed); the L1 resolver remains query
-	// correct over the uncompacted tail. Gated alongside meshCtx so SIGINT/SIGTERM
-	// cancels it (the compaction honors ctx.Err() at every L0 download).
+	// Compact each entity's L0 files into L1 on a separate goroutine so a slow
+	// merge does not block writes or gossip (ADR-0019). A nil compactor disables
+	// scheduling when --lsm-root is absent. meshCtx cancellation stops downloads
+	// during shutdown.
 	go compactionSchedulerLoop(meshCtx, queryCompactor, queryResolver)
 	if queryCompactor != nil {
 		log.Printf("sovereign-node: L0→L1 compaction scheduler started, trigger=%d files/entity (read-L0/write-L1 background; no write-path lock)",
 			queryCompactor.L0FilesPerEntityTrigger())
 	}
 
-	// ADR-0021: the L0 reaper goroutine. It reclaims manifest-listed
-	// superseded L0 files AFTER verifying the L1 still exists (Stage C safety
-	// guard). It is COMPLEMENTARY to the compaction scheduler (which DRIVES new
-	// L1s + manifests; the reaper RECLAIMS the L0s the compactor superseded),
-	// runs LESS often (default 5m vs compaction's 30s — the superseded L0s are
-	// a safety net, zero urgency), and reaps ALL entities per sweep (not one at
-	// a time like the per-entity compactor). A nil reaper (--compaction-reap-
-	// enable=false, or no --lsm-root) makes this a no-op — byte-identical to
-	// the prior behavior (the backstop kept forever). Gated alongside meshCtx so SIGINT/SIGTERM
-	// cancels it (the reaper honors ctx.Err() at every list/download/delete).
+	// The optional reaper deletes superseded L0 files after verifying their L1
+	// replacements (ADR-0021). Its default five-minute cadence is slower than
+	// compaction, and each sweep covers all entities. A nil reaper preserves the
+	// old files. meshCtx cancellation stops its storage operations on shutdown.
 	go reaperLoop(meshCtx, queryReaper, cfg.compactionReapInterval)
 	if queryReaper != nil {
-		log.Printf("sovereign-node: L0 reaper started, interval=%s (cross-entity superseded-L0 reclaim; Stage C verifies the L1 before any L0 delete; NEVER auto-on)",
+		log.Printf("sovereign-node: L0 reaper started, interval=%s (replacement L1 verified before deleting superseded L0 files)",
 			cfg.compactionReapInterval)
 	}
 
@@ -1589,18 +1158,10 @@ func run(args []string) error {
 	return nil
 }
 
-// digestDemuxer adapts the Gossiper to the mesh.DigestSink contract for the
-// cmd accept-side serveConn. The accept-side serveConn does NOT hold the
-// Gossiper directly (it holds the *receive.Receiver); the digest
-// exchange routes a WireDigestMagic-tagged frame to the Gossiper's
-// DeliverDigest via this adapter so the sweep's per-peer blocking-receive
-// channel gets the peer's StrataEstimator. A nil Gossiper (the --selftest path
-// that constructs no gossiper) makes the digester nil — DispatchFrame's digest
-// branch is then a no-op drop (the honest cold-start when stratified is OFF).
-//
-// It is a thin wrapper (NOT a new object graph) so the readLoop + serveConn +
-// serveTestConn all reach the SAME Gossiper's DeliverDigest — one digest sink
-// per node, shared across the dial-side readLoop and the accept-side serveConn.
+// digestDemuxer adapts a Gossiper to mesh.DigestSink for accepted connections.
+// Both dial-side and accept-side readers deliver tagged digest frames to the
+// same DeliverDigest method, which wakes the corresponding sweep exchange. A
+// nil Gossiper discards digests rather than passing them to the receive gate.
 type digestDemuxer struct{ g *mesh.Gossiper }
 
 func (d digestDemuxer) DeliverDigest(peerID [16]byte, frame []byte) {
@@ -1609,13 +1170,9 @@ func (d digestDemuxer) DeliverDigest(peerID [16]byte, frame []byte) {
 	}
 }
 
-// acceptLoopWithDigest is the accept loop: it threads the digestSink so
-// the accept-side serveConn can route a WireDigestMagic-tagged frame to the
-// Gossiper's DeliverDigest (the dial-side readLoop already routes via the
-// PeerSet's digester; the accept-side needs the same sink because a digest
-// arrives on the conn the PEER dialed in, which the local node reads on its
-// accept side, NOT its dial-side readLoop). A nil digester (the --selftest
-// path) keeps serveConn's digest branch a no-op drop.
+// acceptLoopWithDigest serves each accepted connection in its own goroutine.
+// A peer's digest can arrive on a connection it dialed to this node, so the
+// accept-side reader needs the same DigestSink used by dialed connections.
 func acceptLoopWithDigest(ctx context.Context, ln net.Listener, recv *receive.Receiver, rec *metrics.Recorder, digester mesh.DigestSink, peerSet *mesh.PeerSet) {
 	for {
 		conn, err := ln.Accept()
@@ -1630,156 +1187,129 @@ func acceptLoopWithDigest(ctx context.Context, ln net.Listener, recv *receive.Re
 	}
 }
 
-// serveConn drives the frame reassembler + the gate stack for one TLS
-// connection. It logs the typed verdict per frame (the gate-stack decision is
-// the load-bearing attribution signal). A malformed/closed connection ends
-// the goroutine; the gate stack never panics on adversarial input.
-//
-// (Option B — the observer wrapper, ADR-0008 §3): the per-frame
-// observation is an ACCEPT-LOOP concern, NOT a gate-stack concern. The
-// per-conn goroutine is uncontended (one frame at a time per conn), so the
-// Recorder's atomic Observe/Inc is wait-free here. receiver.go is left
-// unmodified; the Verdict enum (receiver.go:81, six values)
-// carries 100% of the per-gate signal, so the wrapper captures it at the
-// caller. A nil Recorder disables observation (the --selftest path may run
-// without one if constructed that way; here it is always non-nil).
+// serveConnWithDigest reassembles frames and dispatches them for one
+// connection. It records the receive gate's typed verdict and elapsed time in
+// the caller, outside the gate implementation (ADR-0008 §3). Each connection
+// processes one frame at a time. A nil Recorder disables observation.
 func serveConnWithDigest(ctx context.Context, conn net.Conn, recv *receive.Receiver, rec *metrics.Recorder, digester mesh.DigestSink, peerSet *mesh.PeerSet) {
 	defer conn.Close()
-	// ADR-0045 Scope-A: register the inbound peer in ps.peers so
-	// a connection becomes a BIDIRECTIONAL publishable edge. Before this fix the
-	// accept loop served frames for a connection it never registered → a B→A
-	// edge was publishable for B but NOT for A → A's Publish to a peer that
-	// dialed A returned "no live peer" → the 100-node cardinality cliff (the
-	// seed's boot dial races 99 listeners, a failed dial leaves the peer
-	// permanently absent from ps.peers → 99/99 root-zero). RegisterInbound
-	// decodes the peer's REAL nodeID from the inbound TLS leaf CN (the SAME
-	// nodeIDFromConn the Dial-side reconcile uses) + installs a peerConn with
-	// NO readLoop (this accept loop owns the read side; a second readLoop would
-	// double-read the conn). ReleaseInbound on exit marks the entry dead so a
-	// later Dial/ReconnectLoop re-establishes. A nil peerSet (the --selftest
-	// path) skips registration — byte-identical to the pre-registration accept path.
+	// RegisterInbound decodes the peer's node ID from its TLS leaf and installs
+	// a publishable handle for this accepted connection. It does not start a
+	// second reader because this goroutine owns the read side. On exit,
+	// ReleaseInboundConn releases only the handle installed here so a declined
+	// duplicate cannot close another live connection.
 	var inboundNodeID [16]byte
-	if tc, ok := conn.(*tls.Conn); ok {
+	var myPC *mesh.PeerConnHandle // registered handle for digest and challenge routing
+	var declNodeID [16]byte
+	var declPC *mesh.PeerConnHandle // challenge handle for a declined duplicate connection
+	var tc *tls.Conn                // serving connection used for challenge answers
+	if t, ok := conn.(*tls.Conn); ok {
+		tc = t
 		if err := tc.Handshake(); err != nil {
 			log.Printf("tls handshake from %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 		if peerSet != nil {
-			// Bind the deferred release to the *peerConn
-			// RegisterInbound actually INSTALLED, not to the nodeID. myPC is nil on a
-			// decode miss OR on an decline (we already hold a LIVE edge to this
-			// peer, so the registration was refused and this goroutine owns nothing
-			// in ps.peers). Releasing by nodeID alone would close whatever conn IS
-			// registered — killing a live edge this goroutine never owned (the
-			// wrong-kill: latent before the fix, load-bearing after it). ReleaseInboundConn
-			// closes only if ps.peers[real] == myPC. A DECLINED registration still
-			// SERVES the conn below (the earlier semantics: the remote publishes over
-			// it and the frames still reach the gate stack) — it just does not own a
-			// ps.peers entry.
-			var myPC *mesh.PeerConnHandle
+			// Release the exact handle returned by RegisterInbound. myPC is nil
+			// after an identity decode failure or when a live connection already
+			// exists. ReleaseInboundConn compares handles before closing, preventing
+			// this goroutine from closing a connection it does not own. A declined
+			// connection still serves inbound frames without a peers entry.
 			inboundNodeID, myPC = peerSet.RegisterInbound(tc)
 			defer peerSet.ReleaseInboundConn(inboundNodeID, myPC)
+			if myPC == nil {
+				declNodeID, declPC = peerSet.ArmDeclinedInbound(tc)
+			}
 		}
 	}
-	fr := receive.NewFrameReader(conn) // receiver.go:474
-	// acceptLogCount:
-	// the per-Accept log line below is CAPPED — see acceptLogLine. Uncapped,
-	// it printed one line per accepted frame/batch: with the relay
-	// re-shipping every batch every sweep and duplicate arrivals counted
-	// as Keep(Accept), the line fired ~120K times on ONE node in one run —
-	// the same EBS log-storm class the missLogCap=8 cap killed on the miss
-	// path. The full-fidelity signal lives in rec.RecordIngest (the verdict
-	// counter); this log is the debug channel.
+	fr := receive.NewFrameReader(conn) // reassemble length-prefixed frames
+	// acceptLogLine limits diagnostic Accept logs; verdict metrics retain the
+	// full per-delta count even when repeated relay arrivals are accepted.
 	var acceptLogCount int64
+	// Include digest delivery and receive-gate execution in accept-side busy
+	// time. NoteDispatchBusy performs the enabled check; a nil peerSet skips it.
+	noteServeBusy := func(t0 time.Time) {
+		if peerSet != nil {
+			peerSet.NoteDispatchBusy(mesh.L0ILoopServe, time.Since(t0).Nanoseconds())
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		frame, err := fr.ReadFrame() // receiver.go:486
+		frame, err := fr.ReadFrame() // reassemble one length-prefixed frame
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				log.Printf("frame read from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
-		// digest branch (ADR-0034): a WireDigestMagic-tagged frame is a
-		// StrataEstimator digest, NOT a CRDT delta. It routes to the Gossiper's
-		// DeliverDigest (via the digester shim), NOT the gate stack — a digest
-		// never reaches HandleFrame (which would DropMalformed it; the
-		// gossip.go:356 comment names this). It is NOT timed/recorded as a
-		// gate-stack verdict: a digest is advisory, the signed delta that
-		// follows is the authoritative state transfer the gate stack + recorder
-		// cover (the threat model in wire_v1.go's WireDigestMagic comment).
-		// The accept side passes a zero peerID (it does not know the sender from
-		// the conn alone); DeliverDigest reads the authoritative senderID from
-		// the digest-frame header.
-		if attribution.IsDigestFrame(frame) {
-			if digester != nil {
-				digester.DeliverDigest([16]byte{}, frame) // mesh.DigestSink -> Gossiper.DeliverDigest
+		// Every dispatch path records its busy interval before continuing.
+		busyT0 := time.Now()
+		// Digest and challenge frames are protocol control traffic, not CRDT
+		// deltas, and do not enter the receive gate or its verdict metrics.
+		// Challenges use the registered connection handle; declined connections
+		// use the separate challenge handle armed above (ADR-0034, ADR-0068).
+		if peerSet != nil && mesh.IsChallengeFrame(frame) {
+			if myPC != nil {
+				peerSet.HandleConnChallengeFrame(myPC, tc, frame)
+			} else {
+				peerSet.HandleDeclinedChallengeFrame(declPC, tc, frame)
 			}
+			noteServeBusy(busyT0)
 			continue
 		}
-		// Option B observer: time the full gate-stack composition (cheap gates
-		// + the ~60us Verify when it fires) and record the latency + the
-		// typed verdict. The bimodal histogram (sub-1us cheap-reject + ~60us
-		// verify-pass) is the guard this produces.
-		//
-		// dispatch: peek the post-length-prefix body's first 4 bytes.
-		// A BatchEnvelope magic (attribution.IsBatchFrame) routes to
-		// HandleBatchFrame (the batch path — one Ed25519 over N deltas); the
-		// RelayEnvelope path (the default) routes to HandleFrame (the frozen
-		// per-frame gate stack). On a batch Accept, the per-delta verdict
-		// counter is incremented by N (BatchAcceptCount), NOT +1 — the counter
-		// is PER-DELTA, so a batch of N accepted deltas adds N to the Accept
-		// label (ADR-0010 §2).
-		//
-		// dispatch arm (ADR-0037 — the hybrid-accept-path fix): a
-		// HybridEnvelope magic (attribution.IsHybridFrame) routes to
-		// HandleHybridFrame (the hybrid-PQ batch gate stack — BOTH Ed25519 +
-		// ML-DSA-65 over the SAME 120-byte SHAKE256 pad). On a hybrid Accept,
-		// the per-delta verdict counter is incremented by N via
-		// HybridAcceptCount (the hybrid-frame sibling of BatchAcceptCount — it
-		// parses the WireHybridPQMagic header, which BatchAcceptCount's
-		// WireV1Magic parser would reject → return 0 → silent undercount). The
-		// dispatch order is load-bearing: IsBatchFrame first (the highest-rate
-		// opt-in path), then IsHybridFrame (the hybrid-PQ batch), then the
-		// default routes to the frozen relay/HandleFrame — the SAME 4-way order
-		// pkg/mesh/digest.go DispatchFrame uses (the dial-side readLoop +
-		// the test serveTestConn both call DispatchFrame; this arm brings the
-		// ACCEPT-side production path to parity with the dial side, closing the
-		// asymmetry a review surfaced: a hybrid frame on an INBOUND connection
-		// previously fell through to HandleFrame → the RelayEnvelope parser saw
-		// WireHybridPQMagic not the 0x02/0x03 version prefix → DropMalformed →
-		// the hybrid delta was SILENTLY DROPPED on the accept side +
-		// HybridFrameAccepted never fired. The guards masked this because
-		// serveTestConn calls DispatchFrame (the 4-way router) which the
-		// production accept side did NOT call).
+		if attribution.IsDigestFrame(frame) {
+			// Deliver only on a connection whose key challenge succeeded. Use
+			// the identity established by that connection rather than trusting
+			// the sender field in the digest header. A declined simultaneous
+			// dial uses the identity and handle from ArmDeclinedInbound; without
+			// either, DigestConnVerified rejects the frame (ADR-0068).
+			activePC := myPC
+			activeID := inboundNodeID
+			if activePC == nil {
+				activePC = declPC
+				activeID = declNodeID
+			}
+			if digester != nil && peerSet != nil && peerSet.DigestConnVerified(activePC) {
+				digester.DeliverDigest(activeID, frame) // mesh.DigestSink -> Gossiper.DeliverDigest
+			}
+			noteServeBusy(busyT0)
+			continue
+		}
+		// Dispatch on the frame magic. Batch envelopes use HandleBatchFrame,
+		// hybrid envelopes use HandleHybridFrame, and other frames use
+		// HandleFrame. verdict.Accepted is the number of deltas actually joined;
+		// held batch elements do not increment the accept count (ADR-0010 §2).
+		// Hybrid batches carry Ed25519 and ML-DSA-65 signatures over the same
+		// 120-byte SHAKE256 pad (ADR-0037). Keep this accept-side dispatch order
+		// aligned with mesh.DispatchFrame so inbound and dialed connections handle
+		// the same envelope types. Use verdict.Accepted rather than the header's
+		// batch count because held elements are not joined.
 		start := time.Now()
 		var verdict receive.AcceptVerdict
 		var acceptedDeltas int
 		if attribution.IsBatchFrame(frame) {
-			verdict = recv.HandleBatchFrame(frame) // receiver.go — the batch gate stack
+			verdict = recv.HandleBatchFrame(frame)
 			if verdict.Verdict == receive.Accept {
-				acceptedDeltas = receive.BatchAcceptCount(frame)
+				acceptedDeltas = verdict.Accepted // excludes held batch elements
 			}
 		} else if attribution.IsHybridFrame(frame) {
-			verdict = recv.HandleHybridFrame(frame) // receiver.go — the hybrid-PQ batch gate stack
+			verdict = recv.HandleHybridFrame(frame)
 			if verdict.Verdict == receive.Accept {
-				acceptedDeltas = receive.HybridAcceptCount(frame)
+				acceptedDeltas = verdict.Accepted
 			}
 		} else {
-			verdict = recv.HandleFrame(frame) // receiver.go:350 — the frozen gate stack
+			verdict = recv.HandleFrame(frame)
 			if verdict.Verdict == receive.Accept {
-				acceptedDeltas = 1
+				acceptedDeltas = verdict.Accepted // 1 on the per-frame path
 			}
 		}
 		if rec != nil {
-			// Record the per-delta verdict: +N on a batch Accept, +1 on a
-			// per-frame Accept, +1 on any drop (a drop is one frame's verdict,
-			// regardless of the batch it would have carried). The latency is
-			// observed once per frame (the gate-stack composition time), so the
-			// histogram sees one sample per frame; the verdict counter sees the
-			// per-delta count (the throughput signal).
+			// Record one timed observation per frame. Accepted batches add N-1
+			// zero-duration observations so verdict totals count joined deltas.
+			// Every dropped frame contributes one observation, regardless of any
+			// batch count in its header.
 			rec.RecordIngest(time.Since(start), verdict.Verdict)
 			if acceptedDeltas > 1 {
 				for i := 1; i < acceptedDeltas; i++ {
@@ -1788,31 +1318,18 @@ func serveConnWithDigest(ctx context.Context, conn net.Conn, recv *receive.Recei
 			}
 		}
 		if verdict.Verdict == receive.Accept {
-			// the receive-side H3/H-apply signal.
-			// The accept loop is the SINGLE receive-side observability point for
-			// BOTH arrival directions (seed->peer delta lands HERE on the peer's
-			// accept loop; peer->seed bootstrap lands HERE on the seed's accept
-			// loop — the dial-side readLoop carries neither, per the full-duplex
-			// finding). An Accept is otherwise SILENT (the continue below skips
-			// the 1623 drop log), so "Accept + 0 entries landed" (the Join no-ops
-			// — the true receive-side delta-apply blocker) is INDISTINGUISHABLE
-			// from "Accept + 10K entries landed" without this line. Uses the
-			// EXISTING acceptedDeltas (the batch delta COUNT — how many deltas the
-			// envelope carries, NOT the per-delta entry count; that lives inside
-			// frozen crdt_apply.go and is unreachable here).
-			//
-			// CAPPED: the first 8
-			// Accepts per conn + every 1024th thereafter. The earlier form's
-			// comment calibrated the line for "a 3-node/100-key run" — at the
-			// 100-node relay fan-out it printed 120,354 lines on ONE node in one run
-			// (the missLogCap=8 class, on the accept side).
+			// Report the joined-delta count so an accepted frame that joined no
+			// entries is distinguishable from a successful batch. acceptLogLine
+			// limits these diagnostics to the initial window and periodic samples.
 			acceptLogCount++
 			if acceptLogLine(acceptLogCount) {
 				log.Printf("accept from %s: verdict=Accept acceptedDeltas=%d (accept #%d on this conn)", conn.RemoteAddr(), acceptedDeltas, acceptLogCount)
 			}
+			noteServeBusy(busyT0)
 			continue
 		}
 		log.Printf("frame from %s: %s (reason: %v)", conn.RemoteAddr(), verdict.Verdict, verdict.Reason)
+		noteServeBusy(busyT0)
 	}
 }
 
@@ -1823,14 +1340,10 @@ type livecheckBody struct {
 	TLSVersion string   `json:"tls_version"`
 }
 
-// convergenceGaugePoller feeds the three poller-driven /metrics gauges off the
-// hot path on a 1s ticker. It reads the Gossiper's convergence-lag seed (the
-// SweepLoop is the single writer; this is the single reader) and the verdict-
-// counter delta (sovereign_ingest_pps). It does NOT touch the ingest hot path.
-// The roots-equal gauge is 1.0 when the local engine's current MerkleRoot
-// matches the last converged root (the mesh is converged RIGHT NOW), 0.0
-// otherwise — a 2-node binary indicator (a 3-node quorum-aware gauge is
-// future work, ADR-0008 §8).
+// convergenceGaugePoller updates convergence lag, root equality, and ingest
+// rate once per second without instrumenting frame handling. The roots-equal
+// gauge compares the current local root with the gossiper's last converged
+// root; it is a binary indicator, not a quorum decision (ADR-0008).
 func convergenceGaugePoller(ctx context.Context, gossiper *mesh.Gossiper, exp *metrics.Exporter) {
 	if gossiper == nil || exp == nil {
 		return
@@ -1846,7 +1359,7 @@ func convergenceGaugePoller(ctx context.Context, gossiper *mesh.Gossiper, exp *m
 			// roots-equal: the local engine's current root vs the last
 			// converged root. Equal => the mesh is at the converged state
 			// right now (1.0); diverged => 0.0.
-			curRoot := gossiper.CurrentRoot() // gossip.go CurrentRoot -> crdt.go:1225 + hamt.go:265
+			curRoot := gossiper.CurrentRoot() // read the engine root from its shards
 			exp.SetConvergenceRootsEqual(curRoot == gossiper.LastConvergedRoot())
 			// ingest pps: the verdict-counter delta over the 1s interval.
 			exp.SetIngestPPS(exp.ObserveVerdictDelta(time.Now()))
@@ -1854,30 +1367,20 @@ func convergenceGaugePoller(ctx context.Context, gossiper *mesh.Gossiper, exp *m
 	}
 }
 
-// acceptLogLine decides
-// whether the n-th Accept on one connection logs a line: the first 8 (the
-// diagnostic window — a broken receive path shows up immediately) and every
-// 1024th thereafter (the heartbeat that proves the path stays alive at
-// volume). Everything between is carried by the verdict metrics, which are
-// per-Accept exact.
+// acceptLogLine reports whether the nth accepted frame on a connection should
+// produce a diagnostic log. The first eight aid startup diagnosis and every
+// 1024th provides a liveness sample; verdict metrics retain the full count.
 func acceptLogLine(n int64) bool {
 	return n <= 8 || n%1024 == 0
 }
 
-// startLivecheck serves /livecheck AND /metrics on ONE PLAIN http.Server (no
-// TLS — ops debug, not the data plane; the C1 boundary). It serves the
-// /metrics Prometheus scrape route on the SAME mux (one server, one mux — the
-// --metrics-addr flag already binds it; a second HTTP server is NOT spawned).
-// Returns the server so the caller can Shutdown it.
-func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.Exporter, gossiper *mesh.Gossiper, bridge *durability.Bridge, bootWitness *durability.RecoveryWitness) *http.Server {
-	// bridge + bootWitness are the (ADR-0045) recovery-witness
-	// terms for /debug/memstats: the witness is the struct CAPTURED AT
-	// RECOVERY TIME (this server starts only after recovery completes, and
-	// the harness asserts recovery logs precede startLivecheck — nothing
-	// here recomputes at scrape time); bridge feeds the live arena
-	// high-water term. BOTH are nil on a research node (--wal-path empty);
-	// the handler reports witness_present=false, never a zero-filled
-	// fiction.
+// startLivecheck serves /livecheck, /metrics, and optional diagnostics on one
+// unauthenticated plain-HTTP server, separate from the peer data plane. The
+// caller owns the returned server's shutdown.
+func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.Exporter, gossiper *mesh.Gossiper, bridge *durability.Bridge, bootWitness *durability.RecoveryWitness, engine *eng.DeltaCRDTEngine) *http.Server {
+	// bootWitness was captured during recovery, before this server started;
+	// scrapes do not recompute it. bridge supplies the arena high-water mark.
+	// In-memory nodes have neither and report witness_present=false.
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livecheck", func(w http.ResponseWriter, r *http.Request) {
@@ -1889,51 +1392,25 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 		}
 		_ = json.NewEncoder(w).Encode(body)
 	})
-	// /metrics: the Prometheus scrape surface. promhttp.HandlerFor is bound to
-	// the per-process Registry (NOT DefaultRegisterer); it is non-blocking (the
-	// scrape iterates instruments, no hot-path lock). The seven sovereign_*
-	// series are scrapeable with HELP+TYPE from a cold start.
+	// The exporter handler uses the per-process registry rather than the
+	// Prometheus default registerer, with metadata available from cold start.
 	if exp != nil {
 		mux.Handle("/metrics", exp.Handler())
 	}
-	// /debug/memstats — the RSS-decomposition seam.
+	// /debug/memstats separates live Go heap, retained heap, runtime address
+	// space, goroutines, and mesh cache memory for RSS diagnosis. The mesh totals
+	// account for payload and relay caches, while touched off-heap arena pages
+	// remain outside Go's heap statistics.
 	//
-	// WHY IT EXISTS: silicon reported max node RSS 567,616 KB against a
-	// 512,000 KB watch threshold — a breach whose DRIVER WAS UNKNOWN, and which
-	// was initially mis-attributed to the payloadCache on the strength of
-	// "same posture" rather than a measurement. (That hypothesis is now refuted:
-	// the payloadCache holds 10K x ~100 B = ~1 MB, because the gate injects a
-	// 10-byte %010d payload.) Attribution requires decomposition, so the run must
-	// report where the bytes actually are.
-	//
-	// WHY THIS SEAM AND NOT INSTRUMENTATION: it is OFF the hot path entirely —
-	// runtime.ReadMemStats runs ONLY when an operator scrapes this endpoint, so a
-	// node that is never scraped pays exactly nothing. It rides the mux the
-	// livecheck/metrics server already binds (no new listener, no new port, no new
-	// goroutine). ReadMemStats does stop-the-world briefly, which is why it is a
-	// PULL endpoint hit once at teardown rather than a periodic sampler.
-	//
-	// HeapAlloc/HeapInuse/HeapIdle/HeapReleased/Sys are the terms that separate
-	// "live Go heap" from "heap the runtime is holding but not using" from "total
-	// address space the runtime obtained" — the split that decides whether the RSS
-	// residual is live state, un-returned heap, or something outside the Go heap
-	// entirely (the off-heap arena's TOUCHED pages, which RSS counts and Go's
-	// memstats do NOT). The handler also surfaces the mesh-cache terms
-	// (payload/relay counts + running byte totals) so the residual becomes a
-	// subtraction with a NAMED cache term, not an inference (mesh_cache_bytes).
+	// runtime.ReadMemStats runs only on a scrape and briefly stops the world, so
+	// this is a pull endpoint rather than a periodic sampler. It shares the
+	// existing diagnostics listener and adds no background goroutine.
 	mux.HandleFunc("/debug/memstats", func(w http.ResponseWriter, r *http.Request) {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
-		// The mesh-cache terms — counts + running byte
-		// totals from mesh.Gossiper.CacheStats (O(1) read of counters
-		// maintained at retain/record/delete; no map walk). With these the RSS
-		// residual is a SUBTRACTION, not an inference:
-		// RSS ≈ arena-touched + (sys - heap_released) + mesh_cache_bytes +
-		// TLS-buffers + kernel
-		// and the re-derived threshold (ADR-0045) gets a NAMED cache
-		// term with a number next to it. CacheStats is nil-safe, so a gossiper-
-		// less build (no such build exists today, but the handler must not
-		// grow one as a precondition) reports zeros, not a panic.
+		// CacheStats reads counters maintained at retain, record, and delete;
+		// it does not walk the cache maps. The four byte totals form
+		// mesh_cache_bytes. A nil gossiper reports zero cache terms.
 		cs := gossiper.CacheStats()
 		resp := map[string]any{
 			"node_id":                   hex.EncodeToString(nodeID[:]),
@@ -1946,7 +1423,7 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 			"sys":                       m.Sys,
 			"num_gc":                    m.NumGC,
 			"goroutines":                runtime.NumGoroutine(),
-			"mesh_cache_bytes":          cs.PayloadBytes + cs.RelayFrameBytes + cs.RelayBatchForwardBytes,
+			"mesh_cache_bytes":          cs.PayloadBytes + cs.RelayFrameBytes + cs.RelayBatchForwardBytes + cs.RelayBatchReverseBytes,
 			"payload_entries":           cs.PayloadEntries,
 			"payload_bytes":             cs.PayloadBytes,
 			"relay_frames":              cs.RelayFrames,
@@ -1954,17 +1431,11 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 			"relay_batch_forward":       cs.RelayBatchForward,
 			"relay_batch_forward_bytes": cs.RelayBatchForwardBytes,
 			"relay_batch_reverse":       cs.RelayBatchReverse,
+			"relay_batch_reverse_bytes": cs.RelayBatchReverseBytes, // fourth mesh cache byte total
 		}
-		// (ADR-0045): the recovery-witness terms — surfaced HERE
-		// (the /debug/memstats seam opened), NOT as a /metrics counter:
-		// a counter is the wrong shape for a once-per-boot value. The terms are
-		// read from bootWitness, the struct
-		// captured at recovery time (the endpoint cannot answer during replay,
-		// so nothing is recomputed at scrape time). witness_present=false on a
-		// research node (--wal-path empty) — the absent case is HONEST, not a
-		// zero-filled fiction. The arena high-water is guarded on bridge alone:
-		// bridge is non-nil on every durable node, while the witness can be nil
-		// even there (RecoverEngineWithSnapshot may return a nil witness).
+		// Recovery facts belong in this boot-time diagnostic record rather than
+		// cumulative metrics. Durable nodes always have a bridge, but recovery
+		// may return a nil witness; guard the two independently.
 		if bridge != nil {
 			resp["recovery_arena_high_water_bytes"] = bridge.LastCheckpointArenaHighWater()
 		}
@@ -1979,14 +1450,12 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 			resp["recovery_fallback_reason"] = bootWitness.FallbackReason
 			resp["recovery_legacy_records"] = bootWitness.LegacyRecords
 			resp["recovery_holes_repaired"] = bootWitness.HolesRepaired
-			// (ADR-0045): the integrity-check arming witness —
-			// FALSE means this boot carried NO pre-tail root+fingerprint check.
+			// False means recovery did not perform the pre-tail root and
+			// fingerprint checks (ADR-0045 §5.1).
 			resp["recovery_integrity_checks_armed"] = bootWitness.IntegrityChecksArmed
 			resp["recovery_legacy_checkpoint"] = bootWitness.LegacyCheckpoint
-			// (ADR-0045): the post-tail
-			// root check's arming answer (FALSE on every replay-only path —
-			// scoped off, not silently absent), the seq-contiguity loss check's
-			// run proof, and the ClockHigh clamp disclosure.
+			// Record whether the post-tail root and sequence-contiguity checks
+			// ran, along with any ClockHigh clamp applied during recovery.
 			resp["recovery_post_tail_root_armed"] = bootWitness.PostTailRootArmed
 			resp["recovery_seq_contiguity_verified"] = bootWitness.SeqContiguityVerified
 			resp["recovery_records_verified"] = bootWitness.RecordsVerified
@@ -1998,6 +1467,87 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+	// SOVEREIGN_STATE_FP_DEBUG=1 exposes a read-only state fingerprint and
+	// entry count. The Merkle root covers dots, while the fingerprint also
+	// checks the associated state. StateFingerprint takes its own EBR pin and
+	// does not grow the arena. The route is absent unless explicitly enabled.
+	if os.Getenv("SOVEREIGN_STATE_FP_DEBUG") == "1" && engine != nil {
+		mux.HandleFunc("/debug/state-fingerprint", func(w http.ResponseWriter, r *http.Request) {
+			fp := durability.StateFingerprint(engine)
+			body := map[string]any{
+				"node_id":           hex.EncodeToString(nodeID[:]),
+				"state_fingerprint": hex.EncodeToString(fp[:]),
+				// Include the entry count alongside the hash so receivers expose
+				// how much state the fingerprint covers.
+				"state_entry_count": durability.StateEntryCount(engine),
+			}
+			// SOVEREIGN_TEST_FAULT_FINGERPRINT=oracleblind substitutes the
+			// dot-only root as a negative control for fingerprint checking.
+			if os.Getenv("SOVEREIGN_TEST_FAULT_FINGERPRINT") == "oracleblind" {
+				root := engine.MerkleRootFromShards()
+				body["state_fingerprint"] = hex.EncodeToString(root[:])
+				body["neutered"] = "oracleblind"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(body)
+		})
+		log.Printf("state-fp: /debug/state-fingerprint enabled (SOVEREIGN_STATE_FP_DEBUG=1)")
+	}
+	// SOVEREIGN_RESPOND_INDEG_DEBUG=1 exposes RespondIndegSnapshot: whether
+	// tracking is enabled, arrival count, the 17-bucket occupancy histogram,
+	// and its cap. Otherwise the route is absent.
+	if os.Getenv("SOVEREIGN_RESPOND_INDEG_DEBUG") == "1" && gossiper != nil {
+		mux.HandleFunc("/debug/responder-indegree", func(w http.ResponseWriter, r *http.Request) {
+			snap := gossiper.RespondIndegSnapshot()
+			body := map[string]any{
+				"node_id":        hex.EncodeToString(nodeID[:]),
+				"armed":          snap.Armed,
+				"arrivals":       snap.Arrivals,
+				"occupancy_hist": snap.Hist,
+				"cap":            snap.Cap,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(body)
+		})
+		log.Printf("respond-indeg: /debug/responder-indegree enabled (SOVEREIGN_RESPOND_INDEG_DEBUG=1)")
+	}
+	// Either digest debug variable enables /debug/heartbeat. It reports the
+	// last round's exchange and response byte counts, cumulative exchange
+	// totals, and send/arrival timing and busy-time diagnostics directly from
+	// the gossiper. Without either variable the route is absent.
+	if (os.Getenv("SOVEREIGN_DIGEST_LATENCY_DEBUG") == "1" || os.Getenv("SOVEREIGN_EXCH_DEBUG") == "1") && gossiper != nil {
+		mux.HandleFunc("/debug/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+			snap := gossiper.DigestLatencyStats()
+			l0 := gossiper.L0IStats()
+			body := map[string]any{
+				"node_id":               hex.EncodeToString(nodeID[:]),
+				"last_round":            snap.LastRound,
+				"last_exch_done":        snap.LastExchDone,
+				"last_exch_drained":     snap.LastExchDrained,
+				"last_resp_delta_bytes": snap.LastRespDeltaBytes,
+				"exch_completed_total":  snap.ExchCompletedTotal,
+				"exch_drained_total":    snap.ExchDrainedTotal,
+				"resp_bytes_total":      snap.RespBytesTotal,
+				"stamp_broken_total":    snap.StampBrokenTotal,
+				"last_ship_bytes":       l0.LastShipBytes,
+				"last_digest_req_bytes": l0.LastDigestReqBytes,
+				"send_done_count":       l0.SendDoneCount,
+				"send_done_span_ns":     l0.SendDoneSpanNs,
+				"send_done_max_ns":      l0.SendDoneMaxNs,
+				"arrive_count":          l0.ArriveCount,
+				"arrive_span_ns":        l0.ArriveSpanNs,
+				"arrive_max_ns":         l0.ArriveMaxNs,
+				"arrive_broken_total":   l0.ArriveBrokenTotal,
+				"holl_read_busy_ns":     l0.ReadBusyNs,
+				"holl_read_max_ns":      l0.ReadBusyMaxNs,
+				"holl_serve_busy_ns":    l0.ServeBusyNs,
+				"holl_serve_max_ns":     l0.ServeBusyMaxNs,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(body)
+		})
+		log.Printf("digest-latency: /debug/heartbeat enabled (SOVEREIGN_DIGEST_LATENCY_DEBUG=1 or SOVEREIGN_EXCH_DEBUG=1)")
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -2012,23 +1562,16 @@ func startLivecheck(addr string, nodeID [16]byte, peers []string, exp *metrics.E
 	return srv
 }
 
-// pprofBindAddr resolves the loopback-ONLY bind address for the pprof
-// endpoint. The host is STRUCTURALLY always 127.0.0.1 — net.JoinHostPort is given
-// the loopback literal, so this function CANNOT produce a non-loopback bind, no
-// matter what --pprof-addr carries (the FORBIDDEN rule is enforced by
-// construction, not by a check that could be bypassed). Port resolution order:
-// 1. an explicit --pprof-addr (only its PORT is honored; any host is dropped);
-// 2. else the metrics port + 1000 (the silicon case: 34 nodes share one host, so
-// each node's distinct metrics port yields a distinct pprof port — node-0's
-// 9100 becomes 10100);
-// 3. else a fixed fallback (the default metrics port 7431 + 1000).
+// pprofBindAddr resolves a loopback-only profiling address. It passes the
+// loopback literal to net.JoinHostPort regardless of the configured host.
+// An explicit --pprof-addr supplies the port; otherwise it uses the metrics
+// port plus 1000, falling back to the default metrics port's derived address.
 func pprofBindAddr(metricsAddr, pprofFlag string) string {
 	const fallback = "127.0.0.1:8431" // 7431 (default --metrics-addr) + 1000
 	port := 0
 	if p := strings.TrimSpace(pprofFlag); p != "" {
-		// Accept "PORT" or "host:PORT"; only the PORT is honored, the host is
-		// always forced to loopback (a non-loopback host is silently discarded —
-		// by design, so the endpoint can never be bound public).
+		// Accept a port or host:port and discard the host so the listener
+		// cannot be moved off loopback by configuration.
 		if _, hp, err := net.SplitHostPort(p); err == nil {
 			p = hp
 		}
@@ -2049,26 +1592,19 @@ func pprofBindAddr(metricsAddr, pprofFlag string) string {
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 }
 
-// startPprof serves /debug/pprof on a DEDICATED loopback-ONLY listener — the
-// NON-DESTRUCTIVE stack-capture seam that lets a silicon run observe a wedged
-// seed's goroutine stack (and, with --diag-profile, its mutex/block profile)
-// WITHOUT killing it (the capture-then-continue the 300s stall needed). It is
-// a SEPARATE *http.Server + listener from the 0.0.0.0 metrics mux (that bind is
-// load-bearing for the cross-host scrape and is left untouched). The goroutine
-// endpoint is always cheap; mutex/block COLLECTION is armed separately via
-// --diag-profile (it is EXPENSIVE and default-OFF). A bind failure is returned as
-// an error so the caller logs it loudly — the profiler is diagnostic, never
-// load-bearing, so the node continues without it. Returns the server (its Addr
-// holds the ACTUAL bound address, so a test can pass 127.0.0.1:0 and read the
-// ephemeral port back) so the caller can Shutdown it.
+// startPprof serves goroutine, mutex, and block profiles on a dedicated
+// loopback listener without interrupting the process. Mutex and block sampling
+// are controlled separately by --diag-profile because collection adds runtime
+// overhead. A bind error disables profiling without stopping the node. Addr is
+// the actual bound address, including an ephemeral port selected with :0.
 func startPprof(addr string) (*http.Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
 	mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
 	mux.Handle("/debug/pprof/block", pprof.Handler("block"))
-	// Bind EXPLICITLY (not ListenAndServe) so a collision is a returned error, and
-	// so an ephemeral:0 resolves to its real port for the caller to read back.
+	// Bind before starting Serve so collisions return an error and :0 resolves
+	// to the actual port for the caller.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("pprof: bind %s: %w", addr, err)
@@ -2079,7 +1615,7 @@ func startPprof(addr string) (*http.Server, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("pprof: serving /debug/pprof on %s (LOOPBACK-ONLY, non-destructive)", ln.Addr())
+		log.Printf("pprof: serving /debug/pprof on %s (loopback only)", ln.Addr())
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("pprof: %v", err)
 		}
@@ -2087,18 +1623,12 @@ func startPprof(addr string) (*http.Server, error) {
 	return srv, nil
 }
 
-// startControlPort serves the JSON-over-mTLS client control port on addr. It
-// is a SEPARATE *tls.Listener from the --bind peer listener: it uses the SAME
-// mTLS config (tr.ServerConfig — RequireAndVerifyClientCert, Min==Max==1.3) so
-// a no-cert dial is a hard TLS error, but its accept loop drives an http.Server
-// (the /v1/* routes), NOT the length-prefixed frame reassembler the peer path
-// uses. A client's JSON request and a peer's length-prefixed BatchEnvelope do
-// NOT share an accept loop (ADR-0011 §3, §6 — the primary-risk mitigation).
-// The metrics handler is injected as an http.Handler so the control port can
-// serve /metrics over TLS to SDK consumers without coupling pkg/mesh to
-// pkg/metrics (the seam discipline); the plain-HTTP --metrics-addr
-// surface stays for unauthenticated ops scrape (ADR-0006).
-func startControlPort(addr string, tr *transport.TLSConnections, gossiper *mesh.Gossiper, nodeID [16]byte, peers []string, exp *metrics.Exporter, resolver *database.Resolver) *http.Server {
+// startControlPort serves JSON /v1 routes on a TLS listener separate from the
+// peer listener. tr.ServerConfig requires a client certificate and TLS 1.3.
+// Client HTTP requests and peer length-prefixed frames therefore use different
+// accept loops (ADR-0011 §3, §6). The injected metrics handler avoids coupling
+// pkg/mesh to pkg/metrics; the plain-HTTP metrics listener remains independent.
+func startControlPort(addr string, tr *transport.TLSConnections, gossiper *mesh.Gossiper, nodeID [16]byte, peers []string, exp *metrics.Exporter, resolver *database.Resolver, secondaryIndex bool) *http.Server {
 	ln, err := tls.Listen("tcp", addr, tr.ServerConfig())
 	if err != nil {
 		log.Fatalf("control-addr: tls listen %s: %v", addr, err)
@@ -2107,13 +1637,13 @@ func startControlPort(addr string, tr *transport.TLSConnections, gossiper *mesh.
 	if exp != nil {
 		metricsHandler = exp.Handler()
 	}
-	// SetResolver wires the bitemporal query tier onto /v1/query.
-	// resolver is nil when --lsm-root is absent (or enableIndex false) — in
-	// that case /v1/query returns the honest 503, NOT a silent 404 (ADR-0017
-	// §3). SetResolver is the SEPARATE seam that keeps NewControlServer's
-	// 4-arg signature stable for the mesh tests (mirrors SetSnapshotter).
+	// A nil resolver leaves /v1/query registered but unavailable, returning 503
+	// rather than 404 (ADR-0017 §3). SetResolver keeps query construction
+	// separate from NewControlServer.
 	cs := mesh.NewControlServer(gossiper, nodeID, peers, metricsHandler)
 	cs.SetResolver(resolver)
+	// The same flag controls cross-entity query routes and h3_index acceptance.
+	cs.SetSecondaryIndex(secondaryIndex)
 	srv := &http.Server{
 		Handler:           cs.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -2127,10 +1657,9 @@ func startControlPort(addr string, tr *transport.TLSConnections, gossiper *mesh.
 	return srv
 }
 
-// mintSelftestCerts mints a dev CA + leaf into a temp dir and returns the
-// PEM paths + the in-process CA (so the automated rotation trigger can
-// mint NEW leaves via the SAME CA under --selftest). It uses pkg/crypto (the
-// dev-mesh CA) so --selftest exercises the same certgen the TLS tests use.
+// mintSelftestCerts creates a development CA and leaf in a temporary
+// directory. It returns their PEM paths and the CA, which the self-test's
+// rotation manager reuses for replacement leaves.
 func mintSelftestCerts(nodeID [16]byte) (certPath, keyPath, caPath string, ca *crypto.MeshCA, err error) {
 	dir, err := os.MkdirTemp("", "sovereign-selftest-")
 	if err != nil {
@@ -2155,25 +1684,17 @@ func mintSelftestCerts(nodeID [16]byte) (certPath, keyPath, caPath string, ca *c
 	return certPath, keyPath, caPath, ca, nil
 }
 
-// buildRotationMinter constructs the transport.RotationMinter the automated
-// leaf-rotation trigger (StartRotationManager) calls when the live leaf is
-// within --cert-rotation-lifetime of expiry. The minter mints a NEW Ed25519
-// leaf via the in-process dev-mesh CA (the SAME CA mintSelftestCerts returned
-// under --selftest), writes the PEM to the transport's cert+key paths, and
-// calls tr.Reload so the NEXT handshake presents the NEW serial.
+// buildRotationMinter returns the callback StartRotationManager invokes when
+// the live leaf enters its rotation window. The callback issues a new Ed25519
+// leaf with the same node ID CommonName, writes its PEM files, and reloads the
+// transport for subsequent handshakes.
 //
-// The operator path (NOT --selftest) has NO in-process CA — it loads PEMs
-// from disk the operator provides — so a nil ca returns a clear error. A
-// production deployment that wants automated rotation on the operator path supplies
-// an out-of-process minter (a KMS/HSM-backed CA) via the transport.RotationMinter
-// seam directly (bypassing this helper); the trigger's polling + reload
-// mechanism is the load-bearing wiring, the minter is the swappable seam
-// (disclosed ADR-0035 §6). The nodeID is the leaf CommonName (the SAME field
-// IssueLeaf embeds; a rotated leaf has a NEW serial but the SAME nodeID — the
-// identity is stable, the credential rotates).
+// Only the self-test has an in-process CA. A nil CA returns an error; rotating
+// externally supplied PEM files requires a transport.RotationMinter backed by
+// an external issuer (ADR-0035).
 func buildRotationMinter(ca *crypto.MeshCA, nodeID [16]byte, certPath, keyPath string, tr *transport.TLSConnections) (transport.RotationMinter, error) {
 	if ca == nil {
-		return nil, fmt.Errorf("--cert-rotation-enable requires an in-process CA (the --selftest path mints one; the operator path loads PEMs from disk + has NO in-process CA — supply an out-of-process minter via transport.RotationMinter for operator-path rotation, ADR-0035 §6)")
+		return nil, fmt.Errorf("--cert-rotation-enable requires an in-process CA; --selftest mints one, while PEM-only setups need an external transport.RotationMinter (ADR-0035)")
 	}
 	nodeIDHex := hex.EncodeToString(nodeID[:])
 	return func() (*big.Int, error) {
@@ -2181,24 +1702,16 @@ func buildRotationMinter(ca *crypto.MeshCA, nodeID [16]byte, certPath, keyPath s
 		if err != nil {
 			return nil, fmt.Errorf("rotation IssueLeaf: %w", err)
 		}
-		// Write the NEW PEM to the SAME paths the transport loaded at
-		// construction (certPath/keyPath) so the Reload re-parses the NEW leaf.
-		// WritePEM writes cert.pem + key.pem INTO a dir — but certPath/keyPath
-		// are FILE paths (the transport's exact paths). The rotation must write
-		// the EXACT files, so call WritePEM into the dir + the returned paths
-		// OVERWRITE the transport's paths only if they match (the selftest path
-		// mints into a temp dir; the returned paths ARE the transport's paths).
+		// WritePEM creates cert.pem and key.pem in certPath's directory. The
+		// self-test uses those exact paths for the transport, so Reload parses
+		// the replacement leaf.
 		dir := filepath.Dir(certPath)
 		newCert, newKey, err := leaf.WritePEM(dir)
 		if err != nil {
 			return nil, fmt.Errorf("rotation WritePEM: %w", err)
 		}
-		// WritePEM writes cert.pem/key.pem (FIXED names) into dir; the
-		// transport's paths are dir/cert.pem + dir/key.pem (the selftest
-		// convention). If the operator's paths differ, the rotation writes the
-		// fixed names + the Reload reads the operator's paths — a mismatch the
-		// selftest path does NOT hit (the selftest uses the WritePEM names). The
-		// operator-path rotation is the out-of-process-minter concern (above).
+		// These fixed names are why this helper supports the self-test layout,
+		// not arbitrary operator-supplied PEM paths.
 		_ = newCert
 		_ = newKey
 		if err := tr.Reload(); err != nil {
@@ -2208,24 +1721,15 @@ func buildRotationMinter(ca *crypto.MeshCA, nodeID [16]byte, certPath, keyPath s
 	}, nil
 }
 
-// buildNodeIdentity derives the node's CRDT-delta signing identity. If
-// --identity-seed is set it MUST produce the same nodeID the engine runs under
-// (the derived pubkey's first 16 bytes); a mismatch fails fast. If unset a
-// random seed is minted for the already-resolved nodeID — but a randomly-minted
-// seed derives its OWN nodeID, so when --identity-seed is empty we re-derive the
-// nodeID from the seed and the engine's localNodeID is taken as the seed's
-// derived nodeID (the binary logs both; the deploy MUST pass --identity-seed for
-// a deterministic node identity).
+// buildNodeIdentity derives the CRDT-delta signing identity. A configured
+// --identity-seed must derive engineNodeID from the public key's first 16
+// bytes; a mismatch is fatal. Without a seed, a random signing identity is
+// created and its derived node ID can differ from the engine's ID. The startup
+// log exposes both values; deterministic identity requires --identity-seed.
 //
-// ADR-0037: when --hybrid-sign is set, the owner is constructed via
-// mesh.NewNodeIdentityHybrid (the Ed25519 keypair + the ML-DSA-65 keypair, BOTH
-// derived from the SAME --identity-seed — one identity space, the deploy
-// discipline). A non-hybrid-sign owner (the DEFAULT) is constructed via the
-// classical NewNodeIdentity — byte-identical (NO PQ key is minted; the
-// gossiper's hybrid arm is disarmed; NO hybrid frame is produced). The PQ pubkey
-// is registered in the Directory via RegisterPQ at the wiring site (the owner
-// carries it; the Directory is the OOB provisioning layer the hybrid verify
-// resolves).
+// Hybrid signing uses NewNodeIdentityHybrid to derive Ed25519 and ML-DSA-65
+// keys from the same seed (ADR-0037). Otherwise NewNodeIdentity creates only
+// the classical keypair. The caller registers any PQ public key for verification.
 func buildNodeIdentity(cfg *nodeConfig, engineNodeID [16]byte) *mesh.NodeIdentity {
 	newIdent := mesh.NewNodeIdentity
 	if cfg.hybridSignEnable {
@@ -2240,7 +1744,7 @@ func buildNodeIdentity(cfg *nodeConfig, engineNodeID [16]byte) *mesh.NodeIdentit
 		if err != nil {
 			log.Fatalf("identity: %v", err)
 		}
-		log.Printf("identity: minted random signing seed; derived nodeID=%x (engine nodeID=%x) — a deterministic identity REQUIRES --identity-seed", ident.NodeID, engineNodeID)
+		log.Printf("identity: minted random signing seed; derived nodeID=%x (engine nodeID=%x); deterministic identity requires --identity-seed", ident.NodeID, engineNodeID)
 		return ident
 	}
 	raw, err := hex.DecodeString(cfg.identitySeed)
@@ -2257,24 +1761,16 @@ func buildNodeIdentity(cfg *nodeConfig, engineNodeID [16]byte) *mesh.NodeIdentit
 	return ident
 }
 
-// compactionSchedulerLoop (ADR-0019) periodically lists the l0/ entity
-// prefixes and runs a Compaction job for each entity whose L0 file count is at
-// the trigger threshold. It is a background READ-L0 → WRITE-L1 job — it never
-// touches the SkipList/HAMT/WAL write path. A nil compactor (the research / no
-// --lsm-root default) makes this a no-op. The loop honors ctx cancellation so
-// SIGINT/SIGTERM stops it cleanly.
-//
-// ADR-0027: the loop also carries the query *Resolver so runCompactionSweep
-// can read the observed live-query txTime frontier (QueryTxTimeFrontier) and feed
-// the inferrer BEFORE each per-entity CompactionByHash8. A nil resolver (the
-// research node with no --lsm-root keeps queryResolver nil) leaves the inferrer
-// inert — the compactor's operator-set horizon stands unchanged (byte-identical).
-// The inferrer is the §0.a "engine tracks the frontier itself" seam.
+// compactionSchedulerLoop runs an L0-to-L1 merge every 30 seconds for each
+// entity at its file-count trigger (ADR-0019). It does not use the CRDT or WAL
+// write path and stops on context cancellation. A nil compactor disables it.
+// runCompactionSweep also uses the resolver's observed transaction-time
+// frontier to update the prune horizon before compacting (ADR-0027).
 func compactionSchedulerLoop(ctx context.Context, compactor *database.L1Compactor, resolver *database.Resolver) {
 	if compactor == nil {
 		return
 	}
-	const interval = 30 * time.Second // the compaction cadence; tunable, NOT on the write path
+	const interval = 30 * time.Second // compaction cadence; independent of the write path
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -2287,44 +1783,21 @@ func compactionSchedulerLoop(ctx context.Context, compactor *database.L1Compacto
 	}
 }
 
-// runCompactionSweep lists the distinct entity prefixes under l0/ (one compaction
-// job per entity at/over the trigger) and runs the per-entity L0→L1 merge. It is
-// best-effort: a per-entity error is logged and the sweep continues to the next
-// entity (one sick entity does NOT stall compaction for the rest). The entity
-// set is derived from the L0 key prefixes (l0/{hex(hash8)}/); a future change
-// may cache the live entity set off the CRDT engine to avoid the prefix list.
+// runCompactionSweep discovers entity hashes from l0/{hex(hash8)}/ keys and
+// compacts each entity at or above its trigger. An entity failure is logged and
+// does not stop the remaining entities.
 //
-// ADR-0027: BEFORE the per-entity compactions, the sweep runs the T_gc
-// auto-inferrer step — read the Resolver's observed live-query txTime frontier,
-// compute the effective horizon = max(operatorFloor, observedFrontier - backoff),
-// advance the compactor's horizon via SetInferredHorizon (the §0.c monotone
-// clamp; a retreat is refused + counted + logged). The inferrer is inert when
-// pruning is OFF (EnableDominancePruning=false) — SetInferredHorizon still
-// advances the horizon but DominancePrune is skipped at the seam (the §0.e
-// byte-identical guard at l1_compactor.go:540), so the effective horizon
-// advances but no rows drop (the operator-visible gauges still surface it). A
-// nil resolver leaves the inferrer inert (the research node keeps queryResolver
-// nil — no --lsm-root).
+// InferHorizon first computes max(operatorFloor, observedFrontier-backoff) and
+// advances the compactor's horizon monotonically (ADR-0027). A nil resolver
+// leaves the configured floor unchanged. Disabling pruning still permits the
+// horizon and gauges to advance, but DominancePrune does not drop rows.
 func runCompactionSweep(ctx context.Context, compactor *database.L1Compactor, resolver *database.Resolver) {
-	// ADR-0027: the T_gc auto-inferrer step (the §0.a "engine tracks
-	// the frontier itself" seam). InferHorizon reads the Resolver's observed
-	// live-query txTime frontier, computes effective = max(operatorFloor,
-	// observedFrontier - backoff), advances the compactor's horizon
-	// monotonically (the §0.c clamp; a retreat is refused + counted + logged
-	// inside SetInferredHorizon), and surfaces the two gauges. Inert when
-	// pruning is OFF (DominancePrune is skipped at the seam — the §0.e guard —
-	// so the horizon advances but no rows drop; the gauges still surface the
-	// inferrer's state). A nil resolver (research node, no --lsm-root) leaves
-	// the inferrer inert — the horizon stands at the operator's static knob
-	// (byte-identical). The gauge-advance + counter reads live in
-	// internal/database (the database package imports internal/telemetry for
-	// the prune-seam counters already); cmd does NOT import internal/telemetry
-	// directly (the §0.d two-exporter separation — the ONE Init caller is
-	// armOTel in otel.go; reading counters is not an Init caller).
+	// InferHorizon owns the frontier read, monotone horizon update, and related
+	// telemetry in internal/database. This command only supplies the resolver.
 	compactor.InferHorizon(resolver)
-	// List ALL l0/ keys (uncapped) to count per-entity L0 files + discover the
-	// entity set. The bucket "local" is ignored by LocalFS; the prefix "l0/"
-	// scopes to the per-entity Arrow index.
+	// List every l0/ key without a cap to count each entity's L0 files and
+	// discover the entity set. The bucket "local" is ignored by LocalFS; the
+	// prefix "l0/" scopes to the per-entity Arrow index.
 	l0Keys, err := compactor.ListL0Keys(ctx, "l0/")
 	if err != nil {
 		log.Printf("compaction sweep: list l0/: %v", err)
@@ -2369,15 +1842,9 @@ func runCompactionSweep(ctx context.Context, compactor *database.L1Compactor, re
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		// The compaction needs the entityID to re-verify Filter4 rows; the
-		// scheduler derives it from the L0 keys themselves is NOT available
-		// (the hash is one-way). The L1Compactor.Compaction takes the
-		// entityID + hash8; the scheduler cannot invert the hash. HONEST design:
-		// the compaction is entity-list-driven via the CRDT engine's live
-		// entity set (a future change caches it); for the scheduler calls
-		// CompactionByHash8 (below) which uses hash8-only Filters (Filter1, no
-		// Filter4) — defense-in-depth is maintained by the L0 file's per-entity
-		// construction (keying guarantees only the one entity's rows).
+		// The L0 key contains a one-way entity hash, not the entity ID needed
+		// for Filter4. CompactionByHash8 therefore uses hash-based filters;
+		// per-entity L0 file construction keeps other entities' rows out.
 		res, err := compactor.CompactionByHash8(ctx, b.hash8)
 		if err != nil {
 			log.Printf("compaction sweep: entity %x: %v", b.hash8, err)
@@ -2417,22 +1884,17 @@ func hexNibble(c byte) int {
 	return -1
 }
 
-// reaperLoop (ADR-0021) periodically runs ONE cross-entity reaper sweep
-// that reclaims manifest-listed superseded L0 files AFTER verifying the L1
-// still exists (the Stage C safety guard in database.L0Reaper.Reap). It is the
-// reaper analogue of compactionSchedulerLoop: a nil reaper (the default —
-// --compaction-reap-enable=false, or no --lsm-root) makes this a no-op, so the
-// superseded L0s stay on disk as the crash-recovery backstop (byte-identical).
-// The loop honors ctx cancellation so SIGINT/SIGTERM stops it cleanly.
-// It runs LESS often than the compactor (default 5m vs 30s) — the superseded
-// L0s are a safety net with zero urgency to delete; the slower cadence also
-// amortizes the manifest-list + L1-probe cost over more compactions.
+// reaperLoop periodically asks database.L0Reaper to delete superseded L0
+// files after their L1 replacements are verified (ADR-0021). A nil reaper keeps
+// all L0 files. The default five-minute interval is slower than compaction and
+// amortizes manifest listing and L1 checks across more merges. Context
+// cancellation stops the loop during shutdown.
 func reaperLoop(ctx context.Context, reaper *database.L0Reaper, interval time.Duration) {
 	if reaper == nil {
 		return
 	}
 	if interval <= 0 {
-		interval = 5 * time.Minute // sane floor; --compaction-reap-interval=0 is treated as the default
+		interval = 5 * time.Minute // nonpositive values use the default
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -2446,97 +1908,47 @@ func reaperLoop(ctx context.Context, reaper *database.L0Reaper, interval time.Du
 	}
 }
 
-// runReaperSweep runs ONE database.L0Reaper.Reap and logs the honest result
-// (disclose the counts, not adjectives). A Reap error is impossible —
-// Reap returns a ReapResult tally, not an error; per-manifest failures are
-// counted INTO the result (SkippedOrphan / SkippedError) + logged inside Reap.
-// So this logs the sweep summary line; the per-manifest WARN/detail lines live
-// in database.L0Reaper.Reap (the reaper owns its own honest-negative logging).
+// runReaperSweep performs one cross-entity reap and logs its result counts.
+// Reap reports per-manifest orphan and deletion failures in ReapResult and logs
+// their details, so this function only emits the summary.
 func runReaperSweep(ctx context.Context, reaper *database.L0Reaper) {
 	if reaper == nil {
 		return
 	}
 	res := reaper.Reap(ctx)
-	log.Printf("sovereign-node: L0 reaper sweep — manifests reaped=%d, L0s deleted=%d, skipped orphan(L1 gone/sick)=%d, skipped error(delete failed)=%d",
+	log.Printf("sovereign-node: L0 reaper sweep: manifests reaped=%d, L0 files deleted=%d, skipped missing or invalid L1=%d, delete errors=%d",
 		res.ReapedManifests, res.ReapedL0, res.SkippedOrphan, res.SkippedError)
 }
 
-// engineHAMTAdapter (ADR-0032) is the read-your-writes live source: a
-// database.LiveSource whose impl wraps the live δ-CRDT HAMT. It is constructed
-// at the cmd/sovereign-node boundary — the ONLY place the concrete
-// eng.DeltaCRDTEngine is in scope (internal/database does NOT import pkg/sync,
-// so the seam is the LiveSource interface, owned by internal/database, impl'd
-// here — the SetResolver / SetSnapshotter precedent).
+// engineHAMTAdapter implements database.LiveSource at the command boundary,
+// where the concrete engine is available and internal/database does not need to
+// import pkg/sync. It lets query results include recent local writes before the
+// next checkpoint (ADR-0032).
 //
-// LiveRead pins the live store with the EXACT EBR pattern SnapshotToLSM uses
-// (snapshot.go:391-394): ebr.Acquire() → participant.Enter(ebr) → defer
-// ebr.Release(participant). Enter() sets active=true, epoch=globalEpoch
-// (reclamation.go:120) which holds freeRetiredList back, so a concurrent
-// InsertLocal's CAS CANNOT retire+free a shard root the LiveRead is iterating
-// (the production-grade concurrent-read guard handleGet already proves under
-// -race; control.go:356 reads engine.State().Get WITHOUT an EBR pin because
-// the HTTP read is tolerant — the Resolver's merged answer is held to the
-// SAME correctness bar as SnapshotToLSM, so it pins). It is NOT a SkipList
-// freeze; it does NOT touch skiplist_arena.go (the SkipList is the per-checkpoint
-// index writer, NOT the live read target — the §0 audit's decisive refutation).
-//
-// Filter2 (SystemTime <= txTimeNs) is applied HERE — the visibility bound
-// well-defined for BOTH AsOf and Range. Filter3 (point OR window) + dominance
-// are applied by the Resolver (the LiveRead returns the full Filter2-passing
-// set; the Resolver's AsOf/Range callers apply their own Filter3). This split is
-// the resolution of the spec's point-form LiveRead signature vs the Range
-// window: the adapter owns Filter2; the Resolver owns Filter3+dominance.
-//
-// CRDTEntry → LiveEvent mapping: SystemTime/ValidTimeStart/ValidTimeEnd/
-// AssertionTime/H3Index/PayloadDigest carry one-for-one. Payload is nil (the
-// durable Arrow index's payload=sentry discipline, snapshot.go:435, carried to
-// the live path — the no-recompute law means the digest IS the identity; a
-// future change surfacing live Payload through the query response is a SEPARATE
-// seam, ADR-0032 §6). CRDTEntry carries NO payload body (hamt.go:29, ADR 10:
-// 120-byte struct) — only PayloadDigest — so the nil Payload is the honest
-// value, NOT a fabrication.
-//
-// READ-PATH COST (updated): LiveRead reads via
-// engine.PointGet — the O(log N) per-shard point-Get (point_get.go), a PURE read
-// with ZERO arena allocation. This replaces the former engine.State().Get(entityID),
-// which materialized a FULL merged HAMT of every entity's dot set on EACH call
-// (O(total entries)) and — because Set's functional path-copying never retires its
-// intermediate roots — LEAKED O(N·log N) arena bytes per call, monotonically,
-// until the arena OOM'd under sustained reads (the defect a crash
-// harness hit at ~2000 /v1/gets; this is the severity-elevation of the bound
-// ADR-0032 §6 disclosed and deferred). PointGet reads ONLY the entityID's own shard
-// (routeShard, crdt.go:561 — the InsertLocal access pattern run as a read), so the
-// live read is now O(log N) and leak-free. This does NOT change read-your-writes
-// CORRECTNESS (the live read-your-writes guard still governs); it removes the
-// scale/availability ceiling the State()-backed read path carried.
+// LiveRead applies the transaction-time visibility bound. The Resolver applies
+// point or range selection and dominance to the returned entries. Temporal and
+// H3 fields map directly; Payload remains nil because CRDTEntry stores only a
+// payload digest, matching the durable index representation.
 type engineHAMTAdapter struct {
 	engine *eng.DeltaCRDTEngine
 }
 
-// LiveRead implements database.LiveSource. It returns the live entries for
-// entityID visible at txTimeNs (Filter2: SystemTime <= txTimeNs), EBR-pinned
-// for the call duration. A nil/empty result is NOT an error (no live entry is
-// visible at txTime → the durable answer stands alone). An error is returned
-// only on a pin/State failure (the Resolver logs it via QueryLiveSourceReads
-// + NEVER fails the query — the SAME failure-honesty loadSupersededL0Keys uses).
+// LiveRead returns entries for entityID whose SystemTime is at most txTimeNs.
+// PointGet holds its own EBR pin while copying the entity's entries out of the
+// HAMT, so the returned slice is caller-owned and does not retain arena views.
+// An empty result means no live entry is visible and is not an error.
 func (a *engineHAMTAdapter) LiveRead(ctx context.Context, entityID string, txTimeNs int64) ([]database.LiveEvent, error) {
 	if a == nil || a.engine == nil {
 		return nil, nil
 	}
-	// PointGet takes its OWN EBR pin (Acquire/Enter/Release) and
-	// copies the entity's entries OUT under it, so the returned slice is
-	// caller-owned. The explicit Acquire/Enter/Release pin this method previously
-	// held — solely to protect the old arena-backed State().Get view — protected
-	// nothing else in this body, so it has been removed (PointGet's self-pin is
-	// the complete guard). nil entries = no live entry (the Resolver treats it as
-	// "the durable answer stands alone").
+	// PointGet reads only the entity's shard, avoiding construction of a full
+	// merged HAMT on each query. Its copy is safe to use after the EBR pin ends.
 	entries := a.engine.PointGet(entityID)
 	out := make([]database.LiveEvent, 0, len(entries))
 	for i := range entries {
 		e := entries[i]
-		// Filter2: SystemTime <= txTimeNs — the visibility bound. STRICT <=
-		// (a row AT sysTime==txTime passes — byte-identical to scanRecordBatch's
-		// Filter2 at query.go:969, the boundary in reverse).
+		// The visibility bound includes entries whose SystemTime equals txTimeNs,
+		// matching the durable Arrow scan's transaction-time filter.
 		if e.SystemTime > txTimeNs {
 			continue
 		}
@@ -2547,8 +1959,7 @@ func (a *engineHAMTAdapter) LiveRead(ctx context.Context, entityID string, txTim
 			AssertionTime:  e.AssertionTime,
 			H3Index:        e.H3Index,
 			PayloadDigest:  e.PayloadDigest,
-			// Payload: nil — CRDTEntry carries no payload body (ADR 10); the
-			// digest is the no-recompute identity (control.go:441).
+			// Payload stays nil because CRDTEntry carries only PayloadDigest.
 		})
 	}
 	return out, nil

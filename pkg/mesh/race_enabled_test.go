@@ -8,9 +8,6 @@
 
 package mesh_test
 
-// raceEnabled is true when the `race` build tag is active (go test -race).
-// The pkg/metrics/race_enabled_test.go precedent, mirrored for the
-// loopback guards: -race instrumentation slows the VirtualNet delivery
-// goroutines ~20x on a 4-core box, so the per-round quiesce window must
-// scale (the ROUND cap — the topology property under test — never changes).
+// raceEnabled lets the loopback mesh tests extend their delivery windows under
+// the race detector. The round limits and topology assertions stay unchanged.
 const raceEnabled = true

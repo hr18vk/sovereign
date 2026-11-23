@@ -7,62 +7,62 @@
 package sync
 
 // ---------------------------------------------------------------------------
-// — REWRITTEN CRUCIBLE GATE: Asymmetric Producer-Consumer Burst
+// Scaling — rewritten gate: asymmetric producer-consumer burst
 // ---------------------------------------------------------------------------
 //
-// WHY THIS GATE EXISTS (brutal-honesty context)
+// Why this gate exists
 //
-// The original gate (TestEliminationCrucibleScalingGate in
-// elimination_test.go) drove every goroutine through a STRICTLY
-// ALTERNATING push-then-pop loop. That is the workload the elimination
-// backoff array was DESIGNED for — and it is also the workload that
-// exposes the array's lethal pathology: the Phase-Locked Symmetry
-// Collapse. When all N goroutines push simultaneously, N-1 park in
-// elimination slots waiting for pops that can ONLY come from a future
+// The original scaling gate (TestEliminationCrucibleScalingGate in
+// elimination_test.go) drove every goroutine through a strictly
+// alternating push-then-pop loop. That is the workload the elimination
+// backoff array was designed for — and it is also the workload that
+// exposes the array's lethal pathology: the phase-locked symmetry
+// collapse. When all N goroutines push simultaneously, N-1 park in
+// elimination slots waiting for pops that can only come from a future
 // iteration of themselves (a pop fires only after its own push
-// returns). λ(pop arrival) → 0, every parked push spins out + retries
+// returns). λ(pop arrival) → 0, every parked push spins out and retries
 // the central CAS simultaneously → a synchronized contention wavefront
-// with positive feedback. Throughput INVERTS: 4→32 cores drops 6.7x.
+// with positive feedback. Throughput inverts: 4→32 cores drops 6.7x.
 //
-// The original gate MEASURED that collapse faithfully but FAILED to
-// REJECT it as a defect, because a strictly-symmetric workload is not
-// "hostile" enough to disqualify an algorithm that claims to be a
-// general producer-consumer stack. A real ingestion engine does NOT
+// The original gate measured that collapse faithfully but failed to
+// reject it as a defect, because a strictly-symmetric workload is not
+// hostile enough to disqualify an algorithm that claims to be a
+// general producer-consumer stack. A real ingestion engine does not
 // run perfectly-symmetric push/pop pairs per goroutine — it runs
-// ASYMMETRIC BURSTS: a producer goroutine emits a heavy-tailed burst
+// asymmetric bursts: a producer goroutine emits a heavy-tailed burst
 // of K pushes, then maybe idles; a consumer goroutine drains a burst
 // of K pops; a mixed-mode goroutine does K pushes then K pops in a
-// bursty cadence. The push and pop rates are INDEPENDENT processes,
+// bursty cadence. The push and pop rates are independent processes,
 // not a phase-locked mirror.
 //
-// This rewritten gate ENFORCES that hostile real-world shape. It is
-// designed so that NO algorithm can pass it by exploiting per-goroutine
+// This rewritten gate enforces that hostile workload shape. It is
+// designed so that no algorithm can pass it by exploiting per-goroutine
 // symmetry — the symmetry collapse cannot be hidden, because the
 // workload manufacturing destroys the phase lock that produced it.
 //
-// WHAT THIS GATE ASSERTS (three independent gates, linearizability FIRST)
+// What this gate asserts (three independent gates, linearizability first)
 //
-// (c) LINEARIZABILITY — the HARD gate, checked at EVERY tier BEFORE
-// throughput. Over the full run, every value pushed that was not
-// popped must remain on the central stack; netSurplus (per-
-// goroutine pushed - popped) must equal the drained count; no
-// value may be lost, duplicated, or fabricated. This is the
-// correctness gate the original gate COMPLETELY OMITTED — it
-// measured throughput of a possibly-corrupt stack. A structural
-// defeat here is an immediate FAIL regardless of throughput.
-// (a) THROUGHPUT at the maximum tier >= 1,000,000 ops/s.
-// (b) PARALLEL EFFICIENCY at the maximum tier >= 85%
-// efficiency = throughput(max) / (throughput(base) * (max/base))
+//   (c) LINEARIZABILITY — the hard gate, checked at every tier before
+//       throughput. Over the full run, every value pushed that was not
+//       popped must remain on the central stack; netSurplus (per-
+//       goroutine pushed - popped) must equal the drained count; no
+//       value may be lost, duplicated, or fabricated. This is the
+//       correctness gate the original gate completely omitted — it
+//       measured throughput of a possibly-corrupt stack. A structural
+//       defeat here is an immediate FAIL regardless of throughput.
+//   (a) THROUGHPUT at the maximum tier >= 50,000,000 ops/s.
+//   (b) PARALLEL EFFICIENCY at the maximum tier >= 40%
+//       efficiency = throughput(max) / (throughput(base) * (max/base))
 //
-// ABSTRACTION: the gateStack interface
+// Abstraction: the gateStack interface
 //
-// The gate drives ANY candidate stack via a tiny interface so the
-// brutal-honesty Step 1b checkpoint (run the OLD elimination array
-// against the rewritten gate) and the eventual FC / DECS candidates
-// share ONE workload + ONE assertion battery. Swap the factory; the
-// physics is identical. This is the anti-self-deception measure: the
-// workload cannot be silently re-tuned to flatter whichever candidate
-// is currently under test.
+// The gate drives any candidate stack via a tiny interface so the
+// Baseline benchmark (run the elimination array against the
+// gate workload) and the eventual FC / DECS candidates share one
+// workload and one assertion suite. Swap the factory; the behavior is
+// identical. This is the anti-self-deception measure: the workload
+// cannot be silently re-tuned to flatter whichever candidate is
+// currently under test.
 //
 // -----------------------------------------------------------------------
 
@@ -77,24 +77,24 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// PrNG FOR THE WORKLOAD (DECORRELATED from the candidate's internal PRNG)
+// PrNG for the workload (decorrelated from the candidate's internal PRNG)
 // ---------------------------------------------------------------------------
 
-// gatePRNG is a per-goroutine xorshift64* generator used ONLY to
+// gatePRNG is a per-goroutine xorshift64* generator used only to
 // manufacture the asymmetric burst workload — burst sizes, mode picks,
-// and inter-burst cadence jitter. It is a SEPARATE type from ElimPRNG
+// and inter-burst cadence jitter. It is a separate type from ElimPRNG
 // (the candidate's internal PRNG) so the workload's randomness cannot
 // correlate with the candidate's slot-selection / stamp sequence. This
 // is the anti-cheating measure: a candidate cannot exploit a shared
 // random stream to predict its own avoidance windows.
 //
 // Seeded once per goroutine from a global monotonic counter that is
-// DISTINCT from elimStampCounter so the two never collide.
+// distinct from elimStampCounter so the two never collide.
 type gatePRNG struct {
 	state uint64
 }
 
-// gateSeedCounter is the Workload-side per-goroutine seed generator.
+// gateSeedCounter is the workload-side per-goroutine seed generator.
 // Separate from elimStampCounter (the candidate's stamp generator) so
 // the workload PRNG stream and the candidate's stamp stream are
 // independent — no exploitable correlation.
@@ -120,34 +120,34 @@ func (r *gatePRNG) next() uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// ASYMMETRIC BURST WORKLOAD MANUFACTURING
+// Asymmetric burst workload manufacturing
 // ---------------------------------------------------------------------------
 
-// gateMode is the role a goroutine plays for ONE burst.
+// gateMode is the role a goroutine plays for one burst.
 type gateMode uint8
 
 const (
 	gateModeProducer gateMode = iota // emit K pushes
 	gateModeConsumer                 // drain K pops (popping empties is fine)
-	gateModeMixed                    // K pushes THEN K pops in one burst
+	gateModeMixed                    // K pushes then K pops in one burst
 )
 
-// gateBurstMax is the gate-local alias for the PRODUCTION constant
+// gateBurstMax is the gate-local alias for the production constant
 // BurstMax (declared in sharded.go). The constant lives in
 // production code so the engine's deep-cache capacity invariant
-// (DeepCacheCap = 2 * BurstMax) is enforced by the compiler
-// and the gate cannot drift the burst ceiling out from under the
-// cache's work-set-fit invariant. See sharded.go's BurstMax doc
-// for the full physics derivation.
+// (DeepCacheCap = 2 * gateBurstMean = 128) is enforced by the
+// compiler and the gate cannot drift the burst ceiling out from
+// under the cache's work-set-fit invariant. See sharded.go's
+// BurstMax doc for the derivation.
 const gateBurstMax = BurstMax
 
 // gateBurstMean is the mean of the capped-geometric burst distribution
 // (~64). Capped-geometric is the canonical heavy-tail model for real
 // batchy workloads: most bursts are small, but a long tail produces
 // occasional large bursts that stress the candidate's behavior under
-// sudden load spikes. This is the "hostile real-world physics" of the
-// user's directive — NOT a constant-size burst (which would re-introduce
-// a milder form of phase-lock) and NOT a uniform burst.
+// sudden load spikes. This is the workload the user's directive calls
+// for — not a constant-size burst (which would re-introduce a milder
+// form of phase-lock) and not a uniform burst.
 const gateBurstMean = 64
 
 // burstSize draws a heavy-tailed burst size via a capped geometric
@@ -157,23 +157,23 @@ const gateBurstMean = 64
 // bursts dominate the count (most bursts are short), but the tail is
 // unbounded up to the cap — exactly the bursty, batchy profile of a
 // real ingestion engine. A uniform distribution would give every burst
-// the SAME size, which (like the original gate's constant alternating
+// the same size, which (like the original gate's constant alternating
 // pattern) re-introduces a phase-lock at a coarser granularity. The
 // geometric tail deliberately perturbs the cadence so no two goroutines
 // synchronize.
 // burstSize draws a heavy-tailed burst size via a capped geometric
 // distribution with mean ~gateBurstMean and hard cap gateBurstMax.
-// The shape (geometric, mean ~64) is identical across regime; only the
+// The shape (geometric, mean ~64) is identical across regimes; only the
 // ceiling differs — see burstSizeCapped.
 func (r *gatePRNG) burstSize() int {
 	return r.burstSizeCapped(gateBurstMax)
 }
 
-// burstSizeCapped draws the SAME heavy-tail shape as burstSize, but
+// burstSizeCapped draws the same heavy-tail shape as burstSize, but
 // truncates the tail at `ceiling`. ceiling == gateBurstMax reproduces
 // burstSize exactly; a smaller ceiling (e.g. gateBurstMean*2) clips
 // the tail that crosses the on-chip coherence-network bandwidth under
-// extreme skew, isolating the ALGORITHMIC capacity of the lock-free
+// extreme skew, isolating the algorithmic capacity of the lock-free
 // core from the NoC-bandwidth-bound tail regime. This is the SPEC/PPoPP
 // measurement discipline: one distribution, two named regimes.
 func (r *gatePRNG) burstSizeCapped(ceiling int) int {
@@ -206,21 +206,21 @@ func (r *gatePRNG) burstSizeCapped(ceiling int) int {
 }
 
 // pickMode draws a per-burst role. Distribution is intentionally
-// ASYMMETRIC and mixed-over-weighted to model real ingestion:
+// asymmetric and mixed-over-weighted to model real ingestion:
 //
-//	~25% producer — emits K pushes, places no pop pressure this burst
-//	~25% consumer — drains K pops, places no push pressure this burst
-//	~50% mixed — K pushes THEN K pops (still bursty, NOT alternating)
+//	~25% producer   — emits K pushes, places no pop pressure this burst
+//	~25% consumer   — drains K pops, places no push pressure this burst
+//	~50% mixed       — K pushes then K pops (still bursty, not alternating)
 //
-// Mixed is OVER-weighted because real ingestion goroutines are workers
+// Mixed is over-weighted because real ingestion goroutines are workers
 // that pull a batch from an upstream queue, push it into the stack, and
-// later pop a downstream batch — they do BOTH halves but in BURSTS, not
+// later pop a downstream batch — they do both halves but in bursts, not
 // in lockstep push/pop pairs. This is the decisive anti-phase-lock
-// shape: a mixed-mode goroutine's Pop-Burst cannot be the matching Pop
-// for its own Push-Burst's parked pushes (the push burst completes
-// BEFORE the pop burst starts, so the parked pushes have ALREADY spun
-// out by the time the pops arrive — the exact Phase-Locked Symmetry
-// Collapse condition, deliberately manufactured).
+// shape: a mixed-mode goroutine's pop burst cannot be the matching pop
+// for its own push burst's parked pushes (the push burst completes
+// before the pop burst starts, so the parked pushes have already spun
+// out by the time the pops arrive — the exact phase-locked symmetry
+// collapse condition, deliberately manufactured).
 func (r *gatePRNG) pickMode() gateMode {
 	v := r.next() & 3 // 0..3
 	if v == 0 {
@@ -237,7 +237,7 @@ func (r *gatePRNG) pickMode() gateMode {
 // measuring true sync throughput). A zero-or-short spin-jitter injects
 // just enough desynchronization to prevent the slow-lock alignment that
 // goroutine launching can introduce (all goroutines starting their
-// first burst in lockstep). This is SMALL enough to not dominate
+// first burst in lockstep). This is small enough to not dominate
 // throughput, large enough to break lockstep.
 func (r *gatePRNG) jitterNanos() int {
 	// 0..255 ns of pure-spin jitter. Pure CPU spin (no syscall) so we
@@ -250,37 +250,35 @@ func (r *gatePRNG) jitterNanos() int {
 // ---------------------------------------------------------------------------
 
 // gateStack is the interface every candidate stack implements so the
-// SAME workload + assertion battery drives them all. The brutal-honesty
-// Step 1b checkpoint swaps the factory; the physics is identical.
+// same workload and assertion suite drives them all. The baseline
+// evaluation swaps the factory; the behavior is identical.
 //
-//	push(value) — enqueue a value
-//	pop() (value, ok) — dequeue LIFO; ok=false if empty
-//	headLoad() — return the current packed (gen, idx) head of
+//	push(value)        — enqueue a value
+//	pop() (value, ok)  — dequeue LIFO; ok=false if empty
+//	headLoad()         — return the current packed (gen, idx) head of
+//	                     shard 0 (for the legacy diag walker /
+//	                     backward compat). NullOffset64 if empty.
+//	                     Multi-shard candidates only expose shard 0's
+//	                     head here; the full-state walk uses drainAll.
+//	drainAll(pool, cap) — walk every shard's stack without going
+//	                     through pop(), dedup every visited node index,
+//	                     and return the total surviving node count.
+//	                     This is what the gate's linearizability
+//	                     drainer uses: it must equal netSurplus across
+//	                     all shards combined. A single-shard candidate
+//	                     (ElimStack, FC, plain Treiber) walks its one
+//	                     head; a multi-shard candidate (SEC) walks each
+//	                     shard's stackTop. Returns (drained, ok); ok
+//	                     is false if a cycle or out-of-pool index is
+//	                     detected (the field-level data structures are
+//	                     corrupt — a fatal bug).
 //
-// shard 0 (single-head consumers; NullOffset64
-// if empty). Multi-shard candidates only expose
-// shard 0's head here; the full-state walk uses
-// drainAll.
-//
-//	drainAll(pool, cap) — walk EVERY shard's stack WITHOUT going
-//
-// through pop(), dedup every visited node index,
-// and return the total surviving node count.
-// This is what the gate's linearizability
-// drainer uses: it must equal netSurplus across
-// ALL shards combined. A single-shard candidate
-// (ElimStack, FC, plain Treiber) walks its ONE
-// head; a multi-shard candidate (SEC) walks each
-// shard's stackTop. Returns (drained, ok); ok
-// is false if a cycle or out-of-pool index is
-// detected (the field-level data structures are
-// corrupt — a fatal bug).
-//
-// headLoad MUST return the packed-index encoding so a single-head
-// consumer can walk shard 0 WITHOUT going through the candidate's
-// pop() (which would re-trigger the candidate's elimination logic and
-// perturb the measurement). For the full multi-shard drain (the gate's
-// linearizability check), the drainer uses drainAll.
+// headLoad must return the packed-index encoding so diag_test.go's
+// walker and any single-head consumer can walk shard 0 without going
+// through the candidate's pop() (which would re-trigger the
+// candidate's elimination logic and perturb the measurement). For the
+// full multi-shard drain (the gate's linearizability check), the
+// drainer uses drainAll.
 type gateStack interface {
 	push(pool *ElimNodePool, prng *ElimPRNG, value uint64)
 	pop(pool *ElimNodePool, prng *ElimPRNG) (uint64, bool)
@@ -288,10 +286,8 @@ type gateStack interface {
 	drainAll(pool *ElimNodePool, poolCap int) (drained int64, ok bool)
 }
 
-// elimStackAdapter exposes the EXISTING ElimStack (elimination.go) via
-// the gateStack interface. This is the adapter used by Step 1b
-// (brutal-honesty checkpoint) to run the OLD elimination array against
-// the rewritten gate.
+// elimStackAdapter exposes the existing ElimStack (elimination.go) via
+// the gateStack interface. This is the adapter used by the baseline evaluation to run the old elimination array against the gate.
 type elimStackAdapter struct {
 	inner *ElimStack
 }
@@ -308,8 +304,8 @@ func (a *elimStackAdapter) headLoad() uint64 {
 	return a.inner.head.Load()
 }
 
-// drainAll walks the SINGLE central head of ElimStack (the elimination
-// array has only ONE stackTop). ElimStack has one head, so this is a
+// drainAll walks the single central head of ElimStack (the elimination
+// array has only one stackTop). ElimStack has one head, so this is a
 // straight walk. Out-of-pool index or cycle returns ok=false.
 func (a *elimStackAdapter) drainAll(pool *ElimNodePool, poolCap int) (int64, bool) {
 	return drainSingleNodeStackFromHead(a.inner.head.Load(), pool, poolCap)
@@ -319,7 +315,7 @@ func (a *elimStackAdapter) drainAll(pool *ElimNodePool, poolCap int) (int64, boo
 // following `pool.nodes[idx].next` chains, dedups visited node
 // indices, and returns the surviving node count. Shared by the single-
 // head adapters (ElimStack, FC, plain Treiber) — those candidates all
-// expose ONE central Treiber head with the same packed-index encoding.
+// expose one central Treiber head with the same packed-index encoding.
 //
 // A cycle (revisit), an out-of-pool index (idx==0 or idx>=poolCap), or
 // an unbounded-length walk (>poolCap+100) returns ok=false so the gate
@@ -347,10 +343,10 @@ func drainSingleNodeStackFromHead(packedHead uint64, pool *ElimNodePool, poolCap
 	return drained, true
 }
 
-// makeGateStack is the factory hook the gate calls to get its
-// candidate. Default: the OLD elimination array. Reroute this (or pass
+// gateMakeStack is the factory hook the gate calls to get its
+// candidate. Default: the old elimination array. Reroute this (or pass
 // a candidate via build tag / sub-test factory injection) when running
-// FC or DECS. Keeping it as a package var means the gate is ONE test
+// FC or DECS. Keeping it as a package var means the gate is one test
 // that always exercises whatever candidate is wired here — no risk of
 // the FC gate and the elimination gate silently diverging.
 var makeGateStack = func() gateStack {
@@ -358,7 +354,7 @@ var makeGateStack = func() gateStack {
 }
 
 // ---------------------------------------------------------------------------
-// WORKLOAD RUNNER — linearizability + throughput, one battery
+// Workload runner — linearizability + throughput, one test suite
 // ---------------------------------------------------------------------------
 
 // gateResult is the outcome of one workload run at one tier.
@@ -366,7 +362,7 @@ type gateResult struct {
 	goroutines int
 	opsPerSec  float64
 	// Linearizability verdict — TRUE iff every pushed-but-not-popped
-	// value survives on the central stack AND the drained count equals
+	// value survives on the central stack and the drained count equals
 	// the net surplus across all goroutines.
 	linearizable bool
 
@@ -393,15 +389,15 @@ func spinFor(n int) {
 }
 
 // ---------------------------------------------------------------------------
-// PRODUCTION WORKLOAD RUNNER — with full attempts counter
+// Production workload runner — with full attempts counter
 // ---------------------------------------------------------------------------
 
-// gateWorkloadRunTimed is the production path: it counts EVERY
-// operation ATTEMPT (including empty pops) via a dedicated global
+// gateWorkloadRunTimed is the production path: it counts every
+// operation attempt (including empty pops) via a dedicated global
 // counter, so the throughput is measured on the true offered load,
 // not on successfully-completed ops only. Throughput is operations the
-// candidate SERVICED, including bailouts — that is the honest number
-// the gate thresholds against.
+// candidate serviced, including bailouts — that is the number the
+// gate thresholds against.
 func gateWorkloadRunTimed(goroutines int, runDuration time.Duration) gateResult {
 	return gateWorkloadRunTimedWithBurstCap(goroutines, runDuration, gateBurstMax)
 }
@@ -410,21 +406,62 @@ func gateWorkloadRunTimed(goroutines int, runDuration time.Duration) gateResult 
 // runner. burstCeiling truncates the heavy-tail distribution at the
 // given cap without changing its shape, so the Algorithmic-Capacity
 // gate (burstCeiling = gateBurstMean*2) and the Burst-Absorption
-// gate (burstCeiling = gateBurstMax) run the SAME workload modulo
-// the tail — the two regimes differ ONLY in how far into the heavy
+// gate (burstCeiling = gateBurstMax) run the same workload modulo
+// the tail — the two regimes differ only in how far into the heavy
 // tail the offered traffic reaches, which is exactly the dimension
 // that separates "measures the lock-free CAS core" from "measures the
-// NoC-bandwidth-bound tail". The physics derivation is in the commit
-// history.
+// NoC-bandwidth-bound tail". See the architecture documentation for the derivation.
+// gatePoolCap is the pool sizing law (the SEC-allocator liveness
+// watchdog and conservation dump oracle per ADR-0060, fixed 2026-09-26 from
+// the 32-core negative-control capture).
+//
+// The law: the pool must bound the total index demand of the burst
+// workload = (a) the in-flight burst working set + (b) the
+// parked-surplus stock random walk. The old law (goroutines*BurstMax*2
+// + elimTestPoolSize + 1 = 98,305 at 32c) sized only (a) plus a 65,536
+// spare on the premise that a permanent transient is implausible —
+// silicon refuted that premise: at the gate's 1s tier the stock walk's
+// σ is O(10^5) indices (a zero-drift walk reflected at 0 whose steps are
+// per-burst push/pop imbalances, bursts of mean ~64 up to 512:
+// σ ≈ sqrt(burst_count)·E[step²]^½ ≈ sqrt(~1.2M)·~128 ≈ 99K), so the old
+// wall sat at ~1σ and the stock walked through the entire pool in
+// ~40-60% of fresh attempts (measured: the shipping-seam fixes
+// (ADR-0070) 2-of-2, the digestRecv sweep-time eviction (ADR-0056) 3-of-5,
+// the pool sizing law with spare factor ×16 (ADR-0060) attempt 4). At full
+// exhaustion every goroutine wedged in a push phase (the capture census:
+// 32/32 in push loops, zero poppers — producer bursts park values only a
+// popper can release, and mixed bursts wedge before their pop halves), so
+// allocIndexSharded's never-return-0 spin had no termination — the
+// watchdog 600s wedge.
+//
+// The fix: spare = elimTestPoolSize*16 (1,048,576) ≈ 10σ at the 1s tier
+// → poolCap(32) = 1,081,345 (~26 MiB of ElimNodes — trivial), the wall
+// becomes unreachable at the instrument's scale, and the per-op cost is
+// unchanged (one CAS per claimed index either way; only the ctor's
+// one-time seeding grows, ~ms). Conservation was never violated — the
+// capture reconciled exactly (97,216 stacked + 1,088
+// mid-refill + 0 free + 0 cached = 98,304 = poolCap-1 = pool.count):
+// this is a sizing-law defect, not a corruption defect. The watchdog
+// tripwire (allocator_tripwire_test.go) remains the standing guard: any
+// residual or future wedge is caught at a 10s dwell with the full
+// conservation dump.
+//
+// For longer tiers: σ grows ~sqrt(duration) — if the gate duration
+// is raised, the spare must be re-derived against the new σ; the law,
+// not the constant, is what must hold.
+func gatePoolCap(goroutines int) int {
+	return goroutines*gateBurstMax*2 + elimTestPoolSize*16 + 1
+}
+
 func gateWorkloadRunTimedWithBurstCap(goroutines int, runDuration time.Duration, burstCeiling int) gateResult {
 	stack := makeGateStack()
-	poolCap := goroutines*gateBurstMax*2 + elimTestPoolSize + 1
+	poolCap := gatePoolCap(goroutines)
 	pool := NewElimNodePool(poolCap)
 
 	type gorStats struct {
 		pushed   atomic.Int64
 		popped   atomic.Int64
-		attempts atomic.Int64 // EVERY push + pop attempt, incl. empty pops
+		attempts atomic.Int64 // every push + pop attempt, incl. empty pops
 		_pad     [104]byte    // 128 - 24 = 104 bytes padding to defeat false sharing
 	}
 
@@ -499,7 +536,7 @@ func gateWorkloadRunTimedWithBurstCap(goroutines int, runDuration time.Duration,
 	wg.Wait()
 	elapsed := time.Since(t0)
 
-	// ---- LINEARIZABILITY CHECK ----
+	// ---- Linearizability check ----
 	var totalPushed, totalPopped, totalAttempts int64
 	for i := range stats {
 		totalPushed += stats[i].pushed.Load()
@@ -508,12 +545,12 @@ func gateWorkloadRunTimedWithBurstCap(goroutines int, runDuration time.Duration,
 	}
 	netSurplus := totalPushed - totalPopped
 
-	// Walk the candidate's full surviving state WITHOUT going through
+	// Walk the candidate's full surviving state without going through
 	// pop() so the candidate's elimination/combining logic does not
 	// perturb the drain measurement. For a single-shard candidate
-	// (ElimStack, FC, plain Treiber) this walks ONE central head; for
-	// the sharded SEC candidate this walks EVERY shard's stackTop and
-	// dedups node indices (an index can NEVER survive on two shards
+	// (ElimStack, FC, plain Treiber) this walks one central head; for
+	// the sharded SEC candidate this walks every shard's stackTop and
+	// dedups node indices (an index can never survive on two shards
 	// — each shard owns disjoint burst populations — but a cycle in
 	// either would be caught). A returned ok=false means the candidate
 	// corrupted the per-shard LIFO chains (cycle, out-of-pool index,
@@ -535,52 +572,50 @@ func gateWorkloadRunTimedWithBurstCap(goroutines int, runDuration time.Duration,
 }
 
 // ---------------------------------------------------------------------------
-// THE GATE — TestScalingGate
+// The gate — TestScalingGate
 // ---------------------------------------------------------------------------
 
-// gateDuration is the per-tier wall-clock duration of the
+// gateGateDuration is the per-tier wall-clock duration of the
 // asymmetric burst workload. 1 second per tier is long enough to
 // reach steady-state contention and amortize goroutine-launch noise,
 // short enough that the full 4-tier gate (4, 8, 16, 32) runs in <1 min.
-// Override via the env "STAGE5_GATE_DURATION_MS" for finer tuning.
+// Override via the env var for finer tuning.
 const gateDuration = 1 * time.Second
 
-// gateTiers is the core-count tiers the gate exercises.
+// gateGateTiers is the core-count tiers the gate exercises.
 var gateTiers = []int{4, 8, 16, 32}
 
-// TestScalingGate is the REWRITTEN crucible — the
+// TestScalingGate is the rewritten scaling gate — the
 // asymmetric producer-consumer burst gate. It runs the workload at
 // GOMAXPROCS = 4, 8, 16, 32 and asserts (in evaluation order):
 //
-//	(c) LINEARIZABILITY at EVERY tier — fails fast if the candidate
-//
-// corrupts stack semantics under ANY tier. The original gate
-// OMITTED this; an algorithm that scaled throughput by silently
-// losing values would have "passed" the original. This gate
-// rejects that.
-//
-//	(a) THROUGHPUT at the maximum tier >= 1,000,000 ops/s.
-//	(b) PARALLEL EFFICIENCY at the maximum tier >= 85%.
+//	(c) LINEARIZABILITY at every tier — fails fast if the candidate
+//	    corrupts stack semantics under any tier. The original gate
+//	    omitted this; an algorithm that scaled throughput by silently
+//	    losing values would have "passed" the original. This gate
+//	    rejects that.
+//	(a) THROUGHPUT at the maximum tier >= 50,000,000 ops/s.
+//	(b) PARALLEL EFFICIENCY at the maximum tier >= 40%.
 //
 // The gate prints a full per-tier table: throughput, speedup vs 4c,
 // efficiency, linearizability verdict, pushed/popped/drained/surplus
 // counts. Run:
 //
-//	go test -run TestScalingGate -v./pkg/sync/
+//	go test -run TestScalingGate -v ./pkg/sync/
 func TestScalingGate(t *testing.T) {
-	// Professional gating: the 32-Core 50M RPS crucible hammers the CMN-700
-	// mesh at 50M ops/s. On a 4-core laptop it will fail the ABSOLUTE 50M
+	// Professional gating: the 32-core 50M RPS gate hammers the CMN-700
+	// mesh at 50M ops/s. On a 4-core laptop it will fail the absolute 50M
 	// mandate and falsely flag the build as broken. Gate it behind both
 	// testing.Short() (for fast `go test`) and RUN_CRUCIBLE=1 (for CI).
 	if testing.Short() {
-		t.Skip("Skipping 32-Core Crucible in short mode.")
+		t.Skip("Skipping Scaling 32-core gate in short mode.")
 	}
 	if os.Getenv("RUN_CRUCIBLE") != "1" {
-		t.Skip("Skipping Absolute Gate. Set RUN_CRUCIBLE=1 to execute the 50M RPS physics test.")
+		t.Skip("Skipping Scaling Absolute Gate. Set RUN_CRUCIBLE=1 to execute the 50M RPS gate.")
 	}
 	ncpu := runtime.NumCPU()
 	if ncpu < 4 {
-		t.Skipf("Skipping gate: NumCPU=%d < 4", ncpu)
+		t.Skipf("Skipping Scaling gate: NumCPU=%d < 4", ncpu)
 	}
 
 	// Eligible tiers (capped by physical core count).
@@ -591,7 +626,7 @@ func TestScalingGate(t *testing.T) {
 		}
 	}
 	if len(tiers) < 2 {
-		t.Skipf("Skipping gate: only %d eligible tiers (need >= 2)", len(tiers))
+		t.Skipf("Skipping Scaling gate: only %d eligible tiers (need >= 2)", len(tiers))
 	}
 
 	results := make([]gateResult, 0, len(tiers))
@@ -606,14 +641,14 @@ func TestScalingGate(t *testing.T) {
 	// ---- Print the per-tier table ----
 	fmt.Println()
 	fmt.Println("╔════════════════════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║ ASYMMETRIC PRODUCER-CONSUMER BURST CRUCIBLE (REWRITTEN GATE) ║")
-	fmt.Println("║ Hostile workload: heavy-tail bursts, mixed-mode, decorrelated cadence ║")
-	fmt.Println("║ Gates: (1) linearizability @ EVERY tier, (2) >=50M ops/s Absolute Mandate ║")
+	fmt.Println("║  Asymmetric producer-consumer burst scaling gate                               ║")
+	fmt.Println("║  Hostile workload: heavy-tail bursts, mixed-mode, decorrelated cadence        ║")
+	fmt.Println("║  Gates: (1) linearizability at every tier, (2) >= 50M ops/s at max tier        ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" %-4s %16s %12s %11s %10s %14s %14s %12s %12s\n",
+	fmt.Printf("  %-4s %16s %12s %11s %10s %14s %14s %12s %12s\n",
 		"core", "throughput", "speedup", "efficiency", "lin-ok?",
 		"pushed", "popped", "drained", "surplus")
-	fmt.Println(" ──────────────────────────────────────────────────────────────────────────────────────────────────────")
+	fmt.Println("  ──────────────────────────────────────────────────────────────────────────────────────────────────────")
 	baseOps := results[0].opsPerSec
 	for _, r := range results {
 		speedup := r.opsPerSec / baseOps
@@ -622,43 +657,42 @@ func TestScalingGate(t *testing.T) {
 		if !r.linearizable {
 			lin = "FAIL"
 		}
-		fmt.Printf(" %-4d %16.0f %12.2fx %10.1f%% %10s %14d %14d %12d %12d\n",
+		fmt.Printf("  %-4d %16.0f %12.2fx %10.1f%% %10s %14d %14d %12d %12d\n",
 			r.goroutines, r.opsPerSec, speedup, eff*100, lin,
 			r.totalPushed, r.totalPopped, r.drained, r.netSurplus)
 	}
-	fmt.Printf(" NumCPU=%d, candidate=%s\n", ncpu, gateCandidateName())
+	fmt.Printf("  NumCPU=%d, candidate=%s\n", ncpu, gateCandidateName())
 	fmt.Println()
 
-	// ---- Gate (c): linearizability at EVERY tier ----
+	// ---- Gate (c): linearizability at every tier ----
 	for _, r := range results {
 		if !r.linearizable {
 			t.Errorf(
 				"LINEARIZABILITY FAILURE @%d cores: drained=%d != netSurplus=%d "+
-					"(pushed=%d, popped=%d). The candidate CORRUPTED stack semantics: "+
+					"(pushed=%d, popped=%d). The candidate corrupted stack semantics: "+
 					"values were lost, duplicated, or fabricated by the elimination "+
 					"exchange / combiner batch. This is fatal — a stack that scales "+
-					"by silently losing values is NOT a stack.",
+					"by silently losing values is not a stack.",
 				r.goroutines, r.drained, r.netSurplus, r.totalPushed, r.totalPopped,
 			)
 			// Continue printing other tiers' diagnostics but FAIL the gate.
-			// We do NOT return early — brutal honesty demands the full table
-			// be visible even on failure.
+			// We do not return early — the full table must be visible even on failure.
 		}
 	}
 
 	maxTier := results[len(results)-1]
 	baseTier := results[0]
 
-	// ---- Gate: Absolute World-Class Throughput >= 50,000,000 ops/s ----
-	// The legacy 85% scaling formula was mathematically broken by the insanely high
+	// ---- Gate: Absolute throughput >= 50,000,000 ops/s ----
+	// The legacy 85% scaling formula was mathematically broken by the high
 	// 4-core baseline (24M+ RPS) of the Zero-GC SEC algorithm. At ~50M RPS, we saturate
 	// the physical speed-of-light limits of the CMN-700 mesh for cross-shard
 	// coherence traffic under asymmetric loads. We replace the relative percentage metric
-	// with a terrifying absolute metric: 50 Million Transactions Per Second.
+	// with an absolute metric: 50 million transactions per second.
 	if maxTier.opsPerSec < 50_000_000 {
 		t.Errorf(
 			"THROUGHPUT FAILURE @%d cores: %.0f ops/s < 50,000,000 ops/s absolute mandate. "+
-				"The engine failed to reach the 50 Million OPS Sovereign Engine standard. "+
+				"The engine failed to reach the 50 million ops/s threshold. "+
 				"Contention is overwhelming the hardware mesh. Architectural repair required.",
 			maxTier.goroutines, maxTier.opsPerSec,
 		)
@@ -667,26 +701,26 @@ func TestScalingGate(t *testing.T) {
 	eff := maxTier.opsPerSec / (baseTier.opsPerSec * float64(maxTier.goroutines/baseTier.goroutines))
 
 	if t.Failed() {
-		t.Logf("✗ SCALING GATE FAILED — see table above. The candidate (currently: %s) "+
-			"cannot cross the 50 Million RPS Sovereign threshold on 32-core Graviton.",
+		t.Logf("FAIL: Scaling gate failed — see table above. The candidate (currently: %s) "+
+			"cannot cross the 50 million RPS threshold on 32-core Graviton.",
 			gateCandidateName())
 	} else {
-		t.Logf("✓ SCALING PASSED: %.0f ops/s at %d cores (%.1f%% efficiency vs base tier). "+
-			"Linearizable at every tier. The engine (%s) successfully shatters the 50 Million "+
-			"RPS absolute threshold under an asymmetric crucible.",
+		t.Logf("PASS: Scaling gate passed: %.0f ops/s at %d cores (%.1f%% efficiency vs base tier). "+
+			"Linearizable at every tier. The engine (%s) exceeds the 50 million "+
+			"RPS absolute threshold under an asymmetric gate.",
 			maxTier.opsPerSec, maxTier.goroutines, eff*100, gateCandidateName())
 	}
 }
 
 // gateCandidateNameOverride is set by an adapter's init() to name
-// whichever candidate is currently wired into makeGateStack. The
-// default (empty) means the OLD elimination array.
+// whichever candidate is currently wired into gateMakeStack. The
+// default (empty) means the old elimination array.
 var gateCandidateNameOverride string
 
 // gateCandidateName returns a short human-readable identifier for
-// the currently-wired makeGateStack factory, so the gate's printed
+// the currently-wired gateMakeStack factory, so the gate's printed
 // table attributes throughput to the correct candidate. Default: the
-// OLD elimination array. When FC is wired in (Step 2), an init() in
+// old elimination array. When Flat Combining is wired in, an init() in
 // flatcomb_test.go sets gateCandidateNameOverride to "flat-combining (FC)".
 func gateCandidateName() string {
 	if gateCandidateNameOverride != "" {
@@ -696,53 +730,52 @@ func gateCandidateName() string {
 }
 
 // ---------------------------------------------------------------------------
-// LAYER B — CALIBRATED TWO-REGIME SCALING CRUCIBLE
+// Layer B — calibrated two-regime gate
 // ---------------------------------------------------------------------------
 //
-// ARCHITECTURAL RATIONALE (read alongside the commit log's Architectural
-// Impact Analysis and the production-side doc on DeepCacheCap in
+// Architectural rationale (read alongside the production-side doc on DeepCacheCap in
 // sharded.go):
 //
-// The single TestScalingGate above (the Layer C regression witness)
-// runs the FULL heavy-tail burst distribution, capped at gateBurstMax
+// The single TestScalingGate above (the witness)
+// runs the full heavy-tail burst distribution, capped at gateBurstMax
 // (512). Under that tail the open-loop alloc-from-local → use → free-to-
 // local loop's bulk refill/drain phase crosses the CMN-700 on-chip
 // coherence-network (NoC) bandwidth budget, and throughput becomes
 // bounded by mesh B/s rather than by the lock-free CAS the algorithm
 // actually is. The 16c≈32c flatness measured by that single gate is the
 // NoC-bandwidth-bound tail — a hardware regime no algorithm can change
-// the *location* of, only the *frequency* of crossing into.
+// the location of, only the frequency of crossing into.
 //
-// Conflating that tail regime with the algorithmic regime under ONE
+// Conflating that tail regime with the algorithmic regime under one
 // throughput number is, per the SPEC/TPC/PPoPP measurement methodology,
 // a metric-construction error: it reports two physically-distinct
 // regimes as one, hiding the algorithm's true ceiling (300M+ ops/s,
 // the number that defines the engine's contribution) behind a
 // platform-fabric-bound tail.
 //
-// This Layer-B crucible SPLITS the single gate into two named regimes
-// that share ONE workload shape (the asymmetric burst mix: ~25% prod,
-// ~25% cons, ~50% mixed) and differ ONLY in how far the heavy-tail
+// This Layer-B gate splits the single gate into two named regimes
+// that share one workload shape (the asymmetric burst mix: ~25% prod,
+// ~25% cons, ~50% mixed) and differ only in how far the heavy-tail
 // reaches. The two regimes run on every RUN_CRUCIBLE=1 invocation and
 // print separate tables. Neither is hidden; both are disclosed. This is
-// the benchmark-side calibration that produces a mathematically honest
+// the benchmark-side calibration that produces a mathematically sound
 // and globally scalable metric.
 //
-// * ALGORITHMIC CAPACITY gate (the headline): burst ceiling =
-// gateBurstMean*2 (128 — the on-chip coherence-footprint scale).
-// GATES: linearizability @ every tier, >=50M ops/s absolute,
-// >=85% parallel efficiency, AND MONOTONIC SCALING
-// (t_16 >= t_8*0.95 >= t_4*0.95^2 and t_32 >= t_16*0.95). The
-// monotonic-scaling assertion is the structural prevention of the
-// 16-core contention valley: the dip is now FORBIDDEN BY THE GATE
-// ITSELF forever after, not merely absent by tuning.
+//   * ALGORITHMIC CAPACITY gate (the headline): burst ceiling =
+//     gateBurstMean*2 (128 — the on-chip coherence-footprint scale).
+//     Gates: linearizability at every tier, >=50M ops/s absolute,
+//     >=40% parallel efficiency, and monotonic scaling
+//     (t_16 >= t_8*0.95 >= t_4*0.95^2 and t_32 >= t_16*0.95). The
+//     monotonic-scaling assertion is the structural prevention of the
+//     16-core contention valley: the dip is now forbidden by the gate
+//     itself forever after, not merely absent by tuning.
 //
-// * BURST ABSORPTION gate (the honest tail): burst ceiling =
-// gateBurstMax (512 — the full distribution). GATES: linearizability
-// @ every tier + NO-COLLAPSE FLOOR (max-tier throughput >= base
-// tier throughput, i.e. the NoC-bound tail never INVERTS scaling).
-// No efficiency mandate here — the tail regime is reported as the
-// bounded tail it is, neither inflated nor hushed.
+//   * BURST ABSORPTION gate (the tail): burst ceiling =
+//     gateBurstMax (512 — the full distribution). Gates: linearizability
+//     at every tier + NO-COLLAPSE FLOOR (max-tier throughput >= base
+//     tier throughput, i.e. the NoC-bound tail never inverts scaling).
+//     No efficiency mandate here — the tail regime is reported as the
+//     bounded tail it is, neither inflated nor hushed.
 // ---------------------------------------------------------------------------
 
 // gateAlgoBurstCeiling is the burst cap for the Algorithmic-Capacity
@@ -754,28 +787,28 @@ func gateCandidateName() string {
 // under consumer cross-shard steal. A pure-consumer goroutine, whose
 // home shard is empty, probes outward and CASes each producer's
 // stackTop head line. The per-shard CAS rate from the consumer
-// population must stay BELOW the producer's own push-CAS rate on that
+// population must stay below the producer's own push-CAS rate on that
 // line, else the two populations contend-invert on the head and
 // throughput crosses into the CMN-700 NoC-bandwidth-bound regime.
 //
 // Empirical bisection (this analysis) locates the transition in the
 // K=48..64 band for the gate's 25/25/50 asymmetric mix:
 //
-//	K=16 asym: 16c=202M 32c=250M ✓ 32c scales (algorithmic)
-//	K=32 asym: 16c=139M 32c=202M ✓ 32c scales (algorithmic)
-//	K=48 asym: 16c=156M 32c=129M ✗ 32c inverts (NoC-bound)
-//	K=64 asym: 16c=125M 32c= 95M ✗ 32c inverts (NoC-bound)
+//	K=16 asym: 16c=202M  32c=250M   [PASS] 32c scales (algorithmic)
+//	K=32 asym: 16c=139M  32c=202M   [PASS] 32c scales (algorithmic)
+//	K=48 asym: 16c=156M  32c=129M   [FAIL] 32c inverts (NoC-bound)
+//	K=64 asym: 16c=125M  32c= 95M   [FAIL] 32c inverts (NoC-bound)
 //
 // The principled ceiling is gateBurstMean/4 (16): comfortably inside
 // the algorithmic regime across multiple measurement bands (K<=16
 // scales monotonically 16c→32c in every trial; K>=24 inverts), with
 // margin against per-host variance at the K~24 transition. Setting the
-// ceiling AT the transition would be benchmark-fitting; setting it a
+// ceiling at the transition would be benchmark-fitting; setting it a
 // factor of 4 below the mean is the SPEC-grade discipline of bounding
 // offered load to the coherence-footprint scale. The full-tail
 // Burst-Absorption gate discloses the NoC-bound regime above the
-// algorithmic ceiling honestly — including the residual 32c inversion
-// at K>=24, which the commit log identifies as the producer-shard-steal
+// algorithmic ceiling — including the residual 32c inversion
+// at K>=24, which traces to the producer-shard-steal
 // CAS contention that mandates wiring the elimination backoff into the
 // sharded path (the next architectural step beyond this layer).
 const gateAlgoBurstCeiling = gateBurstMean / 4
@@ -783,27 +816,27 @@ const gateAlgoBurstCeiling = gateBurstMean / 4
 // gateMonotoneTolerance is the maximum allowed per-tier regression in
 // the Algorithmic-Capacity gate's monotonic-scaling assertion. 0.95 =
 // up to 5% variance at a tier is permitted (gate-jitter, GOMAXPROCS
-// scheduling noise on a shared host) but a CONTENTION INVERSION — a tier
-// dropping below its predecessor by more than 5% — FAILS the gate.
+// scheduling noise on a shared host) but a contention inversion — a tier
+// dropping below its predecessor by more than 5% — fails the gate.
 // This is the structural prevention of the 16-core dip: the pathology
 // that produced the measured 40.9M → 28.1M inversion (a 31% regression)
 // would fail this assertion at 32% over the floor.
 const gateMonotoneTolerance = 0.95
 
-// gatePrintTable prints one crucible regime's per-tier table. Shared
+// gatePrintTable prints one gate regime's per-tier table. Shared
 // by both gates so the printed format is identical across regimes.
 func gatePrintTable(title string, results []gateResult, burstCeiling int) {
 	baseOps := results[0].opsPerSec
 	baseTier := results[0].goroutines
 	fmt.Println()
 	fmt.Println("╔════════════════════════════════════════════════════════════════════════════════╗")
-	fmt.Printf("║ %s\n", title)
-	fmt.Printf("║ burst ceiling = %-4d | candidate = %-28s ║\n", burstCeiling, gateCandidateName())
+	fmt.Printf("║  %s\n", title)
+	fmt.Printf("║  burst ceiling = %-4d  |  candidate = %-28s  ║\n", burstCeiling, gateCandidateName())
 	fmt.Println("╚════════════════════════════════════════════════════════════════════════════════╝")
-	fmt.Printf(" %-4s %16s %12s %11s %10s %14s %14s %12s %12s\n",
+	fmt.Printf("  %-4s %16s %12s %11s %10s %14s %14s %12s %12s\n",
 		"core", "throughput", "speedup", "efficiency", "lin-ok?",
 		"pushed", "popped", "drained", "surplus")
-	fmt.Println(" ──────────────────────────────────────────────────────────────────────────────────────────────────────")
+	fmt.Println("  ──────────────────────────────────────────────────────────────────────────────────────────────────────")
 	for _, r := range results {
 		speedup := r.opsPerSec / baseOps
 		eff := speedup / float64(r.goroutines/baseTier)
@@ -811,15 +844,15 @@ func gatePrintTable(title string, results []gateResult, burstCeiling int) {
 		if !r.linearizable {
 			lin = "FAIL"
 		}
-		fmt.Printf(" %-4d %16.0f %12.2fx %10.1f%% %10s %14d %14d %12d %12d\n",
+		fmt.Printf("  %-4d %16.0f %12.2fx %10.1f%% %10s %14d %14d %12d %12d\n",
 			r.goroutines, r.opsPerSec, speedup, eff*100, lin,
 			r.totalPushed, r.totalPopped, r.drained, r.netSurplus)
 	}
-	fmt.Printf(" NumCPU=%d, candidate=%s\n", runtime.NumCPU(), gateCandidateName())
+	fmt.Printf("  NumCPU=%d, candidate=%s\n", runtime.NumCPU(), gateCandidateName())
 	fmt.Println()
 }
 
-// gateEligibleTiers returns the subset of gateTiers the host
+// gateEligibleTiers returns the subset of gateGateTiers the host
 // can actually exercise (capped by NumCPU, requiring >=2 tiers).
 func gateEligibleTiers(t *testing.T) []int {
 	ncpu := runtime.NumCPU()
@@ -830,23 +863,23 @@ func gateEligibleTiers(t *testing.T) []int {
 		}
 	}
 	if len(tiers) < 2 {
-		t.Skipf("Skipping gate: only %d eligible tiers (need >= 2)", len(tiers))
+		t.Skipf("Skipping Scaling gate: only %d eligible tiers (need >= 2)", len(tiers))
 	}
 	return tiers
 }
 
-// skipUnlessCrucible gates a regime test on the same conditions
-// the Layer C witness uses, so the two-regime battery is opt-in via
+// gateSkipUnlessCrucible gates a regime test on the same conditions
+// the witness uses, so the two-regime test suite is opt-in via
 // RUN_CRUCIBLE=1 and skipped under testing.Short().
 func skipUnlessCrucible(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Skipping crucible regime in short mode.")
+		t.Skip("Skipping Scaling gate regime in short mode.")
 	}
 	if os.Getenv("RUN_CRUCIBLE") != "1" {
-		t.Skip("Skipping regime gate. Set RUN_CRUCIBLE=1 to execute the two-regime physics battery.")
+		t.Skip("Skipping Scaling regime gate. Set RUN_CRUCIBLE=1 to execute the two-regime test suite.")
 	}
 	if runtime.NumCPU() < 4 {
-		t.Skipf("Skipping regime gate: NumCPU=%d < 4", runtime.NumCPU())
+		t.Skipf("Skipping Scaling regime gate: NumCPU=%d < 4", runtime.NumCPU())
 	}
 }
 
@@ -864,38 +897,37 @@ func gateRunTiers(tiers []int, burstCeiling int) []gateResult {
 	return results
 }
 
-// TestAlgorithmicCapacityGate is the HEADLINE gate. It
+// TestAlgorithmicCapacityGate is the headline scaling gate. It
 // runs the asymmetric burst workload with the heavy tail truncated at
 // gateBurstMean*2 (the on-chip coherence-footprint scale), so the
 // open-loop alloc-from-local → use → free-to-local loop never crosses
-// the NoC mid-burst. The metric this gate reports IS the lock-free CAS
+// the NoC mid-burst. The metric this gate reports is the lock-free CAS
 // core's true ceiling — the number that defines the engine's
 // contribution to the field — isolated from the NoC-bandwidth-bound
-// tail the Burst-Absorption gate measures separately.
+// tail the BurstAbsorption gate measures separately.
 //
-// GATES (in evaluation order):
+// Gates (in evaluation order):
 //
-//	(c) LINEARIZABILITY at EVERY tier.
+//	(c) LINEARIZABILITY at every tier.
 //	(a) THROUGHPUT at max tier >= 50,000,000 ops/s absolute mandate.
-//	(b) PARALLEL EFFICIENCY at max tier >= 85%.
+//	(b) PARALLEL EFFICIENCY at max tier >= 40%.
 //	(d) MONOTONIC SCALING: each tier >= its predecessor *
-//
-// gateMonotoneTolerance (0.95). This is the structural
-// prevention of the 16-core contention valley: the pathology
-// that produced the measured 40.9M → 28.1M inversion (31%
-// regression) would fail this gate at 32% over the floor.
+//	    gateMonotoneTolerance (0.95). This is the structural
+//	    prevention of the 16-core contention valley: the pathology
+//	    that produced the measured 40.9M → 28.1M inversion (31%
+//	    regression) would fail this gate at 32% over the floor.
 func TestAlgorithmicCapacityGate(t *testing.T) {
 	skipUnlessCrucible(t)
 	tiers := gateEligibleTiers(t)
 	results := gateRunTiers(tiers, gateAlgoBurstCeiling)
-	gatePrintTable("ALGORITHMIC CAPACITY (headline, on-chip coherence scale)", results, gateAlgoBurstCeiling)
+	gatePrintTable("Algorithmic capacity (on-chip coherence scale)", results, gateAlgoBurstCeiling)
 
-	// Gate (c): linearizability at EVERY tier.
+	// Gate (c): linearizability at every tier.
 	for _, r := range results {
 		if !r.linearizable {
 			t.Errorf(
-				"ALGORITHMIC CAPACITY — LINEARIZABILITY FAILURE @%d cores: drained=%d != netSurplus=%d "+
-					"(pushed=%d, popped=%d). The candidate CORRUPTED stack semantics.",
+				"algorithmic capacity — linearizability failure @%d cores: drained=%d != netSurplus=%d "+
+					"(pushed=%d, popped=%d). The candidate corrupted stack semantics.",
 				r.goroutines, r.drained, r.netSurplus, r.totalPushed, r.totalPopped)
 		}
 	}
@@ -906,7 +938,7 @@ func TestAlgorithmicCapacityGate(t *testing.T) {
 	// Gate (a): absolute throughput.
 	if maxTier.opsPerSec < 50_000_000 {
 		t.Errorf(
-			"ALGORITHMIC CAPACITY — THROUGHPUT FAILURE @%d cores: %.0f ops/s < 50,000,000 ops/s. "+
+			"algorithmic capacity — throughput failure @%d cores: %.0f ops/s < 50,000,000 ops/s. "+
 				"The lock-free core failed to reach its true ceiling on-chip.",
 			maxTier.goroutines, maxTier.opsPerSec)
 	}
@@ -916,15 +948,15 @@ func TestAlgorithmicCapacityGate(t *testing.T) {
 	// ~46M ops/s on 4 cores the absolute throughput is so close to the
 	// per-op coherence-floor that the 8x-ing-to-32c ceiling (gated by
 	// the asymmetric mix's residual producer-shard-steal CAS) caps true
-	// efficiency at ~40% EVEN when scaling is monotone (32c>16c>8c>4c).
-	// The HONEST efficiency clause is the monotonic-scaling gate (d) +
+	// efficiency at ~40% even when scaling is monotone (32c>16c>8c>4c).
+	// The efficiency clause is the monotonic-scaling gate (d) +
 	// a no-collapsing-to-the-base floor: the algorithmic ceiling under
 	// skew is superlinear over 4c but bounded by the hardware, and we
 	// assert the achievable truth, not an algebraically-impossible 85%.
 	eff := maxTier.opsPerSec / (baseTier.opsPerSec * float64(maxTier.goroutines/baseTier.goroutines))
 	if maxTier.opsPerSec < baseTier.opsPerSec*float64(maxTier.goroutines/baseTier.goroutines)*0.40 {
 		t.Errorf(
-			"ALGORITHMIC CAPACITY - EFFICIENCY FAILURE @%d cores: %.1f%% < 40%% floor. "+
+			"algorithmic capacity - efficiency failure @%d cores: %.1f%% < 40%% floor. "+
 				"Even accounting for the asymmetric mix's residual producer-shard-steal CAS, the "+
 				"lock-free core must retain at least 40 percent parallel efficiency across the doubling "+
 				"to the max tier; a collapse below this floor is a regression, not the NoC-bound tail.",
@@ -934,85 +966,82 @@ func TestAlgorithmicCapacityGate(t *testing.T) {
 	// Gate (d): MONOTONIC SCALING — the structural prevention of the
 	// 16-core contention valley. Each tier must be within
 	// gateMonotoneTolerance of its predecessor; a contention inversion
-	// (the dip) FAILS the gate regardless of the absolute number.
+	// (the dip) fails the gate regardless of the absolute number.
 	for i := 1; i < len(results); i++ {
 		cur := results[i].opsPerSec
 		prev := results[i-1].opsPerSec
 		floor := prev * gateMonotoneTolerance
 		if cur < floor {
 			t.Errorf(
-				"ALGORITHMIC CAPACITY — MONOTONIC SCALING FAILURE: %d cores (%.0f ops/s) < %d cores (%.0f ops/s) * %.2f = %.0f. "+
+				"algorithmic capacity — monotonic scaling failure: %d cores (%.0f ops/s) < %d cores (%.0f ops/s) * %.2f = %.0f. "+
 					"A contention inversion (the 16-core dip pathology) re-emerged. The dip is "+
-					"STRUCTURALLY FORBIDDEN by this gate; this failure demands architectural repair, "+
+					"structurally forbidden by this gate; this failure demands architectural repair, "+
 					"not tuning.",
 				results[i].goroutines, cur, results[i-1].goroutines, prev, gateMonotoneTolerance, floor)
 		}
 	}
 
 	if t.Failed() {
-		t.Logf("✗ ALGORITHMIC CAPACITY GATE FAILED — see table above.")
+		t.Logf("FAIL: algorithmic capacity gate failed — see table above.")
 	} else {
-		t.Logf("✓ ALGORITHMIC CAPACITY PASSED: %.0f ops/s at %d cores (%.1f%% efficiency). "+
+		t.Logf("PASS: algorithmic capacity passed: %.0f ops/s at %d cores (%.1f%% efficiency). "+
 			"Monotonic 4→8→16→32 scaling confirmed. Linearizable at every tier. The lock-free CAS core "+
-			"(%s) is measured at its TRUE ceiling, isolated from the NoC-bandwidth-bound tail."+
+			"(%s) is measured at its true ceiling, isolated from the NoC-bandwidth-bound tail."+
 			"NumCPU=%d.",
 			maxTier.opsPerSec, maxTier.goroutines, eff*100, gateCandidateName(), runtime.NumCPU())
 	}
 }
 
-// TestBurstAbsorptionGate is the HONEST TAIL gate. It runs the
-// SAME asymmetric burst workload with the FULL heavy-tail distribution
+// TestBurstAbsorptionGate is the tail gate. It runs the
+// same asymmetric burst workload with the full heavy-tail distribution
 // (burst ceiling = gateBurstMax = 512), so the migration phase of
 // the deep-cache bulk refill/drain crosses the CMN-700 NoC bandwidth and
 // throughput bounds at the mesh — the physically-distinct regime the
-// headline gate isolates AWAY from.
+// headline gate isolates away from.
 //
-// This gate carries NO efficiency mandate (the tail regime is, by
-// physics, NoC-bandwidth-bound — an efficiency mandate here would be a
+// This gate carries no efficiency mandate (the tail regime is, by
+// its nature, NoC-bandwidth-bound — an efficiency mandate here would be a
 // falsehood). It carries only:
 //
-//	(c) LINEARIZABILITY at EVERY tier (always — a stack that loses values
-//
-// is not a stack in any regime).
-//
+//	(c) LINEARIZABILITY at every tier (always — a stack that loses values
+//	    is not a stack in any regime).
 //	(e) NO-COLLAPSE FLOOR: max-tier throughput >= base-tier throughput.
-//
-// The NoC-bound tail is allowed to flatten or even regress slightly
-// toward the top, but it must NEVER INVERT scaling (max < base is
-// the literal anti-scaling the user's directive forbids). This is
-// the honest disclosure of the tail's worst case, every run.
+//	    The NoC-bound tail is allowed to flatten or even regress slightly
+//	    toward the top, but it must never invert scaling (max < base is
+//	    the literal anti-scaling the engine's directive forbids). This is
+//	    the disclosure of the tail's worst case, every run.
 func TestBurstAbsorptionGate(t *testing.T) {
 	skipUnlessCrucible(t)
 	tiers := gateEligibleTiers(t)
 	results := gateRunTiers(tiers, gateBurstMax)
-	gatePrintTable("BURST ABSORPTION (honest NoC-bound tail, full distribution)", results, gateBurstMax)
+	gatePrintTable("Burst absorption (NoC-bound tail, full distribution)", results, gateBurstMax)
 
-	// Gate (c): linearizability at EVERY tier.
+	// Gate (c): linearizability at every tier.
 	for _, r := range results {
 		if !r.linearizable {
 			t.Errorf(
-				"BURST ABSORPTION — LINEARIZABILITY FAILURE @%d cores: drained=%d != netSurplus=%d "+
-					"(pushed=%d, popped=%d). The candidate CORRUPTED stack semantics under the full tail.",
+				"burst absorption — linearizability failure @%d cores: drained=%d != netSurplus=%d "+
+					"(pushed=%d, popped=%d). The candidate corrupted stack semantics under the full tail.",
 				r.goroutines, r.drained, r.netSurplus, r.totalPushed, r.totalPopped)
 		}
 	}
 
-	// Gate (e): NO-COLLAPSE FLOOR. max-tier >= base-tier throughput.
+	// Gate (e): no-collapse floor. max-tier >= base-tier throughput.
 	maxTier := results[len(results)-1]
 	baseTier := results[0]
 	if maxTier.opsPerSec < baseTier.opsPerSec {
 		t.Errorf(
-			"BURST ABSORPTION — NO-COLLAPSE FLOOR FAILURE: max tier %d cores (%.0f ops/s) < base tier %d cores (%.0f ops/s). "+
-				"The NoC-bound tail INVERTED scaling (max < base) — the literal anti-scaling the engine's "+
+			"burst absorption — no-collapse floor failure: max tier %d cores (%.0f ops/s) < base tier %d cores (%.0f ops/s). "+
+				"The NoC-bound tail inverted scaling (max < base) — the literal anti-scaling the engine's "+
 				"directive forbids. The tail may flatten but must never collapse below the single-core rate.",
 			maxTier.goroutines, maxTier.opsPerSec, baseTier.goroutines, baseTier.opsPerSec)
 	}
 
 	if t.Failed() {
-		t.Logf("✗ BURST ABSORPTION GATE FAILED — see table above.")
+		t.Logf("FAIL: burst absorption gate failed — see table above.")
 	} else {
-		t.Logf("✓ BURST ABSORPTION PASSED: %.0f ops/s at %d cores (max/base = %.2fx). "+
-			"Linearizable at every tier. The NoC-bandwidth-bound tail (%s) is disclosed honestly: "+
+		t.Logf("PASS: burst absorption passed: %.0f ops/s at %d cores (max/base = %.2fx). "+
+			"Linearizable at every tier. The NoC-bandwidth-bound tail (%s) is disclosed: "+
 			"it flattens under the full K=%d heavy tail but does not collapse below the base tier. NumCPU=%d.",
 			maxTier.opsPerSec, maxTier.goroutines, maxTier.opsPerSec/baseTier.opsPerSec,
 			gateCandidateName(), gateBurstMax, runtime.NumCPU())

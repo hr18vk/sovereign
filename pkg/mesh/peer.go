@@ -4,29 +4,22 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// Package mesh is the production peer-to-peer gossip layer that rides the
-// TLS 1.3 transport.
+// Package mesh implements peer-to-peer gossip over the TLS 1.3 transport.
+// A PeerSet dials configured peers over mTLS, reads inbound frames into a
+// Receiver, and publishes signed envelopes with transport.TransmitTLSFrame.
+// Accepted and dialed connections use the same receive path, so convergence
+// does not depend on which node initiated a connection.
 //
-// Scope (per the design): a PeerSet dials each configured
-// peer over mTLS, keeps a per-peer reader goroutine feeding the
-// Receiver.HandleFrame sink (the accept loop, reused on the dial side so a
-// node that both dials and accepts converges symmetrically), and publishes
-// outbound signed envelopes via pkg/transport.TransmitTLSFrame. The mesh is a
-// NEW CALLER of the engine + identity + envelope + forward + transport APIs; it
-// modifies none of those packages.
-//
-// Identity model (the load-bearing seam): each
-// node owns a CRDT-delta signing seed (Ed25519, 32 bytes, distinct from the
-// TLS leaf key). The nodeID is the first 16 bytes of the seed's derived public
-// key; the identity.Directory keys originNodeID -> pubkey, and the engine's
-// localNodeID must equal the originNodeID every signed delta carries, so the
-// signing identity and the engine identity MUST coincide. A NodeIdentity
-// bundles the nodeID + the seed + the derived pubkey so the gossiper signs with
-// the seed and every peer Directory registers the pubkey.
+// Each node signs CRDT deltas with a 32-byte Ed25519 seed separate from its TLS
+// leaf key. Its node ID is the first 16 bytes of the derived public key. The
+// engine's local node ID must equal the origin node ID on every signed delta;
+// receivers use that ID to find the public key in an identity.Directory.
+// NodeIdentity keeps the node ID, seed, and public key together.
 package mesh
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -47,61 +40,41 @@ import (
 	"github.com/hr18vk/sovereign/pkg/transport"
 )
 
-// NodeIdentity is the CRDT-delta signing identity of one node. It is the
-// per-node counterpart of the engine's localNodeID: the seed is the hook into
-// identity.SignCRDTFrame, the pubkey is what every peer Directory registers so
-// VerifyCRDTFrame succeeds on the receive side, and the nodeID is the [16]byte
-// that MUST equal engine.localNodeID (so the origin's OriginNodeID, which the
-// engine stamps onto every InsertLocal entry, matches the Directory key the
-// receiver resolves).
+// NodeIdentity is a node's CRDT signing identity. Seed is used by
+// identity.SignCRDTFrame, Pub is registered in peer directories for
+// VerifyCRDTFrame, and NodeID must equal the engine's local node ID. InsertLocal
+// stamps that ID as OriginNodeID, and the receiver uses it for Directory.Lookup.
 //
-// nodeID is the first 16 bytes of the Ed25519 public key. This keeps the
-// identity space flat (one derivation from one seed) and matches the
-// [16]byte OriginNodeID the capnp CRDTDeltaEvent carries; the pubkey is the
-// full 32 bytes the Directory stores. A peer verifying a frame resolves
-// OriginNodeID[:16] -> the 32-byte pubkey via Directory.Lookup.
+// NodeID is the first 16 bytes of the 32-byte Ed25519 public key, matching the
+// origin ID carried by a capnp CRDTDeltaEvent.
 //
-// (ADR-0037): PQPriv is the OPTIONAL ML-DSA-65 private key for the
-// hybrid SIGN (under --hybrid-sign the gossiper's ShipBatchHybrid signs the
-// batch wire under BOTH Ed25519 + ML-DSA-65 via identity.SignCRDTFrame_Hybrid).
-// It is nil by default (the default posture — a node with NO PQ key produces
-// v1 BatchEnvelopes byte-identical to the classical path; --hybrid-sign=false
-// is the byte-identical default). When --hybrid-sign is set, buildNodeIdentity
-// mints the PQ keypair from the SAME 32-byte seed (identity.GeneratePreviewKey65
-// — the deterministic seed form, byte-identical across runs) + registers the PQ
-// pubkey in the Directory via RegisterPQ so peers' hybrid verify resolves it.
-// The PQ key is derived from the SAME seed as the Ed25519 key (one identity
-// space — the deploy discipline named), so a node's Ed25519 pubkey +
-// ML-DSA-65 pubkey BOTH key off the one --identity-seed.
+// The optional ML-DSA-65 keys support hybrid signing (ADR-0037). With
+// --hybrid-sign, ShipBatchHybrid signs each batch with both Ed25519 and
+// ML-DSA-65. The post-quantum keypair is derived deterministically from the same
+// identity seed, and PQPub is registered with RegisterPQ for hybrid verification.
+// Without a post-quantum private key, the node emits ordinary v1 batch envelopes.
 type NodeIdentity struct {
 	NodeID [16]byte
 	Seed   []byte // len 32 (ed25519.SeedSize); owned, never mutated
 	Pub    ed25519.PublicKey
-	// PQPriv is the (ADR-0037) OPTIONAL ML-DSA-65 private key for the
-	// hybrid SIGN. nil by default (the default posture — no hybrid frame is
-	// produced). When non-nil, ShipBatchHybrid signs under BOTH Ed25519 +
-	// ML-DSA-65; the corresponding PQPub is registered in the Directory via
-	// RegisterPQ so peers' hybrid verify resolves it. Owned by the NodeIdentity;
-	// never mutated post-construction.
+	// PQPriv is the optional ML-DSA-65 private key. When non-nil,
+	// ShipBatchHybrid signs with both Ed25519 and ML-DSA-65. The key is owned by
+	// NodeIdentity and is not mutated after construction.
 	PQPriv *mldsa.PrivateKey
-	// PQPub is the ML-DSA-65 public key paired with PQPriv. Registered in
-	// the Directory via RegisterPQ when PQPriv is non-nil; nil otherwise. Owned
-	// by the NodeIdentity; never mutated post-construction.
+	// PQPub is paired with PQPriv and registered with RegisterPQ when hybrid
+	// signing is enabled. It is nil when PQPriv is nil and is not mutated after
+	// construction.
 	PQPub *mldsa.PublicKey
 }
 
-// NewNodeIdentity derives a NodeIdentity from a 32-byte Ed25519 seed. The
-// returned NodeID is the first 16 bytes of the derived public key and MUST be
-// passed to eng.NewDeltaCRDTEngine as its nodeID so the engine's
-// locally-inserted entries carry an OriginNodeID the receiver-side Directory
-// can resolve back to Pub.
+// NewNodeIdentity derives an Ed25519-only NodeIdentity from a 32-byte seed.
+// The returned NodeID is the first 16 bytes of the public key; pass it to
+// eng.NewDeltaCRDTEngine so local entries carry an origin ID that receivers
+// can resolve to Pub.
 //
-// The PQ key (PQPriv/PQPub) is NOT derived here — NewNodeIdentity is the
-// CLASSICAL-ONLY constructor (the classical default, byte-identical). The
-// hybrid-SIGN constructor is NewNodeIdentityHybrid, which derives the
-// ML-DSA-65 keypair from the SAME seed. A NodeIdentity from NewNodeIdentity has
-// PQPriv == nil -> ShipBatchHybrid is a no-op (the gossiper's hybrid arm is
-// disarmed) -> NO hybrid frame is produced (the byte-identical-default).
+// PQPriv and PQPub remain nil. ShipBatchHybrid therefore does nothing, and the
+// gossiper emits no hybrid frames. NewNodeIdentityHybrid derives both keypairs
+// when hybrid signing is required.
 func NewNodeIdentity(seed []byte) (*NodeIdentity, error) {
 	if len(seed) != ed25519.SeedSize {
 		return nil, fmt.Errorf("mesh: NewNodeIdentity: seed len %d, want %d", len(seed), ed25519.SeedSize)
@@ -118,15 +91,11 @@ func NewNodeIdentity(seed []byte) (*NodeIdentity, error) {
 	return ni, nil
 }
 
-// NewNodeIdentityHybrid is the (ADR-0037) hybrid-SIGN constructor: it
-// derives a NodeIdentity carrying BOTH the Ed25519 keypair (from seed) AND the
-// ML-DSA-65 keypair (from the SAME seed, via identity.GeneratePreviewKey65 — the
-// deterministic seed form, byte-identical across runs). A NodeIdentity from
-// this constructor has PQPriv != nil -> ShipBatchHybrid signs under BOTH sigs
-// -> hybrid frames are produced under --hybrid-sign. The Ed25519 half is
-// byte-identical to NewNodeIdentity (the SAME derivation); the PQ half is the
-// ADD. The returned PQPub is what the caller registers in the Directory via
-// RegisterPQ so peers' hybrid verify resolves it.
+// NewNodeIdentityHybrid derives Ed25519 and ML-DSA-65 keypairs from the same
+// 32-byte seed (ADR-0037). The Ed25519 derivation is identical to
+// NewNodeIdentity. With PQPriv set, ShipBatchHybrid can emit hybrid frames when
+// --hybrid-sign is enabled. The caller registers PQPub with RegisterPQ so peers
+// can resolve it during hybrid verification.
 func NewNodeIdentityHybrid(seed []byte) (*NodeIdentity, error) {
 	ni, err := NewNodeIdentity(seed)
 	if err != nil {
@@ -137,50 +106,29 @@ func NewNodeIdentityHybrid(seed []byte) (*NodeIdentity, error) {
 		return nil, fmt.Errorf("mesh: NewNodeIdentityHybrid: GeneratePreviewKey65: %w", err)
 	}
 	ni.PQPriv = pqPriv
-	// Use the concrete PublicKey getter (mldsa.go:139 — returns *PublicKey
-	// directly), NOT the Public interface method (mldsa.go:122 — returns
-	// crypto.PublicKey, which would need an unchecked type assertion). A review
-	// flagged the assertion as a needless panic risk: a future
-	// KMS/HSM-backed mldsa.PrivateKey (the ADR-0037 future-work note
-	// "operator-path hybrid SIGN via a KMS/HSM minter") could return a
-	// non-*mldsa.PublicKey
-	// from Public, panicking at boot; the concrete getter returns the exact
-	// type with no assertion.
+	// PublicKey returns the concrete key type. Public would require a type
+	// assertion, which could panic if another PrivateKey implementation backed
+	// by a KMS or HSM returned a different public-key representation.
 	ni.PQPub = pqPriv.PublicKey()
 	return ni, nil
 }
 
-// dialer is the subset of pkg/transport.TLSConnections the PeerSet uses to open
-// peer connections. Exposed as an interface so the in-process test harness wires
-// a net.Pipe-based dialer WITHOUT a real TCP listener, while the production binary
-// wires the real *transport.TLSConnections (which satisfies Dial — see
-// tls_transport.go:150).
+// dialer is the part of transport.TLSConnections used by PeerSet. Tests can
+// supply a net.Pipe dialer without a TCP listener; production supplies the real
+// TLS transport.
 type dialer interface {
 	Dial(network, addr, serverName string) (*tls.Conn, error)
 }
 
-// frameSink is the subset of pkg/receive.Receiver the PeerSet feeds inbound
-// frames into. Exposed as an interface so the in-process test harness can wire
-// an instrumented sink; the production binary wires the real *receive.Receiver
-// (which satisfies HandleFrame — see receiver.go:253 — and HandleBatchFrame —
-// see receiver.go, the batch path). The return type is
-// receive.AcceptVerdict exactly (not any) so *receive.Receiver satisfies the
-// interface without an adapter.
+// frameSink is the portion of receive.Receiver used by PeerSet. The exact
+// AcceptVerdict return types let *receive.Receiver satisfy the interface
+// directly, while tests can install an instrumented sink.
 //
-// dispatch: readLoop peeks the first 4 bytes of each reassembled frame
-// (post-length-prefix) and routes a BatchEnvelope (attribution.IsBatchFrame) to
-// HandleBatchFrame; everything else routes to HandleFrame (the
-// RelayEnvelope path — back-compat default). The batch path is opt-in via
-// --batch-size>1 on the SEND side; the RECEIVE side dispatches on the wire
-// magic so a node accepts batches from a peer that opted in regardless of its
-// own --batch-size.
-//
-// (ADR-0037): the FOUR-way dispatch adds the hybrid-PQ batch path — a
-// frame tagged WireHybridPQMagic (attribution.IsHybridFrame) routes to
-// HandleHybridFrame (the BOTH-sig verify path). The hybrid path is opt-in via
-// --hybrid-sign on the SEND side + --hybrid-verify on the RECEIVE side; a node
-// accepts hybrid frames from a peer that opted in regardless of its own
-// --hybrid-sign (the SAME dispatch-on-magic discipline the batch path uses).
+// DispatchFrame examines each frame's wire magic. Batch envelopes go to
+// HandleBatchFrame, hybrid envelopes to HandleHybridFrame, and relay envelopes
+// to HandleFrame. Senders opt into batches with --batch-size>1 and hybrid
+// signing with --hybrid-sign. Receivers dispatch on the wire format regardless
+// of their own sending mode; accepting hybrid frames requires --hybrid-verify.
 type frameSink interface {
 	HandleFrame(frameBytes []byte) receive.AcceptVerdict
 	HandleBatchFrame(batchFrameBytes []byte) receive.AcceptVerdict
@@ -194,44 +142,120 @@ type peerConn struct {
 	addr   string
 	conn   *tls.Conn
 	peerID [16]byte
+	// suspectKey identifies this edge in the write-stall breaker. An outbound
+	// edge uses its configured address; an inbound edge uses the node ID from
+	// its certificate because its source address changes on every dial.
+	// RegisterInbound installs only successfully decoded identities. Publish
+	// uses the same key for checks and failure marks, so breaker state survives
+	// reconnection. Outbound edges cannot use the node ID: a failed reconcile
+	// leaves it zero, and the zero-ID map entry is shared by unresolved peers.
+	suspectKey string
 
 	cancelReader context.CancelFunc
 	done         chan struct{}
-	// closeDoneOnce (the silicon-found close-path TOCTOU) closes
-	// pc.done EXACTLY ONCE across the racing goroutines that can both legitimately
-	// signal a peerConn dead: the readLoop's exit defer (peer.go:605) AND
-	// ReleaseInbound (peer.go:573, the accept-loop drop). The earlier code had
-	// the readLoop's `defer close(pc.done)` UNGUARDED + ReleaseInbound guarded by
-	// a `select{case <-pc.done: default: close(pc.done)}` — a check-then-act TOCTOU:
-	// both goroutines see `done` open, both call close → `panic: close of closed
-	// channel` (peer.go:619, the readLoop's deferred close, +0x2bc). At 3 nodes the
-	// window is too narrow to hit; at 100-node silicon the accept-loop churn +
-	// outbound ReconnectLoop firing ReleaseInbound on a conn whose readLoop is
-	// also exiting makes the race fire on the early nodes → the process panics on
-	// boot → the node never serves /livecheck → 1/100-live. sync.Once makes
-	// the close atomic: whichever path wins, the channel closes exactly once;
-	// the loser's Once.Do is a no-op (NOT a panic). closeDone is the ONLY path
-	// that touches pc.done's closed-state (the readers at peer.go:327/691/725/767
-	// only RECEIVE on it, never close).
+	// closeDoneOnce closes pc.done when either the read loop exits or
+	// ReleaseInbound drops the accepted connection. Those paths can race, and a
+	// check followed by close is insufficient: both goroutines could observe an
+	// open channel and the second close would panic. sync.Once gives every path
+	// the same atomic close operation (ADR-0046). Readers only receive from done.
 	closeDoneOnce sync.Once
 
-	// framesReceived is a dial-side receive counter — the
-	// readLoop is the sole writer (one writer per peerConn, launched at Dial),
-	// read only by diagnostics. It is a symmetry probe: did the peer write
-	// ANYTHING back over the connection WE dialed out? (The seed->peer delta and
-	// the peer->seed bootstrap both arrive on the ACCEPT loop at main.go's
-	// serveConnWithDigest, NOT here — so this
-	// counter observes only what the peer Publish'es onto OUR dial.) Accessed
-	// atomically; sole-writer/sole-reader so a plain uint64 would be race-free,
-	// but -race runs a concurrent metrics read, so atomic it is. Last field: zero
-	// existing atomics on this struct (no cache-line neighbor), absorbs into tail
-	// padding (fieldalignment -fix is forbidden here — reorder manually).
+	// framesReceived counts frames arriving on the dialed connection. readLoop
+	// is its only writer; diagnostics and metrics read it concurrently, so all
+	// accesses are atomic. It does not include frames arriving on the separate
+	// accept loop. Challenge state is cold and occupies the following fields.
 	framesReceived uint64
+	// remoteVerified records a successful proof that the peer holds the
+	// Directory-registered private key for pc.peerID (ADR-0068). Only
+	// handleConnChallengeFrame sets it. It changes from false to true once per
+	// connection; a replacement peerConn starts unverified, preventing a new
+	// connection from inheriting its predecessor's proof. Sweeps, DeliverDigest,
+	// and respondToDigest read it concurrently, so it is atomic. The single
+	// store per connection keeps this cold state away from the frame counter.
+	remoteVerified atomic.Bool
+	// challengeNonce is generated with crypto/rand before the connection's
+	// reader starts. Goroutine creation orders that write before reads. A valid
+	// response echoes the nonce exactly, rejecting a replay before signature
+	// verification.
+	challengeNonce [32]byte
+	// challengeArmed records that this connection sent a challenge. A response
+	// without an outstanding challenge is ignored. The field is written before
+	// the dial or accept reader starts and is safe to read there.
+	challengeArmed bool
+	// challengeAnswers counts signatures produced for challenges on this
+	// connection, up to the per-connection answer budget. A replacement
+	// connection gets a fresh budget. Metrics reads require an atomic counter.
+	challengeAnswers atomic.Uint64
 }
 
-// PeerSet dials each configured peer over mTLS, keeps a per-peer reader
-// goroutine feeding the Receiver.HandleFrame sink, and publishes
-// outbound signed envelopes via pkg/transport.TransmitTLSFrame. It is safe for
+// Challenge answers require an Ed25519 signature, so budgets bound the work an
+// unverified peer can request with 53-byte frames. A connected peer gets 16
+// answers per connection, leaving room above the one answer normally needed.
+// Stateless answers on declined connections use two limits: 64 reservations
+// per suspect key and 65,536 across the PeerSet. A decode miss is keyed by
+// remote address, which an attacker can rotate; the global ceiling remains the
+// rotation-independent bound.
+//
+// Reservations expire rather than refilling on a schedule. Exhaustion disables
+// stateless answers until recovery or restart, while new connected peers still
+// receive fresh per-connection budgets (ADR-0069). The global ceiling is a
+// variable so tests can exercise the limit with a small value.
+var challengeAnswerGlobalCeiling = uint64(65536)
+
+const (
+	challengeAnswerPerConnBudget       = 16
+	challengeAnswerPerSuspectKeyBudget = 64
+)
+
+// declinedRes records reservations for one suspect key and the most recent
+// reservation time. Expiring the whole record avoids permanently excluding a
+// peer after repeated mutual-dial declines. With the default limits and TTL,
+// the aggregate stateless-answer rate is about 109 signatures per second.
+type declinedRes struct {
+	count        uint64
+	lastUnixNano int64
+}
+
+// challengeDeclinedReservationTTL controls how long a reservation counts
+// against its key and the global total. Records are reclaimed lazily when read
+// or during a sweep at the global ceiling. It is a variable so tests can use
+// short expiry windows; production uses ten minutes.
+var challengeDeclinedReservationTTL = 10 * time.Minute
+
+// challengeDeclinedSweepInterval rate-limits reclamation sweeps at the global
+// ceiling. Without this interval, each 53-byte challenge could trigger an
+// O(map) walk. Tests may shorten the interval.
+var challengeDeclinedSweepInterval = time.Second
+
+// refundDeclinedReservation releases a reservation after a signing failure.
+// A recorded per-key reservation decrements both its record and the global
+// total. Another connection may already have reclaimed the record, so both
+// operations are guarded: decrementing a missing record would create a
+// zero-value entry and wrap it to MaxUint64, while decrementing the global
+// again would refund a count that reclamation already removed. An unrecorded
+// reservation requires no refund; that state is reachable only through a test
+// injection or direct unit call.
+func (ps *PeerSet) refundDeclinedReservation(suspectKey string, reservedPerKey bool) {
+	ps.challengeDeclinedMu.Lock()
+	defer ps.challengeDeclinedMu.Unlock()
+	if !reservedPerKey {
+		// Every normal reservation writes a record. An unrecorded reservation
+		// can arise only under the sweep-retain test injection or a direct unit
+		// call. Do not decrement the global: if it is already zero, unsigned
+		// subtraction would wrap to MaxUint64.
+		return
+	}
+	if res, ok := ps.challengeDeclinedByKey[suspectKey]; ok && res.count > 0 {
+		res.count--
+		ps.challengeDeclinedByKey[suspectKey] = res
+		ps.challengeDeclinedGlobal--
+	}
+	// A missing or zero-count record has already been reclaimed together with
+	// its contribution to the global. Touching either value would underflow it.
+}
+
+// PeerSet maintains mutually authenticated peer connections, feeds inbound
+// frames to a Receiver, and publishes outbound envelopes. It is safe for
 // concurrent use.
 type PeerSet struct {
 	dialer dialer
@@ -239,51 +263,149 @@ type PeerSet struct {
 	owner  *NodeIdentity
 	engine *eng.DeltaCRDTEngine
 
-	// digester is the digest-exchange sink (ADR-0034). It is the
-	// Gossiper bound to this PeerSet (the Gossiper satisfies DigestSink); nil
-	// by default (a PeerSet with no gossiper-bound digester drops digest
-	// frames — the honest cold-start when stratified is OFF). Set via
-	// SetDigestSink AFTER NewGossiper so the readLoop's DispatchFrame can route
-	// a WireDigestMagic-tagged frame to the sweep's per-peer blocking-receive
-	// channel. The digester is read on the readLoop goroutine; SetDigestSink is
-	// called once at construction before the readLoop starts — the
-	// single-writer-before-reader discipline makes the non-atomic set race-free.
+	// digester is the Gossiper's digest-exchange sink (ADR-0034). SetDigestSink
+	// binds it after NewGossiper so DispatchFrame can route WireDigestMagic
+	// frames to the sweep's per-peer receive channel. A nil sink drops digest
+	// frames when stratified anti-entropy is disabled. Binding happens once,
+	// before readLoop starts, so the plain field needs no atomic access.
 	digester DigestSink
+
+	// challengeDir resolves the identity claimed in a challenge response, using
+	// the same out-of-band Directory as origin verification. Directory
+	// membership alone never authorizes routing or data delivery; only the
+	// possession proof sets remoteVerified. A nil Directory leaves every
+	// connection unverified and all egress gates closed. NewGossiper binds the
+	// Directory once before any connection reader starts.
+	challengeDir *identity.Directory
+
+	// digestSeamDrops counts digest frames rejected because their own dial or
+	// accept connection was not verified. DeliverDigest separately counts
+	// unverified and identity-mismatched deliveries. Checking the receiving
+	// connection prevents a frame on a superseded connection from borrowing the
+	// verified state of the current ps.peers entry.
+	digestSeamDrops atomic.Uint64
+	// These counters measure dispatch time in the dial readLoop and accept
+	// serve loop, exposing head-of-line delay. setL0IExchDebug enables them at
+	// construction. Each sweep reports deltas of the cumulative values and
+	// reads and resets the maxima; a frame spanning two reporting windows is
+	// attributed to the window in which it finishes.
+	l0iExchDebug      atomic.Bool
+	l0iReadBusyNs     atomic.Int64
+	l0iReadBusyMaxNs  atomic.Int64
+	l0iServeBusyNs    atomic.Int64
+	l0iServeBusyMaxNs atomic.Int64
+
+	// Keep handshake outcomes separate so tests and diagnostics can distinguish
+	// replays, mismatches, missing keys, bad signatures, and successful proofs.
+	// challengeVerified is incremented by the only path that sets
+	// remoteVerified. These atomics are local diagnostics, not registry counters.
+	challengeReplay   atomic.Uint64
+	challengeMismatch atomic.Uint64
+	challengeNoEntry  atomic.Uint64
+	challengeSigFail  atomic.Uint64
+	challengeVerified atomic.Uint64
+
+	// disableDigestSeamBugInject disables the per-connection digest check for
+	// a negative control. The default false keeps the check active. The control
+	// also disables the Gossiper's digest-channel gate; otherwise this seam
+	// would still block the frame. digestSeamDrops confirms which check fired.
+	disableDigestSeamBugInject atomic.Bool
 
 	mu     sync.RWMutex
 	peers  map[[16]byte]*peerConn
 	byAddr map[string]*peerConn
 
-	// autoReconcile is the (ADR-0040) OPT-IN runtime TLS-leaf reconcile
-	// flag (Seam B). default false = byte-identical (the dial loop stores
-	// peers under the caller-supplied peerID — zero for an un-provisioned peer —
-	// and the topology selector keys under peerIDForAddr(addr), which never
-	// matches the zero peerID → the region lookup misses → the N=2 no-op
-	// ADR-0040 describes). ON switches Dial to read the peer's TLS leaf
-	// CommonName (hex.DecodeString the 32-char CN → [16]byte — the SAME mirror
-	// mintSelftestCerts uses, IssueLeaf(hex.EncodeToString(nodeID[:])) main.go:1543)
-	// + re-key the peerConn under the REAL nodeID so the topology selector HITS
-	// → Publish(realNodeID) succeeds → the 2-node binary mesh converges.
-	// ROUTING-only: the reconcile re-keys the ROUTING key (which ps.peers entry
-	// Publish writes to); it NEVER touches the verification pubkey (the
-	// Directory's OOB-provisioned key is the verification anchor; a self-
-	// announced node with NO OOB pubkey is ROUTED but NOT VERIFIED → its deltas
-	// DROPPED LOUD via VerifyFail — the correct zero-trust posture, disclosed
-	// ADR-0040 §6). Set via SetAutoReconcile once at construction (the
-	// single-writer-before-reader discipline; read on the Dial goroutine — the
-	// cmd dial loop is single-threaded at boot, and ReconnectLoop's per-peer
-	// goroutine reads it post-boot; the non-atomic read is race-free under the
-	// same discipline SetDigestSink uses). Placed LAST so the 1-byte bool absorbs
-	// into the struct's tail padding (the fieldalignment discipline — manual
-	// reorder, NOT -fix; the bool's trailing padding is NOT counted toward the
-	// struct's useful size, the SAME placement topology.go:60 uses for selfRegion).
+	// A write to a half-open peer can block until the kernel's retransmission
+	// timeout, measured at about 924.6 seconds with the default tcp_retries2.
+	// Because AntiEntropySweep writes serially, one such peer would delay every
+	// healthy peer. writeTimeout bounds each frame write when nonzero.
+	//
+	// A TLS write timeout permanently corrupts Go's TLS write state, so recovery
+	// requires closing and re-dialing rather than retrying on the connection.
+	// The edge-keyed suspect breaker then avoids paying another full timeout on
+	// every redial. Outbound keys use configured addresses and inbound keys use
+	// certificate node IDs, allowing state to survive replacement peerConns.
+	// Keep the hand-arranged field layout; autoReconcile remains last.
+	writeTimeout         time.Duration // zero disables write deadlines
+	suspectBackoff       time.Duration // zero disables suspect skips
+	suspects             map[string]*suspectEntry
+	writeTimeoutReporter func() // nil disables timeout reporting
+
+	// Test-only switches disable individual write-liveness protections. Their
+	// zero values keep deadlines, close-on-error, and the suspect breaker
+	// active; negative controls set them to make the corresponding tests fail.
+	disableWriteDeadline  atomic.Bool
+	disableCloseOnError   atomic.Bool
+	disableSuspectBreaker atomic.Bool
+
+	// disableSuspectEviction skips time-based suspect eviction in a negative
+	// control for the bounded-map behavior.
+	disableSuspectEviction atomic.Bool
+
+	// disableChallengeVerifyBugInject accepts any signature after the Directory
+	// and identity checks. It lets a negative control demonstrate that the
+	// possession proof is necessary; production leaves it false.
+	disableChallengeVerifyBugInject atomic.Bool
+
+	// autoReconcile enables TLS-leaf identity reconciliation (ADR-0040). It is
+	// off by default. When enabled and Dial receives a zero peer ID, Dial decodes
+	// the 32-character hexadecimal CommonName into the real node ID and re-keys
+	// peerConn. The topology selector and Publish can then find the peer.
+	//
+	// The following cold fields are written at connection-setup rate by serve
+	// goroutines. Cache-line padding separates them from ps.mu, which Publish
+	// read-locks per frame, and from the challenge counters. Keep the manual
+	// field layout rather than applying fieldalignment -fix.
+	_padFloodHead eng.CacheLinePad
+	// challengeAnswerBudgetDrops combines connected and declined answer-budget
+	// rejections. Tests drive one path at a time to attribute each increment.
+	challengeAnswerBudgetDrops atomic.Uint64
+	// Declined-connection state is cold and protected by its own mutex, not
+	// ps.mu on the per-frame data path. The map is allocated on first use.
+	// Signing failures refund their reservations.
+	challengeDeclinedMu sync.Mutex
+	// Each record carries its last reservation time. challengeDeclinedGlobal
+	// is the sum of unexpired record counts; the sweep at the ceiling recomputes
+	// that sum after removing expired records.
+	challengeDeclinedByKey map[string]declinedRes
+	// challengeDeclinedLiveEdge records a decline made because this node already
+	// holds a live edge to the peer. A fresh mark skips the per-key reservation
+	// because mutual dialing caused the decline, but the global reservation
+	// still counts so CA-leaf holders cannot bypass the aggregate bound. Marks
+	// expire through lazy reclamation.
+	challengeDeclinedLiveEdge map[string]int64
+	// challengeDeclinedLastSweepNano rate-limits sweeps at the global ceiling.
+	challengeDeclinedLastSweepNano int64
+	challengeDeclinedGlobal        uint64
+	// Test-only controls disable both answer-budget checks, disable live-edge
+	// and TTL policy, or omit live-edge records. Their zero values preserve the
+	// production checks; negative controls use them to restore the guarded
+	// failure modes.
+	disableChallengeAnswerBudgetBugInject atomic.Bool
+	disableDeclinedPolicyBugInject        atomic.Bool
+	disableLiveEdgeRecordBugInject        atomic.Bool
+	signFailBugInject                     atomic.Bool // forces SignCRDTFrame to fail in tests
+	// These controls skip Dial's live peer-ID check or ArmDeclinedInbound's
+	// challenge arming to test connection overwrite and declined verification.
+	disableDialPeerIDCheckBugInject atomic.Bool
+	disableDeclinedVerifyBugInject  atomic.Bool
+	// challengeNoiseLogSeq limits noise logs to the first 8 and every 1000th;
+	// per-class counters continue to count every event.
+	challengeNoiseLogSeq atomic.Uint64
+	_padFloodTail        eng.CacheLinePad
+
+	// Reconciliation changes only the routing key used by Publish. It does not
+	// register verification keys: without an out-of-band Directory entry, a
+	// self-announced peer can be routed but its deltas still fail verification
+	// (ADR-0040 §6). SetAutoReconcile writes this field once before the dial and
+	// reconnect goroutines start, so reads need no atomic operation. The bool is
+	// last to fit within the struct's tail padding, as with topology selfRegion.
 	autoReconcile bool
 }
 
-// NewPeerSet constructs a PeerSet bound to a TLS dialer, the receive
-// sink, and the owner's signing identity. engine is the gossiper's own state
-// (GenerateDigest/GenerateDelta source); recv is the sink every
-// inbound frame flows through.
+// NewPeerSet constructs a PeerSet using d for TLS connections, recv for inbound
+// frames, owner for signing, and engine as the gossiper's digest and delta
+// source.
 func NewPeerSet(d dialer, recv frameSink, owner *NodeIdentity, engine *eng.DeltaCRDTEngine) *PeerSet {
 	return &PeerSet{
 		dialer: d,
@@ -292,81 +414,96 @@ func NewPeerSet(d dialer, recv frameSink, owner *NodeIdentity, engine *eng.Delta
 		engine: engine,
 		peers:  make(map[[16]byte]*peerConn),
 		byAddr: make(map[string]*peerConn),
+		// Dial and RegisterInbound create suspect entries keyed by configured
+		// address or certificate node ID. Later map mutations remove entries
+		// whose skipUntil has expired, including zero-valued cleared entries.
+		// Size is bounded by distinct peer identities rather than connection
+		// count. An unset skipUntil imposes no work on healthy writes.
+		suspects: make(map[string]*suspectEntry),
 	}
 }
 
-// SetDigestSink binds the digest-exchange sink (ADR-0034). The Gossiper
-// calls it once after NewGossiper so the readLoop's DispatchFrame can route a
-// WireDigestMagic-tagged frame to the sweep's per-peer blocking-receive channel.
-// Nil-safe (the SetRoundReporter precedent): a PeerSet with no digester drops
-// digest frames — the honest cold-start when stratified is OFF (the opt-IN
-// default keeps the oversend path byte-identical). Called once at construction
-// before the readLoop starts; the single-writer-before-reader discipline makes
-// the non-atomic set race-free.
+// SetDigestSink binds the Gossiper's digest sink after NewGossiper and before
+// any readLoop starts (ADR-0034). DispatchFrame then routes WireDigestMagic
+// frames to the sweep's per-peer receive channel. A nil sink drops digest
+// frames, which is the default while stratified anti-entropy is disabled. The
+// construction-time write is ordered before reader goroutines start.
 func (ps *PeerSet) SetDigestSink(d DigestSink) { ps.digester = d }
 
-// SetAutoReconcile arms the (ADR-0040) runtime TLS-leaf reconcile (Seam
-// B). Called once at construction (the cmd path wires it from
-// --peer-auto-reconcile before the dial loop starts; the single-writer-before-
-// reader discipline). default false = byte-identical. Nil-safe-by-being-
-// a-primitive (the flag is a bool; the false zero-value is the byte-identical
-// default — no nil-guard needed). See the autoReconcile field doc for the
-// ROUTING-only contract + the zero-trust posture a self-announced-but-not-
-// OOB-provisioned peer has.
+// SetAutoReconcile configures TLS-leaf identity reconciliation from
+// --peer-auto-reconcile before dialing starts (ADR-0040). It is disabled by
+// default. Reconciliation changes routing only; delta verification still
+// requires an out-of-band Directory key, as documented on autoReconcile.
 func (ps *PeerSet) SetAutoReconcile(on bool) { ps.autoReconcile = on }
 
-// Dial opens an mTLS connection to addr and installs a per-peer reader goroutine
-// feeding the sink. peerID is the remote's CRDT-delta signing nodeID.
-// It is idempotent for an already-live peer.
+// SetWriteTimeout sets a fresh deadline for each Publish write. Zero leaves
+// writes without a deadline and disables the associated close and suspect-skip
+// behavior. A positive duration prevents one half-open peer from blocking the
+// serial sweep until the kernel retransmission timeout. TLS write timeouts make
+// the connection unusable, so it is closed and the peer enters suspect backoff.
+// Production passes --mesh-write-timeout, whose default is 10 seconds. Call
+// this before the first Publish.
+func (ps *PeerSet) SetWriteTimeout(d time.Duration) { ps.writeTimeout = d }
+
+// SetSuspectBackoff sets how long a failed edge is skipped before another write
+// probes it. Zero disables skipping. Production uses DefaultSuspectBackoff,
+// derived from the reconnect backoff ceiling. Call this before publishing.
+func (ps *PeerSet) SetSuspectBackoff(d time.Duration) { ps.suspectBackoff = d }
+
+// SetWriteTimeoutReporter registers a callback for a write timeout that closes
+// a connection and marks its edge suspect. The callback avoids a direct
+// internal/telemetry dependency; production binds it to
+// telemetry.MeshWriteTimeouts.Inc at startup. Nil disables reporting.
+func (ps *PeerSet) SetWriteTimeoutReporter(fn func()) { ps.writeTimeoutReporter = fn }
+
+// Dial opens an mTLS connection to addr and starts a reader into the frame
+// sink. peerID is the remote's CRDT signing node ID. Dial is idempotent while
+// that peer's existing connection remains live.
 func (ps *PeerSet) Dial(ctx context.Context, addr, serverName string, peerID [16]byte) error {
-	// (ADR-0040) — the post-drop re-dial liveness fix.
-	// The earlier early-return checked `existing.conn != nil` (a pointer
-	// non-nil test), but a DROPPED peer's readLoop exits via `defer close(pc.done)`
-	// WITHOUT deleting ps.byAddr[addr] / ps.peers[peerID] (the natural-close path
-	// — only the explicit ClosePeer primitive evicts). A closed *tls.Conn is
-	// STILL a non-nil pointer, so the old guard returned nil "already live" for a
-	// DEAD peer → ReconnectLoop's Dial returned nil → the backoff time.After was
-	// NEVER entered → ReconnectLoop tight-spun at 100% CPU per dropped peer,
-	// never re-dialing (the root cause a review found).
-	// The fix: gate the early-return on LIVENESS via pc.done (closed == dead), NOT
-	// on conn-pointer-non-nil. A live peer (done open) → return nil (idempotent).
-	// A dead peer (done closed) → fall through + re-dial; the stale pc's conn is
-	// closed here (the readLoop exited but never closed the conn — the leak the
-	// re-dial would otherwise orphan) + the stale entry is overwritten at the
-	// ps.peers/ps.byAddr writes below (line 332-333). This also fixes the
-	// reconcile-key-mismatch: the lookup is by ADDR (the stable
-	// identity), NOT by peerID — so an un-provisioned reconciled peer (Dial keyed
-	// under the REAL nodeID, ReconnectLoop spawned with zero) is found here
-	// regardless of which nodeID it was keyed under.
+	// A non-nil *tls.Conn does not imply a live peer: its readLoop may already
+	// have exited. Use pc.done for the liveness decision (ADR-0040). An open done
+	// channel makes Dial idempotent; a closed one permits re-dial and replacement
+	// of the stale map entries. Look up by configured address rather than peerID
+	// so reconciliation from a zero ID to a certificate node ID cannot hide the
+	// existing edge from ReconnectLoop.
 	ps.mu.Lock()
-	// staleConn is the DEAD peer's conn to close AFTER releasing the lock (a
-	// review finding: a tls.Conn.Close sends a close-notify alert via
-	// a BLOCKING Write; doing it UNDER ps.mu would stall every concurrent
-	// Publish (RLock) + Peers (RLock) for one slow peer's close. Capture the
-	// stale conn under the lock; close it outside. No SetWriteDeadline exists in
-	// pkg/transport (grep-confirmed), so the close-notify Write has no bound —
-	// moving it out of the lock is the load-bearing fix.
+	// tls.Conn.Close sends close-notify with a blocking write. Capture a stale
+	// connection under ps.mu but close it after unlocking so one slow peer
+	// cannot stall concurrent Publish and Peers calls.
 	var staleConn *tls.Conn
 	if existing, ok := ps.byAddr[addr]; ok && existing.conn != nil {
 		select {
 		case <-existing.done:
-			// DEAD — the readLoop exited (io.EOF / read error / ctx cancel).
-			// Capture the stale conn for an out-of-lock close (the readLoop did
-			// NOT close it — the orphan-conn leak a review found) + let
-			// the re-dial fall through to overwrite the stale entry. The later
-			// close is idempotent if a concurrent path already closed it.
+			// The readLoop exited. Close the stale connection after unlocking;
+			// re-dial will replace its map entries. Close is idempotent if
+			// another path wins the race.
 			staleConn = existing.conn
 		default:
-			// LIVE — the readLoop is still draining. Idempotent: a concurrent
-			// Dial (or a ReconnectLoop racing the boot dial) returns nil instead
-			// of opening a second conn.
+			// The readLoop is still active, so another Dial racing startup or
+			// ReconnectLoop must not open a duplicate connection.
 			ps.mu.Unlock()
 			return nil // already live
 		}
 	}
+	// An inbound edge may be keyed by its ephemeral source address and therefore
+	// invisible in byAddr under the configured listen address. Check peerID too.
+	// A live match suppresses a duplicate dial and preserves the existing entry.
+	if peerID != ([16]byte{}) && !ps.disableDialPeerIDCheckBugInject.Load() {
+		if p, ok := ps.peers[peerID]; ok && p != nil {
+			select {
+			case <-p.done:
+			default:
+				ps.mu.Unlock()
+				if staleConn != nil {
+					_ = staleConn.Close()
+				}
+				return nil // already live via ps.peers[peerID]
+			}
+		}
+	}
 	ps.mu.Unlock()
 	if staleConn != nil {
-		_ = staleConn.Close() // OUT of the lock — see the staleConn comment above.
+		_ = staleConn.Close() // outside ps.mu; close-notify may block
 	}
 
 	conn, err := ps.dialer.Dial("tcp", addr, serverName)
@@ -378,102 +515,86 @@ func (ps *PeerSet) Dial(ctx context.Context, addr, serverName string, peerID [16
 		addr:         addr,
 		conn:         conn,
 		peerID:       peerID,
+		suspectKey:   addr, // outbound breaker state follows the configured address
 		cancelReader: cancel,
 		done:         make(chan struct{}),
 	}
-	// (ADR-0040) Seam B: the runtime TLS-leaf reconcile. When
-	// autoReconcile is ON AND the caller supplied the ZERO peerID (an
-	// un-provisioned peer — the honest gap), read the peer's TLS leaf
-	// CommonName + re-key the peerConn under the REAL nodeID so the topology
-	// selector HITS + Publish(realNodeID) succeeds → the 2-node binary mesh
-	// converges. The reconcile is a ROUTING fix ONLY: it changes WHICH
-	// ps.peers entry Publish writes to; it NEVER touches the verification
-	// pubkey (the Directory's OOB-provisioned key is the verification anchor).
-	// A PROVISIONED peer (caller passed the real nodeID — Seam A already
-	// resolved it) SKIPS the reconcile: the peer is keyed correctly already, +
-	// the leaf CN is a redundant signal. The reconcile is the ZERO-CONFIG bonus
-	// for a deploy that opts into --peer-auto-reconcile WITHOUT --peer-dir (the
-	// ROUTING re-key lands the Publish under the real nodeID — BUT convergence
-	// STILL REQUIRES the OOB verification pubkey, provisioned via --peer-dir; a
-	// reconcile-only deploy routes but the receiver's Directory.Lookup MISSES
-	// (receiver.go:436) → DropVerify → NO convergence. A binary-harness
-	// honest-negative run PROVES this: reconcile-only does NOT converge. See
-	// reconcilePeerID for the leaf-CN decode + the re-key under ps.mu.
+	// With autoReconcile enabled and no provisioned peer ID, decode the TLS
+	// leaf CommonName and route under the certificate's node ID (ADR-0040).
+	// A caller-supplied real ID needs no reconciliation. Reconciliation changes
+	// routing only: convergence still requires the peer's out-of-band public
+	// key in the receiver Directory, normally provisioned by --peer-dir.
 	effectivePeerID := peerID
 	if ps.autoReconcile && peerID == ([16]byte{}) {
 		if real, ok := ps.reconcilePeerID(pc, conn); ok {
 			effectivePeerID = real
 		}
-		// A reconcile MISS (ok=false) leaves effectivePeerID == zero — the
-		// peerConn stays keyed under the zero peerID, the byte-identical
-		// behavior. The miss is logged inside reconcilePeerID (a peer whose
-		// leaf has NO CN, OR a CN that does not hex-decode to 16 bytes — the
-		// honest "leaf did not self-announce a nodeID" case).
+		// A missing or malformed leaf CN leaves effectivePeerID zero, as when
+		// reconciliation is disabled. reconcilePeerID logs the decode failure.
+	}
+	// Arm before publishing pc in the maps. The nonce and armed fields are
+	// still private to this goroutine, and the later map-install lock orders
+	// those writes before any test reads the installed entry under RLock.
+	armed := false
+	if ps.owner != nil {
+		armed = ps.armChallenge(pc)
 	}
 	ps.mu.Lock()
 	ps.peers[effectivePeerID] = pc
 	ps.byAddr[addr] = pc
 	pc.peerID = effectivePeerID
+	// Reuse the map-install lock to evict expired suspect entries before adding
+	// this edge's entry. The outbound key is the configured address, so the
+	// entry and its breaker state survive replacement peerConns.
+	ps.evictExpiredSuspectsLocked(time.Now().UnixNano())
+	if ps.suspects != nil {
+		if _, ok := ps.suspects[pc.suspectKey]; !ok {
+			ps.suspects[pc.suspectKey] = &suspectEntry{}
+		}
+	}
 	ps.mu.Unlock()
+	// Send the challenge after installation and before starting readLoop. A
+	// send failure leaves the connection routed but unverified, with data
+	// egress closed. Without an owner identity no challenge is sent, so the
+	// connection likewise remains unverified.
+	if armed {
+		_ = ps.sendChallengeFrame(pc)
+	}
 	go ps.readLoop(readerCtx, pc)
 	log.Printf("mesh: dialed peer %x at %s", effectivePeerID, addr)
 	return nil
 }
 
-// reconcilePeerID reads the peer's TLS leaf CommonName + hex-decodes it to the
-// REAL [16]byte nodeID (Seam B — the ADR-0040 runtime reconcile). The
-// leaf is minted by certgen.IssueLeaf(hex.EncodeToString(nodeID[:])) (certgen.go
-// :176 CommonName: nodeID; main.go:1543 the binary's own mint), so the CN is the
-// LOWERCASE HEX of the 16-byte nodeID (32 ASCII chars) — NOT the 16 raw bytes.
-// A naive copy(id[:], []byte(cn)) would truncate the 32-char ASCII hex to 16
-// garbage bytes; the reconcile MUST hex.DecodeString the CN (the SAME mirror
-// resolveNodeID main.go:458 + buildNodeIdentity main.go:1642 use for --node-id
-// / --identity-seed). Returns (realNodeID, true) on a successful decode +
-// (zeroPeerID, false) on a miss:
+// reconcilePeerID decodes a node ID from the peer's TLS leaf CommonName
+// (ADR-0040). certgen.IssueLeaf stores the 16-byte ID as 32 hexadecimal
+// characters, so the CN must be hex-decoded rather than copied as raw bytes.
+// It returns (realNodeID, true) after a valid decode and (zero, false) when no
+// certificate is present, the CN is empty, or it is not a 16-byte hexadecimal
+// ID. Failure leaves the peer keyed under zero. An unrecognized leaf therefore
+// falls back to RegionUnset and full-mesh routing rather than causing a crash.
 //
-//   - zero peer certs (the peer presented NO leaf — a misconfigured RequireAny
-//     client cert, NOT the production RequireAndVerifyClientCert posture): the
-//     reconcile cannot read a CN; the peerConn stays keyed under zero (the
-//
-// byte-identical behavior — the honest "leaf did not self-announce").
-//   - a CN that is not 32 hex chars / does not hex-decode to 16 bytes: a leaf
-//     minted by a NON-engine CA (the dev-mesh CA mints engine-shaped CNs; a
-//     foreign CA's CN is arbitrary). The reconcile logs + returns false (the
-//     peerConn stays keyed under zero; the topology selector misses →
-//     RegionUnset = intra = byte-identical full-mesh — the honest conservative
-//     default for an unrecognized leaf, NOT a crash).
-//
-// ROUTING-only: the reconcile re-keys the ROUTING map (ps.peers); it does
-// NOT call Directory.Register/RegisterPQ (the verification pubkey stays the
-// deploy's OOB concern). A self-announced node with NO OOB-provisioned
-// Directory pubkey is ROUTED (Publish succeeds via ps.byAddr) but NOT VERIFIED
-// (the receiver's Directory.Lookup misses → the delta DROPPED LOUD via
-// VerifyFail — the correct zero-trust posture, disclosed ADR-0040 §6).
-//
-// Called on the Dial goroutine (the cmd dial loop is single-threaded at boot;
-// ReconnectLoop's per-peer goroutine calls it post-boot). The re-key takes ps.mu
-// (the write lock) so a concurrent Publish observes a consistent pre- or post-
-// re-key peerID, never a torn one. The conn is already post-handshake (the
-// dialer.Dial returned a *tls.Conn whose Handshake ran inside Dial), so
-// ConnectionState.PeerCertificates is populated + non-blocking.
+// Reconciliation changes only ps.peers routing. It does not call Register or
+// RegisterPQ: without a separately provisioned Directory key, Publish can route
+// to the peer but the receiver rejects its deltas as unverified (ADR-0040 §6).
+// The map update takes ps.mu, so Publish sees either the old or new key. Dial
+// has already completed the TLS handshake, making PeerCertificates available
+// without blocking.
 func (ps *PeerSet) reconcilePeerID(pc *peerConn, conn *tls.Conn) ([16]byte, bool) {
 	real, ok := nodeIDFromConn(conn)
 	if !ok {
-		log.Printf("mesh: reconcile %s: peer leaf did not self-announce a nodeID — staying keyed under zero peerID (the byte-identical behavior)", pc.addr)
+		log.Printf("mesh: reconcile %s: peer leaf did not self-announce a nodeID — staying keyed under zero peerID (the byte-identical region-fanout behavior)", pc.addr)
 		return [16]byte{}, false
 	}
-	log.Printf("mesh: reconcile %s: peer leaf CN -> real nodeID %x (re-keying PeerSet under the real nodeID; ROUTING-only)", pc.addr, real)
+	log.Printf("mesh: reconcile %s: peer leaf CN -> real nodeID %x (re-keying PeerSet for routing only)", pc.addr, real)
 	return real, true
 }
 
-// nodeIDFromConn extracts the peer's REAL [16]byte nodeID from the TLS leaf
-// CommonName (certgen.go:192/244 embeds the hex nodeID as the CN; certgen.NodeID
-// mirrors it). Shared by the Dial-side reconcile (reconcilePeerID) and the
-// accept-side RegisterInbound (ADR-0045) so the decode is a SINGLE
-// source of truth. The conn MUST be post-handshake (ConnectionState populated).
-// Returns (realNodeID, true) on a 32-hex-char CN that decodes to 16 bytes;
-// (zero, false) otherwise (no leaf, empty CN, non-hex, or wrong length — the
-// honest "leaf did not self-announce a nodeID" case, the conservative default).
+// nodeIDFromConn extracts a 16-byte node ID from the TLS leaf CommonName,
+// which certgen encodes as hexadecimal. Dial reconciliation and
+// RegisterInbound share this decoder (ADR-0045). The connection must have
+// completed its handshake. It returns (id, true) for a valid 32-character CN
+// and (zero, false) for a missing leaf, empty CN, invalid hexadecimal, or an
+// incorrect decoded length.
 func nodeIDFromConn(conn *tls.Conn) ([16]byte, bool) {
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
@@ -492,119 +613,84 @@ func nodeIDFromConn(conn *tls.Conn) ([16]byte, bool) {
 	return real, true
 }
 
-// RegisterInbound is the accept-loop half of the accept-symmetry change (ADR-0045):
-// it installs a peerConn for a connection the PEER dialed IN, keyed by the
-// peer's REAL nodeID (decoded from the inbound TLS leaf CN — the same
-// nodeIDFromConn the Dial-side reconcile uses). This makes a connection a
-// BIDIRECTIONAL publishable edge: before the accept fix, ps.peers was populated ONLY on
-// outbound Dial (peer.go:389), so a B→A edge was publishable for B but NOT for
-// A — A's Publish to a peer that dialed A returned "no live peer" (the
-// cardinality cliff: at 100 nodes the seed's boot dial races 99 listeners, a
-// failed dial leaves the peer permanently absent from ps.peers → the peer never
-// receives A's deltas → 99/99 root-zero, the blocker).
+// RegisterInbound installs a peerConn for an accepted TLS connection, keyed by
+// the node ID decoded from its leaf CN (ADR-0045). Publish can then write back
+// over the connection the peer dialed, and Peers and topology.Select include
+// the inbound peer. Without this registration, only the dialing side could
+// publish over its connection.
 //
-// The accept loop (serveConnWithDigest / serveTestConn) OWNS the read side of
-// the inbound conn — RegisterInbound installs a peerConn with NO readLoop (a
-// second readLoop would double-read the conn, each stealing half the frames).
-// The peerConn exists so Publish(realNodeID) can WRITE back over the same conn
-// the peer dialed in (full-duplex: one TCP conn, two directions, each side
-// reads its own read side + writes via Publish to the peer's entry in its own
-// ps.peers) + so Peers/topology.Select list the inbound peer.
+// serveConnWithDigest or serveTestConn retains ownership of the inbound read
+// loop. RegisterInbound deliberately starts no second reader, which would split
+// frames unpredictably between two goroutines. The full-duplex TCP connection
+// carries reads in the accept loop and writes through Publish.
 //
-// PeerConnHandle is an OPAQUE registration receipt. It
-// exists because `peerConn` is unexported while the accept loop that must bind its
-// release to a specific registration lives in package main
-// (cmd/sovereign-node/main.go serveConnWithDigest). The handle carries no methods
-// and exposes no fields: the caller's only legitimate use is to hand it back to
-// ReleaseInboundConn, which compares it by IDENTITY against the currently-
-// registered peerConn. A nil handle means "nothing was installed" (a decode miss
-// or a decline) and makes the release a no-op.
+// PeerConnHandle identifies one registration to the accept loop in package main
+// without exposing peerConn. ReleaseInboundConn compares the handle's identity
+// with the currently registered connection before closing it. A nil handle
+// means registration failed or was declined and makes release a no-op.
 type PeerConnHandle struct{ pc *peerConn }
 
-// LIVENESS GUARD (the storm's close). The earlier code
-// evicted any existing peerConn for realNodeID/addr UNCONDITIONALLY, and its
-// comment claimed that was "the SAME discipline Dial uses at peer.go:389". That
-// claim was FALSE on the bytes: Dial (peer.go:344-358) is LIVENESS-GUARDED —
-// `select <-existing.done` → DEAD: replace; `default` → LIVE: return nil
-// "already live". RegisterInbound had no such guard, and that ASYMMETRY WAS the
-// colocated stampede:
+// If an edge for this node ID or address is already live, RegisterInbound
+// declines the new registration rather than replacing it. The accept loop still
+// serves the unregistered connection, so inbound frames continue through
+// DispatchFrame, but no done channel closes and ReconnectLoop is not woken.
 //
-//  1. A and B dial each other (at 34 nodes/host, mutual dials are the NORM).
-//  2. B's accept loop calls RegisterInbound for A's inbound conn → it evicts
-//     B's own LIVE outbound peerConn to A + cancels its readLoop → B's
-//     pc.done CLOSES.
-//  3. B's ReconnectLoop wakes on that closed done, sees DEAD, and re-dials
-//     A IMMEDIATELY (the success path has no backoff floor).
-//  4. A's accept loop registers the new inbound, evicting A's live outbound
-//     → goto 1.
+// Replacing live edges creates a mutual-dial feedback loop: A's accepted
+// connection replaces its outbound edge to B, the old reader exits,
+// ReconnectLoop dials B again, and B repeats the same replacement. At 34 nodes
+// per host this reached about 700 dials per second per node for four minutes;
+// one node recorded 127,163 dials to 99 peers while the remote regions received
+// no frames.
 //
-// Silicon measured ~700 dials/sec/node sustained for 4 minutes (127,163 dials
-// on ONE eu-west-1 node for 99 peers), and BOTH remote regions received ZERO
-// frames for the whole run.
+// The invariant is to preserve live edges, not to force exactly one connection
+// per pair. Mutual dials can leave two connections, with each node publishing
+// on its outbound edge. A staggered connection with no existing edge is still
+// registered. Avoiding a node-ID tie-break also avoids another close protocol
+// around done, whose close race previously caused a double-close panic
+// (ADR-0046).
 //
-// The guard makes the comment true: if the existing peerConn is LIVE, do NOT
-// evict and do NOT register — return a DECLINE (nil pc). The caller (the accept
-// loop) KEEPS SERVING the conn unregistered, which is exactly the original
-// semantics: the remote still Publishes over it and the frames still reach our
-// receive path via DispatchFrame. No close, no done fired, no ReconnectLoop
-// wake. First-writer-wins-if-live.
+// A restarted peer's new inbound connection can be declined while the old
+// outbound connection still appears live. Recovery waits for the old readLoop
+// to observe RST or EOF; keepalives or read deadlines can shorten that window
+// if measurements show it dominates recovery.
 //
-// WHY A GUARD AND NOT A TIE-BREAK: the invariant the engine needs is NOT "exactly
-// one conn per pair" — it is "no live edge is ever evicted". A lower-nodeID
-// tie-break would need a winner election plus loser-close choreography, and the
-// done-close seam is the one with TOCTOU history (the
-// `close of closed channel` boot panic at 100 nodes). Every avoidable close
-// removed from this seam is risk removed. Steady state: mutual dials →
-// 2 conns/pair, each side publishing on its OWN outbound (the proven
-// topology); staggered boot → 1 conn registered by the accept side (the
-// inbound-registration repair, INTACT — TestMutualDialStaggeredBoot is the
-// anti-tautology guard proving it cannot be implemented as an unconditional decline).
+// For a dead edge, capture the old peerConn under ps.mu, install the new one,
+// then cancel the old reader and close its connection after unlocking. Close
+// can block on close-notify and must not stall Publish or Peers. The accept
+// loop remains responsible for closing the inbound connection itself.
 //
-// DISCLOSED WINDOW (an accepted trade-off): crash-restart staleness. A peer that
-// crashes and restarts dials in; the guard DECLINES because our old conn to it
-// still reads LIVE (its done does not close until that readLoop observes RST/EOF).
-// Recovery is bounded by dead-conn detection latency, NOT deadlocked — the same
-// order as the tie-break's worst case. Revisit with a keepalive/deadline if a
-// ≥1K-node run shows it dominating.
-//
-// Stale-close discipline for the DEAD case (mirrors Dial at peer.go:316-345):
-// under ps.mu, capture the dead peerConn for an out-of-lock close + reader cancel
-// (a tls.Conn.Close sends a blocking close-notify Write; doing it under ps.mu
-// would stall every concurrent Publish/Peers), then install the inbound peerConn.
-// The accept loop's own defer conn.Close owns the inbound conn's close;
-// RegisterInbound does NOT close the inbound conn.
-//
-// RETURNS (the identity-guarded release): the real nodeID AND the INSTALLED
-// *peerConn. The pc is nil on a decode miss OR on a decline (nothing was
-// installed) — and on a DECLINE the returned nodeID is ZERO, so the caller's
-// deferred ReleaseInboundConn no-ops at its zero check instead of slipping
-// past the identity guard with a nil mine and closeDoneing the LIVE edge
-// the decline just protected. The caller MUST bind its deferred release to
-// the RETURNED pc — not to the nodeID — via ReleaseInboundConn, so a goroutine
-// whose registration was superseded (or declined) cannot close a conn it never
-// owned. See ReleaseInbound/ReleaseInboundConn for the wrong-kill this closes.
-// Safe to call concurrently with Dial/Publish/Peers.
+// RegisterInbound returns the real node ID and an installed handle. A decode
+// failure or live-edge decline returns zero and nil. The zero ID makes a
+// deferred ReleaseInboundConn a no-op, preventing a declined goroutine from
+// closing the live edge it does not own. Callers must release the returned
+// handle rather than just the node ID. The method is safe concurrently with
+// Dial, Publish, and Peers.
 func (ps *PeerSet) RegisterInbound(conn *tls.Conn) ([16]byte, *PeerConnHandle) {
 	real, ok := nodeIDFromConn(conn)
 	if !ok {
-		// The peer's leaf did not self-announce a nodeID (no leaf, empty CN,
-		// non-hex, or wrong length — a non-engine CA). Stay byte-identical to the
-		// original accept path: do NOT register, so Publish to this peer keeps
-		// missing (the honest conservative default, the SAME posture reconcile
-		// keeps for an unrecognized Dial-side leaf).
+		// Without a valid engine-shaped leaf CN there is no stable node ID to
+		// register. Leave the connection unregistered, as Dial reconciliation
+		// does for an unrecognized leaf.
 		return [16]byte{}, nil
 	}
 	addr := conn.RemoteAddr().String()
 	pc := &peerConn{
-		addr:   addr,
-		conn:   conn,
-		peerID: real,
-		done:   make(chan struct{}),
+		addr:       addr,
+		conn:       conn,
+		peerID:     real,
+		suspectKey: suspectKeyForNodeID(real), // inbound breaker key from the certificate
+		done:       make(chan struct{}),
+	}
+	// Arm while pc is still private to this accept goroutine. The map-install
+	// lock publishes those writes before any RLock reader can inspect them.
+	// Decode failures return before any handshake state is created.
+	armed := false
+	if ps.owner != nil {
+		armed = ps.armChallenge(pc)
 	}
 
-	// Look up the existing edge, then BRANCH ON LIVENESS (the Dial mirror).
-	// LIVE → decline (no evict, no register, no close). DEAD → capture it for an
-	// out-of-lock close + reader cancel, and install the inbound peerConn.
+	// A live edge is preserved and the new registration is declined. A dead
+	// edge is captured for close and reader cancellation after unlocking.
 	var stalePC *peerConn
 	ps.mu.Lock()
 	existing, ok := ps.peers[real]
@@ -614,42 +700,48 @@ func (ps *PeerSet) RegisterInbound(conn *tls.Conn) ([16]byte, *PeerConnHandle) {
 	if ok && existing != nil {
 		select {
 		case <-existing.done:
-			// DEAD — the readLoop exited (io.EOF / read error / ctx cancel) or a
-			// prior release closed it. Replace: capture for the out-of-lock close.
+			// The old reader exited or a prior release marked it dead. Capture
+			// the edge so its connection can be closed after unlocking.
 			stalePC = existing
 		default:
-			// LIVE — we already hold a working edge to this peer (we dialed them
-			// outbound, or another accept goroutine registered first). DECLINE.
-			// Evicting here is what armed the mutual-eviction storm; keeping the
-			// live edge means no pc.done fires, so no ReconnectLoop wakes.
-			//
-			// The decline
-			// MUST return the ZERO nodeID, not `real`. The accept loops defer
-			// ReleaseInboundConn(inboundNodeID, myPC) UNCONDITIONALLY, and a
-			// (real, nil) pair slips PAST ReleaseInboundConn's identity guard
-			// (`mine != nil && ...` is false when mine==nil), so when this
-			// declined conn later dropped, the deferred release closeDoned the
-			// LIVE edge — the exact wrong-kill the docstring at :663-667
-			// describes. The zero nodeID makes the
-			// release no-op at its first check, delivering the documented
-			// contract ("a nil handle makes the release a no-op"). The declined
-			// conn keeps being SERVED unregistered either way (the original
-			// semantics); only the release bookkeeping changes.
+			// A working edge already exists, either outbound or accepted by
+			// another goroutine. Decline without evicting it or waking its
+			// ReconnectLoop. Return a zero node ID as well as a nil handle:
+			// accept loops defer ReleaseInboundConn unconditionally, and the
+			// zero check must stop this declined connection from releasing the
+			// live edge it never owned. It continues serving inbound frames.
 			ps.mu.Unlock()
+			// Record that this decline came from our own live edge. The peer's
+			// mutual-dial verification should not consume its per-key answer
+			// reservation. Take the leaf lock only after releasing ps.mu.
+			ps.challengeDeclinedMu.Lock()
+			if ps.challengeDeclinedLiveEdge == nil {
+				ps.challengeDeclinedLiveEdge = make(map[string]int64) // lazy, cold
+			}
+			ps.challengeDeclinedLiveEdge[pc.suspectKey] = time.Now().UnixNano()
+			ps.challengeDeclinedMu.Unlock()
 			return [16]byte{}, nil
 		}
 	}
 	ps.peers[real] = pc
 	ps.byAddr[addr] = pc
+	// Key the inbound breaker by certificate node ID, not pc.addr: the source
+	// port changes on every dial, while sweeps publish by ps.peers node ID.
+	// Reusing this stable key preserves backoff across replacement connections.
+	// Evict expired entries before inserting; an entry with a future skipUntil
+	// survives, so redialing during backoff does not clear the skip.
+	ps.evictExpiredSuspectsLocked(time.Now().UnixNano())
+	if ps.suspects != nil {
+		if _, ok := ps.suspects[pc.suspectKey]; !ok {
+			ps.suspects[pc.suspectKey] = &suspectEntry{}
+		}
+	}
 	ps.mu.Unlock()
 
 	if stalePC != nil {
-		// Cancel the stale peerConn's readLoop (the outbound Dial spawned it)
-		// + close its conn OUT of the lock (the blocking close-notify Write).
-		// The stale readLoop exits via its defer close(pc.done) → the stale entry
-		// (if it was keyed under a DIFFERENT nodeID, e.g. the zero peerID of an
-		// un-reconciled outbound dial) is now dead; a later ReconnectLoop re-dials
-		// + re-registers. Idempotent if the stale conn is already closed.
+		// Cancel the old outbound reader and close its connection outside ps.mu.
+		// Its deferred closeDone marks any stale zero-ID entry dead so a later
+		// ReconnectLoop can replace it. Repeated close is harmless.
 		if stalePC.cancelReader != nil {
 			stalePC.cancelReader()
 		}
@@ -657,48 +749,34 @@ func (ps *PeerSet) RegisterInbound(conn *tls.Conn) ([16]byte, *PeerConnHandle) {
 			_ = stalePC.conn.Close()
 		}
 	}
-	log.Printf("mesh: registered inbound peer %x at %s (accept-symmetry — the B→A edge is now publishable for A)", real, addr)
+	// Both ends prove key possession. Send this side's challenge after
+	// installation, on the accept goroutine that will read the response after
+	// RegisterInbound returns to the serve loop.
+	if armed {
+		_ = ps.sendChallengeFrame(pc)
+	}
+	log.Printf("mesh: registered inbound peer %x at %s (inbound edge is publishable)", real, addr)
 	return real, &PeerConnHandle{pc: pc}
 }
 
-// ReleaseInbound marks the inbound peerConn for nodeID as dead (closes pc.done)
-// so a later Dial/ReconnectLoop sees it as dropped + re-establishes. Called by
-// the accept loop (serveConnWithDigest / serveTestConn) when its goroutine exits
-// (io.EOF / read error / ctx cancel). It does NOT close the conn — the accept
-// loop's own defer conn.Close owns that. Safe to call with a nodeID that was
-// never registered (a decode-miss skip) or already released (idempotent: the
-// select-default guards a double close of pc.done, which would panic).
+// ReleaseInbound marks an inbound peerConn dead so Dial or ReconnectLoop can
+// replace it. The accept loop calls it on EOF, a read error, or cancellation.
+// Closing the TLS connection remains the accept loop's responsibility. Unknown
+// and already released IDs are harmless.
 func (ps *PeerSet) ReleaseInbound(nodeID [16]byte) {
 	ps.ReleaseInboundConn(nodeID, nil)
 }
 
-// ReleaseInboundConn is the IDENTITY-GUARDED release.
-// It marks the inbound peerConn for nodeID dead ONLY IF the currently-registered
-// peerConn IS the one the caller installed (ps.peers[nodeID] == mine). The accept
-// loop passes the *peerConn RegisterInbound returned; a nil mine preserves the
-// legacy identity-blind behavior for callers that have no pc to bind to.
+// ReleaseInboundConn releases nodeID only when mine is the currently registered
+// peerConn. Without this identity check, an old accept goroutine could release
+// a newer connection after its own registration had been superseded. A declined
+// registration could likewise close the live edge that caused the decline.
+// A nil mine retains the identity-blind behavior for external callers of
+// ReleaseInbound; accept loops in this repository pass their returned handle.
 //
-// THE WRONG-KILL THIS CLOSES (a review finding — latent before the guard, and
-// load-bearing after it):
-//
-//	Without the identity guard (latent): accept goroutine G1 registers pc1 for
-//	  peer P. A newer
-//	  registrant (or a Dial) supersedes it, so ps.peers[P] == pc2 (LIVE). G1's
-//	  conn then drops and its deferred ReleaseInbound(P) fires — the identity-blind
-//	  lookup finds pc2 and closes pc2.done. G1 just killed a LIVE conn it never
-//	  owned, waking P's ReconnectLoop for no reason.
-//	With a naive guard (would be worse): a DECLINED registration returns nil pc,
-//	  but an
-//	  identity-blind release keyed on the nodeID would still close whatever edge
-//	  IS registered — so every declining accept goroutine would, on exit, kill the
-//	  very live edge the guard just protected. Without the identity check, the
-//	  guard would trade the eviction storm for a wrong-kill race.
-//
-// The comparison is a POINTER identity check under ps.mu, so it is atomic with
-// respect to a concurrent RegisterInbound/Dial swap: either we observe our own pc
-// (and close it) or we observe someone else's (and leave it alone). The close
-// itself routes through pc.closeDone — the sync.Once — so
-// even a double release cannot panic.
+// The pointer comparison under ps.mu is atomic with concurrent registration and
+// dialing. closeDone uses sync.Once (ADR-0046), so a duplicate release cannot
+// panic by closing done twice.
 func (ps *PeerSet) ReleaseInboundConn(nodeID [16]byte, mine *PeerConnHandle) {
 	if nodeID == ([16]byte{}) {
 		return // a decode-miss skip — nothing was registered.
@@ -709,49 +787,39 @@ func (ps *PeerSet) ReleaseInboundConn(nodeID [16]byte, mine *PeerConnHandle) {
 	if !ok || pc == nil {
 		return
 	}
-	// Release ONLY our own registration. A nil `mine` keeps the legacy
-	// identity-blind behavior (no caller in this repo relies on it — the accept
-	// loops all bind to the returned pc — but the ReleaseInbound wrapper preserves
-	// the exported signature for any external caller).
+	// A non-nil handle must match the current registration. Accept loops always
+	// pass their handle; nil retains ReleaseInbound's compatibility behavior for
+	// external callers.
 	if mine != nil && pc != mine.pc {
-		return // superseded (or declined): NOT ours to close.
+		return // the registration was superseded or declined
 	}
 	select {
 	case <-pc.done:
-		// already closed (a double-release, or the stale-close path closed it).
+		// A duplicate release or stale-close path already closed it.
 	default:
 		pc.closeDone()
 	}
-	// An inbound edge has no readLoop to run the removal defer — the
-	// accept-loop release IS its death path, so the byAddr bound lives here.
+	// Inbound edges have no readLoop defer to remove their map entries, so the
+	// accept-loop release performs that cleanup here.
 	ps.removeDeadEntry(pc)
 }
 
-// closeDone closes pc.done EXACTLY ONCE (the sync.Once at the closeDoneOnce
-// field). Both ReleaseInbound (the accept-loop drop) + the readLoop's exit
-// defer route through this — whichever fires first wins, the other's Once.Do
-// is a no-op. This is the fix for the silicon-found
-// `panic: close of closed channel` (the TOCTOU between the readLoop's UNGUARDED
-// `defer close(pc.done)` + ReleaseInbound's select-guarded close).
+// closeDone closes pc.done once across the racing readLoop exit and
+// ReleaseInbound paths. The sync.Once prevents the double-close panic that a
+// check followed by close cannot avoid (ADR-0046).
 func (pc *peerConn) closeDone() {
 	pc.closeDoneOnce.Do(func() { close(pc.done) })
 }
 
-// removeDeadEntry (ADR-0045) deletes pc's ps.byAddr and
-// ps.peers entries — ONLY if the maps still point at THIS peerConn. It is the
-// byAddr cardinality bound: RegisterInbound keys byAddr under the peer's
-// EPHEMERAL source port, so every inbound reconnection minted a FRESH key and
-// nothing ever deleted on a natural close — the map grew without bound,
-// pinning each dead peerConn → *tls.Conn → grown record buffers.
+// removeDeadEntry deletes pc's byAddr and peers entries only when they still
+// point to that exact peerConn (ADR-0045). Inbound source ports change on every
+// connection, so without removal byAddr would retain dead TLS connections and
+// their record buffers indefinitely.
 //
-// THE TRAP THIS RESPECTS (do not "simplify" it away): the identity check
-// (cur == pc) is what makes deletion safe against the re-registration race —
-// if Dial or RegisterInbound already replaced the entry with a NEWER live
-// peerConn, the delete is skipped. Deletion and the dead-entry tolerance in
-// Dial/liveReconnectEdge are COMPLEMENTS: a lookup that races the delete sees
-// either the dead entry (and falls through past it) or no entry (and dials) —
-// both correct. The tolerance MUST REMAIN (deletion can never be assumed to
-// have won the race); it is the correctness floor, this is the bound.
+// The identity check preserves a newer connection installed by Dial or
+// RegisterInbound. Lookup paths must still tolerate dead entries: racing this
+// deletion, they can see either the old entry or no entry, and both cases must
+// lead to a valid redial decision.
 func (ps *PeerSet) removeDeadEntry(pc *peerConn) {
 	ps.mu.Lock()
 	if cur, ok := ps.byAddr[pc.addr]; ok && cur == pc {
@@ -765,42 +833,29 @@ func (ps *PeerSet) removeDeadEntry(pc *peerConn) {
 	ps.mu.Unlock()
 }
 
-// readLoop reads frames from the conn and dispatches them
-// -> recv.HandleFrame / recv.HandleBatchFrame (the receive sinks). It exits on
-// ctx cancel or a read error (io.EOF on peer close); the reconnect loop
-// (ReconnectLoop) re-dials with bounded backoff.
+// readLoop reads length-prefixed frames from pc and dispatches them to the
+// receive or digest sink. It exits on cancellation, EOF, or a read error;
+// ReconnectLoop can then re-dial with bounded backoff.
 //
-// dispatch: after ReadFrame strips the 4-byte length prefix, read the
-// first 4 bytes of the frame body. attribution.IsBatchFrame returns true iff
-// they match WireV1Magic (big-endian) — route to HandleBatchFrame (the batch
-// path); else route to HandleFrame (the RelayEnvelope path — back-compat
-// default). The peek is a NO-COPY slice-header read (it never allocates); the
-// magic is DISTINCT from the RelayEnvelope's uint16-LE version prefix so the
-// dispatch is unambiguous (a batch is never handed to the RelayEnvelope parser,
-// which would DropMalformed it — a silent throughput collapse).
+// ReadFrame strips the four-byte length prefix. DispatchFrame examines the body
+// prefix without copying it: WireV1Magic selects HandleBatchFrame,
+// WireHybridPQMagic selects HandleHybridFrame, WireDigestMagic selects the
+// digest sink, and a little-endian RelayEnvelope version selects HandleFrame.
+// The distinct prefixes prevent a batch or hybrid frame from being rejected as
+// a malformed RelayEnvelope.
 func (ps *PeerSet) readLoop(ctx context.Context, pc *peerConn) {
-	// A review finding: close the conn when the readLoop exits so
-	// a natural peer drop (io.EOF / read error / ctx cancel) does NOT leak the
-	// underlying *tls.Conn + its TCP socket + fd. The earlier code had only
-	// `defer close(pc.done)` (the goroutine-signal) — the conn was closed only
-	// by ClosePeer (the explicit primitive, never called for a natural drop) or
-	// the Dial DEAD-branch (post-drop re-dial, which never fires during a
-	// meshCtx-canceled shutdown). A drop during shutdown (ReconnectLoop returns
-	// without re-dialing on ctx.Err) leaked the conn for the process lifetime.
-	// The close is idempotent (tls.Conn.Close after a TCP RST returns an error
-	// we discard; a double-close is a no-op on the fd). LIFO defer order:
-	// declare pc.conn.Close FIRST + close(pc.done) SECOND so close(pc.done)
-	// RUNS FIRST — a concurrent Dial's DEAD-branch capture sees pc.done closed
-	// BEFORE the conn is closed, so the liveness check (`<-existing.done`) stays
-	// the gating signal, NOT a conn-state sniff (no torn-state window where done
-	// is open but the conn is closing).
+	// Close the TLS connection on every exit, including cancellation during
+	// shutdown, so its socket and file descriptor are not retained. Close is
+	// idempotent after a reset or another close path.
+	//
+	// Defers run in reverse order: closeDone, removeDeadEntry, then conn.Close.
+	// A concurrent Dial therefore observes done closed before the connection
+	// closes and continues to use done as the liveness signal. Map removal is
+	// identity-checked so a replacement edge at the same address survives.
 	defer pc.conn.Close()
-	// After the done-signal, drop this edge's map entries (identity-checked
-	// — a re-registered newer edge at the same addr survives). LIFO: closeDone
-	// runs first, then the removal, then the conn close.
 	defer ps.removeDeadEntry(pc)
-	defer pc.closeDone()                  // Once-guarded (was unguarded `defer close(pc.done)` → the silicon TOCTOU panic)
-	fr := receive.NewFrameReader(pc.conn) // receiver.go:474 (io.Reader)
+	defer pc.closeDone() // sync.Once shared with ReleaseInbound (ADR-0046)
+	fr := receive.NewFrameReader(pc.conn)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -815,44 +870,152 @@ func (ps *PeerSet) readLoop(ctx context.Context, pc *peerConn) {
 			}
 			return
 		}
-		// Dial-side receive-count (a symmetry probe).
-		// Bounded: ONE log line every 100th frame so the hot loop is NOT a log
-		// storm. Answers: did the peer write anything back over the connection WE
-		// dialed? (NOT the seed->peer delta nor the peer->seed bootstrap — both
-		// arrive on the accept loop. This is the narrower symmetry check.) The
-		// DispatchFrame verdict stays discarded into `_` below — do NOT remove the
-		// discard (the accept side at main.go owns verdict logging).
+		// Count frames arriving on this dialed connection, including handshake
+		// frames, and log only every hundredth. Frames on the accept loop are
+		// accounted separately. DispatchFrame verdicts are discarded here; the
+		// accept loop owns verdict logging.
 		rcvd := atomic.AddUint64(&pc.framesReceived, 1)
 		if rcvd%100 == 0 {
 			log.Printf("mesh: peer %x dial-side received %d frame(s)", pc.peerID, rcvd)
 		}
-		// dispatch: peek the post-length-prefix body's first 4
-		// bytes. DispatchFrame centralizes the three-way routing — a
-		// BatchEnvelope magic routes to HandleBatchFrame (the batch
-		// path); a WireDigestMagic routes to the digestSink (the
-		// stratified-anti-entropy digest-exchange, ADR-0034); the default routes
-		// to HandleFrame (the relay path). The digestSink is the
-		// Gossiper bound to this PeerSet (nil-safe: a Gossiper with stratified
-		// OFF never registers a sink, so the digest branch is a no-op drop).
-		_ = DispatchFrame(frame, pc.peerID, ps.recv, ps.digester)
+		// DispatchFrame has no challenge arm, so route challenge frames before
+		// data-plane parsing. The prefix check is allocation-free. Accepted
+		// connections handle challenges in their serve loops instead.
+		if IsChallengeFrame(frame) {
+			ps.handleConnChallengeFrame(pc, frame)
+			continue
+		}
+		// Reject a digest received on an unverified connection before identity
+		// processing. DeliverDigest separately checks identity binding. Using
+		// the frame's own connection prevents a superseded connection from
+		// borrowing the current map entry's verified bit. The check adds one
+		// atomic load and branch to digest frames only.
+		if frameIsDigest(frame) && !pc.remoteVerified.Load() && !ps.disableDigestSeamBugInject.Load() {
+			ps.digestSeamDrops.Add(1)
+			continue
+		}
+		// DispatchFrame routes batch, hybrid, digest, and relay frames by magic.
+		// A nil digest sink drops digests while stratified anti-entropy is off
+		// (ADR-0034). When exchange diagnostics are disabled, the else branch
+		// makes the same dispatch call without timing it.
+		if ps.l0iExchDebug.Load() {
+			l0iT0 := time.Now()
+			_ = DispatchFrame(frame, pc.peerID, ps.recv, ps.digester)
+			ps.NoteDispatchBusy(L0ILoopRead, time.Since(l0iT0).Nanoseconds())
+		} else {
+			_ = DispatchFrame(frame, pc.peerID, ps.recv, ps.digester)
+		}
 	}
 }
 
-// Publish writes length-prefixed frame bytes to a live peer identified by
-// peerID. The caller (gossip.go) has already length-prefixed the bytes via
-// receive.LengthPrefixFrame; Publish just runs the TransmitTLSFrame
-// copy-mode writer.
+// DefaultSuspectBackoff matches the production ReconnectLoop backoff ceiling.
+// A write probe cannot succeed before re-dial completes, so a shorter suspect
+// window would mostly probe dead connections. Ten seconds limits a chronically
+// failing peer to about one write-timeout per reconnect cycle while allowing a
+// recovered peer to be probed after the next dial. The window always expires;
+// it is not a permanent partition.
+const DefaultSuspectBackoff = 10 * time.Second
+
+// errPeerSuspected lets Publish fail immediately while an edge is in suspect
+// backoff. The sweep skips that peer for the current round, and errors.Is lets
+// diagnostics distinguish a temporary skip from other write failures.
+var errPeerSuspected = errors.New("mesh: peer is in write-stall suspect backoff")
+
+// suspectKeyForNodeID namespaces a certificate-derived node ID with a NUL
+// prefix. Printable host:port addresses cannot contain NUL, so inbound and
+// outbound breaker keys cannot collide. The string is allocated once during
+// edge installation.
+func suspectKeyForNodeID(id [16]byte) string {
+	b := make([]byte, 17)
+	b[0] = 0
+	copy(b[1:], id[:])
+	return string(b)
+}
+
+// evictExpiredSuspectsLocked deletes entries whose skipUntil is at or before
+// now, including zero-valued cleared entries. markSuspect, Dial, and
+// RegisterInbound call it under ps.mu, avoiding another lock or goroutine.
+// removeDeadEntry and ClosePeer deliberately do not call it: connection loss
+// must not erase the backoff that suppresses immediate retries.
+//
+// Expiry is lazy. During complete quiescence an expired entry remains until
+// the next mutation, so the bound is on distinct identities and at most one
+// unswept generation, not on how long an expired entry can remain in memory.
+func (ps *PeerSet) evictExpiredSuspectsLocked(now int64) {
+	if ps.suspects == nil {
+		return
+	}
+	if ps.disableSuspectEviction.Load() {
+		return // test-only eviction control
+	}
+	for k, se := range ps.suspects {
+		if se == nil || se.skipUntil.Load() <= now {
+			delete(ps.suspects, k)
+		}
+	}
+}
+
+// suspectEntry holds write-stall backoff for one configured address or
+// certificate node ID. Dial and RegisterInbound create entries that survive
+// replacement peerConns. markSuspect sets skipUntil after any write error,
+// Publish reads it for its fast-fail check, and a successful write clears it.
+// Atomic access avoids a new hot-path mutex. Lazy expiry bounds the map by
+// distinct peer identities rather than connection count.
+type suspectEntry struct {
+	skipUntil atomic.Int64
+}
+
+// markSuspect records a write failure under the edge's stable configured
+// address or certificate node ID. It runs only on Publish's cold error path.
+// The upsert also supports a zero-value PeerSet used directly by a test.
+//
+// Expired entries are swept before the upsert. A positive backoff leaves the
+// new skipUntil in the future so the entry survives its own sweep. Zero
+// backoff stores the current time, and the next mutation removes the entry.
+func (ps *PeerSet) markSuspect(key string) {
+	now := time.Now()
+	ps.mu.Lock()
+	ps.evictExpiredSuspectsLocked(now.UnixNano())
+	se, ok := ps.suspects[key]
+	if !ok || se == nil {
+		if ps.suspects == nil {
+			ps.suspects = make(map[string]*suspectEntry)
+		}
+		se = &suspectEntry{}
+		ps.suspects[key] = se
+	}
+	// Store skipUntil while still holding ps.mu. If a new zero-valued entry
+	// were published first, a concurrent eviction could delete it before this
+	// store, losing the mark and leaving the store on an orphaned entry.
+	se.skipUntil.Store(now.Add(ps.suspectBackoff).UnixNano())
+	ps.mu.Unlock()
+}
+
+// Publish writes a frame already prefixed by receive.LengthPrefixFrame to the
+// live peer identified by peerID. It delegates to transport.TransmitTLSFrame
+// through writeToPC.
 func (ps *PeerSet) Publish(peerID [16]byte, prefixed []byte) error {
+	// writeToPC is the sole production caller of TransmitTLSFrame. Data frames,
+	// digest responses, challenges, and challenge responses therefore share the
+	// same write deadline, close-on-error handling, and suspect bookkeeping.
 	ps.mu.RLock()
 	pc, ok := ps.peers[peerID]
-	ps.mu.RUnlock()
 	if !ok || pc == nil {
+		ps.mu.RUnlock()
 		return fmt.Errorf("mesh: Publish: no live peer %x", peerID)
 	}
-	if _, err := transport.TransmitTLSFrame(pc.conn, prefixed); err != nil { // transport.go:142
-		return fmt.Errorf("mesh: Publish to %x: %w", peerID, err)
+	// Read the suspect entry under the same RLock as the peer lookup. Its
+	// configured-address or certificate-ID key survives redials. A live backoff
+	// makes writeToPC fail before touching the connection, avoiding another
+	// write-timeout delay in every sweep round.
+	var se *suspectEntry
+	if !ps.disableSuspectBreaker.Load() {
+		se = ps.suspects[pc.suspectKey]
 	}
-	return nil
+	ps.mu.RUnlock()
+	// Challenge senders also call writeToPC directly, keeping connection writes
+	// on one deadline, abort, and suspect-accounting path.
+	return ps.writeToPC(peerID, pc, prefixed, se)
 }
 
 // Peers returns a snapshot of the live peer IDs. Used by the gossip sweep to
@@ -865,6 +1028,17 @@ func (ps *PeerSet) Peers() [][16]byte {
 	}
 	ps.mu.RUnlock()
 	return ids
+}
+
+// isLive reports whether peerID is registered in the PeerSet. It is used by
+// peer-root and deferred-state eviction and is private to the mesh package.
+// isLive takes ps.mu.RLock itself: ps.mu, not the caller's peerRootsMu,
+// serializes this membership read against PeerSet mutations.
+func (ps *PeerSet) isLive(peerID [16]byte) bool {
+	ps.mu.RLock()
+	_, ok := ps.peers[peerID]
+	ps.mu.RUnlock()
+	return ok
 }
 
 // Close cancels all reader goroutines and closes the peer connections.
@@ -885,26 +1059,21 @@ func (ps *PeerSet) Close() error {
 				firstErr = err
 			}
 		}
-		// (ADR-0045): an INBOUND peerConn has no
-		// readLoop, so nothing closes its done once the accept loop is gone —
-		// `<-pc.done` would block forever (the deadlock shape ClosePeer
-		// already fixes at :885). closeDone is the sync.Once no-op for
-		// outbound conns (their readLoop's deferred close is the primary
-		// path) and the deadlock break for inbound ones.
+		// Inbound peerConns have no readLoop defer to close done after the
+		// accept loop exits, so closeDone prevents the wait below from blocking.
+		// For outbound connections it is harmless if the reader already closed
+		// done (ADR-0045).
 		pc.closeDone()
 		<-pc.done
 	}
 	return firstErr
 }
 
-// ClosePeer closes ONE peer's connection and cancels its readLoop, leaving every
-// other peer untouched. It is the per-peer partition primitive the
-// ConvergenceProbe composes: a partition drops a single peer's conn (NOT
-// Close-all), and a later Dial re-establishes it (the heal). The peer is removed
-// from BOTH the peers and byAddr maps under the write lock BEFORE the conn is
-// closed, so a concurrent Publish finds the peer already gone and returns
-// ErrNoPeers (never a write to a closed/nil conn — the nil-safety).
-// Returns nil for a peer that is not present (already gone = idempotent).
+// ClosePeer closes one peer's connection and cancels its readLoop without
+// affecting other peers. ConvergenceProbe uses it to create a per-peer
+// partition; a later Dial restores the connection. The peers and byAddr entries
+// are removed under the write lock before the connection closes, so concurrent
+// Publish calls cannot write to a closed connection. Missing peers return nil.
 func (ps *PeerSet) ClosePeer(peerID [16]byte) error {
 	ps.mu.Lock()
 	pc, ok := ps.peers[peerID]
@@ -926,16 +1095,10 @@ func (ps *PeerSet) ClosePeer(peerID [16]byte) error {
 	if pc.conn != nil {
 		_ = pc.conn.Close()
 	}
-	// An INBOUND
-	// peerConn (RegisterInbound, peer.go:578) has NO readLoop and NO
-	// cancelReader — its only done-closer is the accept loop's deferred
-	// ReleaseInboundConn, which early-returns because this function ALREADY
-	// deleted the map entry (ps.peers[nodeID] misses → return). Waiting on
-	// `<-pc.done` then blocks FOREVER: a deterministic deadlock the moment
-	// ClosePeer meets an inbound-registered edge. closeDone here is the fix;
-	// the sync.Once makes it a no-op for OUTBOUND conns,
-	// whose readLoop's deferred close is the primary path — the wait below
-	// still observes the close.
+	// An inbound peerConn has no readLoop or cancelReader. Its accept loop's
+	// deferred release cannot close done because the map entry is already gone,
+	// so closeDone prevents a permanent wait here. sync.Once handles outbound
+	// readers that close done concurrently (ADR-0046).
 	pc.closeDone()
 	<-pc.done // the readLoop goroutine exits on ctx cancel / io.EOF
 	return nil
@@ -944,55 +1107,29 @@ func (ps *PeerSet) ClosePeer(peerID [16]byte) error {
 // ErrNoPeers is returned by the sweep when the PeerSet has zero live peers.
 var ErrNoPeers = errors.New("mesh: no live peers")
 
-// liveReconnectEdge returns the LIVE peerConn representing "we already have a
-// working connection to this peer", or nil if there is none. It is the liveness
-// predicate ReconnectLoop drives off, and it consults BOTH keyings:
+// liveReconnectEdge returns a live connection to peerID, or nil when
+// ReconnectLoop should dial. It checks byAddr for the configured outbound
+// address, which remains stable when reconciliation changes the peers key from
+// zero to the certificate node ID. It also checks peers[peerID], the map Publish
+// uses. An accepted connection is keyed by its ephemeral source address in
+// byAddr and is therefore invisible under the configured listen address
+// (ADR-0045). Recognizing that publishable inbound edge prevents redundant
+// dials and mutual reconnection churn.
 //
-//   - ps.byAddr[addr] — the OUTBOUND edge we dialed (the addr-keyed
-//     lookup: stable across Dial's reconcile re-key, which moves the ps.peers
-//     key from the caller's zero peerID to the real nodeID).
-//   - ps.peers[peerID] — the edge Publish ACTUALLY consults (peer.go:798). This
-//     is the inbound edge (ADR-0045), and it is the load-bearing addition:
+// A zero peerID is never looked up in peers. Every unresolved peer can share
+// the zero entry, so treating it as proof of connectivity could suppress a
+// different peer's reconnect. Provisioned deployments pass real node IDs.
 //
-// RegisterInbound keys byAddr under conn.RemoteAddr — the peer's EPHEMERAL
-//
-//	port (peer.go:634) — NOT the configured listen addr ReconnectLoop holds.
-//	So a live SYMMETRIC inbound edge is INVISIBLE to any byAddr[configuredAddr]
-//	lookup, including Dial's own liveness guard (peer.go:343). That invisibility
-//	is the colocated stampede: at 34 nodes/host A holds a live publishable
-//	inbound edge from B, yet A's ReconnectLoop re-dials B anyway; B's
-//	RegisterInbound then stale-closes B's own outbound peerConn (peer.go:597-643),
-//	B's ReconnectLoop wakes and re-dials A, and the two hosts ping-pong
-//	re-registrations — the "registered inbound peer ~10× at different ephemeral
-//
-// ports" the 100-node silicon logged, starving the anti-entropy sweep
-//
-//	to 1 round in 91s. Checking ps.peers closes it: an already-publishable peer
-//	is not re-dialed.
-//
-// The ZERO peerID is EXCLUDED from the ps.peers half deliberately. An
-// un-provisioned peer whose leaf-CN reconcile MISSES stays keyed under the zero
-// nodeID (Dial's effectivePeerID), so ps.peers[zero] is a COLLISION BUCKET shared
-// by every un-provisioned peer: honoring it would let one peer's liveness
-// suppress a DIFFERENT peer's reconnect (a false dedupe that would silently
-// partition the mesh). For the zero peerID the predicate degrades to exactly the
-// original byAddr-only behavior. Production (--peer-dir provisioned) always passes
-// a real nodeID, so the ps.peers half is live where it matters.
-//
-// "Live" means the peerConn exists AND its done channel is still open (closed ==
-// the readLoop exited == dead — the liveness discipline, NOT a
-// conn-pointer-non-nil test).
+// A connection is live only when its peerConn exists and done remains open;
+// a non-nil TLS pointer alone is insufficient.
 func (ps *PeerSet) liveReconnectEdge(addr string, peerID [16]byte) *peerConn {
 	ps.mu.RLock()
 	pc, ok := ps.byAddr[addr]
 	if ok && pc != nil {
 		select {
 		case <-pc.done:
-			// DEAD byAddr entry. A natural drop never deletes it (only
-			// ClosePeer does), so it SHADOWED any live inbound edge keyed by
-			// peerID — a review finding: ReconnectLoop
-			// re-dialed into an already-connected peer, the churn the
-			// recheck exists to stop. Fall through to the peerID keying.
+			// A dead byAddr entry can hide a live accepted connection under
+			// peerID. Fall through to that lookup before deciding to re-dial.
 			ok = false
 		default:
 		}
@@ -1006,24 +1143,20 @@ func (ps *PeerSet) liveReconnectEdge(addr string, peerID [16]byte) *peerConn {
 	}
 	select {
 	case <-pc.done:
-		return nil // DEAD — the readLoop exited; the caller re-dials.
+		return nil // dead: the readLoop exited; the caller re-dials
 	default:
-		return pc // LIVE.
+		return pc // live
 	}
 }
 
 // ReconnectLoop re-establishes a peer that dropped, with bounded exponential
 // backoff (backoff0 initial, backoffMax ceiling). It is optional (the production
-// binary wires it); the in-process test harness uses persistent net.Pipe connections.
+// binary wires it); the in-process gate uses persistent net.Pipe connections.
 func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, peerID [16]byte, backoff0, backoffMax time.Duration) {
-	// base is the NORMALIZED initial backoff. The earlier code normalized into
-	// `b` but reset with `b = backoff0` (the raw argument) after a successful dial
-	// — so a caller passing backoff0 <= 0 got b = 0 on the reset, then
-	// time.NewTimer(0) fired instantly and `b *= 2` stayed 0: a 100%-CPU tight
-	// re-dial spin, which at colocated density IS a stampede. Reset to `base`, not
-	// to the raw argument. (Production passes time.Second — the spin was latent,
-	// not live — but a zero-backoff loop is exactly the failure mode the backoff-bucket
-	// fix exists to remove, so it closes here.)
+	// Normalize a nonpositive initial backoff once and always reset to base.
+	// Resetting to the raw argument would leave b at zero: timers would fire
+	// immediately and doubling would never increase the delay, producing a tight
+	// redial loop. Production supplies one second.
 	base := backoff0
 	if base <= 0 {
 		base = time.Second
@@ -1032,16 +1165,11 @@ func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, p
 	if backoffMax <= 0 {
 		backoffMax = 10 * time.Second
 	}
-	// (ADR-0045) — the per-loop deterministic jitter source.
-	// math/rand/v2 has NO top-level Seed (v1's rand.Seed is REMOVED), and the
-	// process-global source would serialize 3366 colocated loops on one lock; a
-	// per-loop rand.New(rand.NewPCG(...)) is goroutine-local, allocation-free on
-	// use, and DETERMINISTIC per (addr, peerID) — the topology.go:298
-	// precedent. The seed is an inline FNV-1a over addr THEN the peerID bytes, so
-	// every ReconnectLoop in a 100-node mesh (distinct peer per loop) draws a
-	// DISTINCT jitter sequence: that de-correlation is the whole point. The second
-	// PCG word is the first XOR the golden-ratio constant so the two state words
-	// are not identical for a low-entropy seed.
+	// Each loop gets a goroutine-local PCG source (ADR-0045). A shared source
+	// would serialize thousands of colocated reconnect loops. FNV-1a over the
+	// address and peer ID gives each peer a deterministic but distinct jitter
+	// sequence, and XORing the golden-ratio constant differentiates the two PCG
+	// state words for low-entropy seeds.
 	seed := uint64(14695981039346656037) // FNV-1a offset basis
 	for i := 0; i < len(addr); i++ {
 		seed ^= uint64(addr[i])
@@ -1056,29 +1184,13 @@ func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, p
 		if ctx.Err() != nil {
 			return
 		}
-		// (ADR-0040) — the ADDR-KEYED liveness lookup.
-		// The earlier lookup was `ps.peers[peerID]` (the caller-supplied
-		// peerID), but Dial re-keys an UN-PROVISIONED reconciled peer under the
-		// REAL nodeID (reconcilePeerID → effectivePeerID), so the caller's zero
-		// peerID never matches → the lookup MISSed → the `pc.done` wait was
-		// skipped → ReconnectLoop called Dial immediately → Dial's old
-		// `existing.conn != nil` guard returned nil "already live" for the LIVE
-		// reconciled peer → no backoff → a tight CPU spin (the
-		// reconcile-key-mismatch a review found). The fix: look up by ADDR
-		// (the stable identity the dial loop + the reconnect watcher share),
-		// NOT by peerID — so the wait finds the peer regardless of whether Dial
-		// keyed it under the zero or the reconciled real nodeID. A live peer
-		// (done open) → block on pc.done until the drop; a dead/absent peer →
-		// fall through to Dial, which now re-dials (the accept fix: the done-liveness
-		// check, NOT conn-pointer-non-nil).
-		//
-		// (ADR-0045): the lookup is liveReconnectEdge —
-		// byAddr[addr] OR ps.peers[peerID] (the inbound edge Publish
-		// consults, which byAddr CANNOT see because RegisterInbound keys it under
-		// the peer's ephemeral port). Waiting on the SAME predicate the post-wait
-		// dedupe below re-checks is what makes the loop structurally spin-free:
-		// every iteration either BLOCKS on a live edge's done channel or DIALS
-		// with backoff. Never neither.
+		// liveReconnectEdge checks the stable configured address and the real
+		// peer-ID entry (ADR-0040, ADR-0045). Looking up only the caller's ID
+		// would miss after reconciliation replaces a zero ID with the leaf's
+		// node ID; looking up only byAddr would miss an accepted edge keyed by
+		// its ephemeral source port. A live result blocks on done, while a dead
+		// or absent result proceeds to Dial. The post-wait recheck below uses
+		// the same predicate, so every iteration either waits or dials.
 		if pc := ps.liveReconnectEdge(addr, peerID); pc != nil {
 			select {
 			case <-pc.done:
@@ -1086,75 +1198,40 @@ func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, p
 				return
 			}
 		}
-		// A review finding: re-check ctx.Err AFTER the pc.done
-		// wait + BEFORE the dial. The runtime may pick the pc.done case at the
-		// SAME instant ctx is canceled (a peer drop racing SIGINT/meshCancel) —
-		// without this re-check, control falls straight to ps.Dial with a
-		// canceled ctx. ps.dialer.Dial (tls.Dial, NOT tls.DialContext — no ctx
-		// param, tls_transport.go:430) ignores the canceled ctx + completes a real
-		// TCP+TLS dial against a peer that's up → installs a conn whose readLoop
-		// exits immediately (readerCtx is a child of the canceled meshCtx) → the
-		// *tls.Conn + its fd leak (peerSet.Close is never called on the production
-		// shutdown path). The re-check retires the leak: a woken-on-shutdown
-		// ReconnectLoop returns without dialing.
+		// Recheck cancellation after the done wait and before dialing. A peer drop
+		// and shutdown can become ready together. The transport dialer does not
+		// accept a context, so it could otherwise establish a new TLS connection
+		// whose reader exits immediately, retaining the connection and descriptor
+		// when the production shutdown path does not call PeerSet.Close.
 		if ctx.Err() != nil {
 			return
 		}
-		// (ADR-0045) — the POST-WAIT re-check: the storm drain.
-		// The liveness lookup above is the guard BEFORE the wait; it was NOT
-		// re-checked after. Between our wake-up (this peer's edge died) and this
-		// point, ANOTHER path may have already re-established the peer:
-		//   - the peer re-dialed US and the accept loop called RegisterInbound
-		//     (the symmetric inbound edge — the common case at colocated density,
-		//     because a host-wide drop makes both ends reconnect simultaneously);
-		//   - a concurrent boot dial or a sibling ReconnectLoop won the race.
-		// Re-dialing on top of a live edge is not merely wasted work: it makes the
-		// remote's RegisterInbound stale-close the peer's own outbound peerConn
-		// (peer.go:597-643), which wakes THAT node's ReconnectLoop, which re-dials
-		// us — the self-sustaining ping-pong. Returning to the top of the loop
-		// re-enters the wait on the NEW live edge (no dial, no timer, no spin) and
-		// resets the backoff, because a healthy peer must not inherit a stale
-		// backoff ladder. This is a pure ADDITION: when there is no live edge the
-		// behavior is byte-identical to the original path.
+		// Recheck liveness after waking. The peer may already have dialed us and
+		// been registered by the accept loop, or a concurrent boot dial may have
+		// won. Dialing again could make the remote replace a live edge and wake
+		// another reconnect loop. Returning to the top waits on the new edge and
+		// resets backoff; if no edge appeared, this recheck changes nothing
+		// (ADR-0045).
 		if pc := ps.liveReconnectEdge(addr, peerID); pc != nil {
 			b = base
 			continue
 		}
 		if err := ps.Dial(ctx, addr, serverName, peerID); err != nil {
 			log.Printf("mesh: reconnect %x@%s: %v (backoff %v)", peerID, addr, err, b)
-			// A review finding: time.NewTimer + Stop (NOT
-			// time.After, which returns a channel with no Stop handle). A
-			// ReconnectLoop in backoff when meshCancel fires selects the ctx.Done
-			// branch + returns, but a time.After(b) Timer it created is NOT
-			// stopped → the Timer + its channel leak in the runtime heap until b
-			// elapses (up to 10s), then fire into a channel no one reads. Per-peer
-			// Timer leak on shutdown. time.NewTimer gives a Stop handle: stop
-			// the timer on the ctx.Done branch + drain its channel if Stop reports
-			// the timer already fired (the time.AfterFunc/Stop drain idiom) so the
-			// Timer is reclaimed immediately.
-			// (ADR-0045) — ±20% uniform jitter: the anti-stampede.
-			// The backoff ladder is per-peer-per-goroutine and was PERFECTLY
-			// DETERMINISTIC (1s, 2s, 4s, 8s, 10s, 10s...). At 34 colocated nodes ×
-			// 99 peers each, a host-wide event (a listener restart, a GC pause, a
-			// NIC hiccup) drops thousands of edges within the same millisecond, and
-			// every one of those loops then re-dials in LOCKSTEP — the classic
-			// thundering herd, re-synchronizing at every rung of the ladder because
-			// doubling preserves phase. Jitter breaks the phase lock: the dial
-			// arrivals spread across a window instead of spiking, so the dial/TLS
-			// work per instant drops from O(all colocated edges) to O(fanout) and
-			// the anti-entropy sweep goroutine actually gets scheduled.
+			// NewTimer provides a Stop handle so cancellation can release the
+			// timer immediately. If Stop reports that it already fired, drain the
+			// channel before returning. time.After would retain each timer and
+			// channel until its delay expired.
 			//
-			// The jittered value is used ONLY for THIS sleep; the ladder variable b
-			// keeps the clean power-of-two so the ceiling logic stays exact and the
-			// jitter cannot compound into a random walk (a jittered-and-fed-back
-			// ladder drifts and can collapse toward the floor, re-creating the
-			// storm it was meant to prevent).
+			// Apply uniform ±20% jitter to this sleep (ADR-0045). Without it, a
+			// host-wide connection drop makes many loops redial in lockstep, and
+			// doubling preserves that alignment at every backoff level. Jitter
+			// spreads TLS and dial work across the window.
 			//
-			// Int64N(2*span+1) - span yields a symmetric integer offset in
-			// [-span, +span] with span = b/5 (20%). The nanosecond magnitudes are
-			// huge (b >= 1ms in every real caller), so integer truncation of b/5 is
-			// immaterial; the span==0 guard keeps Int64N's "panics if n <= 0"
-			// contract satisfied for a sub-5ns backoff (a test could pass one).
+			// Only the sleep is jittered; b retains its exact power-of-two ladder
+			// and ceiling, preventing accumulated random drift. Int64N(2*span+1)
+			// minus span gives an offset in [-span,+span], with span=b/5. The
+			// span>0 guard avoids Int64N panicking for test backoffs below 5 ns.
 			d := b
 			if span := int64(b) / 5; span > 0 {
 				d = b + time.Duration(rng.Int64N(2*span+1)-span)
@@ -1174,29 +1251,16 @@ func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, p
 			}
 			continue
 		}
-		// Reset to the NORMALIZED base (not the raw backoff0 argument) — see the
-		// `base` comment at the top of the function: resetting to a caller's
-		// zero/negative backoff0 re-armed a 100%-CPU tight re-dial spin.
+		// Reset to the normalized base, not a raw nonpositive backoff0.
 		b = base
-		// — THE SUCCESS-PATH FLOOR. A SUCCESSFUL dial fell
-		// straight back to the top of the loop with no sleep at all: the timer sits
-		// on the FAILURE branch only. So any mechanism that killed the freshly-dialed
-		// edge produced an UNTHROTTLED re-dial — dial, get evicted, dial again, at
-		// whatever rate the TLS handshake allows. Silicon measured ~700
-		// dials/sec/node sustained for 4 minutes (127,163 dials on one node) with
-		// `mesh: reconnect` = 0 on EVERY node, i.e. the failure path (and its
-		// backoff ladder) never executed once — the storm rode entirely on this
-		// unfloored success path.
-		//
-		// The liveness guard removes the eviction that drove that loop; this floor
-		// is the BACKSTOP
-		// that bounds the damage of ANY future instant-death cause (a peer closing
-		// on us, a half-open conn, a TLS-level reject that still returns nil). It is
-		// deliberately small (successFloor = 250ms): large enough that a pathological
-		// churn is ~4 dials/sec instead of ~700, small enough to be invisible to a
-		// legitimate reconnect (the caller's backoff0 is 1s in production).
-		// Jittered from the SAME per-loop PCG source as the failure ladder so a
-		// colocated fleet cannot re-synchronize on the floor either.
+		// Successful dials also need a delay. If a new connection dies
+		// immediately, otherwise only the failure branch sleeps and the loop can
+		// redial at handshake speed. A measured mutual-eviction case reached
+		// about 700 dials per second per node without entering the failure path.
+		// The live-edge guard addresses that cause; this 250 ms floor bounds any
+		// similar immediate-death loop to about four dials per second while
+		// remaining small relative to the one-second production backoff. Reuse
+		// the loop's PCG source to jitter the floor and avoid synchronization.
 		floor := successFloor
 		if span := int64(floor) / 5; span > 0 {
 			floor += time.Duration(rng.Int64N(2*span+1) - span)
@@ -1213,15 +1277,526 @@ func (ps *PeerSet) ReconnectLoop(ctx context.Context, addr, serverName string, p
 	}
 }
 
-// successFloor is the minimum interval between a SUCCESSFUL ReconnectLoop dial
-// and the next dial attempt for the same peer. See the comment in
-// ReconnectLoop: it bounds an instant-death re-dial loop to ~4/sec instead of the
-// ~700/sec silicon measured, without delaying a legitimate reconnect (whose
-// caller-supplied backoff0 is 1s in production).
+// successFloor is the minimum interval between a successful ReconnectLoop dial
+// and the next attempt for that peer. It limits an immediate-death loop to
+// about four dials per second, compared with roughly 700 in the measured
+// mutual-eviction case, and is shorter than the production one-second backoff.
 const successFloor = 250 * time.Millisecond
 
 // splitHostPort returns the host (SNI) portion of a host:port address.
 func splitHostPort(addr string) (host string, err error) {
 	host, _, err = net.SplitHostPort(addr)
 	return host, err
+}
+
+// Verified-key challenges (ADR-0068) are armed and sent during Dial and
+// RegisterInbound installation, before the connection's reader starts. This
+// orders the nonce and armed writes before response handling. The dial readLoop
+// and accept serve loop recognize IsChallengeFrame before data dispatch and
+// call handleConnChallengeFrame.
+//
+// A node answers a challenge with its own node ID and a signature over the
+// challenger's nonce, proving possession of its own key without revealing
+// other state. An impostor using a victim's certificate CN either answers with
+// a different ID or presents a signature for its own Directory key, so the
+// connection remains unverified. The sweep, DeliverDigest, and respondToDigest
+// then deny data egress while leaving the routing entry installed.
+
+// SetChallengeDirectory binds the Directory used to verify a challenge
+// response's claimed identity. NewGossiper calls it once before any connection
+// reader starts. A nil Directory leaves all connections unverified, so data
+// egress remains closed rather than defaulting to acceptance.
+func (ps *PeerSet) SetChallengeDirectory(d *identity.Directory) { ps.challengeDir = d }
+
+// egressVerified reports whether the current peerConn installed under peerID
+// has proved possession of its registered key. The sweep, DeliverDigest, and
+// respondToDigest consult this bit before data egress. Directory membership
+// alone is insufficient, an absent connection is unverified, and a replacement
+// connection starts false until it completes its own challenge.
+func (ps *PeerSet) egressVerified(peerID [16]byte) bool {
+	ps.mu.RLock()
+	pc := ps.peers[peerID]
+	verified := pc != nil && pc.remoteVerified.Load()
+	ps.mu.RUnlock()
+	return verified
+}
+
+// armChallenge generates a fresh per-connection nonce and marks the challenge
+// armed before the reader goroutine starts. A crypto/rand failure returns false
+// and leaves the connection unverified with data egress closed; it does not
+// fail the dial itself.
+func (ps *PeerSet) armChallenge(pc *peerConn) bool {
+	if _, err := crand.Read(pc.challengeNonce[:]); err != nil {
+		log.Printf("mesh: challenge arm %x: crypto/rand: %v — conn stays unverified", pc.peerID, err)
+		return false
+	}
+	pc.challengeArmed = true
+	return true
+}
+
+// writeToPC applies the common per-frame deadline, close-on-error handling,
+// and suspect skip, mark, and clear logic. Publish calls it after resolving
+// peerID and pc under RLock. Challenge and response senders call it directly,
+// so 53-byte challenges and 133-byte responses follow the same write path as
+// data frames.
+//
+// se is the suspect entry captured by Publish, or nil for challenge senders.
+// A fresh connection has no active skip, but a failed challenge write still
+// closes the connection and marks its suspect key. The caller resolves the
+// peerID/pc pair; returned errors retain Publish's existing text.
+func (ps *PeerSet) writeToPC(peerID [16]byte, pc *peerConn, prefixed []byte, se *suspectEntry) error {
+	var skipUntil int64
+	if se != nil {
+		skipUntil = se.skipUntil.Load()
+	}
+	if skipUntil != 0 && time.Now().UnixNano() < skipUntil {
+		return fmt.Errorf("mesh: Publish to %x at %s skipped: write-stall suspect backoff until %v: %w",
+			peerID, pc.addr, time.Unix(0, skipUntil), errPeerSuspected)
+	}
+	// Set a fresh absolute deadline for each frame, so a slow but progressing
+	// WAN peer is not charged for earlier writes. Frames are bounded by
+	// MaxBatchSize deltas, roughly 20-41 KB for a digest, or roughly 65 bytes
+	// for a root announcement. Read and write deadlines are independent, so the
+	// readLoop is unaffected. If setting the deadline fails because the
+	// connection is closing, the following write reports the same failure.
+	if d := ps.writeTimeout; d > 0 && !ps.disableWriteDeadline.Load() {
+		_ = pc.conn.SetWriteDeadline(time.Now().Add(d))
+	}
+	if _, err := transport.TransmitTLSFrame(pc.conn, prefixed); err != nil { // transport.go:142
+		// Go's crypto/tls records a write timeout as a permanentError: the TLS
+		// state is corrupt and every later Write returns the same error. Retrying
+		// on this connection cannot recover it. Closing unblocks readLoop, whose
+		// defers call closeDone, removeDeadEntry, and conn.Close. ReconnectLoop
+		// then dials a fresh connection whose first write probes recovery.
+		if !ps.disableCloseOnError.Load() {
+			// Abort the underlying TCP connection rather than calling
+			// tls.Conn.Close. The latter attempts close-notify with its own
+			// five-second write deadline over the same full kernel buffers;
+			// a wedged 256 KiB write measured an extra 5.2 seconds. The TLS
+			// state is already unusable, so NetConn().Close avoids that wait
+			// and immediately unblocks readLoop for the ordinary recovery path.
+			// The receiver sees the same abrupt EOF as a peer crash, which the
+			// AEAD record layer and 16 MiB-bounded FrameReader already handle.
+			// The deferred TLS close then operates on an already closed fd.
+			_ = pc.conn.NetConn().Close()
+		}
+		// Any write error arms the edge-keyed breaker, limiting a failing peer
+		// to roughly one timeout per backoff window instead of one per redial.
+		if !ps.disableSuspectBreaker.Load() {
+			ps.markSuspect(pc.suspectKey)
+		}
+		// Report actual timeouts through the injected callback without adding
+		// an internal/telemetry dependency. Ordinary connection drops do not
+		// increment this metric.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() && ps.writeTimeoutReporter != nil {
+			ps.writeTimeoutReporter()
+		}
+		return fmt.Errorf("mesh: Publish to %x: %w", peerID, err)
+	}
+	// A successful write CLEARS the suspect state: the peer answered a probe
+	// on a (fresh) conn — it is healthy again and must not be skipped.
+	if se != nil && se.skipUntil.Load() != 0 {
+		se.skipUntil.Store(0)
+	}
+	return nil
+}
+
+// sendChallengeFrame writes a length-prefixed 53-byte challenge through
+// writeToPC, inheriting its deadline, TCP abort, and suspect marking. Dial and
+// RegisterInbound call it after armChallenge and before their readers start.
+// A send failure leaves the connection installed but unverified, with data
+// egress closed; it is logged rather than failing the connection installation.
+func (ps *PeerSet) sendChallengeFrame(pc *peerConn) error {
+	frame := buildChallengeFrame(ps.owner.NodeID, pc.challengeNonce)
+	return ps.writeToPC(pc.peerID, pc, receive.LengthPrefixFrame(frame), nil)
+}
+
+// handleConnChallengeFrame processes handshake frames on the dial readLoop or
+// accept serve loop.
+//
+// For a CHALLENGE, this node signs (domain || peer nonce || own ID || peer ID)
+// with its own key. The answer proves possession of that key over a fresh nonce
+// and reveals no other state; data egress still requires separate verification.
+//
+// For a RESPONSE, verification rejects cheap failures before signature work:
+//   - no challenge is outstanding on this connection;
+//   - challengerID is not this node's ID;
+//   - responderID differs from the connection's claimed pc.peerID;
+//   - the nonce differs from this connection's fresh nonce, including a replay
+//     captured on an earlier connection;
+//   - challengeDir is nil or has no key for responderID.
+//
+// Only identity.VerifyCRDTFrame then sets pc.remoteVerified. The Directory
+// supplies the expected public key but does not itself verify the connection.
+// Failures are logged and dropped while the routing entry remains installed
+// with data egress denied.
+// challengeNoiseLog limits malformed-frame, replay, mismatch, missing-entry,
+// and unknown-role messages to the first 8 and every 1000th per PeerSet.
+// Per-class counters remain exact. This prevents a stream of small invalid
+// frames from filling the log while answer budgets bound signing work.
+func (ps *PeerSet) challengeNoiseLog() bool {
+	n := ps.challengeNoiseLogSeq.Add(1)
+	return n <= 8 || n%1000 == 0
+}
+
+func (ps *PeerSet) handleConnChallengeFrame(pc *peerConn, frame []byte) {
+	switch challengeFrameRole(frame) {
+	case challengeRoleChallenge:
+		challengerID, nonce, ok := parseChallengeFrame(frame)
+		if !ok || ps.owner == nil {
+			if ps.challengeNoiseLog() {
+				log.Printf("mesh: challenge from %x: malformed frame or no owner identity — not answered (conn stays unverified)", pc.peerID)
+			}
+			return
+		}
+		// Bound the signatures an unverified challenger can request on this
+		// connection. Each 53-byte challenge otherwise buys about 60 us of
+		// Ed25519 signing. A normal handshake needs one answer; a redial gets a
+		// fresh budget, while suspect-key backoff bounds reconnection churn.
+		// Remember whether this frame reserved a slot. A later test-injection
+		// change must not cause a refund without a reservation and underflow
+		// the counter.
+		reserved := false
+		if !ps.disableChallengeAnswerBudgetBugInject.Load() {
+			if n := pc.challengeAnswers.Add(1); n > challengeAnswerPerConnBudget {
+				// Count every rejected answer but log only the first and every
+				// 1000th rejection to avoid a log flood.
+				if d := ps.challengeAnswerBudgetDrops.Add(1); d == 1 || d%1000 == 0 {
+					log.Printf("mesh: challenge from %x dropped: per-conn answer budget exhausted (%d answered, cap %d; drop #%d) — the pre-verify answer flood is bounded", pc.peerID, n-1, challengeAnswerPerConnBudget, d)
+				}
+				return
+			}
+			reserved = true
+		}
+		msg := buildChallengeMsg(nonce, ps.owner.NodeID, challengerID)
+		sig, err := identity.SignCRDTFrame(ps.owner.Seed, msg)
+		if ps.signFailBugInject.Load() {
+			err = errors.New("test-only sign failure injection")
+		}
+		if err != nil {
+			// Only a successful signature consumes a budget slot. Refund this
+			// frame's reservation on the same sequential reader, so a seed
+			// configuration error can be corrected without exhausting the
+			// connection and a flood of failed signatures cannot burn its budget.
+			// The local reservation flag, not a fresh injection check, controls
+			// the refund.
+			if reserved {
+				// ^uint64(0) == -1 mod 2^64: the unsigned wrap-around
+				// decrement. Safe by construction — the refund pairs with
+				// THIS frame's own Add(1) above, so the counter returns to
+				// its pre-frame value, never below.
+				pc.challengeAnswers.Add(^uint64(0))
+			}
+			log.Printf("mesh: challenge from %x: sign: %v — not answered (conn stays unverified; the budget slot is refunded)", pc.peerID, err)
+			return
+		}
+		resp := buildChallengeResponseFrame(ps.owner.NodeID, challengerID, nonce, sig)
+		if err := ps.writeToPC(pc.peerID, pc, receive.LengthPrefixFrame(resp), nil); err != nil {
+			log.Printf("mesh: challenge response to %x: %v", pc.peerID, err)
+		}
+	case challengeRoleResponse:
+		responderID, challengerID, nonce, sig, ok := parseChallengeResponseFrame(frame)
+		if !ok {
+			return // short frame — wire noise; never a verify event
+		}
+		// Count each rejection class separately. Check the nonce first so a
+		// replayed response on a fresh armed connection is always classified as
+		// a replay rather than another identity or arming mismatch.
+		if nonce != pc.challengeNonce {
+			ps.challengeReplay.Add(1)
+			if ps.challengeNoiseLog() {
+				log.Printf("mesh: challenge response from %x dropped: nonce echo mismatch; captured responses cannot verify a new connection", responderID)
+			}
+			return
+		}
+		if !pc.challengeArmed || ps.owner == nil || challengerID != ps.owner.NodeID || responderID != pc.peerID {
+			ps.challengeMismatch.Add(1)
+			if ps.challengeNoiseLog() {
+				log.Printf("mesh: challenge response from %x dropped: not this conn's outstanding challenge (armed=%v, identity-match=%v)",
+					responderID, pc.challengeArmed, responderID == pc.peerID)
+			}
+			return
+		}
+		if ps.challengeDir == nil {
+			ps.challengeNoEntry.Add(1)
+			if ps.challengeNoiseLog() {
+				log.Printf("mesh: challenge response from %x dropped: no challenge Directory wired; verify-closed", responderID)
+			}
+			return
+		}
+		key, ok := ps.challengeDir.Lookup(responderID)
+		if !ok {
+			ps.challengeNoEntry.Add(1)
+			if ps.challengeNoiseLog() {
+				log.Printf("mesh: challenge response from %x dropped: no Directory entry — membership is not verification, and absence is not proof", responderID)
+			}
+			return
+		}
+		// A test-only control skips only signature verification while retaining
+		// the Directory and identity checks. It demonstrates that rejecting a
+		// wrong key depends on the possession proof.
+		if ps.disableChallengeVerifyBugInject.Load() {
+			pc.remoteVerified.Store(true)
+			log.Printf("mesh: peer %x verified (test-only fault injection: possession proof skipped)", responderID)
+			return
+		}
+		msg := buildChallengeMsg(nonce, responderID, challengerID)
+		if identity.VerifyCRDTFrame(key, msg, sig) {
+			ps.challengeVerified.Add(1)
+			pc.remoteVerified.Store(true)
+			log.Printf("mesh: peer %x verified (connect-time possession proof)", responderID)
+		} else {
+			ps.challengeSigFail.Add(1)
+			log.Printf("mesh: challenge response from %x: signature verification failed; dropped", responderID)
+		}
+	default:
+		if ps.challengeNoiseLog() {
+			log.Printf("mesh: challenge frame from %x: unknown role %d — dropped", pc.peerID, challengeFrameRole(frame))
+		}
+	}
+}
+
+// HandleConnChallengeFrame routes an accepted connection's challenge-family
+// frame through the same handler used by the dial readLoop. myPC is the handle
+// from RegisterInbound, or nil after a decode failure or live-edge decline; tc
+// is the accepted TLS connection.
+//
+// A declined connection has no registered peerConn, data egress, or digest
+// identity, but it still answers CHALLENGE frames. In a mutual-dial mesh, each
+// connection can be declined at one end, and the other end's registered edge
+// needs that answer to verify. The response reveals only possession of this
+// node's key over the challenger's nonce.
+//
+// The decliner never initiates a challenge on this connection, so a RESPONSE
+// has no armed state and is dropped. Answers use a transient peerConn solely
+// for writeToPC's common write handling. It is never installed or retained.
+// Its suspect key uses the certificate node ID when available, or the remote
+// address after a decode failure, so a failed answer marks the right edge.
+func (ps *PeerSet) HandleConnChallengeFrame(myPC *PeerConnHandle, tc *tls.Conn, frame []byte) {
+	if myPC != nil && myPC.pc != nil {
+		ps.handleConnChallengeFrame(myPC.pc, frame)
+		return
+	}
+	if tc == nil || challengeFrameRole(frame) != challengeRoleChallenge {
+		return // a declined conn serves the responder arm only; a RESPONSE has no armed state to verify against
+	}
+	challengerID, nonce, ok := parseChallengeFrame(frame)
+	if !ok || ps.owner == nil {
+		return // malformed, or no identity to answer with — the dialer times out and stays unverified
+	}
+	// A declined connection has no persistent per-connection state, so its
+	// answer budget uses a per-suspect-key limit and a PeerSet-wide ceiling.
+	// After a decode failure the key is the remote address, which an attacker
+	// can rotate; the global ceiling remains the rotation-independent bound.
+	// Derive the key before signing, and refund a reservation if signing fails.
+	// Expiry and reclamation allow recovery without a periodic refill. Exhaustion
+	// disables stateless answers until recovery or restart, while new connected
+	// peers retain fresh per-connection budgets (ADR-0069).
+	addr := ""
+	if ra := tc.RemoteAddr(); ra != nil {
+		addr = ra.String()
+	}
+	suspectKey := addr // decode-miss: the outbound addr convention (never the zero bucket)
+	if real, ok := nodeIDFromConn(tc); ok {
+		suspectKey = suspectKeyForNodeID(real) // inbound certificate node ID convention
+	}
+	// Capture whether and how this frame reserved budget. Refunds must use
+	// these snapshots rather than rechecking a mutable test-injection flag.
+	// Normal reservations have per-key records; an unrecorded reservation is
+	// reachable only through the sweep-retain injection or a direct unit call.
+	reserved := false
+	reservedPerKey := false
+	if !ps.disableChallengeAnswerBudgetBugInject.Load() {
+		ps.challengeDeclinedMu.Lock()
+		if ps.challengeDeclinedByKey == nil {
+			ps.challengeDeclinedByKey = make(map[string]declinedRes) // lazy, cold
+		}
+		if ps.challengeDeclinedLiveEdge == nil {
+			ps.challengeDeclinedLiveEdge = make(map[string]int64) // lazy, cold
+		}
+		now := time.Now().UnixNano()
+		ttlNS := int64(challengeDeclinedReservationTTL)
+		n2 := !ps.disableDeclinedPolicyBugInject.Load()
+		// Expired records are absent and return their counts to the global,
+		// allowing a fresh reservation window without restart. Live-edge marks
+		// expire the same way. Disabling the policy preserves lifetime records
+		// for the negative control.
+		if n2 {
+			if res, ok := ps.challengeDeclinedByKey[suspectKey]; ok && now-res.lastUnixNano >= ttlNS {
+				ps.challengeDeclinedGlobal -= res.count
+				delete(ps.challengeDeclinedByKey, suspectKey)
+			}
+			if mark, ok := ps.challengeDeclinedLiveEdge[suspectKey]; ok && now-mark >= ttlNS {
+				delete(ps.challengeDeclinedLiveEdge, suspectKey)
+			}
+		}
+		// A fresh live-edge mark skips the per-key reservation because our own
+		// working connection caused the decline. The global still counts, so a
+		// CA-leaf holder cannot use live edges to bypass the aggregate bound.
+		liveEdgeFresh := false
+		if n2 {
+			if mark, ok := ps.challengeDeclinedLiveEdge[suspectKey]; ok && now-mark < ttlNS {
+				liveEdgeFresh = true
+			}
+		}
+		perKey := uint64(0)
+		if !liveEdgeFresh {
+			if res, ok := ps.challengeDeclinedByKey[suspectKey]; ok {
+				perKey = res.count
+			}
+			perKey++
+		}
+		globalNow := ps.challengeDeclinedGlobal
+		// At the ceiling, remove expired records and recompute the global as
+		// the surviving map sum; reserve and refund keep those values equal.
+		// Rate-limit this work so a saturated flood cannot turn every 53-byte
+		// challenge into an O(map) sweep.
+		if n2 && globalNow >= challengeAnswerGlobalCeiling && now-ps.challengeDeclinedLastSweepNano >= int64(challengeDeclinedSweepInterval) {
+			ps.challengeDeclinedLastSweepNano = now
+			total := uint64(0)
+			for k, res := range ps.challengeDeclinedByKey {
+				if now-res.lastUnixNano >= ttlNS {
+					delete(ps.challengeDeclinedByKey, k)
+					continue
+				}
+				total += res.count
+			}
+			ps.challengeDeclinedGlobal = total
+			globalNow = total
+		}
+		over := perKey > challengeAnswerPerSuspectKeyBudget || globalNow >= challengeAnswerGlobalCeiling
+		if !over {
+			record := !liveEdgeFresh || !ps.disableLiveEdgeRecordBugInject.Load()
+			if record {
+				res := ps.challengeDeclinedByKey[suspectKey]
+				if liveEdgeFresh {
+					// Record live-edge reservations too so the ceiling sweep
+					// includes them in the global sum and the guarded refund can
+					// find the record. Omitting the record would let repeated
+					// sweeps restart an adversarial live-edge window. The per-key
+					// cap still does not bind because perKey remained zero above.
+					res.count++
+				} else {
+					res.count = perKey
+				}
+				res.lastUnixNano = now
+				ps.challengeDeclinedByKey[suspectKey] = res
+			}
+			reservedPerKey = record
+			ps.challengeDeclinedGlobal++
+		}
+		ps.challengeDeclinedMu.Unlock()
+		if over {
+			// Log the snapshot captured under the mutex, not
+			// challengeDeclinedGlobal after unlocking: another declined serve
+			// goroutine could increment it concurrently. globalNow is the value
+			// used for this reservation decision.
+			if d := ps.challengeAnswerBudgetDrops.Add(1); d == 1 || d%1000 == 0 {
+				// suspectKey can contain a NUL-prefixed raw node ID. Format it
+				// with %x rather than %s so logs remain valid UTF-8 and
+				// searchable.
+				log.Printf("mesh: declined-conn challenge from %x dropped: the stateless answer budget is exhausted (per-key %d > cap %d, or global %d >= ceiling %d; drop #%d) — the pre-verify answer flood is bounded (no refill; restart resets; ADR-0069)", suspectKey, perKey, challengeAnswerPerSuspectKeyBudget, globalNow, challengeAnswerGlobalCeiling, d)
+			}
+			return
+		}
+		reserved = true
+	}
+	msg := buildChallengeMsg(nonce, ps.owner.NodeID, challengerID)
+	sig, err := identity.SignCRDTFrame(ps.owner.Seed, msg)
+	if ps.signFailBugInject.Load() {
+		err = errors.New("test-only sign failure injection")
+	}
+	if err != nil {
+		if reserved {
+			// Signing failed, so return this reservation through the guarded
+			// helper rather than consuming budget for an answer never sent.
+			ps.refundDeclinedReservation(suspectKey, reservedPerKey)
+		}
+		return
+	}
+	resp := buildChallengeResponseFrame(ps.owner.NodeID, challengerID, nonce, sig)
+	tpc := &peerConn{addr: addr, conn: tc, done: make(chan struct{})}
+	tpc.suspectKey = suspectKey
+	if real, ok := nodeIDFromConn(tc); ok {
+		tpc.peerID = real
+	}
+	_ = ps.writeToPC(tpc.peerID, tpc, receive.LengthPrefixFrame(resp), nil)
+}
+
+// ArmDeclinedInbound arms per-connection challenge verification for an inbound
+// TLS connection that RegisterInbound declined because ps.peers[real] already
+// holds a live edge, as can happen during simultaneous mutual dialing. It
+// returns real and an unregistered handle that serveConnWithDigest or
+// serveTestConn uses only to verify challengeRoleResponse frames and answer
+// DigestConnVerified. RegisterInbound and ReleaseInboundConn retain their
+// existing return and no-op behavior for declined registrations.
+func (ps *PeerSet) ArmDeclinedInbound(tc *tls.Conn) ([16]byte, *PeerConnHandle) {
+	if ps == nil || tc == nil || ps.owner == nil || ps.disableDeclinedVerifyBugInject.Load() {
+		return [16]byte{}, nil
+	}
+	real, ok := nodeIDFromConn(tc)
+	if !ok || real == ([16]byte{}) {
+		return [16]byte{}, nil
+	}
+	ps.mu.RLock()
+	existing, ok := ps.peers[real]
+	live := false
+	if ok && existing != nil {
+		select {
+		case <-existing.done:
+		default:
+			live = true
+		}
+	}
+	ps.mu.RUnlock()
+	if !live {
+		return [16]byte{}, nil
+	}
+	addr := ""
+	if ra := tc.RemoteAddr(); ra != nil {
+		addr = ra.String()
+	}
+	pc := &peerConn{
+		addr:       addr,
+		conn:       tc,
+		peerID:     real,
+		suspectKey: suspectKeyForNodeID(real),
+		done:       make(chan struct{}),
+	}
+	if ps.armChallenge(pc) {
+		_ = ps.sendChallengeFrame(pc)
+	}
+	return real, &PeerConnHandle{pc: pc}
+}
+
+// HandleDeclinedChallengeFrame routes challenge-family frames on a declined
+// connection. A challengeRoleResponse with a non-nil declPC goes to
+// handleConnChallengeFrame, which verifies the dialer's response to
+// ArmDeclinedInbound against ps.challengeDir and sets declPC.pc.remoteVerified.
+// Other roles go to HandleConnChallengeFrame with a nil handle, preserving the
+// stateless responder and its per-key and global answer budgets.
+func (ps *PeerSet) HandleDeclinedChallengeFrame(declPC *PeerConnHandle, tc *tls.Conn, frame []byte) {
+	if ps == nil {
+		return
+	}
+	if challengeFrameRole(frame) == challengeRoleResponse && declPC != nil && declPC.pc != nil {
+		ps.handleConnChallengeFrame(declPC.pc, frame)
+		return
+	}
+	ps.HandleConnChallengeFrame(nil, tc, frame)
+}
+
+// DigestConnVerified reports whether the accepted connection represented by h
+// has completed its own key-possession challenge. A nil declined or decode-miss
+// handle and an unverified connection return false and increment
+// digestSeamDrops. The dial readLoop performs the corresponding check; both use
+// the receiving connection's bit rather than the current map entry. It is
+// exported for cmd's serve loop and serveTestConn.
+func (ps *PeerSet) DigestConnVerified(h *PeerConnHandle) bool {
+	verified := (h != nil && h.pc != nil && h.pc.remoteVerified.Load()) || ps.disableDigestSeamBugInject.Load()
+	if !verified {
+		ps.digestSeamDrops.Add(1)
+	}
+	return verified
 }

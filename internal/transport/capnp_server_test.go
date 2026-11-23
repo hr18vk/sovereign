@@ -20,13 +20,12 @@ import (
 	capnp_schema "github.com/hr18vk/sovereign/api/capnp/api/capnp"
 )
 
-// buildTestMessage constructs a valid Cap'n Proto TriTemporalEvent message
-// with the stream framing header prepended. This builder is the canonical
-// way to generate protocol-compliant test payloads for the EPOLLET server.
+// buildTestMessage constructs a framed, single-segment TriTemporalEvent for
+// the ingestion tests.
 func buildTestMessage(t *testing.T, lat, lng float64, assertionTime uint64, entityID, payload string) []byte {
 	t.Helper()
 
-	// Build a Cap'n Proto message using the standard library.
+	// Build a single-segment Cap'n Proto message.
 	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
 	if err != nil {
 		t.Fatalf("NewMessage: %v", err)
@@ -56,8 +55,8 @@ func buildTestMessage(t *testing.T, lat, lng float64, assertionTime uint64, enti
 	return data
 }
 
-// TestBuildTestMessage_Serialization validates that buildTestMessage produces
-// a valid Cap'n Proto message with correct framing and round-trip fidelity.
+// TestBuildTestMessage_Serialization checks the framing and field values after
+// a Cap'n Proto round trip.
 func TestBuildTestMessage_Serialization(t *testing.T) {
 	data := buildTestMessage(t, 37.7749, -122.4194, 1719907200000, "entity-test-001", "subscription enrollment")
 
@@ -78,7 +77,7 @@ func TestBuildTestMessage_Serialization(t *testing.T) {
 		t.Fatalf("framing mismatch: header claims %d bytes, total is %d", expectedTotal, len(data))
 	}
 
-	// Round-trip: unmarshal and verify field fidelity.
+	// Unmarshal the message and compare every field with the input.
 	roundTrip, err := capnp.Unmarshal(data)
 	if err != nil {
 		t.Fatalf("Unmarshal round-trip: %v", err)
@@ -113,24 +112,24 @@ func TestBuildTestMessage_Serialization(t *testing.T) {
 	}
 }
 
-// TestBuildTestMessage_MaxMessageSizeGuard validates that oversized messages
-// exceed MaxMessageSize threshold for rejection testing.
+// TestBuildTestMessage_MaxMessageSizeGuard verifies that the large-payload
+// fixture encodes to more than MaxMessageSize bytes.
 func TestBuildTestMessage_MaxMessageSizeGuard(t *testing.T) {
-	// Build a large payload that should exceed MaxMessageSize.
+	// The payload alone exceeds the server's segment-size limit.
 	largePayload := make([]byte, MaxMessageSize+1)
 	for i := range largePayload {
 		largePayload[i] = 'A'
 	}
 
-	// This should produce a message larger than MaxMessageSize.
+	// Framing and event fields make the encoded message larger still.
 	data := buildTestMessage(t, 0.0, 0.0, 0, "overflow-test", string(largePayload))
 	if len(data) <= MaxMessageSize {
 		t.Fatalf("expected oversized message (>%d bytes), got %d bytes", MaxMessageSize, len(data))
 	}
 }
 
-// TestEpollServer_BasicMessage validates end-to-end: client sends a
-// TriTemporalEvent → epoll server receives and parses it.
+// TestEpollServer_BasicMessage starts a listener on an ephemeral port and
+// verifies that Shutdown terminates the event loop.
 func TestEpollServer_BasicMessage(t *testing.T) {
 	allocator := database.NewJemallocAllocator()
 
@@ -146,42 +145,34 @@ func TestEpollServer_BasicMessage(t *testing.T) {
 
 	server := NewEpollServer(allocator, handler)
 
-	// Start server in background.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- server.ListenAndServe(":0") // Let OS pick a port
+		errCh <- server.ListenAndServe(":0") // Let the OS pick a port.
 	}()
 
-	// Give server time to bind. In production, we'd use a ready signal.
+	// Allow ListenAndServe to enter the event loop before requesting shutdown.
 	time.Sleep(50 * time.Millisecond)
-
-	// Note: The server binds to :0, but we need the actual port.
-	// For testing, use a fixed port.
 	server.Shutdown()
 
-	// Basic validation that the server starts and stops without panic.
 	select {
 	case err := <-errCh:
 		if err != nil {
-			t.Logf("Server exited with: %v (expected for port 0 test)", err)
+			t.Logf("ListenAndServe returned an error on port 0: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Server did not shut down within 2 seconds")
 	}
 }
 
-// TestParseMessages_FramingHeader validates Cap'n Proto framing header parsing.
+// TestParseMessages_FramingHeader checks the single-segment framing values
+// used by parseMessages.
 func TestParseMessages_FramingHeader(t *testing.T) {
-	// A single-segment Cap'n Proto message with:
-	// - Framing header: [0x00,0x00,0x00,0x00] (1 segment) + [words LE32]
-	// - Segment data
-
-	// Build a minimal framing header for a 4-word (32-byte) segment.
+	// Build a header for a single segment containing four 8-byte words.
 	header := make([]byte, 8)
 	binary.LittleEndian.PutUint32(header[0:4], 0) // segCount - 1 = 0 (1 segment)
 	binary.LittleEndian.PutUint32(header[4:8], 4) // 4 words = 32 bytes
 
-	// Append 32 bytes of data (all zeros — represents an empty struct).
+	// Append a zeroed segment, which represents an empty struct.
 	data := make([]byte, 32)
 	msg := append(header, data...)
 
@@ -202,11 +193,12 @@ func TestParseMessages_FramingHeader(t *testing.T) {
 	}
 }
 
-// TestMaxMessageSize validates that oversized messages are rejected.
+// TestMaxMessageSize verifies that the oversized framing fixture exceeds the
+// server's segment-size limit.
 func TestMaxMessageSize(t *testing.T) {
 	header := make([]byte, 8)
 	binary.LittleEndian.PutUint32(header[0:4], 0)
-	// Set segment size to MaxMessageSize + 1 word.
+	// Set the segment size to MaxMessageSize plus one word.
 	oversize := uint32((MaxMessageSize / 8) + 1)
 	binary.LittleEndian.PutUint32(header[4:8], oversize)
 

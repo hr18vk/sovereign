@@ -16,44 +16,29 @@ import (
 	"unsafe"
 )
 
-// ---------------------------------------------------------------------------
-// — Concurrency & ABA Immunity (Ruthless Go Engine Verification Blueprint)
-// ---------------------------------------------------------------------------
+// The slab free-lists are lock-free Treiber stacks protected by EBR epoch
+// pinning. Without that protection, a thread could read head=A and be
+// preempted while another thread pops A, pushes B, and pushes A back. The
+// first thread's compare-and-swap would then accept the recycled A even though
+// the stack had changed.
 //
-// The engine's slab free-lists are lock-free Treiber stacks protected by
-// EBR epoch pinning. The ABA anomaly is the canonical threat: Thread 1
-// reads head=A, gets preempted; Thread 2 pops A, pushes B, pushes A back;
-// Thread 1 resumes, CAS sees head==A, succeeds — but the stack is
-// structurally destroyed.
-//
-// EBR prevents ABA by pinning the goroutine to the current epoch during
-// the Treiber pop CAS loop. No concurrent RetireBlock can physically
-// recycle 'head' back onto the stack while an active epoch pin is held.
-//
-// These tests exercise that guarantee under the Go race detector (-race)
-// with chaotic goroutine preemption (runtime.Gosched) precisely between
-// the read phase and the CAS phase of Treiber stack operations.
-// ---------------------------------------------------------------------------
+// An active epoch pin prevents RetireBlock from recycling the head during the
+// pop's compare-and-swap loop. These tests call runtime.Gosched between the
+// read and allocation to exercise that protection under the race detector.
 
-// TestTreiberStackABAImmunity exercises the arena's class-0 Treiber
-// free-list with aggressive pop/push cycling under chaos goroutines.
-// The victim thread reads the head pointer, then runtime.Gosched()s
-// to invite an ABA attack, then attempts the CAS. Attacker threads
-// rapidly pop and push to cycle memory addresses.
+// TestTreiberStackABAImmunity cycles the arena's class-0 free-list from
+// several goroutines. One goroutine yields after reading the head; the others
+// repeatedly allocate and retire nodes to recycle addresses.
 //
-// If EBR's epoch pinning fails, the race detector will trap a
-// use-after-free or the arena will SIGSEGV on corrupted next-pointers.
-//
+// Broken epoch pinning can produce a use-after-free or corrupt next pointers.
 // Run with: go test -race -run=TestTreiberStackABAImmunity -count=100
 //
-// DESIGN NOTE: AdvanceEpoch is called sparingly (every 200 ops per
-// goroutine, not every op) because it is O(participants × hazardSlots)
-// and cannot advance while any participant is active. Calling it every
-// iteration would cause livelock — the goroutine's own Enter() pins
-// the epoch, making AdvanceEpoch a no-op that burns CPU iterating the
-// participant list. The EBR three-epoch ring buffer tolerates sparse
-// epoch advancement: retired nodes sit in their epoch's list until the
-// epoch advances by 2, which is safe as long as the arena has capacity.
+// AdvanceEpoch runs every 200 operations rather than on every iteration. Its
+// cost is O(participants × hazardSlots), and it cannot advance while any
+// participant is active. An epoch pin held by the caller would otherwise make
+// repeated advancement attempts consume CPU without reclaiming nodes. Retired
+// nodes remain queued until the epoch advances twice, so sparse advancement is
+// safe while the arena has capacity.
 func TestTreiberStackABAImmunity(t *testing.T) {
 	arena, err := NewHamtArena(512*1024*1024, NewEBRManager())
 	if err != nil {
@@ -61,8 +46,7 @@ func TestTreiberStackABAImmunity(t *testing.T) {
 	}
 	defer arena.Free()
 
-	// Pre-populate the free-list with nodes by allocating and then
-	// freeing them via EBR. We need a pool of recycled nodes.
+	// Build a pool of recycled nodes for the free-list.
 	const poolSize = 256
 	nodes := make([]NodePtr, poolSize)
 	for i := range nodes {
@@ -92,7 +76,7 @@ func TestTreiberStackABAImmunity(t *testing.T) {
 			p.Enter(arena.ebr)
 			// Read the head — this is the ABA window start.
 			head := arena.freeHeads[0].head.Load()
-			// Force chaotic OS preemption between read and CAS.
+			// Yield between reading the head and allocating from it.
 			runtime.Gosched()
 			// If head is still the same, the CAS will succeed.
 			// EBR guarantees head was not recycled during Gosched.
@@ -116,7 +100,7 @@ func TestTreiberStackABAImmunity(t *testing.T) {
 		}
 	}()
 
-	// Attacker threads: rapidly pop and push to cycle memory addresses.
+	// Concurrent goroutines recycle addresses through rapid pops and pushes.
 	for a := 0; a < numAttackers; a++ {
 		wg.Add(1)
 		go func(id int) {
@@ -138,7 +122,7 @@ func TestTreiberStackABAImmunity(t *testing.T) {
 				if i%200 == 0 {
 					arena.ebr.AdvanceEpoch()
 				}
-				// Chaotic yield to interleave with the victim.
+				// Yield to vary the interleaving with the other allocator.
 				runtime.Gosched()
 			}
 		}(a)
@@ -147,12 +131,9 @@ func TestTreiberStackABAImmunity(t *testing.T) {
 	wg.Wait()
 }
 
-// TestEBRHazardPointerSequencing verifies that the EBR hazard pointer
-// protocol correctly prevents reclamation of nodes that are currently
-// protected by a hazard slot. A goroutine sets a hazard pointer on a
-// node, then concurrent goroutines attempt to retire and reclaim it.
-// The hazard-protected node must NOT be physically recycled while the
-// hazard is held.
+// TestEBRHazardPointerSequencing protects a node with a hazard slot, retires
+// it, and advances the epoch twice. Reclamation must leave the node's
+// reference count intact until the hazard is cleared.
 func TestEBRHazardPointerSequencing(t *testing.T) {
 	arena, err := NewHamtArena(128*1024*1024, NewEBRManager())
 	if err != nil {
@@ -173,12 +154,10 @@ func TestEBRHazardPointerSequencing(t *testing.T) {
 		t.Fatal("DetachAndProtect failed for valid slot")
 	}
 
-	// Now attempt to retire and reclaim the node from another "thread".
-	// We simulate this by retiring the block and advancing epochs.
+	// Retire the protected block and attempt to reclaim it by advancing epochs.
 	arena.ebr.RetireBlock(arena, offset, true)
 
-	// Advance epoch — the node should NOT be reclaimed because it's
-	// hazard-protected.
+	// The hazard prevents reclamation.
 	arena.ebr.AdvanceEpoch()
 	arena.ebr.AdvanceEpoch()
 
@@ -197,9 +176,8 @@ func TestEBRHazardPointerSequencing(t *testing.T) {
 	arena.ebr.Release(p)
 }
 
-// TestConcurrentAllocFree exercises AllocNode and DecRef concurrently
-// across many goroutines to detect races in the Treiber stack and
-// EBR reclamation under the -race detector.
+// TestConcurrentAllocFree exercises AllocNode and RetireBlock concurrently to
+// detect races in the Treiber stack and EBR reclamation.
 func TestConcurrentAllocFree(t *testing.T) {
 	arena, err := NewHamtArena(512*1024*1024, NewEBRManager())
 	if err != nil {
@@ -235,8 +213,8 @@ func TestConcurrentAllocFree(t *testing.T) {
 	wg.Wait()
 }
 
-// TestConcurrentInsertLocalRace exercises the DeltaCRDTEngine's
-// lock-free CAS loop under the race detector with chaotic preemption.
+// TestConcurrentInsertLocalRace exercises DeltaCRDTEngine's lock-free CAS loop
+// under the race detector with frequent goroutine yields.
 func TestConcurrentInsertLocalRace(t *testing.T) {
 	engine, err := NewDeltaCRDTEngine([16]byte{1}, 0, 256*1024*1024)
 	if err != nil {
@@ -257,7 +235,7 @@ func TestConcurrentInsertLocalRace(t *testing.T) {
 				engine.InsertLocal(key, CRDTEntry{
 					SystemTime: int64(writerID*10000 + i),
 				})
-				// Chaotic yield to interleave CAS retries.
+				// Yield periodically to vary CAS retries.
 				if i%10 == 0 {
 					runtime.Gosched()
 				}
@@ -319,10 +297,9 @@ func TestConcurrentJoinRace(t *testing.T) {
 	}
 }
 
-// TestEpochStateMachineFuzz fuzzes the EBR epoch state machine with
-// random sequences of Enter, Exit, Retire, and AdvanceEpoch operations.
-// The invariant: no node is physically recycled while any participant
-// holds an active epoch pin.
+// TestEpochStateMachineFuzz drives deterministic pseudo-random sequences of
+// Enter, Exit, allocation, retirement, and AdvanceEpoch. No node may be
+// recycled while a participant holds an active epoch pin.
 func TestEpochStateMachineFuzz(t *testing.T) {
 	arena, err := NewHamtArena(256*1024*1024, NewEBRManager())
 	if err != nil {

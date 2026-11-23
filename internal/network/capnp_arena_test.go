@@ -73,7 +73,7 @@ func TestNewIngestionArena_ReleaseSafe(t *testing.T) {
 
 	// After release, the original data slice should be untouched.
 	// Release() on SingleSegmentArena with bp=nil only sets seg.data=nil,
-	// it does NOT zero our original data slice.
+	// it does not zero our original data slice.
 	if data[0] != 0xFF {
 		t.Fatal("Release() corrupted the underlying memory")
 	}

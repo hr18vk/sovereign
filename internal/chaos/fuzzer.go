@@ -5,28 +5,25 @@
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
 // ---------------------------------------------------------------------------
-// §2 Off-Heap Chaos Fuzzer — the violent C-space SIGSEGV injector
+// Off-Heap Chaos Fuzzer — the C-space SIGSEGV injector
 // ---------------------------------------------------------------------------
 //
-// Blueprint (§2): "The verification blueprint must introduce random
-// memory corruption directly into the off-heap pointers during the absolute
-// peak of the 1,000,000 RPS stress test."
+// The fuzzer introduces random memory corruption directly into off-heap
+// pointers during peak engine load. It corrupts an off-heap pointer the
+// engine will dereference; the next access faults into an unmapped (or
+// protected) region and raises a raw SIGSEGV — the unrecoverable C-space
+// crash that recover() cannot catch. The Supervisor-Worker architecture
+// proves that this crash, induced inside a worker child process, is
+// recovered: the supervisor detects the dead child, replays the WAL, and
+// spawns a pristine worker without dropping an active connection.
 //
-// The fuzzer corrupts an off-heap pointer the engine will dereference, then
-// the next access faults into an unmapped (or protected) region and raises a
-// raw SIGSEGV — the unrecoverable C-space crash that recover() cannot catch.
-// The TASK of the Supervisor-Worker architecture is to prove that this crash,
-// induced inside a WORKER child process, is recovered: the supervisor detects
-// the dead child, replays the WAL, and spawns a pristine worker without
-// dropping an active connection.
-//
-// MACHINE TRUTH (verified against the engine):
-// A `NodePtr` is a raw uintptr into the mmap'd `HamtArena.base..base+size`.
-// Flipping high bits of a node offset moves it outside [base, base+size),
-// so dereferencing it faults. The Go runtime converts a fault on a Go
-// pointer into a panic (when debug.SetPanicOnFault(true)), but a fault on
-// off-heap memory is NOT converted — it is a raw kernel SIGSEGV and the
-// process dies. That is exactly why the engine must be isolated in a child.
+// Machine truth (verified against the engine):
+//   A `NodePtr` is a raw uintptr into the mmap'd `HamtArena.base..base+size`.
+//   Flipping high bits of a node offset moves it outside [base, base+size),
+//   so dereferencing it faults. The Go runtime converts a fault on a Go
+//   pointer into a panic (when debug.SetPanicOnFault(true)), but a fault on
+//   off-heap memory is not converted — it is a raw kernel SIGSEGV and the
+//   process dies. That is exactly why the engine must be isolated in a child.
 // ---------------------------------------------------------------------------
 
 package chaos
@@ -45,14 +42,14 @@ import (
 // `slot` must point to a uint64-sized region in the engine's memory that the
 // engine will load as a NodePtr. The caller is responsible for choosing the
 // slot (typically a child node pointer the engine is about to traverse); the
-// fuzzer ONLY performs the corruption — it does not itself cause the crash,
-// the engine's own next Get/Set does, exactly mid-RPS as the design doc states.
+// fuzzer only performs the corruption — it does not itself cause the crash;
+// the engine's own next Get/Set does.
 //
 // Returns the pre- and post-corruption pointer values for the test logs.
-// Pre-mortem honesty: this is a deliberate, controlled corruption — a REAL
-// fuzzer would flip random bits at random times; this version deterministically
-// produces a guaranteed-faulting pointer so the survival test is reproducible
-// rather than probabilistic (CI determinism > chaos entertainment).
+// This is a deliberate, controlled corruption — a real fuzzer would flip
+// random bits at random times; this version deterministically produces a
+// guaranteed-faulting pointer so the survival test is reproducible rather
+// than probabilistic (CI determinism > chaos entertainment).
 func CorruptOffHeapPointer(baseLo, baseHi uintptr, slot unsafe.Pointer) (before, after uintptr, err error) {
 	if baseHi <= baseLo {
 		return 0, 0, errors.New("chaos/fuzzer: base range invalid")
@@ -84,7 +81,7 @@ func CorruptOffHeapPointer(baseLo, baseHi uintptr, slot unsafe.Pointer) (before,
 }
 
 // RandomFaultIndex returns a uniformly-random non-negative integer in [0, n)
-// drawn from crypto/rand. The fuzzer uses it to pick WHICH node pointer to
+// drawn from crypto/rand. The fuzzer uses it to pick which node pointer to
 // corrupt out of N candidate slots, mid-RPS, so successive runs exercise
 // different crash sites without losing reproducibility of the survival property.
 func RandomFaultIndex(n int) int {
@@ -94,7 +91,7 @@ func RandomFaultIndex(n int) int {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// crypto/rand failure — fall back to a deterministic low slot so the
-		// fuzzer still injects SOMETHING rather than silently skipping.
+		// fuzzer still injects something rather than silently skipping.
 		return 0
 	}
 	v := binary.BigEndian.Uint32(b[:])

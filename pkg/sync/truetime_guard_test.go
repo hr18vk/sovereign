@@ -4,58 +4,53 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// — the Wait-Until-Safe anti-regression guard.
+// TestNoTrueTimeWaitUntilSafe enforces ADR-0001 (Reject TrueTime commit-wait):
+// the engine rejects TrueTime commit-wait because HLC with Amazon Time Sync ε
+// (~26-50 µs) plus per-peer EWMA is mathematically sufficient for CRDT causal
+// consistency, which needs only a causal partial order, not absolute
+// linearizability. A TrueTime commit-wait would insert an O(ε) sleep into the
+// Join hot path, taxing ingress throughput for a property the lattice already
+// guarantees.
 //
-// TestNoTrueTimeWaitUntilSafe is the structural enforcement of ADR-0001
-// (docs/architecture/adr/0001_reject_truetime_commit_wait.md): the engine
-// rejects TrueTime commit-wait because HLC + Amazon Time Sync ε (~26-50µs) +
-// per-peer EWMA is mathematically sufficient for CRDT causal consistency, which
-// needs only a causal partial order — NOT absolute linearizability. A TrueTime
-// commit-wait would insert an O(ε) sleep into the Join hot path, taxing ingress
-// throughput for a property the lattice already guarantees.
+// This test is a lint-style static AST scan (stdlib go/token, go/parser,
+// go/ast; zero new dependencies). It is not a proof of system correctness.
+// A future contributor who adds a wait-until-safe primitive to Join will see
+// this test fail at CI time; the correct response is to amend ADR-0001 with a
+// superseding ADR that re-opens the math, not to weaken this test.
 //
-// This guard pins the GROUND STATE: the Join path is non-blocking TODAY. It is
-// a lint-style static AST scan (stdlib go/token + go/parser + go/ast; zero new
-// deps), NOT a proof of system correctness. A future contributor who injects a
-// wait-until-safe primitive into Join will FAIL this guard at CI time, before
-// merge — and the correct response is to amend ADR-0001 with a superseding
-// ADR-0001b that re-opens the math, NOT to loosen this guard.
+// Scope (load-bearing): parse only the Join fast-path files in pkg/sync and
+// their deliver-to-Join callees, not the entire repo. Chaos tests
+// (internal/chaos) legitimately sleep; a broad scan would false-positive.
 //
-// SCOPE (load-bearing — do NOT broaden): parse ONLY the Join fast-path files in
-// pkg/sync and their deliver-to-Join callees, NOT the entire repo. Chaos tests
-// (internal/chaos) legitimately sleep; a broad scan would false-positive. The
-// targeted assertion over the Join call graph is the load-bearing one.
+//   - pkg/sync/crdt.go
+//   - pkg/sync/crdt_apply.go
+//   - pkg/sync/crdt_apply_batch.go
 //
-// - pkg/sync/crdt.go (Join at line 1016; callees defined in pkg/sync)
-// - pkg/sync/crdt_apply.go (Join call site at:186)
-// - pkg/sync/crdt_apply_batch.go (Join call site at:240)
+// Depth cap = 1: Join calls internal helpers, but a commit-wait would be added
+// at the Join call site or Join body, not buried inside a leaf helper. A
+// depth-1 scan of Join and its direct callees inside pkg/sync is the right
+// granularity. A wait hidden two calls deep would escape; this is a known
+// limitation, not a fixable defect.
 //
-// DEPTH CAP = 1 (documented): Join calls internal helpers, but a commit-wait
-// would be added AT the Join call site / Join body, not buried inside a leaf
-// helper. A depth-1 scan of Join + its direct callees inside pkg/sync is the
-// right granularity. A wait hidden two calls deep would escape — this is honest
-// weakness (4) in the commit body, not a fixable defect.
+// Carve-out: the in-engine HLC advances via AdvanceLamportTo, which uses an
+// atomic.CompareAndSwap loop. That is lock-free (atomic CAS, not a clock-wait).
+// The test must not flag the CAS loop; it is the proof that Join is
+// non-blocking by construction. The channel-name regex below matches channel
+// receive identifiers only; the CAS loop is an atomic operation on a *uint64,
+// not a channel, so it is naturally not matched. Do not broaden the regex to
+// match the CAS loop; that would conflate a lock-free primitive with a
+// clock-wait and defeat the test's purpose.
 //
-// CARVE-OUT (documented): the in-engine HLC is advanced via AdvanceLamportTo
-// (pkg/sync/crdt.go:1639), which uses an atomic.CompareAndSwap loop — that is
-// lock-free (atomic CAS, NOT a clock-wait). The guard MUST NOT flag the CAS
-// loop; it is the proof Join is non-blocking by construction. The channel-name
-// regex /(wait|safe|epsilon|truetime|uncertain)/i below is for CHANNEL receive
-// identifiers only; the CAS loop is an atomic op on a *uint64, not a channel —
-// it is naturally not matched. Do NOT "fix" this carve-out by broadening the
-// regex to match the CAS loop; that would conflate a lock-free primitive with a
-// clock-wait and defeat the guard's point.
-//
-// FORBIDDEN PRIMITIVES (a CallExpr or Stmt matching any of these FAILS):
-// - time.Sleep
-// - time.After / time.NewTimer / time.Tick / time.NewTicker whose result feeds
-// a <- receive (a blocking wait on a time channel)
-// - (*sync.Cond).Wait / (*sync.WaitGroup).Wait keyed to clock-derived data
-// (a TrueTime commit-wait would key a WaitGroup/Cond to the uncertainty
-// window; flag any.Wait() whose enclosing func also references time.Now /
-// utcx / epsilon locally — conservative is correct for a negative guard)
-// - a <- receive on a channel whose identifier matches
-// /(wait|safe|epsilon|truetime|uncertain)/i (regex; conservative)
+// Forbidden primitives (a matching CallExpr or Stmt fails):
+//   - time.Sleep
+//   - time.After, time.NewTimer, time.Tick, time.NewTicker whose result feeds
+//     a <- receive (a blocking wait on a time channel)
+//   - (*sync.Cond).Wait or (*sync.WaitGroup).Wait keyed to clock-derived data
+//     (a TrueTime commit-wait would key a WaitGroup or Cond to the uncertainty
+//     window; flag any .Wait() whose enclosing function also references
+//     time.Now, utcx, or epsilon locally — conservative for a negative test)
+//   - a <- receive on a channel whose identifier matches
+//     /(wait|safe|epsilon|truetime|uncertain)/i (regex; conservative)
 
 package sync
 
@@ -68,7 +63,7 @@ import (
 	"testing"
 )
 
-// joinPathFiles are the ONLY files the guard scans (see SCOPE above).
+// joinPathFiles are the files the test scans (see Scope above).
 var joinPathFiles = []string{
 	"crdt.go",
 	"crdt_apply.go",
@@ -76,14 +71,14 @@ var joinPathFiles = []string{
 }
 
 // waitChannelRe matches channel identifiers named for the uncertainty window.
-// It is for CHANNEL receives only (see CARVE-OUT: the CAS loop is an atomic,
-// not a channel, and is intentionally not matched).
+// It is for channel receives only (see Carve-out: the CAS loop is an atomic
+// operation, not a channel, and is intentionally not matched).
 var waitChannelRe = regexp.MustCompile(`(?i)wait|safe|epsilon|truetime|uncertain`)
 
 // clockKeyRe matches local identifiers a clock-keyed Wait would reference.
 var clockKeyRe = regexp.MustCompile(`(?i)time\.Now|utcx|epsilon|truetime|uncertain|wallNow|hlc\.Physical`)
 
-// scannedFunc records one function scanned by the guard, for the t.Logf table.
+// scannedFunc records one function scanned by the test, for the t.Logf table.
 type scannedFunc struct {
 	name      string
 	pos       token.Position
@@ -97,7 +92,7 @@ func TestNoTrueTimeWaitUntilSafe(t *testing.T) {
 	for _, name := range joinPathFiles {
 		f, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
 		if err != nil {
-			t.Fatalf("guard: parse %s: %v", name, err)
+			t.Fatalf("parse %s: %v", name, err)
 		}
 		pkgFiles[name] = f
 	}
@@ -119,7 +114,7 @@ func TestNoTrueTimeWaitUntilSafe(t *testing.T) {
 
 	join, ok := funcsByName["Join"]
 	if !ok {
-		t.Fatalf("guard: Join FuncDecl not found in scanned files — scope regression")
+		t.Fatalf("Join FuncDecl not found in scanned files — scope regression")
 	}
 
 	// Depth-1 scan set: Join itself + every direct callee of Join that is
@@ -151,23 +146,23 @@ func TestNoTrueTimeWaitUntilSafe(t *testing.T) {
 	}
 
 	// Diagnosable table: a CI failure shows exactly what was found and where,
-	// not a mystery "guard failed" blob.
-	t.Logf("wait-until-safe guard — depth-1 scan of Join call graph (%d funcs):", len(rows))
-	t.Logf(" %-10s %-7s %-9s %s", "FUNC", "LINE", "VERDICT", "PRIMITIVE")
+	// not a mystery "test failed" blob.
+	t.Logf("wait-until-safe test — depth-1 scan of Join call graph (%d funcs):", len(rows))
+	t.Logf("  %-10s %-7s %-9s %s", "Func", "Line", "Verdict", "Primitive")
 	for _, r := range rows {
-		t.Logf(" %-10s %-7d %-9s %s", r.name, r.pos.Line, r.verdict, r.primitive)
+		t.Logf("  %-10s %-7d %-9s %s", r.name, r.pos.Line, r.verdict, r.primitive)
 	}
 
 	if failed {
-		t.Fatalf("guard: ADR-0001 violated — a wait-until-safe primitive was found in the " +
+		t.Fatalf("ADR-0001 violated — a wait-until-safe primitive was found in the " +
 			"Join call graph. Either revert the commit-wait, or amend ADR-0001 with a " +
-			"superseding ADR-0001b that re-opens the math. Do NOT loosen this guard.")
+			"superseding ADR that re-opens the math. Do not weaken this test.")
 	}
 }
 
 // directCallees returns the set of function/method names called directly within
 // fn's body (the textual identifiers of every CallExpr's Fun, unwrapped from
-// selectors and index expressions). It does NOT recurse into callees' bodies —
+// selectors and index expressions). It does not recurse into callees' bodies —
 // that is the depth-1 cap.
 func directCallees(fn *ast.FuncDecl) []string {
 	var out []string
@@ -247,14 +242,14 @@ func forbiddenCall(ce *ast.CallExpr, clockKeyed bool) string {
 			return "time." + name + " feeding a <- receive"
 		}
 		// A time.After/timer result that is stored to a var and later received
-		// (e.g. `t:= time.After(eps); <-t`) is caught by the receive-side scan
+		// (e.g. `t := time.After(eps); <-t`) is caught by the receive-side scan
 		// below in findWaitUntilSafe only if the channel ident matches the
 		// uncertainty regex; a bare `t` does not. The direct `<-time.After(eps)`
 		// shape is caught here by AST identity.
 	case "Wait":
 		// (*sync.Cond).Wait / (*sync.WaitGroup).Wait. Flag unconditionally when
-		// clock-derived, else flag only the explicit.Wait() form (conservative
-		// for a negative guard: a WaitGroup/Cond keyed to the uncertainty
+		// clock-derived, else flag only the explicit .Wait() form (conservative
+		// for a negative test: a WaitGroup/Cond keyed to the uncertainty
 		// window is exactly the TrueTime commit-wait shape).
 		if clockKeyed {
 			return ".Wait() in a func referencing clock-derived data"
@@ -280,13 +275,13 @@ func isPkg(fun ast.Expr, pkg string) bool {
 // signal — a non-received timer stored to a var would still mean time was
 // introduced into the non-blocking path. We therefore treat every time.*
 // timer-constructing call as forbidden, which is conservative in the correct
-// direction for a negative guard. See ADR-0001 §6 N1: Join is O(1)-non-blocking.
+// direction for a negative test. See ADR-0001 §6 N1: Join is O(1)-non-blocking.
 func feedsReceive(ce *ast.CallExpr) bool {
 	return true
 }
 
 // chanIdent extracts the identifier of a channel expression for the receive
-// rule, unwrapping selectors (t.C -> C is NOT matched; only bare ids like
+// rule, unwrapping selectors (t.C -> C is not matched; only bare ids like
 // `waitCh` are) and parens. We match bare identifiers only so the CAS-loop
 // carve-out (an atomic on a *uint64) is never confused with a channel.
 func chanIdent(x ast.Expr) string {

@@ -4,13 +4,9 @@
 // which can be found in the LICENSE file. Production use requires a written
 // grant from the Licensor until the Change Date stated in the LICENSE file.
 
-// raceEnabled is true when the `race` build tag is active (go test -race). The
-// race detector perturbs the cheap-gate-reject latency floor: a DropMalformed
-// frame that returns sub-1us in a clean build returns ~5-10us under -race (the
-// shadow-memory bookkeeping on every memory access). The bimodality guard
-// (two separated populations) still holds under -race, but the cheap-reject
-// population shifts right, so the le=1e-06 sub-1us assertion is gated to clean
-// builds only. Canonical Go idiom (mirrors pkg/sync/race_enabled_test.go).
+// raceEnabled lets the ingest test use a wider latency bucket under the race
+// detector. Detector instrumentation shifts cheap-reject samples to the right,
+// while the signed-frame samples remain in a separate, higher-latency population.
 
 //go:build race
 // +build race

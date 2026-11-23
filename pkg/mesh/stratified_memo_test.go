@@ -6,33 +6,22 @@
 
 package mesh
 
-// stratified_memo_test.go — the stratified-memo guard.
+// These tests cover the sweep-envelope memo (ADR-0045 §2).
 //
-// THE DEFECT (ADR-0045): the sweep-envelope memo is keyed by
-// POSITION (sweepEnvIdx) and was never guarded against STRATIFIED mode. With
-// --stratified-anti-entropy ON (ADR-0034), each peer's delta is a PER-PEER
-// digest-exchange result: peer 1 fills memo slots 0..N with ITS envelopes, the
-// per-peer rewind (batch.go:371) resets the cursor to 0 for peer 2, and peer 2
-// HITS THE MEMO — receiving PEER 1's diff. The keys peer 2's digest asked for are
-// never shipped: convergence stalls for exactly the entries the stratified path
-// exists to send. Latent on the gate (stratified is OFF on silicon); live for any
-// customer who turns the flag on.
+// With --stratified-anti-entropy enabled, every peer's delta comes from that
+// peer's digest. A memo keyed only by sweepEnvIdx must therefore be bypassed:
+// shipBatchedDelta rewinds the cursor for each peer, so reusing a position
+// across peers would deliver the first peer's diff to the next one. The
+// classical and hybrid batch paths both enforce this rule.
 //
-// THE guard drives the exact production seam deterministically: ShipBatch (the
-// function shipBatchedDelta's flush calls per batch) with the memo cursor
-// managed exactly as the sweep manages it (round reset as AntiEntropySweep does;
-// per-peer rewind verbatim from batch.go:371). A originates DISJOINT sets X and
-// Y; peer B's digest-answer is Y, peer C's is X. Pre-fix, C's ShipBatch HITS the
-// memo and C receives Y's envelope — C applies Y and never sees X. Post-fix the
-// memo is bypassed under stratified and C receives X. Real TLS, real receiver,
-// real apply — the only test-managed part is the two cursor lines, because the
-// digest exchange itself (the timeout→oversend fallback) would MASK the memo
-// defect by delivering the full state on any timeout.
+// Without stratified anti-entropy, the hybrid path consults the memo so two
+// peers receiving the same content share one signed batch. The test checks
+// batchSeq rather than envelope bytes because deterministic ML-DSA-65 signing
+// can also produce identical bytes from independent mints.
 //
-// RED on pre-fix bytes (C never holds X); GREEN once the memo is gated on
-// !g.stratified. Run:
-//
-//	go test -run 'Test(StratifiedMemo|HybridMemo)' -race -count=1 -v ./pkg/mesh/
+// The tests drive ShipBatch and ShipBatchHybrid over real TLS connections.
+// They reproduce the sweep's round reset and per-peer cursor rewind directly;
+// running a digest exchange would let its oversend fallback mask memo reuse.
 
 import (
 	"context"
@@ -55,8 +44,8 @@ import (
 	"github.com/hr18vk/sovereign/pkg/transport"
 )
 
-// stratMemoNode is one node of the 3-node harness.
-type stratMemoNode struct {
+// StratifiedMemoNode is one node of the 3-node harness.
+type StratifiedMemoNode struct {
 	ln     net.Listener
 	ident  *NodeIdentity
 	engine *eng.DeltaCRDTEngine
@@ -67,26 +56,26 @@ type stratMemoNode struct {
 	addr   string
 }
 
-// stratMemoHarness is a 3-node loopback TLS mesh (A, B, C) with MANUAL peering:
-// the test dials exactly A⇄B and A⇄C — never B⇄C — so no cross-seeding can mask
-// which envelope each peer received.
-type stratMemoHarness struct {
-	nodes  [3]*stratMemoNode // 0=A (origin), 1=B, 2=C
+// StratifiedMemoHarness is a 3-node loopback TLS mesh (A, B, C) with manual
+// peering: the test dials exactly A⇄B and A⇄C — never B⇄C — so no
+// cross-seeding can mask which envelope each peer received.
+type StratifiedMemoHarness struct {
+	nodes  [3]*StratifiedMemoNode // 0=A (origin), 1=B, 2=C
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     *sync.WaitGroup
 }
 
-func newStratMemoHarness(t *testing.T) *stratMemoHarness {
+func newStratifiedMemoHarness(t *testing.T) *StratifiedMemoHarness {
 	t.Helper()
-	return buildStratMemoHarness(t, false)
+	return newCommitWindowHarness(t, false)
 }
 
-// buildStratMemoHarness builds the 3-node harness; hybrid=true mints HYBRID
+// newCommitWindowHarness builds the 3-node harness; hybrid=true mints hybrid
 // identities (NewNodeIdentityHybrid — the PQ key from the same seed) and arms
 // the receivers' SetHybridVerify, so the hybrid batch path (ShipBatchHybrid →
-// HandleHybridFrame) can run end to end.
-func buildStratMemoHarness(t *testing.T, hybrid bool) *stratMemoHarness {
+// HandleHybridFrame) runs end to end.
+func newCommitWindowHarness(t *testing.T, hybrid bool) *StratifiedMemoHarness {
 	t.Helper()
 	ca, err := crypto.NewMeshCA()
 	if err != nil {
@@ -98,7 +87,7 @@ func buildStratMemoHarness(t *testing.T, hybrid bool) *stratMemoHarness {
 		t.Fatalf("WriteCAPEM: %v", err)
 	}
 
-	h := &stratMemoHarness{}
+	h := &StratifiedMemoHarness{}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	h.wg = &sync.WaitGroup{}
 
@@ -126,10 +115,9 @@ func buildStratMemoHarness(t *testing.T, hybrid bool) *stratMemoHarness {
 			clock.NewIngressHLCScalarCap(clock.NewSystemClock(), engine),
 			clock.NewSystemClock(), nodeDir, engine, 50_000_000)
 		if hybrid {
-			recv.SetHybridVerify(true) // the receiver-side opt-in (receiver.go:364)
+			recv.SetHybridVerify(true) // the receiver-side opt-in
 			// The hybrid verify path resolves the origin's ML-DSA-65 pubkey
-			// through the Directory — register SELF now (peers at connect),
-			// the fixture's shape.
+			// through the Directory — register self now (peers at connect()).
 			if err := nodeDir.RegisterPQ(ident.NodeID, ident.PQPub); err != nil {
 				t.Fatalf("RegisterPQ self %d: %v", i, err)
 			}
@@ -152,11 +140,13 @@ func buildStratMemoHarness(t *testing.T, hybrid bool) *stratMemoHarness {
 		}
 		ps := NewPeerSet(tr, recv, ident, engine)
 		g := NewGossiper(ps, ident, engine, nodeDir)
-		h.nodes[i] = &stratMemoNode{ln: ln, ident: ident, engine: engine, recv: recv, dir: nodeDir, ps: ps, g: g, addr: ln.Addr().String()}
+		h.nodes[i] = &StratifiedMemoNode{ln: ln, ident: ident, engine: engine, recv: recv, dir: nodeDir, ps: ps, g: g, addr: ln.Addr().String()}
 		h.wg.Add(1)
-		// nil digester: the guard drives ShipBatch directly — no digest exchange
+		// nil digester: the test drives ShipBatch directly — no digest exchange
 		// runs, so no digest sink is needed (the batchMesh precedent).
-		go runAcceptLoop(h.ctx, ln, recv, nil, h.wg)
+		// The PeerSet-threaded accept loop registers connections, completes the
+		// challenge handshake, and edges earn egress.
+		go runAcceptLoopWithPeerSet(h.ctx, ln, recv, nil, h.wg, ps)
 	}
 	return h
 }
@@ -164,7 +154,7 @@ func buildStratMemoHarness(t *testing.T, hybrid bool) *stratMemoHarness {
 // connect dials both directions between nodes i and j and registers the
 // directories both ways (the batch verify path resolves the origin through the
 // Directory).
-func (h *stratMemoHarness) connect(t *testing.T, i, j int) {
+func (h *StratifiedMemoHarness) connect(t *testing.T, i, j int) {
 	t.Helper()
 	if err := h.nodes[i].ps.Dial(h.ctx, h.nodes[j].addr, "localhost", h.nodes[j].ident.NodeID); err != nil {
 		t.Fatalf("dial %d->%d: %v", i, j, err)
@@ -176,9 +166,7 @@ func (h *stratMemoHarness) connect(t *testing.T, i, j int) {
 	asyncWait(t, h.nodes[j].ps, h.nodes[i].ident.NodeID)
 	_ = h.nodes[i].g.RegisterPeer(h.nodes[j].ident.NodeID, h.nodes[j].ident.Pub)
 	_ = h.nodes[j].g.RegisterPeer(h.nodes[i].ident.NodeID, h.nodes[i].ident.Pub)
-	// The hybrid verify path resolves the origin's PQ pubkey through the
-	// Directory (RegisterPQ,'s fixture shape) — register the peer's PQ
-	// key on both nodes when present.
+	// Register each peer's ML-DSA public key for hybrid verification.
 	if h.nodes[j].ident.PQPub != nil {
 		if err := h.nodes[i].dir.RegisterPQ(h.nodes[j].ident.NodeID, h.nodes[j].ident.PQPub); err != nil {
 			t.Fatalf("RegisterPQ %d<-%d: %v", i, j, err)
@@ -191,7 +179,7 @@ func (h *stratMemoHarness) connect(t *testing.T, i, j int) {
 	}
 }
 
-func (h *stratMemoHarness) close() {
+func (h *StratifiedMemoHarness) close() {
 	h.cancel()
 	for _, n := range h.nodes {
 		_ = n.ln.Close() // unblock the accept loops
@@ -200,24 +188,23 @@ func (h *stratMemoHarness) close() {
 }
 
 // holds reports whether node's engine state carries every key.
-func (h *stratMemoHarness) holds(node int, keys []string) bool {
+func (h *StratifiedMemoHarness) holds(node int, keys []string) bool {
 	for _, k := range keys {
-		if len(h.nodes[node].engine.State().Get(k)) == 0 {
+		if len(h.nodes[node].engine.PointGet(k)) == 0 {
 			return false
 		}
 	}
 	return true
 }
 
-// eventsOf builds the BuiltEvent slice the ship path consumes — each entry's
-// stamped dot read from the origin node's STATE (no counter arithmetic
-// assumed), the payload looked up by THAT dot: the exact pair the production
-// walk uses.
-func (h *stratMemoHarness) eventsOf(t *testing.T, node int, keys []string) []BuiltEvent {
+// eventsOf builds the BuiltEvent slice consumed by the ship path. Each entry's
+// stamped dot comes from the origin's current state, and the payload is looked
+// up by that dot, matching the production walk.
+func (h *StratifiedMemoHarness) eventsOf(t *testing.T, node int, keys []string) []BuiltEvent {
 	t.Helper()
 	evs := make([]BuiltEvent, 0, len(keys))
 	for _, k := range keys {
-		ents := h.nodes[node].engine.State().Get(k)
+		ents := h.nodes[node].engine.PointGet(k)
 		if len(ents) == 0 {
 			t.Fatalf("premise: node %d state lacks %s", node, k)
 		}
@@ -233,8 +220,8 @@ func (h *stratMemoHarness) eventsOf(t *testing.T, node int, keys []string) []Bui
 }
 
 // resetSweepRound puts the gossiper's memo at the top of a fresh round,
-// exactly as AntiEntropySweep does (gossip.go: sweepEnvCache = nil,
-// sweepEnvRound = sweepRound, sweepEnvIdx = 0 after sweepRound++).
+// exactly as AntiEntropySweep does (sweepEnvCache = nil, sweepEnvRound =
+// sweepRound, sweepEnvIdx = 0 after sweepRound++).
 func resetSweepRound(g *Gossiper) {
 	g.sweepRound++
 	g.sweepEnvCache = nil
@@ -242,17 +229,17 @@ func resetSweepRound(g *Gossiper) {
 	g.sweepEnvIdx = 0
 }
 
-// TestStratifiedMemoServesPerPeerContent is the guard.
+// TestStratifiedMemoServesPerPeerContent is the position-keyed memo regression test.
 func TestStratifiedMemoServesPerPeerContent(t *testing.T) {
-	h := newStratMemoHarness(t)
+	h := newStratifiedMemoHarness(t)
 	defer h.close()
 	const A, B, C = 0, 1, 2
 
-	// A originates two DISJOINT sets X and Y (A's payloadCache holds all).
+	// A originates two disjoint sets; its payload cache holds both.
 	var xs, ys []string
 	for i := 0; i < 5; i++ {
-		xk := fmt.Sprintf("strat-x-%d", i)
-		yk := fmt.Sprintf("strat-y-%d", i)
+		xk := fmt.Sprintf("stratmemo-x-%d", i)
+		yk := fmt.Sprintf("stratmemo-y-%d", i)
 		h.nodes[A].g.InsertLocalEvents(xk, fmt.Sprintf("xv-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_400_000 + i), H3Index: uint64(i)})
 		h.nodes[A].g.InsertLocalEvents(yk, fmt.Sprintf("yv-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_410_000 + i), H3Index: uint64(1000 + i)})
 		xs = append(xs, xk)
@@ -268,30 +255,23 @@ func TestStratifiedMemoServesPerPeerContent(t *testing.T) {
 	g := h.nodes[A].g
 	g.SetStratifiedAntiEntropy(true) // the condition the memo must respect
 
-	// Reproduce ONE stratified sweep round's per-peer ship sequence, with the
-	// cursor managed exactly as production manages it:
-	//   round reset — gossip.go (AntiEntropySweep): sweepEnvCache = nil,
-	//     sweepEnvRound = sweepRound, sweepEnvIdx = 0;
-	//   per-peer rewind — batch.go:371 (shipBatchedDelta): sweepEnvIdx = 0.
+	// Reproduce AntiEntropySweep's round reset and shipBatchedDelta's per-peer
+	// cursor rewind.
 	g.sweepRound++
 	g.sweepEnvCache = nil
 	g.sweepEnvRound = g.sweepRound
 	g.sweepEnvIdx = 0
 
-	// Peer 1 (B): the digest exchange's answer for B is Y (B lacks Y). The memo
-	// is empty, so this mints slot 0 — the Y envelope.
+	// B's diff is Y; the empty memo mints its envelope in slot 0.
 	if _, _, err := g.ShipBatch(h.ctx, h.nodes[B].ident.NodeID, eventsY); err != nil {
 		t.Fatalf("ShipBatch B: %v", err)
 	}
-	// Peer 2 (C): the per-peer cursor rewind (batch.go:371), then C's ship — the
-	// digest exchange's answer for C is X. PRE-FIX this HITS the memo and
-	// publishes the Y envelope to C.
+	// Rewind the cursor before sending C's different diff, X.
 	g.sweepEnvIdx = 0
 	if _, _, err := g.ShipBatch(h.ctx, h.nodes[C].ident.NodeID, eventsX); err != nil {
 		t.Fatalf("ShipBatch C: %v", err)
 	}
 
-	// Wait for the receivers to apply, then assert on CONTENT, not on counters.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if h.holds(B, ys) {
@@ -300,9 +280,8 @@ func TestStratifiedMemoServesPerPeerContent(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if !h.holds(B, ys) {
-		t.Fatalf("premise broken: peer 1's minted ship never landed (B lacks Y) — the guard proves nothing")
+		t.Fatalf("B did not receive Y, so the first ShipBatch did not complete")
 	}
-	// Give C's (possibly wrong) envelope the same chance to apply.
 	cDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(cDeadline) {
 		if h.holds(C, xs) {
@@ -311,35 +290,29 @@ func TestStratifiedMemoServesPerPeerContent(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if h.holds(C, ys) && !h.holds(C, xs) {
-		t.Fatalf("(ADR-0045): peer C received PEER B's envelope — C holds Y=%v, X=%v. The position-keyed memo served peer 1's content to peer 2 under stratified mode; C's requested diff (X) was never shipped. Gate the memo on !g.stratified.",
+		t.Fatalf("memo reused B's envelope for C under stratified anti-entropy: C has Y=%v X=%v (ADR-0045 §2)",
 			h.holds(C, ys), h.holds(C, xs))
 	}
 	if !h.holds(C, xs) {
-		t.Fatalf("C holds neither X nor the wrong Y — the ship itself failed (check the receiver path); the memo verdict is indeterminate")
+		t.Fatalf("C received neither its own X nor B's Y; delivery failed before memo behavior could be checked")
 	}
-	t.Logf("GREEN: under stratified mode, peer C received ITS OWN digest-answer (X) — B holds Y=%v, C holds X=%v, and neither got the other's envelope",
+	t.Logf("stratified memo kept peer content separate: B has Y=%v and C has X=%v",
 		h.holds(B, ys), h.holds(C, xs))
 }
 
-// TestHybridMemoByteIdenticalPerSweep is the guard,
-// mirroring TestByteIdenticalEnvelopePerSweep for the
-// HYBRID frame. The check is batchSeq, not byte-identity: ML-DSA-65 signing is
-// deterministic, so two independent mints of the same content CAN be
-// byte-identical — but a memo hit never advances batchSeq (no mint, no re-sign,
-// no OriginSeq churn). Before this change, ShipBatchHybrid had NO memo consult: two peers
-// in one round each paid the 60.19us Ed25519 + 585.8us ML-DSA-65 sign —
-// 3,500 hybrid signs ≈ 2.26s per sweep round at the 35-peer × 100-batch gate
-// shape. This test pins the stratified guard on the HYBRID path: stratified ON,
-// disjoint per-peer sets, each peer must receive its OWN content.
+// TestHybridMemoByteIdenticalPerSweep checks both hybrid memo contracts. Two
+// peers receiving one content in a round share one mint, observed through
+// batchSeq. With stratified anti-entropy enabled and disjoint peer content,
+// each peer gets a separately signed batch containing its own diff.
 func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
-	h := buildStratMemoHarness(t, true)
+	h := newCommitWindowHarness(t, true)
 	defer h.close()
 	const A, B, C = 0, 1, 2
 
 	var xs, ys []string
 	for i := 0; i < 5; i++ {
-		xk := fmt.Sprintf("hyb-x-%d", i)
-		yk := fmt.Sprintf("hyb-y-%d", i)
+		xk := fmt.Sprintf("stratmemo-hyb-x-%d", i)
+		yk := fmt.Sprintf("stratmemo-hyb-y-%d", i)
 		h.nodes[A].g.InsertLocalEvents(xk, fmt.Sprintf("xv-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_500_000 + i), H3Index: uint64(i)})
 		h.nodes[A].g.InsertLocalEvents(yk, fmt.Sprintf("yv-%d", i), eng.CRDTEntry{SystemTime: int64(1_700_510_000 + i), H3Index: uint64(2000 + i)})
 		xs = append(xs, xk)
@@ -349,7 +322,7 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 	h.connect(t, A, C)
 	g := h.nodes[A].g
 
-	// ── ONE round, ONE content, TWO peers → ONE mint (the memo). ──────
+	// First phase: one round, one content, two peers → one mint (the memo).
 	resetSweepRound(g)
 	eventsX := h.eventsOf(t, A, xs)
 	seq0 := g.batchSeq
@@ -358,7 +331,7 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 		t.Fatalf("ShipBatchHybrid B: %v", err)
 	}
 	mintWall := time.Since(t0)
-	g.sweepEnvIdx = 0 // the per-peer cursor rewind (shipBatchedDelta, batch.go:371)
+	g.sweepEnvIdx = 0 // the per-peer cursor rewind (shipBatchedDelta)
 	t0 = time.Now()
 	if _, _, err := g.ShipBatchHybrid(h.ctx, h.nodes[C].ident.NodeID, eventsX); err != nil {
 		t.Fatalf("ShipBatchHybrid C: %v", err)
@@ -366,7 +339,7 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 	memoWall := time.Since(t0)
 
 	if g.batchSeq != seq0+1 {
-		t.Fatalf("(ADR-0045): two peers in ONE round minted %d hybrid batches (batchSeq %d → %d) — the hybrid path re-signs per peer: 3,500 × 646us ≈ 2.26s of signing per sweep round at the gate shape. The memo must serve peer 2 (one mint per round).",
+		t.Fatalf("two peers receiving one content minted %d hybrid batches (batchSeq %d → %d), want one memoized mint (ADR-0045 §2)",
 			g.batchSeq-seq0, seq0, g.batchSeq)
 	}
 	// Both peers must hold the content (the hybrid frames verified + applied —
@@ -381,16 +354,15 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 	if !h.holds(B, xs) || !h.holds(C, xs) {
 		t.Fatalf("hybrid memo ship broke delivery: B holds X=%v, C holds X=%v (want both)", h.holds(B, xs), h.holds(C, xs))
 	}
-	t.Logf("hybrid memo: ONE mint for two peers (batchSeq %d → %d); mint+publish=%s vs memo-hit publish=%s", seq0, g.batchSeq, mintWall, memoWall)
+	t.Logf("hybrid memo: one mint for two peers (batchSeq %d → %d); mint+publish=%s vs memo-hit publish=%s", seq0, g.batchSeq, mintWall, memoWall)
 
-	// ── stratified ON: the memo must NOT serve across peers (the
-	// guard holds on the HYBRID path too — do not fix one twin and leave the
-	// other). B's diff is Y2, C's is a different per-peer diff — disjoint. ────
+	// With stratified anti-entropy enabled, B receives Y2 and C receives the
+	// disjoint X2. The hybrid path must bypass the memo for both.
 	g.SetStratifiedAntiEntropy(true)
 	var x2s, y2s []string
 	for i := 0; i < 3; i++ {
-		xk := fmt.Sprintf("hyb2-x-%d", i)
-		yk := fmt.Sprintf("hyb2-y-%d", i)
+		xk := fmt.Sprintf("stratmemo-hyb2-x-%d", i)
+		yk := fmt.Sprintf("stratmemo-hyb2-y-%d", i)
 		h.nodes[A].g.InsertLocalEvents(xk, "x2v", eng.CRDTEntry{SystemTime: int64(1_700_520_000 + i), H3Index: uint64(3000 + i)})
 		h.nodes[A].g.InsertLocalEvents(yk, "y2v", eng.CRDTEntry{SystemTime: int64(1_700_530_000 + i), H3Index: uint64(4000 + i)})
 		x2s = append(x2s, xk)
@@ -408,7 +380,7 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 		t.Fatalf("ShipBatchHybrid C (stratified): %v", err)
 	}
 	if g.batchSeq != seq1+2 {
-		t.Fatalf("Under stratified: two peers minted %d hybrid batches (batchSeq %d → %d) — under stratified EVERY peer must build+sign its own (the memo is bypassed); want 2", g.batchSeq-seq1, seq1, g.batchSeq)
+		t.Fatalf("stratified peers minted %d hybrid batches (batchSeq %d → %d), want separate signatures for both peers", g.batchSeq-seq1, seq1, g.batchSeq)
 	}
 	deadline2 := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline2) {
@@ -418,8 +390,8 @@ func TestHybridMemoByteIdenticalPerSweep(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if !h.holds(C, x2s) || h.holds(C, y2s) {
-		t.Fatalf("On the HYBRID path: under stratified, C must receive ITS OWN content — C holds X2=%v (want true), Y2=%v (want false: that is B's envelope)",
+		t.Fatalf("hybrid memo served the wrong content under stratified anti-entropy: C has X2=%v (want true), Y2=%v (want false)",
 			h.holds(C, x2s), h.holds(C, y2s))
 	}
-	t.Logf("GREEN: hybrid memo serves ONE mint per round per content  and is bypassed under stratified (— both peers signed, each got its own content)")
+	t.Logf("hybrid memo shared one mint for identical content and was bypassed for disjoint stratified content")
 }

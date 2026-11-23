@@ -6,11 +6,10 @@
 
 package mesh
 
-// review_guards_test.go — POST-REVIEW guards. Each test
-// pins one adversarial-review finding's honest behavior; each is RED against
-// the pre-fix tree and GREEN after its fix commit.
+// These tests cover connection ownership and shutdown, relay retention,
+// cache-line layout, and nil-safe statistics.
 //
-//	go test -run 'Test(Decline|ClosePeer|RetainBatch|CommitInFlight|CacheStatsNil|RetainOwnership|LiveReconnectEdge)' -count=1 -v ./pkg/mesh/
+//	go test -run 'TestDeclineMustNotWrongKill|TestClosePeerMustNotDeadlockOnInbound|TestRetainBatchSkipsEmptyDots|TestCommitInFlightCacheLineIsolation|TestCacheStatsNilCaches|TestRetainOwnershipPremise|TestLiveReconnectEdgeSeesPastDeadByAddr' -count=1 -v ./pkg/mesh/
 
 import (
 	"bytes"
@@ -22,14 +21,10 @@ import (
 	"github.com/hr18vk/sovereign/pkg/receive"
 )
 
-// ── Finding #3 (peer.go): an DECLINE must not wrong-kill the live edge ──
-//
-// RegisterInbound declines when a LIVE edge already exists and returns
-// (nodeID, nil). The accept loop's deferred ReleaseInboundConn(nodeID, nil)
-// then bypasses the identity guard (mine == nil) and closeDones the LIVE
-// registration the declining goroutine never owned. The guard: two inbound
-// conns from the same peer; the second is declined; releasing the SECOND
-// must leave the FIRST registration's done OPEN.
+// TestDeclineMustNotWrongKill checks connection ownership when RegisterInbound
+// declines a duplicate edge and returns (nodeID, nil). The accept loop releases
+// that declined connection with the same nil handle. ReleaseInboundConn must not
+// close the existing registration, which the declining goroutine does not own.
 func TestDeclineMustNotWrongKill(t *testing.T) {
 	a, b, _, _ := newMutualPair(t)
 	lnA, err := a.tr.Listen("tcp", "127.0.0.1:0")
@@ -56,7 +51,7 @@ func TestDeclineMustNotWrongKill(t *testing.T) {
 		}
 	}()
 
-	var clientConns []*tls.Conn // the dial-side ends must stay OPEN (closing one drops the server-side conn)
+	var clientConns []*tls.Conn // closing a dial-side end also closes its server-side connection
 	defer func() {
 		for _, c := range clientConns {
 			_ = c.Close()
@@ -77,42 +72,36 @@ func TestDeclineMustNotWrongKill(t *testing.T) {
 		}
 	}
 
-	// First inbound conn: nothing registered yet → REGISTERED (the accept-symmetry repair).
+	// The first inbound connection registers because no edge exists yet.
 	tc1 := dialInbound()
 	idB, h1 := a.ps.RegisterInbound(tc1)
 	if h1 == nil {
-		t.Fatalf("first inbound registration was declined — the accept-symmetry repair is broken (idB=%x)", idB)
+		t.Fatalf("first inbound registration was unexpectedly declined (idB=%x)", idB)
 	}
 	if reg, closed := a.ps.doneClosedForTest(idB); !reg || closed {
 		t.Fatalf("after first RegisterInbound: registered=%v closed=%v, want true/false", reg, closed)
 	}
 
-	// Second inbound conn from the SAME peer: the first is LIVE → DECLINES.
+	// The second connection is declined while the first remains live.
 	tc2 := dialInbound()
 	idB2, h2 := a.ps.RegisterInbound(tc2)
 	if h2 != nil {
-		t.Fatalf("second inbound registration should have been declined by the liveness guard (h2 != nil)")
+		t.Fatalf("second inbound registration was not declined")
 	}
 
-	// The decline's deferred release — the exact call main.go:1620 /
-	// gossip_test.go:360 make. It must NOT kill the first (live) registration.
+	// Releasing the declined connection must leave the live registration open.
 	a.ps.ReleaseInboundConn(idB2, h2)
 	if reg, closed := a.ps.doneClosedForTest(idB); !reg || closed {
-		t.Fatalf("WRONG-KILL (finding #3): releasing the declined registration closed the LIVE edge (registered=%v closed=%v). The decline returns (nodeID, nil); ReleaseInboundConn's `mine != nil` guard is bypassed when mine==nil, so closeDone fired on an edge this goroutine never owned.", reg, closed)
+		t.Fatalf("releasing declined connection closed the live edge: registered=%v closed=%v", reg, closed)
 	}
 	_ = tc1.Close()
 	_ = tc2.Close()
 }
 
-// ── Finding #2 (peer.go): ClosePeer must not deadlock on an INBOUND edge ────
-//
-// ClosePeer deletes ps.peers[peerID] then blocks on <-pc.done. An inbound
-// peerConn has NO readLoop and cancelReader == nil; its only done-closer is
-// the accept loop's deferred ReleaseInboundConn, which early-returns because
-// the map entry is already deleted — so done never closes and ClosePeer hangs
-// forever. The guard registers an inbound edge with no serving goroutine (the
-// starkest form: nothing will EVER close done) and requires ClosePeer to
-// return.
+// TestClosePeerMustNotDeadlockOnInbound registers an inbound edge without a
+// serving goroutine. ClosePeer deletes the map entry and waits for pc.done, so
+// it must close that channel itself rather than rely on a read loop or a later
+// ReleaseInboundConn call that can no longer find the registration.
 func TestClosePeerMustNotDeadlockOnInbound(t *testing.T) {
 	a, b, _, _ := newMutualPair(t)
 	lnA, err := a.tr.Listen("tcp", "127.0.0.1:0")
@@ -154,39 +143,31 @@ func TestClosePeerMustNotDeadlockOnInbound(t *testing.T) {
 			t.Fatalf("ClosePeer returned error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("DEADLOCK (finding #2): ClosePeer on an INBOUND-registered peerConn blocked >5s — it deletes the map entry, then waits on a done nobody closes (no readLoop; the accept loop's release early-returns on the deleted entry). Fix: ClosePeer must closeDone() itself after conn.Close() (the sync.Once makes it idempotent for outbound peerConns whose readLoop also closes done).")
+		t.Fatalf("ClosePeer blocked for more than 5s on an inbound peer with no read loop; ClosePeer must close pc.done after closing the connection")
 	}
 }
 
-// ── Finding #6 (gossip.go): a 0-dot batch must not be retained ──────────────
-//
-// retainBatch stores the forward frame BEFORE the dot loop; with an empty
-// dotCounters the loop never runs, so no refcount and no reverse entry exist —
-// the frame is unreachable AND never freed (the GC frees only ref-counted
-// frames). A 0-dot batch can never be resolved by lookupBatch (the lookup keys
-// on dotCounters), so storing it is unambiguously dead weight.
+// TestRetainBatchSkipsEmptyDots verifies that a batch without dots allocates no
+// relay-cache entries. lookupBatch resolves frames by dot, so such a frame would
+// be unreachable and could never be reclaimed by reference counting.
 func TestRetainBatchSkipsEmptyDots(t *testing.T) {
 	rc := newRelayCache()
 	origin := [16]byte{0xB}
 	rc.retainBatch(origin, 7, nil, make([]byte, 512))
 	fwd, rev := rc.batchLenForTest()
 	if fwd != 0 || rev != 0 {
-		t.Fatalf("0-dot batch retained: forward=%d reverse=%d, want 0/0 — the refcount can never free a frame no dot points at (finding #6)", fwd, rev)
+		t.Fatalf("empty-dot batch retained %d forward and %d reverse entries, want zero", fwd, rev)
 	}
 	g := &Gossiper{relay: rc, cache: newPayloadCache()}
 	cs := g.CacheStats()
 	if cs.RelayBatchForwardBytes != 0 {
-		t.Fatalf("0-dot batch grew the byte counter: %d, want 0 (the E‴ arithmetic must not count dead weight)", cs.RelayBatchForwardBytes)
+		t.Fatalf("empty-dot batch grew RelayBatchForwardBytes to %d, want 0", cs.RelayBatchForwardBytes)
 	}
 }
 
-// ── Finding #13 (gossip.go): commitInFlight's cache-line isolation ──────────
-//
-// The field comment claims a 128-byte stride with "no other field shares the
-// line pair". The compiler's layout puts commitInFlight at offset 112 — inside
-// the 64-byte line [64,128) shared with sweepRound/sweepEnvCache/batchSeq/
-// bridge. The guard pins the honest invariant: the contended atomic must START
-// a 64-byte line AND no other field may live within its 128-byte stride.
+// TestCommitInFlightCacheLineIsolation checks that commitInFlight starts on a
+// 64-byte boundary and that no other field intersects its 128-byte stride.
+// Nearby fields must not share cache lines with this contended atomic.
 func TestCommitInFlightCacheLineIsolation(t *testing.T) {
 	type fieldSpan struct{ off, size uintptr }
 	spans := map[string]fieldSpan{}
@@ -200,11 +181,10 @@ func TestCommitInFlightCacheLineIsolation(t *testing.T) {
 		t.Fatal("Gossiper.commitInFlight not found")
 	}
 	if cf.off%64 != 0 {
-		t.Fatalf("commitInFlight at offset %d shares its 64-byte line [%d,%d) with its lower neighbors (finding #13) — the comment claims 128-byte isolation the layout does not deliver", cf.off, cf.off/64*64, cf.off/64*64+64)
+		t.Fatalf("commitInFlight offset %d is not aligned to a 64-byte cache line; containing line is [%d,%d)", cf.off, cf.off/64*64, cf.off/64*64+64)
 	}
-	// No other field may intersect [cf, cf+128) — the 128-byte stride the
-	// comment promises (Graviton adjacent-line prefetcher). The blank `_`
-	// padding fields ARE the isolation mechanism, not violators — skip them.
+	// Adjacent-line prefetching makes a 128-byte stride necessary. Blank
+	// padding fields provide the isolation and are excluded from the check.
 	for name, span := range spans {
 		if name == "commitInFlight" || name == "_" {
 			continue
@@ -215,16 +195,13 @@ func TestCommitInFlightCacheLineIsolation(t *testing.T) {
 	}
 }
 
-// ── Finding #15 (gossip.go): CacheStats must survive a struct-literal ───────
-//
-// convergence_metric_test.go builds &Gossiper{...} directly (bypassing
-// NewGossiper), leaving the caches nil. The /debug/memstats handler calls
-// CacheStats unconditionally — a nil cache deref there panics the SCRAPE of a
-// running node.
+// TestCacheStatsNilCaches constructs a Gossiper directly, bypassing the
+// constructor's cache initialization. CacheStats must return zero values rather
+// than panic when the memstats handler encounters this shape.
 func TestCacheStatsNilCaches(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
-			t.Fatalf("CacheStats panicked on a struct-literal Gossiper (nil caches): %v (finding #15)", r)
+			t.Fatalf("CacheStats panicked on a Gossiper with nil caches: %v", r)
 		}
 	}()
 	cs := (&Gossiper{}).CacheStats()
@@ -233,15 +210,10 @@ func TestCacheStatsNilCaches(t *testing.T) {
 	}
 }
 
-// ── Finding #14 (gossip.go + receiver.go): the no-copy ownership premise ────
-//
-// retain/retainBatch now TAKE the slice (no copy). That is sound ONLY because
-// FrameReader.ReadFrame returns a fresh per-frame buffer (receiver.go:486
-// `out := make([]byte, frameLen)`). The guard pins the premise END-TO-END:
-// frame 1 is retained, frame 2 is read through the SAME FrameReader, and the
-// retained bytes must still equal frame 1's content. A buffer-reuse
-// regression in ReadFrame fails this guard, which is exactly the failure the
-// old copy was (mis)built to defend against.
+// TestRetainOwnershipPremise checks the ownership contract behind no-copy
+// retention. FrameReader.ReadFrame allocates a fresh buffer for each frame, so
+// reading a second frame through the same reader must not alter retained bytes
+// from the first.
 func TestRetainOwnershipPremise(t *testing.T) {
 	f1 := bytes.Repeat([]byte{0xA5}, 4096)
 	f2 := bytes.Repeat([]byte{0x5A}, 4096)
@@ -261,26 +233,21 @@ func TestRetainOwnershipPremise(t *testing.T) {
 		t.Fatalf("ReadFrame 2: %v", err)
 	}
 	if !bytes.Equal(r2, f2) {
-		t.Fatal("frame 2 content mismatch (the fixture itself is broken)")
+		t.Fatal("second frame did not match its fixture")
 	}
 	got, ok := rc.lookup(origin, 1)
 	if !ok {
 		t.Fatal("the retained frame is missing")
 	}
 	if !bytes.Equal(got, f1) {
-		t.Fatalf("OWNERSHIP BROKEN: the retained frame changed after a later ReadFrame — ReadFrame must return a fresh per-frame buffer (the no-copy retain relies on it)")
+		t.Fatalf("ownership broken: the retained frame changed after a later ReadFrame — ReadFrame must return a fresh per-frame buffer (the no-copy retain relies on it)")
 	}
 }
 
-// ── Finding #4 (peer.go): a DEAD byAddr entry must not shadow a LIVE inbound ──
-//
-// liveReconnectEdge consults byAddr[addr] and falls back to ps.peers[peerID]
-// ONLY when the byAddr entry is ABSENT — never when it is present-but-DEAD.
-// Natural drops never delete byAddr entries (only ClosePeer does), so a dead
-// outbound entry shadows a live inbound edge and ReconnectLoop re-dials into
-// an already-connected peer — the colocated churn the recheck was built to
-// stop. The guard builds the exact state in-memory: dead byAddr entry + live
-// inbound registration.
+// TestLiveReconnectEdgeSeesPastDeadByAddr builds a closed byAddr entry beside
+// a live inbound registration for the same peer. liveReconnectEdge must reject
+// the dead entry and find the live peer by node ID, preventing ReconnectLoop
+// from dialing an already-connected peer.
 func TestLiveReconnectEdgeSeesPastDeadByAddr(t *testing.T) {
 	pid := [16]byte{0xD}
 	dead := &peerConn{addr: "configured-addr:7373", done: make(chan struct{})}
@@ -292,6 +259,6 @@ func TestLiveReconnectEdgeSeesPastDeadByAddr(t *testing.T) {
 	}
 	got := ps.liveReconnectEdge("configured-addr:7373", pid)
 	if got != live {
-		t.Fatalf("finding #4: liveReconnectEdge returned %v with a DEAD byAddr entry shadowing a LIVE inbound edge — ReconnectLoop will re-dial into a live peer (the churn the storm guard was built to stop)", got == nil)
+		t.Fatalf("liveReconnectEdge missed the live inbound registration behind a dead byAddr entry: nil=%v", got == nil)
 	}
 }
