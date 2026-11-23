@@ -1,0 +1,198 @@
+MULTI-REGION CONVERGENCE — 1,000 node processes on 30 machines
+================================================================================
+Claim      : three consecutive runs converged after origin quiescence in 2.906 s,
+             4.038 s and 3.823 s. All 1,000 nodes had the same Merkle root, and
+             all 1,000 state fingerprints within each run were equal.
+Machines   : 30 c7gd.8xlarge instances, ten in each AWS region.
+Fleet      : 1,000 node processes across us-east-1, eu-west-1 and ap-southeast-2,
+             split 333/333/334; mTLS mesh and per-node WAL persistence.
+Workload   : one writer injected 10,000 keys into node 0 in ten chunks of at most
+             1,000 keys; inject_parallel=1. This was not a multi-writer test.
+Date       : 2026-11-06; timestamps below are UTC.
+Binary     : SHA-256 1ea150075c3476ed33c2e7e7ff78b85586bd6c1f94c41366345eef0aaf958b76
+             on all 30 machines. The pre-publication binary's engine code is the
+             release code apart from the declared renames. It was not built from
+             the future v0.2.0 tag, so a build from that tag has a different hash.
+--------------------------------------------------------------------------------
+Fleet derivation
+
+The preparation register has 30 placement rows. The first ten are us-east-1,
+the next ten are eu-west-1, and the final ten are ap-southeast-2. Each region
+therefore has ten machines. The bootstrap record specifies the 333,333,334
+process split.
+
+In us-east-1 and eu-west-1, three machines carry 34 processes and seven carry
+33: 3*34 + 7*33 = 333. In ap-southeast-2, four machines carry 34 and six carry
+33: 4*34 + 6*33 = 334. These counts come from the placement slices, not from
+assuming an even processes-per-machine layout.
+
+Gate command
+
+The retained driver expanded to the following gate invocation. The executable
+uses its public name; bracketed tokens replace private paths. Options and values
+are unchanged. The multi-machine driver itself is not published.
+
+  fleet-gate -bootstrap [fleet-bootstrap] -split 333,333,334 -keys 10000 \
+    -inject-parallel 1 -slo-secs 600 -require-n 1000 -inject-chunk 1000 \
+    -deck [configuration-file]
+
+The driver set ARENA_MIB=256 and digest wait 1500ms. The gate used its built-in
+defaults for the control and metrics port bases, a 300 s quiescence cap, a 180 s
+liveness retry window, and the enabled fingerprint sweep.
+
+Clocks and polling
+
+Injection time is the timestamp printed immediately before the batch writes.
+Quiescence requires a stable seed root and commit_in_flight==0 across 12
+consecutive polls, with a 250 ms sleep between polls. The post-quiescence gate
+then reads the seed root and scrapes every non-seed root concurrently, sleeping
+200 ms after each incomplete round. A reported convergence time is when a poll
+observed equality, not the exact instant the last node changed.
+
+Each injection-to-convergence value is the convergence timestamp minus the
+injection timestamp in its row. Each post-quiescence value is the convergence
+timestamp minus the quiescence timestamp. These are timestamp differences, not
+sums of separately rounded injection, quiescence and convergence durations.
+
+Run          Injection                  Quiescence                 Convergence                Injection-to-convergence  Post-quiescence
+clean-run-1  2026-11-06T12:08:22.958Z   2026-11-06T12:08:26.199Z   2026-11-06T12:08:29.105Z   6.147 s                 2.906 s
+clean-run-2  2026-11-06T12:11:18.023Z   2026-11-06T12:11:21.237Z   2026-11-06T12:11:25.275Z   7.252 s                 4.038 s
+clean-run-3  2026-11-06T12:14:15.109Z   2026-11-06T12:14:18.341Z   2026-11-06T12:14:22.164Z   7.055 s                 3.823 s
+
+The post-quiescence values are the converged_at_ms values in
+convergence-1000-node-runs.tsv. The complete history, including earlier target
+misses and aborted attempts, is convergence-1000-node-attempts.tsv.
+
+--------------------------------------------------------------------------------
+Node configuration
+
+This list comes from the retained configuration file and launcher. The launcher
+appends the configuration flags after its fallback flags, so the last occurrence
+wins. The raw consoles do not capture full node argv; they are not direct argv
+evidence.
+
+Non-default convergence and topology settings:
+
+  --region-aware                         (default off)
+  --self-region 1, 2 or 3                (default 0)
+  --stratified-anti-entropy              (default off)
+  --digest-wait-timeout 1500ms           (default 500ms)
+  --defer-handler                        (default off)
+  --sweep-phase-jitter                   (default off)
+  --lamport-absolute-slack 15000         (default 1000)
+  --partial-intra-view                   (default off)
+  --defer-crossover                      (default off)
+  --digest-wait-adaptive                 (default off)
+  --gateways-per-region 3                (default 0)
+  --iblt-v2                              (default off)
+  --iblt-v2-min-buckets 21845            (default 0, which uses 1024)
+  --arena-mib 256                        (default 64)
+
+The 21,845-bucket floor was sized for this 10,000-key workload: 2.1845 buckets
+per possible difference. The launcher's fallback mesh-write-timeout=0s was
+overridden by the configuration file's 10s value.
+
+The following were explicit defaults, not configuration changes:
+
+  --region-fanout 3        --batch-size 100        --mesh-write-timeout 10s
+
+Placement and persistence settings also differed from the single-node defaults.
+For per-instance local index k, the launcher used --bind 0.0.0.0:7373+k,
+--metrics-addr 0.0.0.0:9100+k and --control-addr 0.0.0.0:8443+k. The mesh
+default is 127.0.0.1:7430; the metrics default is 127.0.0.1:7431; the control
+listener is disabled by default. It supplied
+per-node --node-id and --identity-seed values, --tls-cert, --tls-key and
+--tls-ca paths, --peer-dir and --peers, and per-node --lsm-root and --wal-path
+values. Identity seeds, key material, addresses and private paths are not
+reproduced.
+
+For measurement, the launcher also set SOVEREIGN_STATE_FP_DEBUG=1,
+SOVEREIGN_RESPOND_INDEG_DEBUG=1, SOVEREIGN_MISS_LOG_CAP=10000,
+SOVEREIGN_DIGEST_LATENCY_DEBUG=1 and SOVEREIGN_EXCH_DEBUG=1.
+
+--------------------------------------------------------------------------------
+Verbatim gate output
+
+Only the node-0 address is redacted below, as [node 0, us-east-1:8443]. The
+source's final verdict label contains a pre-publication internal command name
+and is omitted; the unchanged PASS verdicts are in the six-run TSV. The REGION-
+CURVE t100_ms values are the per-region completion times.
+
+clean-run-1 (attempt-034)
+
+INJECT [2026-11-06T12:08:22.958Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1:8443]) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  origin quiesced [2026-11-06T12:08:26.199Z]: root=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 (quiesce wall 3.13s)
+  CONVERGED [2026-11-06T12:08:29.105Z] in 2.906s post-quiescence (all 1000 roots equal = d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); converged_at_ms=2906
+  all 1000 state fingerprints EQUAL (01f4c6ef6cab094c…) — convergence confirmed BYTES-equal, not just dots-equal
+REGION-CURVE region=ap-southeast-2 t50_ms=1128 t90_ms=1128 t100_ms=1128
+REGION-CURVE region=eu-west-1 t50_ms=2906 t90_ms=2906 t100_ms=2906
+REGION-CURVE region=us-east-1 t50_ms=235 t90_ms=235 t100_ms=235
+
+Full common state fingerprint:
+01f4c6ef6cab094c5fb2bf98cf193d2d55c135f83c83fe8e24733a50cd00d68f
+
+clean-run-2 (attempt-035)
+
+INJECT [2026-11-06T12:11:18.023Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1:8443]) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  origin quiesced [2026-11-06T12:11:21.237Z]: root=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 (quiesce wall 3.11s)
+  CONVERGED [2026-11-06T12:11:25.275Z] in 4.038s post-quiescence (all 1000 roots equal = d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); converged_at_ms=4038
+  all 1000 state fingerprints EQUAL (9e89472d812f4829…) — convergence confirmed BYTES-equal, not just dots-equal
+REGION-CURVE region=ap-southeast-2 t50_ms=3613 t90_ms=3613 t100_ms=4038
+REGION-CURVE region=eu-west-1 t50_ms=219 t90_ms=637 t100_ms=637
+REGION-CURVE region=us-east-1 t50_ms=219 t90_ms=219 t100_ms=219
+
+Full common state fingerprint:
+9e89472d812f4829ec3bc87380a50510f462edd6d745462fa483cb4a921cdb00
+
+clean-run-3 (attempt-036)
+
+INJECT [2026-11-06T12:14:15.109Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1:8443]) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  origin quiesced [2026-11-06T12:14:18.341Z]: root=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 (quiesce wall 3.11s)
+  CONVERGED [2026-11-06T12:14:22.164Z] in 3.823s post-quiescence (all 1000 roots equal = d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); converged_at_ms=3823
+  all 1000 state fingerprints EQUAL (7bf6a2436b2e284e…) — convergence confirmed BYTES-equal, not just dots-equal
+REGION-CURVE region=ap-southeast-2 t50_ms=3213 t90_ms=3213 t100_ms=3823
+REGION-CURVE region=eu-west-1 t50_ms=646 t90_ms=646 t100_ms=646
+REGION-CURVE region=us-east-1 t50_ms=220 t90_ms=220 t100_ms=220
+
+Full common state fingerprint:
+7bf6a2436b2e284ee553e9959e52e821ea3d3f0bcafcb902ba204fb1bf7f332b
+
+The Merkle root is a root over dots. The state fingerprint also covers the
+associated state; the three full fingerprints differ between runs, while every
+node within a run has the same fingerprint. The gate's valid_from_ns=0 setting
+uses write-time per batch.
+
+--------------------------------------------------------------------------------
+Raw evidence and limits
+
+- [Six-run measurements](convergence-1000-node-runs.tsv), including the three
+  fault tests, and the [complete attempt history](convergence-1000-node-attempts.tsv).
+- [Fault-test definitions and results](fault-drills-1000-node.txt), including
+  the first failed impostor attempt and its replacement-fleet repetition.
+- Console extracts: [clean-run-1](raw/clean-run-1.console.txt),
+  [clean-run-2](raw/clean-run-2.console.txt), and
+  [clean-run-3](raw/clean-run-3.console.txt). They are selections, not complete
+  consoles.
+- Per-node tables and bundle manifests:
+  [clean-run-1 table](raw/clean-run-1.fingerprints.tsv) /
+  [manifest](raw/clean-run-1.manifest.sha256),
+  [clean-run-2 table](raw/clean-run-2.fingerprints.tsv) /
+  [manifest](raw/clean-run-2.manifest.sha256), and
+  [clean-run-3 table](raw/clean-run-3.fingerprints.tsv) /
+  [manifest](raw/clean-run-3.manifest.sha256).
+
+Each table has one row per node. Its state_fp column is the state fingerprint;
+xor_root has its original raw-table meaning and is not a Merkle root. The common
+Merkle roots above come from the gate logs. Each manifest lists 30 archive
+entries plus one self-entry. The [raw evidence guide](raw/README.md) explains
+redaction, archive coverage, and console-extract limits. All 180 original
+per-machine archives were not preserved after 2026-11-06 and cannot be restored;
+their per-node log members are unavailable. The manifests preserve recorded
+archive names and digests, not current availability.
+
+The fleet harness is not published. This 1,000-process, 30-machine run cannot be
+reproduced from this repository, and no harness publication date is promised.
+The single-machine local mesh is a counterpart, not a substitute. These runs do
+not establish multi-writer behavior, production readiness, or independent
+reproduction. Earlier attempts missed the target and are included in the
+complete history rather than omitted.

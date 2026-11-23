@@ -1,0 +1,34 @@
+# Impostor-identity drill complete gate log (attempt-039)
+# Date: 2026-11-06
+# Fleet: 1,000 processes on 30 machines in us-east-1, eu-west-1, and ap-southeast-2.
+# Source SHA-256: 9f639ccb9dcadbdb069727217451e3d484492dea1783afea55de0ee25f8d167d
+# All 26 source lines follow in order; no source line is omitted.
+# Substitutions: runner labels are fleet-gate and FLEET-GATE; the configuration field
+# is run=impostor-identity-drill; the summary label is RUN-SUMMARY; the harvest route
+# description is "the optional env-gated latency route"; the node-0 address is [node 0, us-east-1].
+fleet-gate: loaded 1000 nodes (control base 8443, metrics base 9100, split 333,333,334)
+GATE 0: boot-liveness (GET /livecheck on all 1000 nodes; slow-boot retry window 3m0s)
+  all 1000 nodes /livecheck OK in 0.86s (pass 1)
+INJECT [2026-11-06T12:38:04.398Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1]:8443) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  injected 10000 keys in 0.12s (0 failures, 0 hard-timeout chunks)
+GATE 1 PRE: seed quiescence probe (root-stable AND commit_in_flight==0, 12x250ms, cap 5m0s)
+  origin quiesced [2026-11-06T12:38:07.638Z]: root=df61910266d7550d8d9690b0e7c6bb2e09054887353d3569ba079b3fe0e17451 (quiesce wall 3.12s)
+GATE 1: poll /v1/merkle on all 1000 (SLO 600s from quiescence)
+  poll 5 [2026-11-06T12:38:09.581Z]: 335 divergent (scraped 999/999; seed root df619102)
+  poll 10 [2026-11-06T12:38:11.723Z]: 333 divergent (scraped 999/999; seed root df619102)
+  CONVERGED [2026-11-06T12:38:13.859Z] in 6.221s post-quiescence (all 1000 roots equal = df61910266d7550d8d9690b0e7c6bb2e09054887353d3569ba079b3fe0e17451); converged_at_ms=6221
+FINGERPRINT SWEEP: GET /debug/state-fingerprint on all 1000 (the armed integrity oracle)
+  all 1000 state fingerprints EQUAL (f26fcfd133a1286c…) — convergence confirmed BYTES-equal, not just dots-equal
+SCHEMA HARVEST: /debug/memstats + /debug/responder-indegree on all 1000 (+ /debug/heartbeat, the optional env-gated latency route)
+  ap-southeast-2: sum(mesh_cache_bytes)=805841800 sum(responder_arrivals)=26483
+  eu-west-1: sum(mesh_cache_bytes)=803429100 sum(responder_arrivals)=19488
+  us-east-1: sum(mesh_cache_bytes)=801116400 sum(responder_arrivals)=56251
+  ap-southeast-2: exch_done(last)=3947 exch_drained(last)=1 exch_completed_total=26979 exch_drained_total=1 resp_bytes_total=11773531072
+  eu-west-1: exch_done(last)=3483 exch_drained(last)=0 exch_completed_total=20173 exch_drained_total=0 resp_bytes_total=8825341711
+  us-east-1: exch_done(last)=26624 exch_drained(last)=0 exch_completed_total=56259 exch_drained_total=0 resp_bytes_total=24579168750
+  schema harvest: 1000/1000 nodes pulled clean (memstats + responder-indegree; heartbeat 1000/1000)
+RUN-SUMMARY run=impostor-identity-drill keys=10000 slo_secs=600 verdict=PASS quiesced=true converged_at_ms=6221 fleet_t50_ms=1512 fleet_t90_ms=5795 inject_wall_ms=121 quiesce_wall_ms=3118 inject_fail=0 inject_timeouts=0 fp_swept=1000 fp_all_equal=true harvest_failed=0
+REGION-CURVE region=ap-southeast-2 t50_ms=1512 t90_ms=1942 t100_ms=2799
+REGION-CURVE region=eu-west-1 t50_ms=5795 t90_ms=5795 t100_ms=6221
+REGION-CURVE region=us-east-1 t50_ms=221 t90_ms=221 t100_ms=221
+FLEET-GATE VERDICT: PASS

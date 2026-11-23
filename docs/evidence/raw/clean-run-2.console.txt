@@ -1,0 +1,29 @@
+# Clean run 2 console extract (attempt-035)
+# Date: 2026-11-06
+# Fleet: 1,000 processes on 30 machines in us-east-1, eu-west-1, and ap-southeast-2.
+# Source console SHA-256: 71c9865e69b421b38a53a4179ac94842936d9feb81985f7a598cd45fb981907a
+# Corresponding gate-log SHA-256: 6f7b7d00dc427329b89d4daf09995e7dd61dc5dbd7296d984033fe751ea7276c
+# Recorded gate result: PASS.
+# This is a selected extract, not the complete console.
+# Redaction: only the node-0 address was replaced, with [node 0, us-east-1].
+# Lines with source-runner or configuration names, private paths, host addresses, and
+# instance IDs are omitted. The result and verdict lines carry such names and are not
+# quoted. Gate-log lines were checked; duplicate console lines are not repeated.
+# Raw console lines 3, 10-20, 28, 30-32, and 38 follow.
+[prep] placement.tsv: 30 instances, 1000 nodes
+GATE 0: boot-liveness (GET /livecheck on all 1000 nodes; slow-boot retry window 3m0s)
+  all 1000 nodes /livecheck OK in 0.87s (pass 1)
+INJECT [2026-11-06T12:11:18.023Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1]:8443) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  injected 10000 keys in 0.10s (0 failures, 0 hard-timeout chunks)
+GATE 1 PRE: seed quiescence probe (root-stable AND commit_in_flight==0, 12x250ms, cap 5m0s)
+  origin quiesced [2026-11-06T12:11:21.237Z]: root=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 (quiesce wall 3.11s)
+GATE 1: poll /v1/merkle on all 1000 (SLO 600s from quiescence)
+  poll 5 [2026-11-06T12:11:23.141Z]: 333 divergent (scraped 999/999; seed root d1406abf)
+  CONVERGED [2026-11-06T12:11:25.275Z] in 4.038s post-quiescence (all 1000 roots equal = d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); converged_at_ms=4038
+FINGERPRINT SWEEP: GET /debug/state-fingerprint on all 1000 (the armed integrity oracle)
+  all 1000 state fingerprints EQUAL (9e89472d812f4829…) — convergence confirmed BYTES-equal, not just dots-equal
+  schema harvest: 1000/1000 nodes pulled clean (memstats + responder-indegree; heartbeat 1000/1000)
+REGION-CURVE region=ap-southeast-2 t50_ms=3613 t90_ms=3613 t100_ms=4038
+REGION-CURVE region=eu-west-1 t50_ms=219 t90_ms=637 t100_ms=637
+REGION-CURVE region=us-east-1 t50_ms=219 t90_ms=219 t100_ms=219
+U1_SUMMARY rows=1000 keys_10000=1000 keys_target=1000 want_keys=10000 unique_fps=1 fp_all_equal=true sample_fp=9e89472d812f4829ec3bc87380a50510f462edd6d745462fa483cb4a921cdb00

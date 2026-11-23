@@ -1,0 +1,50 @@
+attempt	date	processes	keys	verdict	converged_at_ms	scenario	settings	subsequent_change
+attempt-001	2026-10-22	1000	10000	NOT-CONVERGED	0	Convergence attempt; target missed	Gate bound 1800 s	not recorded
+attempt-002	2026-10-23	1000	10000	NOT-CONVERGED	0	Convergence attempt; target missed	Gate bound 1800 s	not recorded
+attempt-003	2026-11-02	1000	10000	PASS	30949	Convergence attempt	Gate bound 1800 s	not recorded
+attempt-004	2026-11-03	1000	10000	PASS	28255	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-005	2026-11-03	1000	10000	PASS	29970	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-006	2026-11-03	1000	10000	PASS	26645	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-007	2026-11-03	1000	10000	PASS	29122	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-008	2026-11-03	1000	10000	PASS	30854	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-009	2026-11-03	1000	10000	PASS	41648	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-010	2026-11-03	1000	10000	PASS	39862	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-011	2026-11-03	1000	10000	PASS	40255	Convergence repetition	Gate bound 1800 s	not recorded
+attempt-012	2026-11-03	1000	10000	PASS	29963	Packet-drop test on one node	Gate bound 1800 s	not recorded
+attempt-013	2026-11-03	1000	10000	PASS	30358	Process kill and restart test on one node	Gate bound 1800 s	not recorded
+attempt-014	2026-11-03	1000	10000	PASS	89871	Network blackhole test	Gate bound 1800 s	not recorded
+attempt-015	2026-11-03	1000	10000	PASS	29342	Node churn test	Gate bound 1800 s	not recorded
+attempt-016	2026-11-03	1000	10000	PASS	34287	Rolling-restart test	Gate bound 1800 s	not recorded
+attempt-017	2026-11-03	1000	10000	PASS	83974	Clock-skew test	Gate bound 1800 s	not recorded
+attempt-018	2026-11-03	1000	10000	PASS	32477	Impostor-identity test	Gate bound 1800 s	not recorded
+attempt-019	2026-11-03	1000	4000	PASS	6291	Pre-seeded trickle-write attempt	6000 keys preloaded in ten rounds; gate bound 1800 s	not recorded
+attempt-020	2026-11-03	1000	100000	NOT-CONVERGED	0	Bounded 100000-key convergence attempt	Eight parallel injections; gate bound 120 s	not recorded
+attempt-021	2026-11-03	1000	20000	PASS	33976	20000-key convergence repetition	Four parallel injections; gate bound 1800 s	not recorded
+attempt-022	2026-11-03	1000	20000	PASS	35265	20000-key convergence repetition	Four parallel injections; gate bound 1800 s	not recorded
+attempt-023	2026-11-03	1000	20000	PASS	36006	20000-key convergence repetition	Four parallel injections; gate bound 1800 s	not recorded
+attempt-024	2026-11-05	1000	10000	PASS	1554	Convergence repetition	64 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-025	2026-11-05	1000	10000	PASS	3321	Convergence repetition	64 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-026	2026-11-05	1000	10000	PASS	3311	Convergence repetition	64 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-027	2026-11-05	1000	10000	NO-VERDICT	not recorded	Convergence attempt aborted after arena OOM	64 MiB arena; digest wait 1500 ms; gate bound 1800 s	Replacement fleet used 256 MiB arenas and a different binary
+attempt-028	2026-11-05	1000	10000	PASS	12442	Convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-029	2026-11-05	1000	10000	PASS	5459	Convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-030	2026-11-05	1000	10000	PASS	13249	Convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-031	2026-11-05	1000	10000	NO-VERDICT	not recorded	Packet-drop test aborted; arena SIGBUS and relay misses recorded	256 MiB arena; digest wait 1500 ms; 30 s packet drop; gate bound 1800 s	not recorded
+attempt-032	2026-11-05	1000	10000	PASS	15116	Process kill and restart test on one node	256 MiB arena; digest wait 1500 ms; 15 s kill hold; gate bound 1800 s	not recorded
+attempt-033	2026-11-05	1000	10000	PASS	12859	Impostor-identity test	256 MiB arena; digest wait 1500 ms; gate bound 1800 s	not recorded
+attempt-034	2026-11-06	1000	10000	PASS	2906	Clean convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 600 s	not recorded
+attempt-035	2026-11-06	1000	10000	PASS	4038	Clean convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 600 s	not recorded
+attempt-036	2026-11-06	1000	10000	PASS	3823	Clean convergence repetition	256 MiB arena; digest wait 1500 ms; gate bound 600 s	not recorded
+attempt-037	2026-11-06	1000	10000	PASS	8671	Packet-drop test on one node	256 MiB arena; digest wait 1500 ms; 30 s packet drop; gate bound 600 s	not recorded
+attempt-038	2026-11-06	1000	10000	PASS	15716	Process kill and restart test on one node	256 MiB arena; digest wait 1500 ms; 15 s kill hold; gate bound 600 s	not recorded
+attempt-039	2026-11-06	1000	10000	PASS	6221	Impostor-identity test on replacement fleet	256 MiB arena; digest wait 1500 ms; gate bound 600 s	not recorded
+attempt-040	2026-11-06	1000	10000	RUN_RC=4; no gate verdict recorded	not recorded	First impostor-identity attempt; exited before a gate verdict	not recorded	Repeated on a replacement fleet; replacement passed in 6221 ms
+attempt-041	not recorded	1000	10000	PASS	544698	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-042	not recorded	1000	10000	PASS	590392	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-043	not recorded	1000	10000	PASS	587159	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-044	not recorded	1000	not recorded	no verdict recorded	not recorded	Early boot attempt; 898 processes failed liveness	Boot-liveness retry window 180 s	not recorded
+attempt-045	not recorded	1000	10000	PASS	297841	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-046	not recorded	1000	10000	PASS	283973	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-047	not recorded	1000	10000	PASS	300556	Early convergence repetition	Gate bound 1800 s	not recorded
+attempt-048	not recorded	1000	not recorded	no verdict recorded	not recorded	Early diagnostic attempt; no final verdict	not recorded	not recorded
+attempt-049	not recorded	1000	not recorded	no verdict recorded	not recorded	Early convergence attempt; no final verdict	not recorded	not recorded

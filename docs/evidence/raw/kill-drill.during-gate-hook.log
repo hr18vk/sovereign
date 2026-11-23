@@ -1,0 +1,14 @@
+# Kill drill during-gate hook log (attempt-038)
+# Date: 2026-11-06
+# Fleet: 1,000 processes on 30 machines in us-east-1, eu-west-1, and ap-southeast-2.
+# Source SHA-256: 58511e43ac6a253468bebb14ec5da0e484be224167faca836164aedec1266e40
+# All 8 source lines follow in order; no source line is omitted.
+# Substitution: the hook host address is [address].
+Warning: Permanently added '[address]' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+Warning: Permanently added '[address]' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html

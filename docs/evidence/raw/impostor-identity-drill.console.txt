@@ -1,0 +1,44 @@
+# Impostor-identity drill console extract (attempt-039)
+# Date: 2026-11-06
+# Fleet: 1,000 processes on 30 machines in us-east-1, eu-west-1, and ap-southeast-2.
+# Source console SHA-256: 299c6683431fe2598f188544401599532c16d24eceaa0e2e817768a215544bf9
+# Corresponding gate-log SHA-256: 9f639ccb9dcadbdb069727217451e3d484492dea1783afea55de0ee25f8d167d
+# Drill-record SHA-256: 7f8b28541f8a524b690afa1ac92918693465b79005cd03f123bde33b1077dcd7
+# Impostor-output SHA-256: 9332cb313727eb47f3be1d1a8bcfebd8834ebba91ae5dffd5c4da21592e3ddff
+# Pre-gate hook-log SHA-256: a87a10107f560478c81a7590f4f0c1a6d7b2ebdbae3147da4d2808f10517ff19
+# Drill record: node 0 logged one signature-verification failure and did not mark the
+# impostor as remotely verified. The gate later converged with the impostor disconnected.
+# Recorded gate result: PASS.
+# This is a selected extract, not the complete console.
+# Redaction: the node-0 address is [node 0, us-east-1].
+# Lines with source-runner, configuration, or fault-chain names, private paths, and
+# instance IDs are omitted. The result, verdict, and drill-command lines carry such names
+# and are not quoted. The hook log contains only repeated SSH warnings; one group follows.
+# Raw console lines 9, 17-28, 36, 38-40, and 46 follow.
+[prep] placement.tsv: 30 instances, 1000 nodes
+GATE 0: boot-liveness (GET /livecheck on all 1000 nodes; slow-boot retry window 3m0s)
+  all 1000 nodes /livecheck OK in 0.86s (pass 1)
+INJECT [2026-11-06T12:38:04.398Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1]:8443) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  injected 10000 keys in 0.12s (0 failures, 0 hard-timeout chunks)
+GATE 1 PRE: seed quiescence probe (root-stable AND commit_in_flight==0, 12x250ms, cap 5m0s)
+  origin quiesced [2026-11-06T12:38:07.638Z]: root=df61910266d7550d8d9690b0e7c6bb2e09054887353d3569ba079b3fe0e17451 (quiesce wall 3.12s)
+GATE 1: poll /v1/merkle on all 1000 (SLO 600s from quiescence)
+  poll 5 [2026-11-06T12:38:09.581Z]: 335 divergent (scraped 999/999; seed root df619102)
+  poll 10 [2026-11-06T12:38:11.723Z]: 333 divergent (scraped 999/999; seed root df619102)
+  CONVERGED [2026-11-06T12:38:13.859Z] in 6.221s post-quiescence (all 1000 roots equal = df61910266d7550d8d9690b0e7c6bb2e09054887353d3569ba079b3fe0e17451); converged_at_ms=6221
+FINGERPRINT SWEEP: GET /debug/state-fingerprint on all 1000 (the armed integrity oracle)
+  all 1000 state fingerprints EQUAL (f26fcfd133a1286c…) — convergence confirmed BYTES-equal, not just dots-equal
+  schema harvest: 1000/1000 nodes pulled clean (memstats + responder-indegree; heartbeat 1000/1000)
+REGION-CURVE region=ap-southeast-2 t50_ms=1512 t90_ms=1942 t100_ms=2799
+REGION-CURVE region=eu-west-1 t50_ms=5795 t90_ms=5795 t100_ms=6221
+REGION-CURVE region=us-east-1 t50_ms=221 t90_ms=221 t100_ms=221
+U1_SUMMARY rows=1000 keys_10000=1000 keys_target=1000 want_keys=10000 unique_fps=1 fp_all_equal=true sample_fp=f26fcfd133a1286c777bf56ddebe4f573440d223f8c380f3791d08d6201823b6
+# Raw impostor-output lines 1-3 follow; these are not console lines.
+impostor: TLS established — presented the X leaf to [node 0, us-east-1]:7373
+impostor: received 57 bytes at t=0.00s (hex head: 0000003553475743015e669e91fae71b)
+impostor: sent forged 133B SGWC challengeRoleResponse (responder=3ea96b4954bef220e6750e75639ab36f challenger=5e669e91fae71bcd7d53e681a23e1a8c)
+# Raw pre-gate hook-log lines 1-4 follow; these are not console lines.
+Warning: Permanently added '[node 0, us-east-1]' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html

@@ -1,0 +1,39 @@
+# Packet-drop drill console extract (attempt-037)
+# Date: 2026-11-06
+# Fleet: 1,000 processes on 30 machines in us-east-1, eu-west-1, and ap-southeast-2.
+# Source console SHA-256: 4c5e2e3ce1c696c8b655558be8ae744fe5c19e489d978cd2b16ea89603e4f5e4
+# Corresponding gate-log SHA-256: 830bfaf152f72c9ec7fb1a6f40498879b94d50adbf4a5a8ec5f51cb84f9adb40
+# Drill-record SHA-256: 06ab47c9a182fef53d9a145cdf4c8ff7e74cbd7ed7b53b1ea51d5e0f02c493e3
+# During-gate hook-log SHA-256: 58511e43ac6a253468bebb14ec5da0e484be224167faca836164aedec1266e40
+# Drill record: node 333 dropped TCP port 7373 from 12:20:22Z until 12:20:53Z, 30 seconds.
+# Recorded gate result: PASS.
+# This is a selected extract, not the complete console.
+# Redaction: the node-0 address is [node 0, us-east-1]; the hook host address is [address].
+# Lines with source-runner, configuration, or fault-chain names, private paths, and
+# instance IDs are omitted. The result, verdict, and drill-command lines carry such names
+# and are not quoted. The hook log contains only repeated SSH warnings; one group follows.
+# Raw console lines 3, 11-23, 31, 33-35, and 41 follow.
+[prep] placement.tsv: 30 instances, 1000 nodes
+GATE 0: boot-liveness (GET /livecheck on all 1000 nodes; slow-boot retry window 3m0s)
+  all 1000 nodes /livecheck OK in 0.86s (pass 1)
+INJECT [2026-11-06T12:20:20.746Z]: 10000 keys into node 0 (us-east-1 [node 0, us-east-1]:8443) via /v1/batch-insert (10 chunk(s) of <=1000 keys; constant valid_from_ns=0)
+  injected 10000 keys in 0.11s (0 failures, 0 hard-timeout chunks)
+GATE 1 PRE: seed quiescence probe (root-stable AND commit_in_flight==0, 12x250ms, cap 5m0s)
+  origin quiesced [2026-11-06T12:20:23.978Z]: root=d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0 (quiesce wall 3.12s)
+GATE 1: poll /v1/merkle on all 1000 (SLO 600s from quiescence)
+  poll 5 [2026-11-06T12:20:25.876Z]: 333 divergent (scraped 999/999; seed root d1406abf)
+  poll 10 [2026-11-06T12:20:27.992Z]: 332 divergent (scraped 999/999; seed root d1406abf)
+  poll 15 [2026-11-06T12:20:30.105Z]: 331 divergent (scraped 999/999; seed root d1406abf)
+  CONVERGED [2026-11-06T12:20:32.649Z] in 8.671s post-quiescence (all 1000 roots equal = d1406abf204461a3246c149b29c05fec7e9ebb76acff533b364cd6f43e699bc0); converged_at_ms=8671
+FINGERPRINT SWEEP: GET /debug/state-fingerprint on all 1000 (the armed integrity oracle)
+  all 1000 state fingerprints EQUAL (23eae16780ab098f…) — convergence confirmed BYTES-equal, not just dots-equal
+  schema harvest: 1000/1000 nodes pulled clean (memstats + responder-indegree; heartbeat 1000/1000)
+REGION-CURVE region=ap-southeast-2 t50_ms=7831 t90_ms=7831 t100_ms=8671
+REGION-CURVE region=eu-west-1 t50_ms=1898 t90_ms=1898 t100_ms=1898
+REGION-CURVE region=us-east-1 t50_ms=219 t90_ms=219 t100_ms=219
+U1_SUMMARY rows=1000 keys_10000=1000 keys_target=1000 want_keys=10000 unique_fps=1 fp_all_equal=true sample_fp=23eae16780ab098f141c4f4eb35648bfdec44631aabbe6257d3f0583eb4a9213
+# Raw during-gate hook-log lines 1-4 follow; these are not console lines.
+Warning: Permanently added '[address]' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html

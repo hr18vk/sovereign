@@ -1,0 +1,164 @@
+PLATFORM BUILD AND SHORT-TEST CHECK — 2026-11-21
+================================================================================
+
+Scope: native Linux arm64 and emulated Linux amd64 builds and complete short-test
+invocations on a pre-publication candidate snapshot. This was not a build from
+the future v0.2.0 tag. No native-amd64 hardware was tested.
+
+RESULT
+------
+Native Linux arm64, Go 1.26.1:
+  go build ./...                         PASS, exit 0, 20 seconds
+  go test -short -count=1 ./...          FAIL, exit 1, 409 seconds
+
+Emulated Linux amd64, Ubuntu 24.04.5, Go 1.26.1:
+  go build ./...                         PASS, exit 0, 357 seconds
+  go test -short -count=1 -timeout=45m ./...
+                                         FAIL, exit 1, 677 seconds
+
+The source builds on both tested configurations. Neither complete short-test
+invocation passed. The emulated result does not establish behavior on native
+amd64 hardware or a root cause for any failure.
+
+TESTED SOURCE AND ISOLATION
+---------------------------
+Two fresh isolated source copies excluded .git and contained the same 609 files.
+The SHA-256 of the sorted per-file manifest was:
+
+  bbfea2a944b333068c3188a53191ccc219516b944d0e0259e813949bdc49f1be
+
+This identifies the manifest, not a commit or a source archive. The second copy
+was synchronized from the native-tested copy before compilation because two
+shell scripts changed in the working candidate between the copy operations.
+Every Go source file already matched; no production Go file changed during the
+check. Both final source manifests still matched this digest and each other.
+
+The native build used separate temporary module, build, and test caches. In the
+emulated run, the source was mounted read-only at /src; writable module, build,
+temporary, and output directories were mounted separately at /gomodcache,
+/gocache, /gotmp, and /output. Docker inspection reported read_write=false for
+the source mount. The source trees were unchanged after both runs.
+
+NATIVE LINUX ARM64
+------------------
+The environment reported aarch64, Go 1.26.1, GOOS=linux, GOARCH=arm64,
+CGO_ENABLED=1, CC=gcc, and jemalloc 5.3.0_0.
+
+Build command, started 2026-11-21T09:41:16Z:
+
+  cd /tmp/sovereign-v020-platform-checks/native/source
+  env GOMODCACHE=/tmp/sovereign-v020-platform-checks/native/gomodcache GOCACHE=/tmp/sovereign-v020-platform-checks/native/gocache GOTMPDIR=/tmp/sovereign-v020-platform-checks/native/gotmp go build ./...
+
+It exited 0 at 09:41:36Z after 20 seconds.
+
+Short-test command, started 2026-11-21T09:45:37Z:
+
+  cd /tmp/sovereign-v020-platform-checks/native/source
+  env GOMODCACHE=/tmp/sovereign-v020-platform-checks/native/gomodcache GOCACHE=/tmp/sovereign-v020-platform-checks/native/gocache GOTMPDIR=/tmp/sovereign-v020-platform-checks/native/gotmp go test -short -count=1 ./...
+
+It exited 1 at 09:52:26Z after 409 seconds. Two packages failed. Selected raw
+lines, including the arena-exhaustion panic and the known SDK failure:
+
+  panic: HamtArena: OOM - arena exhausted (variable alloc)
+  FAIL	github.com/hr18vk/sovereign/pkg/durability	4.404s
+  --- FAIL: TestClientGetOnPeerReturnsDigestNotValue (0.41s)
+      client_test.go:468: did not converge in 20 rounds (rootA=74ed9857d8f00f8bf7fac04734d2422cb6d858eb991d36ebb4513bbe282f1290 rootB=0000000000000000000000000000000000000000000000000000000000000000) — the peer Get negative control needs convergence
+  FAIL	github.com/hr18vk/sovereign/sdk/sovereign	0.568s
+  FAIL
+
+The panic occurred while TestCheckpointWalkPinnedAgainstState was running.
+The other packages passed or had no test files. No retry or selected package
+subset is presented as a passing short suite.
+
+EMULATED LINUX AMD64
+--------------------
+The host already had an enabled qemu-x86_64 binfmt handler with flags POF. No
+handler was installed or changed. The image pull command was:
+
+  sudo docker pull --platform linux/amd64 ubuntu:24.04
+
+It exited 0 after 1 second. The image was Ubuntu 24.04.5 LTS for linux/amd64:
+
+  ubuntu@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+  local image ID: sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+
+The disposable container was started with the source read-only and four other
+writable mounts:
+
+  sudo docker run --rm -d --name sovereign-v020-platform-amd64-1 --platform linux/amd64 --mount type=bind,source=/tmp/sovereign-v020-platform-checks/amd64/source,target=/src,readonly --mount type=bind,source=/tmp/sovereign-v020-platform-checks/amd64/gomodcache,target=/gomodcache --mount type=bind,source=/tmp/sovereign-v020-platform-checks/amd64/gocache,target=/gocache --mount type=bind,source=/tmp/sovereign-v020-platform-checks/amd64/gotmp,target=/gotmp --mount type=bind,source=/tmp/sovereign-v020-platform-checks/amd64/output,target=/output ubuntu@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289 sleep infinity
+
+The initial setup installed ca-certificates, curl, build-essential, pkg-config,
+and libjemalloc-dev in this container, then downloaded the Go toolchain:
+
+  sudo docker exec sovereign-v020-platform-amd64-1 /bin/bash -c 'set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libjemalloc-dev; cd /tmp; curl -fsSLO https://go.dev/dl/go1.26.1.linux-amd64.tar.gz; curl -fsSLO https://go.dev/dl/go1.26.1.linux-amd64.tar.gz.sha256; sha256sum -c go1.26.1.linux-amd64.tar.gz.sha256; tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz; /usr/local/go/bin/go version; pkg-config --modversion jemalloc; gcc --version | head -1'
+
+This attempt exited 1 after 73 seconds. Apt and the archive download completed,
+but the checksum URL returned an HTML redirect document rather than a checksum
+file. The raw failure was:
+
+  sha256sum: go1.26.1.linux-amd64.tar.gz.sha256: no properly formatted checksum lines found
+
+This was a checksum-file retrieval/format failure, not an archive mismatch. The
+retry took the expected digest from the official Go download metadata. Its
+command and output were:
+
+  sudo docker exec sovereign-v020-platform-amd64-1 /bin/bash -c 'set -eu; cd /tmp; printf "%s  %s\n" 031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a go1.26.1.linux-amd64.tar.gz | sha256sum -c -; tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz; /usr/local/go/bin/go version; pkg-config --modversion jemalloc; gcc --version | head -1'
+  go1.26.1.linux-amd64.tar.gz: OK
+  go version go1.26.1 linux/amd64
+  5.3.0_0
+  gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+
+The retry exited 0 after 5 seconds.
+
+Build command, started 2026-11-21T10:07:33Z:
+
+  sudo docker exec --workdir /src --env PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/tmp --env GOMODCACHE=/gomodcache --env GOCACHE=/gocache --env GOTMPDIR=/gotmp --env CGO_ENABLED=1 sovereign-v020-platform-amd64-1 go build ./...
+
+It exited 0 at 10:13:30Z after 357 seconds.
+
+Short-test command, started 2026-11-21T10:16:14Z:
+
+  sudo docker exec --workdir /src --env PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --env HOME=/tmp --env GOMODCACHE=/gomodcache --env GOCACHE=/gocache --env GOTMPDIR=/gotmp --env CGO_ENABLED=1 sovereign-v020-platform-amd64-1 go test -short -count=1 -timeout=45m ./...
+
+The 45-minute per-package timeout was explicit to accommodate emulation; no test
+timeout occurred. The command exited 1 at 10:27:31Z after 677 seconds.
+
+Each of these ten packages printed `signal: segmentation fault (core dumped)`
+and failed almost immediately. Their raw package-result lines were:
+
+  FAIL	github.com/hr18vk/sovereign/cmd/sovereign-node	0.131s
+  FAIL	github.com/hr18vk/sovereign/internal/database	0.155s
+  FAIL	github.com/hr18vk/sovereign/internal/index	0.151s
+  FAIL	github.com/hr18vk/sovereign/internal/network	0.119s
+  FAIL	github.com/hr18vk/sovereign/internal/transport	0.154s
+  FAIL	github.com/hr18vk/sovereign/pkg/durability	0.130s
+  FAIL	github.com/hr18vk/sovereign/pkg/mesh	0.114s
+  FAIL	github.com/hr18vk/sovereign/pkg/receive	0.129s
+  FAIL	github.com/hr18vk/sovereign/pkg/security/fuzz	0.141s
+  FAIL	github.com/hr18vk/sovereign/sdk/sovereign	0.118s
+
+Two other packages failed assertions. Their raw failure and package-result lines
+were:
+
+  --- FAIL: TestEnvelope_HopBoundExceededZeroVerify (0.00s)
+      envelope_test.go:194: O(1) depth check took 12.754µs (must be sub-microsecond, zero Verify)
+  FAIL
+  FAIL	github.com/hr18vk/sovereign/pkg/attribution	45.899s
+  --- FAIL: TestIngestLatencyRecorded (1.49s)
+      recorder_test.go:180: the 1e-06 bucket has no early-rejection samples
+  FAIL
+  FAIL	github.com/hr18vk/sovereign/pkg/metrics	1.938s
+
+The remaining packages passed or had no test files. These segmentation faults
+are observations from this QEMU/container combination; the check does not
+establish their cause. The two timing-sensitive assertion failures are likewise
+not native-amd64 results. Neither suite is green.
+
+CLEANUP
+-------
+The first cleanup exited 1 after 11 seconds: Docker stop returned 0, but the
+immediate absence check and ordinary-user temporary-file removal failed. The
+retry exited 0 at 2026-11-21T10:38:08Z. Its temporary-path and container-absence
+checks both returned 0. No unrelated container was stopped or removed. The
+Ubuntu image and the existing amd64 emulation handler were left unchanged; no
+shared image prune was run.
