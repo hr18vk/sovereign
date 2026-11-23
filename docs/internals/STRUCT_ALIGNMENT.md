@@ -1,208 +1,230 @@
 # Struct Alignment — The Byte-Level Proof
 
-This document is the structural proof that the Sovereign Engine packs Go structs
-into cache lines so that no two concurrently-written fields share a line, and
-no hot struct carries alignment padding it does not need. The byte sizes of the
-record structs are pinned by hard assertion gates that fail the build if they
-change: `TestCRDTEntry_SizeAndAlignment` (120 B), `TestHamtLeaf_SizeAndAlignment`
-(32 B), and `TestEliminationSlotSize` (128 B). The contended-atomic layout is
-enforced by `fieldalignment` (CI). The `[pkg/sync/layout_analysis_test.go](../../pkg/sync/layout_analysis_test.go)`
-is a *diagnostic printer* — it walks every struct via `unsafe.Offsetof` and logs
-the layout; it reports, it does not itself fail the build. Reading order: the
-physics, then the record structs, then the contended-atomics proof.
+This document records the byte layouts of the engine's hot Go structs.
+Uncontended records avoid unnecessary alignment padding; concurrently written
+fields are grouped or separated according to their access patterns. The size
+and field offsets of `CRDTEntry` (120 B) and `hamtLeaf` (32 B) are pinned by
+`TestCRDTEntry_SizeAndAlignment` and `TestHamtLeaf_SizeAndAlignment`.
+`TestEliminationSlotSize` pins `ElimSlot` at 128 B. `TestHamtNodeOffsets` and
+[`TestMemoryLayoutAnalysis`](../../pkg/sync/layout_analysis_test.go) print sizes
+and offsets for inspection; they are diagnostics, not assertion gates. Section
+4 distinguishes the tests that reject a layout change from the reports that only
+describe it.
 
-## 1. The Physics
+## 1. Cache coherence and false sharing
 
-A Graviton core fetches memory in **64-byte cache lines**, and the MESI
-coherence protocol invalidates on the line. If two goroutines on two cores
-write to two distinct fields that happen to fall in the same 64-byte line, the
-cores fight for ownership of that line — a HITM storm — and the write throughput
-collapses to the coherence-serialization rate, not the cores' issue width.
+A Graviton core fetches memory in 64-byte cache lines, and cache coherence
+tracks ownership at line granularity. If two cores write to distinct fields in
+the same line, ownership can pass between them on every write. The cores then
+wait for coherence transfers rather than making independent progress.
 
-The engine's standard is a **128-byte stride** (two cache lines) for any record
-that may be touched concurrently by more than one core, and a **wasted-interior-
-padding budget of zero bytes** for records that are not concurrently contended.
-The padding that isolates hot atomics is not decorative; it is the difference
-between 1.1M ops/s and 50.7M-68.3M ops/s (the CORE microbench range 32c — on this tree 2026-09-03: 68,278,197 ops/s on c8g.8xlarge; the production ingest path is 5.7M-6.0M deltas/sec 32c — see README LAYER DISCIPLINE) (§3).
+The layouts below use a 128-byte stride between independently contended slots
+where that separation is required. Fields that participate in one exchange or
+are updated as a group may deliberately share a padded region. Uncontended
+records instead aim for zero bytes of avoidable interior padding.
 
-The reference measurement for the cost of false sharing is the 
-false-sharing benchmark (`[pkg/sync/physics_test.go](../../pkg/sync/physics_test.go)`): two `atomic.Uint64`
-fields on one line vs. the same fields flanked by `CacheLinePad` (`[64]byte`).
-On multi-core hardware the padded variant is typically 2×–10× faster; the gate
-requires only that padded is not *slower* than unpadded, so a single-core CI
-cannot produce a false failure.
+The retired single-locus allocator recorded 1.1M ops/s at 32 cores. After the
+allocator was sharded, the in-process CRDT core benchmark recorded
+50.7M–68.3M ops/s at 32 cores. Its [upper receipt](../evidence/core-crucible.txt)
+reports 68,278,197 ops/s on a c8g.8xlarge on 2026-09-03. These are allocator and
+core measurements, not results from the engine-proxy benchmark below.
+
+The in-process receive path is a separate layer. It measured 5.7M–6.0M
+deltas/sec at 32 cores on 2026-09-15, including Ed25519 verification, envelope
+decoding and CRDT application; its conditions and output are in the
+[receive-path receipt](../evidence/ingest-ed25519.txt).
+
+The focused false-sharing comparison is in
+[`physics_test.go`](../../pkg/sync/physics_test.go): two `atomic.Uint64`
+counters on one line versus counters separated by `CacheLinePad` (`[64]byte`).
+On multi-core hardware the padded variant is typically 2×–10× faster. The test
+skips when fewer than two threads can run concurrently and allows a timing
+margin for scheduler noise; it does not require a fixed speedup.
 
 ## 2. Record Structs — Zero Wasted Padding
 
-These structs are read and written from a single goroutine's hot path or are
-immutable after publication, so they do not need inter-field line isolation.
-They need intropy: every field packed against the previous one with no
-alignment gap, so the struct size equals the sum of field sizes.
+These record structs prioritize compact representation over per-field line
+isolation. Some are immutable after publication; others, such as `HamtNode`,
+use atomics or ownership rules for mutable fields. Their order satisfies each
+field's alignment requirement without unused gaps.
 
 ### `CRDTEntry` — 120 bytes, zero internal padding
 
-`[pkg/sync/hamt.go:29](../../pkg/sync/hamt.go#L29)`. A single element in the Add-Wins Set lattice. ADR 10
-deliberately flattened the nested `CausalDot` into `DotNodeID`/`DotCounter` to
-remove indirection and the resulting alignment hole.
+[`CRDTEntry`](../../pkg/sync/hamt.go) is a single element in the Add-Wins Set
+lattice. Its nested `CausalDot` is flattened into `DotNodeID` and `DotCounter`
+to avoid indirection and the resulting alignment hole.
 
-| Field | Type | Size (B) | Offset |
+| Field              | Type          | Size (B) | Offset |
 |:--|:--|--:|--:|
-| `PayloadDigest` | `[32]byte` | 32 | 0 |
-| `OriginNodeID` | `[16]byte` | 16 | 32 |
-| `DotNodeID` | `[16]byte` | 16 | 48 |
-| `DotCounter` | `uint64` | 8 | 64 |
-| `SystemTime` | `int64` | 8 | 72 |
-| `ValidTimeStart` | `int64` | 8 | 80 |
-| `ValidTimeEnd` | `int64` | 8 | 88 |
-| `AssertionTime` | `int64` | 8 | 96 |
-| `DecisionTime` | `int64` | 8 | 104|
-| `H3Index` | `uint64` | 8 | 112|
-| **total** | | **120** | |
+| `PayloadDigest`    | `[32]byte`    | 32 | 0  |
+| `OriginNodeID`     | `[16]byte`    | 16 | 32 |
+| `DotNodeID`        | `[16]byte`    | 16 | 48 |
+| `DotCounter`       | `uint64`      |  8 | 64 |
+| `SystemTime`       | `int64`       |  8 | 72 |
+| `ValidTimeStart`   | `int64`       |  8 | 80 |
+| `ValidTimeEnd`     | `int64`       |  8 | 88 |
+| `AssertionTime`    | `int64`       |  8 | 96 |
+| `DecisionTime`     | `int64`       |  8 | 104|
+| `H3Index`          | `uint64`      |  8 | 112|
+| **total**          |               | **120** | |
 
-Field order is byte-descending: the `[32]byte` and `[16]byte` arrays first, then
-the 8-byte words, so no field ever needs more alignment than the previous field's
-trailing offset already satisfies. A `fieldalignment` reordering of these
-fields is a build failure — the canonical order above is the layout, not a
-suggestion.
+The byte arrays come first, followed by the 8-byte words. After `DotNodeID`,
+every subsequent field begins at an offset that satisfies its alignment. The
+size, alignment and offset assertions in `TestCRDTEntry_SizeAndAlignment` make
+an unintended reorder visible; `fieldalignment` is not the enforcing gate.
 
 ### `hamtLeaf` — 32 bytes
 
-`[pkg/sync/hamt.go:53](../../pkg/sync/hamt.go#L53)`. Stores entries for one entity ID at a leaf. Both
-`entityPtr` and `entriesPtr` are `NodePtr` (uint64 offsets into the mmap arena),
-not Go pointers — the leaf stays Zero-GC. Asserted to be exactly 32 bytes.
+[`hamtLeaf`](../../pkg/sync/hamt.go) stores entries for one entity ID at a leaf.
+Both `entityPtr` and `entriesPtr` are `NodePtr` values (uint64 offsets into the
+mmap arena), not Go pointers, so the leaf does not add Go heap pointers to the
+arena representation. Its test asserts a size of exactly 32 bytes.
 
-| Field | Type | Size | Offset |
+| Field         | Type      | Size | Offset |
 |:--|:--|--:|--:|
-| `hash` | `uint64` | 8 | 0 |
-| `entityPtr` | `NodePtr` | 8 | 8 |
-| `entriesPtr` | `NodePtr` | 8 | 16 |
-| `entityLen` | `uint32` | 4 | 24 |
-| `entriesLen` | `uint32` | 4 | 28 |
-| **total** | | **32** | |
+| `hash`        | `uint64`  |  8 | 0  |
+| `entityPtr`   | `NodePtr` |  8 | 8  |
+| `entriesPtr`  | `NodePtr` |  8 | 16 |
+| `entityLen`   | `uint32`  |  4 | 24 |
+| `entriesLen`  | `uint32`  |  4 | 28 |
+| **total**     |           | **32** | |
 
 The two `uint32` length fields are packed into the tail 8 bytes after the three
-`uint64` fields, so the struct's size is 32 with zero trailing pad. A 8-byte
-read of `(entityLen, entriesLen)` is one cache-line access.
+`uint64` fields, so the struct's size is 32 with zero trailing pad. An 8-byte
+read of `(entityLen, entriesLen)` cannot cross a 64-byte cache-line boundary.
 
 ### `HamtNode` — 72 bytes
 
-`[pkg/sync/hamt_arena.go:20](../../pkg/sync/hamt_arena.go#L20)`. An off-heap HAMT node with an atomic reference
-count for epoch-based reclamation and an intrusive Treiber free-list pointer.
-The 72-byte size and the offset-64 `nextFree` placement are a consequence of
-the struct field order (above); `TestHamtNodeOffsets` *logs* them (it does not
-hard-assert — it is a reporting test), and `fieldalignment` (CI) is the gate
-that fails the build if a reorder leaks padding.
+[`HamtNode`](../../pkg/sync/hamt_arena.go) is an off-heap HAMT node with an
+atomic reference count for epoch-based reclamation. The struct occupies 72
+bytes. `TestHamtNodeOffsets` logs its size and selected offsets; it does not
+assert them.
 
-| Field | Type | Size | Offset |
+| Field                | Type           | Size | Offset |
 |:--|:--|--:|--:|
-| `refCount` | `atomic.Int32` | 4 | 0 |
-| `bitmap` | `uint32` | 4 | 4 |
-| `_` (pad) | `uint32` | 4 | 8 | ← explicit, to align the 8-byte ptrs
-| `childrenPtr` | `NodePtr` | 8 | 16 |
-| `entriesPtr` | `NodePtr` | 8 | 24 |
-| `merkleHash` | `[32]byte` | 32 | 32 |
-| `nextFree` | `NodePtr` | 8 | 64 |
-| **total** | | **72** | |
+| `refCount`           | `atomic.Int32` |  4 | 0  |
+| `bitmap`             | `uint32`       |  4 | 4  |
+| `_` (explicit pad)   | `uint32`       |  4 | 8  |
+| compiler alignment   |                |  4 | —  |
+| `childrenPtr`        | `NodePtr`      |  8 | 16 |
+| `entriesPtr`         | `NodePtr`      |  8 | 24 |
+| `merkleHash`         | `[32]byte`     | 32 | 32 |
+| `nextFree`           | `NodePtr`      |  8 | 64 |
+| **total**            |                | **72** | |
 
-The explicit `_ uint32` pad at offset 8 is the *only* deliberately inserted
-padding in a record struct: `childrenPtr` and `entriesPtr` must be 8-aligned and
-the two preceding 4-byte atomics fill 8 bytes, leaving a 4-byte gap that is
-named (not silent) so `fieldalignment` does not move it. `nextFree` lives at
-offset 64 — its own cache line — because the free-list steals the first 8 bytes
-of a dead node, and putting it on a line boundary keeps the CAS off the line
-holding `merkleHash`.
+`refCount` and `bitmap` already fill the first 8 bytes, so the explicit
+`_ uint32` at offset 8 does not fill a gap between them and `childrenPtr`. The
+compiler inserts four more bytes of alignment after that explicit field, before
+`childrenPtr` at offset 16. The 72-byte total therefore includes both the
+explicit word and the implicit four-byte gap.
 
-## 3. Contended Atomics — One Atomic Per Line
+The current free-list implementation does not store its link in `nextFree`.
+After EBR makes a dead node reusable, `pushFreeNode` writes the Treiber
+next-offset into its first 8 bytes, overwriting `refCount` and `bitmap`;
+`AllocNode` reads the same word while holding an EBR participant. `nextFree` is
+zeroed during allocation but is not used as the link.
 
-These structs are written concurrently by multiple cores. Field packing is the
-wrong goal here; **line isolation** is. Every contended atomic is flanked by
-`CacheLinePad` (`[64]byte`), so no other field can migrate onto its line under
-MESI.
+## 3. Contended atomics and cache-line separation
+
+These structs contain fields written concurrently by multiple cores. Packing
+them as tightly as possible would introduce false sharing between independent
+operations. `CacheLinePad` (`[64]byte`) separates hot regions, while fields that
+belong to one protocol may share a region by design. Offsets below are relative
+to the struct's base; physical cache-line placement also depends on the base
+address's alignment.
 
 ### `DeltaCRDTEngine` — sharded root, per-shard CAS locus
 
-`[pkg/sync/crdt.go:135](../../pkg/sync/crdt.go#L135)`. The engine root is **sharded** — `shards []shardRoot`
-(`crdt.go:160`), where each `[pkg/sync/crdt.go:72 shardRoot](../../pkg/sync/crdt.go#L72)` owns one slice of
-the entityID space. The hottest atomic is therefore *not* a single engine-level
-field: it is the **per-shard** `shardRoot.ptr` (the HAMT root pointer for that
-shard, CAS'd on every `InsertLocal`/`Join` *within that shard*). Each shard is
-its own padded CAS slot, so the locus is dispersed across N lines instead of
-collapsing onto one.
+[`DeltaCRDTEngine`](../../pkg/sync/crdt.go) holds `shards []shardRoot`, with each
+shard owning one slice of the entity-ID space. `InsertLocal` and `Join` update
+the HAMT root only within the selected shard. Padding around each
+`shardRoot.ptr` keeps independent root CAS operations on separate lines.
 
 ```
 per shard (shardRoot):
-  _padHead | ptr atomic.Pointer[HAMT] | _padTail    ← per-shard hottest CAS, isolated
+  _padHead | ptr atomic.Pointer[HAMT] | _padTail
 ```
 
-At the engine level, the remaining contended atomics — `lamportCounter` (Add'd
-on every `NextDot`, a SINGLE atomic shared across shards exactly as the
-pre-shard design shared it), `epochCounter` (Add'd on every operation), and the
-metrics counters — each get their own padded regions, same as before the shard.
-`lamportCounter` and `lastSavedCounter` are written by the *same* goroutine in
-`NextDot`, so they safely share a line with each other.
+The Lamport clock remains shared across root shards. `lamportCounter` and
+`lastSavedCounter` occupy one padded region; both are atomic because `NextDot`
+and `AdvanceLamportTo` can run concurrently. `epochCounter` and its advance
+threshold occupy another padded region. The four metrics counters share a third
+region, separated from the clock and epoch fields.
 
-The proof that this matters is `paddedEngineProxy` vs `unpaddedEngineProxy` in
-`[pkg/sync/physics_test.go](../../pkg/sync/physics_test.go)`: a single shared line holding all four metrics
-plus the CAS field is the layout that produced the parallel-efficiency collapse.
-The shard disperses the root CAS across N such lines so no two shards contend.
+`paddedEngineProxy` and `unpaddedEngineProxy` in
+[`physics_test.go`](../../pkg/sync/physics_test.go) compare groups of engine-like
+state, Lamport, epoch and metrics atomics with and without padding. The proxy
+does not execute `DeltaCRDTEngine.InsertLocal` or the allocator. It isolates
+cache-coherence effects rather than measuring end-to-end engine throughput.
 
-### `EBRManager` — two CAS locus split
+### `EBRManager` — separated manager fields
 
-`[pkg/sync/reclamation.go:47](../../pkg/sync/reclamation.go#L47)`. `globalEpoch` is CAS'd by `AdvanceEpoch`;
-`head` is CAS'd by `Register`. Different goroutines, hot concurrently. Both are
-flanked:
+[`EBRManager`](../../pkg/sync/reclamation.go) updates `globalEpoch` in
+`AdvanceEpoch` and `head` in `Register`. Padding separates those fields:
 
 ```
-Line 0: _globalEpochPad0 | globalEpoch atomic.Uint64 | _globalEpochPad1
-Line 1: _headPad0 | head atomic.Pointer[Participant] | _headPad1
-Line 2+: retired [3]RetiredList | pool | retiredPool   ← cold
+_globalEpochPad0 | globalEpoch atomic.Uint64 | _globalEpochPad1
+_headPad0 | head atomic.Pointer[Participant] | _headPad1
+retired [3][arenaRetiredFreelistShardCount]RetiredList
+_retiredRoutePad0 | retiredRoute atomic.Uint64 | _retiredRoutePad1
+pool | retiredPool
+_closingPad0 | closing atomic.Bool | _closingPad1
 ```
 
-### `Participant` — per-slot isolation
+Retirement is distributed across the per-epoch `RetiredList` shards.
+`retiredRoute` selects a shard and has its own padded region, as does `closing`.
+The two pools sit between those regions.
 
-`[pkg/sync/reclamation.go:97](../../pkg/sync/reclamation.go#L97)`. Each `active`, `epoch`, and `hazards` array
-is bracketed by its own `CacheLinePad`, so two cores transacting different
-participants never invalidate each other's lines.
+### `Participant` — per-field isolation
+
+Within each [`Participant`](../../pkg/sync/reclamation.go), `active`, `epoch`
+and the `hazards` array are bracketed by `CacheLinePad`. This separates fields
+within one participant; it does not make a claim about the relative addresses
+of separately allocated participants.
 
 ### `ElimSlot` — the 128-byte stride in full
 
-`[pkg/sync/elimination.go:203](../../pkg/sync/elimination.go#L203)`. The elimination backoff arena packs two
-hot fields onto *one* shared line (they are touched by the two exchanging
-goroutines, so co-location is the rendezvous protocol, not contention), then
-pads with a full 64-byte tail so the *next* slot starts on a fresh line.
+[`ElimSlot`](../../pkg/sync/elimination.go) deliberately places `state` and
+`value` on the same line because the two goroutines exchanging a value use both
+fields. A full 64-byte tail separates the slot from its neighbour.
 
 ```
 ElimSlot (128 bytes = 2 cache lines):
-  offset  0: _padLead [48]byte            ← fill line-0 so state+value land together
-  offset 48: state    atomic.Uint64       ← packed (op<<62)|stamp, control plane
-  offset 56: value    atomic.Uint64       ← payload/sink, data plane
-  offset 64: _padTail CacheLinePad (64B)  ← line-1 isolation; next slot starts at 128
+  offset  0 : _padLead [48]byte            leading fill
+  offset 48 : state    atomic.Uint64       packed (op<<62)|stamp
+  offset 56 : value    atomic.Uint64       payload or sink
+  offset 64 : _padTail CacheLinePad (64B)  trailing isolation
 ```
 
-Adjacent slots therefore never share a line: slot *n*'s `state` at offset
-`128n+48`, slot *n+1*'s `state` at offset `128(n+1)+48` — always 128 bytes
-apart, two cores hitting adjacent slots issue zero cross-core invalidation.
+Slot *n*'s `state` is at relative offset `128n+48`, and slot *n+1*'s is at
+`128(n+1)+48`. The 128-byte stride keeps adjacent states on different lines
+when the array's first line is cache-line aligned. `TestEliminationSlotSize`
+asserts the total size that provides this stride.
 
-### `ElimStack.head` — the surviving contended line
+### `ElimStack.head` — the central contended line
 
-`[pkg/sync/elimination.go:219](../../pkg/sync/elimination.go#L219)`. The Treiber stack head is the one cache line
-that *does* contend under backoff starvation. It is padded away from
-`collisions` (the adaptive probe-budget accumulator, itself on its own pad) and
-from the embedded `EliminationArray` (by value, Zero-GC — no slot heap alloc).
+The Treiber head in [`ElimStack`](../../pkg/sync/elimination.go) remains a
+single CAS locus when elimination does not absorb contention. Padding separates
+it from `collisions`, the adaptive probe-budget accumulator, and from the
+embedded `EliminationArray`. The array is held by value, so its slots do not
+require separate heap allocations.
 
-## 4. Why This Is a Build Gate, Not a Comment
+## 4. What checks the layout
 
-The byte sizes of the record structs are pinned by hard assertion gates:
-`TestCRDTEntry_SizeAndAlignment` (120 B), `TestHamtLeaf_SizeAndAlignment`
-(32 B), and `TestEliminationSlotSize` (128 B) each `t.Fatalf` if the size
-drifts. `fieldalignment` (CI) rejects any reorder that leaks intra-struct
-padding or co-locates two contended atomics, and `bencher` (CI) re-verifies
-that no pad removal regresses throughput. The
-`[pkg/sync/layout_analysis_test.go](../../pkg/sync/layout_analysis_test.go)` is
-a *diagnostic*: it walks every struct via `unsafe.Offsetof` and prints the
-layout so a human can read it — it reports, it does not itself fail the build.
-A maintainer who "cleans up" the `CacheLinePad` fields or re-flattens
-`CRDTEntry` fails the size-assertion gates + `fieldalignment` before review —
-and the engineering post-mortem records that this is exactly how the
-manufactured bugs of Stages 4–6 were caught: by gates that pinned the exact
-expected layout and refused to round it.
+The public CI workflow's struct-layout step runs
+`TestCRDTEntry_SizeAndAlignment`, `TestHamtLeaf_SizeAndAlignment` and
+`TestHamtNodeOffsets`. The first two use assertions to check size, alignment
+and every field offset. `TestHamtNodeOffsets` only logs its results, so its
+presence in that step is diagnostic rather than an offset gate.
+
+`TestEliminationSlotSize` calls `t.Fatalf` if `ElimSlot` is not 128 B, but the
+current public CI selection does not include that test.
+[`TestMemoryLayoutAnalysis`](../../pkg/sync/layout_analysis_test.go) uses
+`unsafe.Offsetof` to print layouts for inspection and has no layout assertions.
+
+`fieldalignment` is not part of the public CI workflow. It is useful as a
+report, not as an automatic rewrite: its suggested packing can move or remove
+the `CacheLinePad` separation that these concurrent layouts require. A layout
+change therefore needs both the relevant assertions and review against the
+fields' access patterns. A smaller struct is not necessarily a better
+concurrent layout.

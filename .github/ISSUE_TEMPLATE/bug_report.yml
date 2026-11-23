@@ -1,0 +1,91 @@
+name: Bug Report
+description: Report a defect in the engine, its tests, or its documentation
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues before filing. Include enough information for a
+        maintainer to reproduce the problem on a clean machine.
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit where the bug appears
+      description: Full SHA-256 from `git rev-parse HEAD` (or the tag/release if using a published version)
+      placeholder: 5dcdedd3e01810cdb40c09e34a2b400a0ebf387b
+    validations:
+      required: true
+
+  - type: input
+    id: go_version
+    attributes:
+      label: Go version
+      description: Output of `go version`
+      placeholder: go1.26.1 linux/arm64
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, and any relevant runtime details (e.g., container, VM, bare metal)
+      placeholder: Ubuntu 24.04, aarch64, Docker container
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction steps
+      description: |
+        Exact commands to reproduce the bug. Include file names, line numbers, or test names
+        if the bug is in a specific test. A failing test command is ideal.
+      placeholder: |
+        go test ./pkg/sync/ -run TestHamtNodeOffsets -count=1 -v
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen according to the documentation or the code's contract
+      placeholder: "The test should pass, reporting zero wasted padding."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happens (error message, panic, wrong output, hang, etc.)
+      placeholder: |
+        --- FAIL: TestHamtNodeOffsets (0.02s)
+            hamt_arena_test.go:142: offset 72 != expected 64
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: |
+        Any configuration, environment variables, build tags, or hardware details that might
+        affect the behavior. If the bug relates to a specific evidence claim or receipt,
+        reference the file (e.g., docs/evidence/convergence-1000-node.txt).
+      placeholder: "Runs with CGO_ENABLED=1 and libjemalloc-dev 5.3.0"
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have read the relevant docs/VERIFY.md section and the bug is not a documented limitation
+          required: true
+        - label: I have tested on a clean clone at the stated commit
+          required: true
+        - label: The bug is not a known issue listed in CHANGELOG.md or SECURITY.md
+          required: false

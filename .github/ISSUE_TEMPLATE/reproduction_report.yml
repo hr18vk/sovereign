@@ -1,0 +1,106 @@
+name: Reproduction Report
+description: Report the result of following docs/VERIFY.md on your machine
+title: "[Reproduction] "
+labels: ["reproduction"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for running the verification steps. Please fill in every field below.
+        If a step was not attempted, write "not run" and explain why.
+
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and OS
+      description: |
+        Example: "c8g.8xlarge, Ubuntu 24.04.1 LTS, Linux 6.8.0-1017-aws, aarch64"
+        For Codespaces: "GitHub Codespace, 4-core, Ubuntu 24.04"
+      placeholder: c8g.8xlarge, Ubuntu 24.04, Linux 6.8, aarch64
+    validations:
+      required: true
+
+  - type: input
+    id: go_version
+    attributes:
+      label: Go version
+      description: Output of `go version`
+      placeholder: go1.26.1 linux/arm64
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit tested
+      description: The full SHA-256 of the commit you built (e.g., from `git rev-parse HEAD`)
+      placeholder: 5dcdedd3e01810cdb40c09e34a2b400a0ebf387b
+    validations:
+      required: true
+
+  - type: dropdown
+    id: level
+    attributes:
+      label: Verification level completed
+      description: Which level of docs/VERIFY.md did you complete?
+      options:
+        - "Five-minute: build + zero-allocation, struct-layout, CRDT-law, PQ negotiation tests"
+        - "Ten-minute: three-node local-mesh.sh + CRASH=1"
+        - "Thirty-minute: c8g.8xlarge reproduce.sh (full transcript)"
+        - "Partial: only some steps completed"
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Exact commands run
+      description: Paste the exact command(s) you executed, including any environment variables
+      placeholder: |
+        git clone https://github.com/hr18vk/sovereign
+        cd sovereign
+        go build ./...
+        go test ./pkg/sync/ -run 'TestHotPathZeroAllocations|TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment|TestHamtNodeOffsets' -count=1
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Command output (trimmed)
+      description: |
+        Paste the relevant output. If the output is long, include the last 50 lines and any error lines.
+        For reproduce.sh, attach the full transcript as a file instead.
+      render: shell
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - "All steps passed as documented"
+        - "Some steps failed — see output"
+        - "Blocked by environment (missing jemalloc, wrong Go version, etc.)"
+        - "Not sure — output unclear"
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes, deviations, or confusion points
+      description: |
+        Any step where the documentation was unclear, a command behaved differently than expected,
+        or you had to deviate from the guide. This helps improve docs/VERIFY.md.
+      placeholder: "The CRASH=1 step required sudo for kill -9 on my system..."
+
+  - type: checkboxes
+    id: transcript
+    attributes:
+      label: Transcript attached
+      description: For the thirty-minute level, a full transcript file must be attached to this issue.
+      options:
+        - label: Full reproduce.sh transcript attached (required for thirty-minute level)
+          required: false

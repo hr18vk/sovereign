@@ -4,39 +4,21 @@ A developer who has never read the engine internals can connect to a running
 mesh over mutual TLS and perform a state operation in under 50 lines of Go.
 This quickstart is the path from zero to a working insert/get loop.
 
+Run these commands from the repository root. Leave the node running in one
+terminal and use another terminal for the SDK commands.
+
 ## 1. What you need
 
+- Linux with gcc and the jemalloc development files; see the
+  [installation commands](../README.md#try-it).
 - Go 1.26+ (the engine targets `go 1.26.1`).
-- A running `sovereign-node` with the control port enabled (`--control-addr`).
-- A client certificate signed by the same CA the node trusts (mTLS — the same
-  trust root as the peer path; see §3).
+- A client certificate signed by the same CA the node trusts. The development
+  helper below creates the CA, node certificate, and client certificate.
 
-## 2. Start a node with the control port
+## 2. Mint a development CA and certificates
 
-```bash
-go build -o sovereign-node ./cmd/sovereign-node
-
-# Mint a dev CA + a node leaf (see §3 for the one-liner), then:
-./sovereign-node \
-  --control-addr 127.0.0.1:7432 \
-  --bind          127.0.0.1:7430 \
-  --metrics-addr  127.0.0.1:7431 \
-  --tls-cert node.crt --tls-key node.key --tls-ca ca.pem \
-  --node-id 27c04aec476bd59d3191a050d55a06bb
-```
-
-The control port (`--control-addr`) is a separate TLS listener from the peer
-gossip port (`--bind`) and the plain-HTTP ops surface (`--metrics-addr`):
-**three surfaces, one trust root**. `--control-addr` defaults to off — a node
-with no `--control-addr` is still a peer in the mesh; the data plane is
-unaffected.
-
-## 3. Mint a dev CA + client cert (one-liner)
-
-The engine ships a development CA helper in `pkg/crypto` (`certgen.go`). It is
-a dev convenience, not a production PKI; a real PKI is a separate, post-launch
-concern. Reuse it to mint the CA, a node leaf, and the client leaf the SDK
-presents as its mTLS client cert:
+The helper in `pkg/crypto` (`certgen.go`) creates a development CA, not a
+production PKI. Save this program as `/tmp/mint_dev_certs.go`:
 
 ```go
 package main
@@ -53,32 +35,68 @@ import (
 
 func main() {
 	ca, _ := crypto.NewMeshCA()
-	caPath, _ := ca.WriteCAPEM(".")          // writes ca.pem
+	caPath, _ := ca.WriteCAPEM(".")
 
 	seed := make([]byte, ed25519.SeedSize)
 	rand.Read(seed)
 	ident, _ := mesh.NewNodeIdentity(seed)
 	nodeHex := hex.EncodeToString(ident.NodeID[:])
-	leaf, _ := ca.IssueLeaf(nodeHex)          // node leaf (CommonName = nodeID hex)
+	leaf, _ := ca.IssueLeaf(nodeHex)
 	certPath, keyPath, _ := leaf.WritePEM("node")
-	fmt.Println("CA:", caPath, "node cert/key:", certPath, keyPath, "nodeID:", nodeHex)
 
-	cleaf, _ := ca.IssueLeaf("sdk-client")    // client leaf (the SDK's mTLS cert)
+	cleaf, _ := ca.IssueLeaf("sdk-client")
 	ccert, ckey, _ := cleaf.WritePEM("client")
+
+	fmt.Println("identity seed:", hex.EncodeToString(seed))
+	fmt.Println("node ID:", nodeHex)
+	fmt.Println("CA:", caPath)
+	fmt.Println("node cert/key:", certPath, keyPath)
 	fmt.Println("client cert/key:", ccert, ckey)
 }
 ```
 
-There is no separate mint tool — the dev CA is minted inline via `pkg/crypto`
-(`NewMeshCA` → `IssueLeaf` → `WritePEM`), exactly as the block above shows. The
-node leaf's `DNSNames` include both the nodeID hex and `localhost`, so the SDK
-can verify the server cert with `ServerName: "localhost"`.
+Run it from the repository root:
 
-## 4. The <50-line example
+```bash
+go run /tmp/mint_dev_certs.go
+```
 
-`examples/sdk/main.go` is the canonical "how to use this" file — 44 lines,
-importing only the `sovereign` SDK + stdlib (zero `internal/` or `pkg/`
-imports; the SDK hides them):
+The program writes `ca.pem`, `node/cert.pem`, `node/key.pem`,
+`client/cert.pem`, and `client/key.pem`. Keep the printed identity seed and
+node ID for the next command. The seed determines the identity that signs CRDT
+deltas; it is separate from the TLS private key. The node certificate includes
+both the node ID and `localhost` in its DNS names, which lets the SDK verify it
+with server name `localhost`.
+
+## 3. Start a node with the control port
+
+Substitute the identity seed and node ID printed by the helper:
+
+```bash
+go build -o sovereign-node ./cmd/sovereign-node
+
+./sovereign-node \
+  --control-addr 127.0.0.1:7432 \
+  --bind          127.0.0.1:7430 \
+  --metrics-addr  127.0.0.1:7431 \
+  --tls-cert node/cert.pem --tls-key node/key.pem --tls-ca ca.pem \
+  --identity-seed <identity-seed-printed-by-the-helper> \
+  --node-id <node-ID-printed-by-the-helper>
+```
+
+`--identity-seed` must derive `--node-id`; startup rejects a mismatch. The
+control port is a separate mTLS listener from the peer gossip port. They use
+the same CA trust root. The operations listener on `--metrics-addr` is plain
+HTTP and serves `/livecheck` and `/metrics` without client authentication.
+These example addresses keep all three listeners on loopback.
+
+`--control-addr` is empty by default, which disables the client API without
+affecting peer gossip.
+
+## 4. The 44-line example
+
+`examples/sdk/main.go` imports only the `sovereign` SDK and the Go standard
+library. It does not import `internal/` or `pkg/` packages:
 
 ```bash
 go run ./examples/sdk \
@@ -86,75 +104,79 @@ go run ./examples/sdk \
   -cert client/cert.pem -key client/key.pem -ca ca.pem
 ```
 
-Output (your Merkle root and digest will differ — they depend on the node's
-identity and history):
+The example dials the control port, inserts 100 key/value pairs, reads the
+Merkle root, and reads `key-0` back from the originator. Output has this form;
+the Merkle root varies by run:
 
-```
-inserted 100 keys; merkle=dafcbb3716958349fbf93a7f766ecc1e946341f416ca39b143a35f131ce4771c; key-0 payload="value-0" digest=bcdbcd7f...
+```text
+inserted 100 keys; merkle=<hex>; key-0 payload="value-0" digest=<hex>
 ```
 
-The example dials the control port, inserts 100 key/value pairs, prints the
-Merkle root, and reads one key back. The cert-loading boilerplate lives in the
-SDK (`sovereign.DialWithCerts`), not the example — the example is the caller,
-not a helper library.
+`sovereign.DialWithCerts` loads the certificate and CA files, so the example
+contains only flag handling, the dial, and the demo call.
 
 ## 5. The SDK surface
 
 ```go
 cli, err := sovereign.DialWithCerts(addr, certPath, keyPath, caPath, "localhost")
-// or: sovereign.Dial(addr, tlsCfg)  // bring your own *tls.Config (TLS 1.3 forced)
+// Or supply a config: sovereign.Dial(addr, tlsCfg).
 
-dotHex, err := cli.InsertLocal(key, val)   // POST /v1/insert -> InsertLocalEvents
-got, err := cli.Get(key)                   // GET  /v1/get    -> GetResult
-root, err := cli.MerkleRoot()              // GET  /v1/merkle
-status, err := cli.Status()                // GET  /livecheck
-metrics, err := cli.Metrics()              // GET  /metrics   (sovereign_* series)
+dotHex, err := cli.InsertLocal(key, val) // POST /v1/insert
+got, err := cli.Get(key)                 // GET /v1/get
+root, err := cli.MerkleRoot()            // GET /v1/merkle
+status, err := cli.Status()              // GET /livecheck
+metrics, err := cli.Metrics()            // GET /metrics (sovereign_* series)
 cli.Close()
 ```
 
-`Dial` forces TLS 1.3 as both the minimum and maximum version — a <1.3
-negotiation is a hard failure. The caller's `tls.Config` carries a client cert
-signed by the mesh CA; a no-cert dial fails the server's
-`RequireAndVerifyClientCert` check (the mTLS guard).
+`Dial` clones the supplied `tls.Config` and sets both its minimum and maximum
+versions to TLS 1.3. The caller supplies a client certificate signed by the
+mesh CA. The server requires and verifies that certificate during the
+handshake.
 
-## 6. The honest read-path boundary (read this before you ship)
+## 6. The read-path payload boundary
 
-I store only the `PayloadDigest` on a joined `CRDTEntry` and discard the
-original value after the integrity cross-check, because keeping the full
-payload would grow the on-disk footprint roughly 10x for no CRDT-merge
-benefit. The value survives only on the originator node's payload cache (the
-node that `InsertLocalEvents`-ed it).
+A joined `CRDTEntry` stores only `PayloadDigest`; see the payload-boundary
+decision in [ADR-0045](architecture/adr/0045_mesh_transport_invariants.md). The
+receive path discards the plaintext after verifying it against that digest.
+Retaining every payload would grow the on-disk footprint roughly 10x without
+improving CRDT merges.
 
-`Get` returns a `GetResult` that makes the boundary visible:
+The originator's gossiper keeps the plaintext in an in-memory cache. `Get`
+returns a `GetResult` that distinguishes a cache hit from a digest-only read:
 
-- **On the originator node**, `Payload` is the cached string (a cache hit).
-- **On a peer node**, `Payload` is `""` and `PayloadDigest` carries the digest
-  the value was hashed to before the read-path discard.
+- On an originator cache hit, `Payload` contains the cached string.
+- On a peer that received the entry through gossip, `Payload` is `""` and
+  `PayloadDigest` contains the verified digest.
 
-A `Get` that reported the digest hex as if it were the value would be a
-fabrication; the SDK reports both paths honestly. If you need the value on a
-peer, re-publish it or hold it out-of-band — the SDK does not paper over the
-boundary.
+An empty `Payload` does not mean the key is absent; check `Present`. The cache
+is not restored from the WAL, so an originator can also return an empty payload
+after a restart. The SDK never substitutes the digest for the value. An
+application that needs plaintext on another node must republish it there or
+store it separately.
 
-## 7. Eventual convergence (not linearizability)
+## 7. Local apply, durability, and convergence
 
-`InsertLocal` returns at local-apply: the insert is durable on the node you
-dialed, but peer convergence is **eventual** — the next gossip sweep ships the
-delta. A client that inserts then immediately reads from a different node may
-see stale state until the sweep lands. I do not offer a read-your-writes
-guarantee across nodes, and I would rather state that here than let you
-discover it in production. For high-rate ingest (more than ~1K ops/sec), ride
-the batched binary data plane (`--bind`), not the JSON control port — the
-control port is a low-rate manageability surface, not a throughput path.
+`InsertLocal` returns after the local apply. If `--wal-path` is configured, the
+node appends and fsyncs the mutation before returning success. The command
+above leaves `--wal-path` empty, so its state is in memory and a successful
+insert is not disk-durable.
 
-## 8. Compile + verify
+Peer convergence is asynchronous. A client that inserts and immediately reads
+from a different node can see stale or missing state until a gossip sweep
+delivers the delta. The SDK does not provide cross-node read-your-writes or
+linearizable reads.
+
+The JSON control port is for low-rate management operations, up to roughly
+1K ops/sec. High-rate replication uses the batched binary protocol on `--bind`.
+
+## 8. Compile and verify
 
 ```bash
-go build ./...                                # whole repo builds (no regression)
-go test -race -count=1 ./sdk/sovereign/       # the SDK tests, race-clean
-wc -l examples/sdk/main.go                    # confirms the example stays under 50 lines
+go build ./...
+go test -race -count=1 ./sdk/sovereign/
+wc -l examples/sdk/main.go
 ```
 
-See `docs/architecture/adr/0011_sdk_control_port.md` for the full decision
-record: the control/data-plane separation, the read-path honesty guard, the
-honest weaknesses, and the self-adversarial critique.
+[ADR-0011](architecture/adr/0011_sdk_control_port.md) records the control-port
+and read-path decisions.

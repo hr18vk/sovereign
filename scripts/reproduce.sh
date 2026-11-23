@@ -3,12 +3,17 @@
 #
 # Use of this software is governed by the Business Source License 1.1,
 # which can be found in the LICENSE file. Production use requires a written
-# grant from the Licensor until the Change Date (2029-08-15).
+# grant from the Licensor until the Change Date stated in the LICENSE file.
 
-# Sovereign Engine — re-run every receipt in docs/evidence on this machine.
+# Sovereign Engine — re-run selected single-host checks from docs/evidence.
 #
-# One command, a provenance header (machine, kernel, Go, jemalloc, commit), every
-# gate and benchmark behind the numbers in docs/evidence, and a saved transcript.
+# One command records a provenance header (machine, kernel, Go, jemalloc, commit).
+# It runs the zero-allocation test and benchmark (zero-alloc.txt), struct-layout,
+# false-sharing, CRDT-algebra and PQ-KEM checks, the batched Ed25519 ingest benchmark
+# (ingest-ed25519.txt), and the core scaling gate (core-crucible.txt). The saved
+# transcript has the same steps as reproduce-c8g-8xlarge-2026-09-22.txt.
+# It does not recreate either multi-region convergence run;
+# CRASH=1 scripts/local-mesh.sh runs the crash-recovery scenario locally.
 # Every step runs even if an earlier one fails; each prints its exit status, and
 # the script's own exit status is 0 only if every step passed.
 #
@@ -32,7 +37,12 @@ set -uo pipefail
 case "${1:-}" in
   -h|--help)
     cat <<USAGE
-sovereign reproduce — every receipt in docs/evidence, on this machine
+sovereign reproduce — selected single-host checks from docs/evidence
+  Re-runs checks behind zero-alloc.txt, ingest-ed25519.txt, core-crucible.txt,
+  plus struct layout, false sharing, CRDT algebra, and PQ KEM.
+  Transcript steps match reproduce-c8g-8xlarge-2026-09-22.txt.
+  Multi-region convergence is not included; local crash recovery uses
+  CRASH=1 scripts/local-mesh.sh.
   CPUS=N         GOMAXPROCS tier for the ingest benchmark and the scaling gate (default: nproc)
   SKIP_INGEST=1  skip step 6, the Ed25519 ingest benchmark
   SKIP_GATE=1    skip step 7, the core scaling gate
@@ -48,7 +58,7 @@ cd "$ROOT" || exit 1
 CPUS="${CPUS:-$(nproc)}"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-LOG="$ROOT/reproduce-$STAMP-$SHA.txt"
+LOG="reproduce-$STAMP-$SHA.txt"
 exec > >(tee "$LOG") 2>&1
 
 FAILS=0
@@ -88,7 +98,7 @@ hr "1. zero-allocation gate + benchmark (pkg/sync)"
 run go test -run TestHotPathZeroAllocations -count=1 ./pkg/sync/
 run go test -run '^$' -bench=BenchmarkHAMTInsertZeroAlloc -benchmem -count=1 ./pkg/sync/
 
-hr "2. struct layout gate (128-byte stride, cache-line alignment)"
+hr "2. struct layout (CRDTEntry and hamtLeaf assertions; HamtNode diagnostics)"
 run go test -run 'TestHamtNodeOffsets|TestCRDTEntry_SizeAndAlignment|TestHamtLeaf_SizeAndAlignment' -count=1 -v ./pkg/sync/
 
 hr "3. false-sharing benchmark (unpadded vs padded counters)"

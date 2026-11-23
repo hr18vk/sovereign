@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/hr18vk
+    about: Request a private reporting channel through the maintainer's GitHub profile. Do not include vulnerability details in public messages.
+  - name: Reproduction report
+    url: https://github.com/hr18vk/sovereign/issues/new?template=reproduction_report.yml
+    about: Report the result of running docs/VERIFY.md on your machine.
+  - name: Bug report
+    url: https://github.com/hr18vk/sovereign/issues/new?template=bug_report.yml
+    about: Report a defect in the engine, its tests, or its documentation.
